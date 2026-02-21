@@ -17,6 +17,9 @@ dependencies = [
 dev = [
   "pytest>=8.0",
 ]
+glm = [
+  "transformers>=4.41",
+]
 
 [tool.setuptools]
 package-dir = {"" = "src"}
