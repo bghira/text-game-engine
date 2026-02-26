@@ -6,7 +6,7 @@ from sqlalchemy import select
 
 from text_game_engine.core.engine import GameEngine
 from text_game_engine.core.types import LLMTurnOutput, ResolveTurnInput, TimerInstruction
-from text_game_engine.persistence.sqlalchemy.models import Snapshot, Turn, Timer
+from text_game_engine.persistence.sqlalchemy.models import Embedding, Snapshot, Timer, Turn
 from text_game_engine.zork_emulator import ZorkEmulator
 
 
@@ -32,7 +32,9 @@ def test_zork_compat_play_action_returns_narration(uow_factory, session_factory,
             action="look",
             manage_claim=True,
         )
-        assert out == "Compat narration"
+        assert out is not None
+        assert out.startswith("Compat narration")
+        assert "\n\nInventory: empty" in out
 
     asyncio.run(run_test())
 
@@ -147,6 +149,28 @@ def test_zork_compat_record_turn_message_ids_and_rewind_by_message_id(
             user_message_id="u-2",
             bot_message_id="b-2",
         )
+        with session_factory() as session:
+            turn_ids = [
+                turn_id
+                for turn_id in session.execute(
+                    select(Turn.id)
+                    .where(Turn.campaign_id == seed_campaign_and_actor["campaign_id"])
+                    .order_by(Turn.id.asc())
+                )
+                .scalars()
+                .all()
+            ]
+            for turn_id in turn_ids:
+                session.add(
+                    Embedding(
+                        turn_id=turn_id,
+                        campaign_id=seed_campaign_and_actor["campaign_id"],
+                        kind="narrator",
+                        content=f"turn-{turn_id}",
+                        embedding=b"\x00\x01",
+                    )
+                )
+            session.commit()
 
         rewind_result = compat.execute_rewind(
             campaign_id=seed_campaign_and_actor["campaign_id"],
@@ -168,6 +192,16 @@ def test_zork_compat_record_turn_message_ids_and_rewind_by_message_id(
                 .all()
             )
             assert [t.id for t in turns] == [1, 2]
+            embeddings = (
+                session.execute(
+                    select(Embedding.turn_id)
+                    .where(Embedding.campaign_id == seed_campaign_and_actor["campaign_id"])
+                    .order_by(Embedding.turn_id.asc())
+                )
+                .scalars()
+                .all()
+            )
+            assert embeddings == [1, 2]
 
     asyncio.run(run_test())
 
@@ -278,6 +312,27 @@ def test_zork_compat_rewind_channel_scope_only_deletes_that_surface(
             session_id=session_a.id,
         )
         compat.record_turn_message_ids(seed_campaign_and_actor["campaign_id"], "u-3", "b-3")
+        with session_factory() as session:
+            turn_ids = (
+                session.execute(
+                    select(Turn.id)
+                    .where(Turn.campaign_id == seed_campaign_and_actor["campaign_id"])
+                    .order_by(Turn.id.asc())
+                )
+                .scalars()
+                .all()
+            )
+            for turn_id in turn_ids:
+                session.add(
+                    Embedding(
+                        turn_id=turn_id,
+                        campaign_id=seed_campaign_and_actor["campaign_id"],
+                        kind="narrator",
+                        content=f"turn-{turn_id}",
+                        embedding=b"\x00\x01",
+                    )
+                )
+            session.commit()
 
         rewind_result = compat.execute_rewind(
             campaign_id=seed_campaign_and_actor["campaign_id"],
@@ -312,6 +367,16 @@ def test_zork_compat_rewind_channel_scope_only_deletes_that_surface(
                 .all()
             )
             assert [s.turn_id for s in snapshots] == [2, 4]
+            embeddings = (
+                session.execute(
+                    select(Embedding.turn_id)
+                    .where(Embedding.campaign_id == seed_campaign_and_actor["campaign_id"])
+                    .order_by(Embedding.turn_id.asc())
+                )
+                .scalars()
+                .all()
+            )
+            assert embeddings == [1, 2, 3, 4]
 
     asyncio.run(run_test())
 

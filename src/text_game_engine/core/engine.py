@@ -215,7 +215,10 @@ class GameEngine:
             campaign_characters = parse_json_dict(campaign.characters_json)
             player_state = parse_json_dict(player.state_json)
 
-            campaign_state = apply_patch(campaign_state, llm_output.state_update or {})
+            campaign_state_update = dict(llm_output.state_update or {})
+            calendar_update = campaign_state_update.pop("calendar_update", None)
+            campaign_state = apply_patch(campaign_state, campaign_state_update)
+            campaign_state = self._apply_calendar_update(campaign_state, calendar_update)
             campaign_characters = apply_patch(campaign_characters, llm_output.character_updates or {})
             player_state = apply_patch(player_state, llm_output.player_state_update or {})
 
@@ -229,17 +232,9 @@ class GameEngine:
             give_item_payload: dict[str, Any] | None = None
             if llm_output.give_item is not None:
                 give_item_payload = asdict(llm_output.give_item)
-            give_item_norm, give_item_issue = normalize_give_item(give_item_payload, self._actor_resolver)
+            _, give_item_issue = normalize_give_item(give_item_payload, self._actor_resolver)
 
-            if give_item_norm is not None and give_item_norm.to_actor_id:
-                self._apply_item_transfer(
-                    uow=uow,
-                    campaign_id=turn_input.campaign_id,
-                    source_player=player,
-                    target_actor_id=give_item_norm.to_actor_id,
-                    item_name=give_item_norm.item,
-                )
-            elif give_item_issue is not None:
+            if give_item_issue is not None:
                 uow.outbox.add(
                     campaign_id=turn_input.campaign_id,
                     session_id=turn_input.session_id,
@@ -258,13 +253,14 @@ class GameEngine:
             player.updated_at = now
             player.last_active_at = now
 
-            player_turn = uow.turns.add(
-                campaign_id=turn_input.campaign_id,
-                session_id=turn_input.session_id,
-                actor_id=turn_input.actor_id,
-                kind="player",
-                content=turn_input.action,
-            )
+            if turn_input.record_player_turn:
+                uow.turns.add(
+                    campaign_id=turn_input.campaign_id,
+                    session_id=turn_input.session_id,
+                    actor_id=turn_input.actor_id,
+                    kind="player",
+                    content=turn_input.action,
+                )
             narrator_turn = uow.turns.add(
                 campaign_id=turn_input.campaign_id,
                 session_id=turn_input.session_id,
@@ -273,7 +269,7 @@ class GameEngine:
                 content=narration,
             )
 
-            timer_instruction = llm_output.timer_instruction
+            timer_instruction = llm_output.timer_instruction if turn_input.allow_timer_instruction else None
             if timer_instruction is not None:
                 uow.timers.cancel_active(turn_input.campaign_id, now)
                 due_at = now + timedelta(seconds=max(30, int(timer_instruction.delay_seconds)))
@@ -366,6 +362,7 @@ class GameEngine:
                 narration=narration,
                 scene_image_prompt=(llm_output.scene_image_prompt or None),
                 timer_instruction=timer_instruction,
+                give_item=give_item_payload,
             )
 
     def _release_claim_best_effort(self, campaign_id: str, actor_id: str, claim_token: str) -> None:
@@ -383,55 +380,56 @@ class GameEngine:
                 return raw[:120]
         return "unknown-room"
 
-    def _apply_item_transfer(self, uow, campaign_id: str, source_player, target_actor_id: str, item_name: str) -> None:
-        if source_player.actor_id == target_actor_id:
-            return
-        target = uow.players.get_by_campaign_actor(campaign_id, target_actor_id)
-        if target is None:
-            return
+    def _apply_calendar_update(
+        self,
+        campaign_state: dict[str, Any],
+        calendar_update: Any,
+    ) -> dict[str, Any]:
+        if not isinstance(calendar_update, dict):
+            return campaign_state
 
-        source_state = parse_json_dict(source_player.state_json)
-        target_state = parse_json_dict(target.state_json)
+        calendar = list(campaign_state.get("calendar") or [])
+        game_time = campaign_state.get("game_time") or {}
+        current_day = game_time.get("day", 1)
+        current_hour = game_time.get("hour", 8)
 
-        source_inv = self._inventory(source_state)
-        target_inv = self._inventory(target_state)
+        to_remove = calendar_update.get("remove")
+        if isinstance(to_remove, list):
+            remove_set = {str(name).strip().lower() for name in to_remove if name}
+            calendar = [
+                event
+                for event in calendar
+                if str(event.get("name", "")).strip().lower() not in remove_set
+            ]
 
-        found = None
-        for idx, item in enumerate(source_inv):
-            if item.get("name", "").lower() == item_name.lower():
-                found = source_inv.pop(idx)
-                break
-        if found is None:
-            return
+        to_add = calendar_update.get("add")
+        if isinstance(to_add, list):
+            for entry in to_add:
+                if not isinstance(entry, dict):
+                    continue
+                name = str(entry.get("name") or "").strip()
+                if not name:
+                    continue
+                event = {
+                    "name": name,
+                    "time_remaining": entry.get("time_remaining", 1),
+                    "time_unit": entry.get("time_unit", "days"),
+                    "created_day": current_day,
+                    "created_hour": current_hour,
+                    "description": str(entry.get("description") or "")[:200],
+                }
+                calendar.append(event)
 
-        if not any(entry.get("name", "").lower() == item_name.lower() for entry in target_inv):
-            target_inv.append({"name": found.get("name", item_name), "origin": f"Received from {source_player.actor_id}"})
+        calendar = [
+            event
+            for event in calendar
+            if not (
+                isinstance(event.get("time_remaining"), (int, float))
+                and event["time_remaining"] <= 0
+            )
+        ]
+        if len(calendar) > 10:
+            calendar = calendar[-10:]
 
-        source_state["inventory"] = source_inv
-        target_state["inventory"] = target_inv
-        source_player.state_json = dump_json(source_state)
-        target.state_json = dump_json(target_state)
-        source_player.updated_at = self._clock()
-        target.updated_at = self._clock()
-
-    def _inventory(self, state: dict[str, Any]) -> list[dict[str, str]]:
-        raw = state.get("inventory")
-        if not isinstance(raw, list):
-            return []
-        out: list[dict[str, str]] = []
-        seen = set()
-        for item in raw:
-            if isinstance(item, dict):
-                name = str(item.get("name") or item.get("item") or item.get("title") or "").strip()
-                origin = str(item.get("origin") or "").strip()
-            else:
-                name = str(item).strip()
-                origin = ""
-            if not name:
-                continue
-            key = name.lower()
-            if key in seen:
-                continue
-            seen.add(key)
-            out.append({"name": name, "origin": origin})
-        return out
+        campaign_state["calendar"] = calendar
+        return campaign_state
