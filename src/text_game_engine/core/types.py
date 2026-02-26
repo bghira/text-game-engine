@@ -56,6 +56,8 @@ class ResolveTurnInput:
     actor_id: str
     action: str
     session_id: Optional[str] = None
+    record_player_turn: bool = True
+    allow_timer_instruction: bool = True
 
 
 @dataclass
@@ -64,6 +66,7 @@ class ResolveTurnResult:
     narration: Optional[str] = None
     scene_image_prompt: Optional[str] = None
     timer_instruction: Optional[TimerInstruction] = None
+    give_item: Optional[dict[str, Any]] = None
     conflict_reason: Optional[str] = None
 
 

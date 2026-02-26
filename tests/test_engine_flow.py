@@ -189,6 +189,49 @@ def test_give_item_unresolved_nonfatal_compat(session_factory, uow_factory, seed
     asyncio.run(run_test())
 
 
+def test_calendar_update_ops_are_applied_and_not_persisted_as_patch_key(
+    session_factory, uow_factory, seed_campaign_and_actor
+):
+    async def run_test():
+        llm = StubLLM(
+            LLMTurnOutput(
+                narration="Calendar updated.",
+                state_update={
+                    "calendar_update": {
+                        "add": [
+                            {
+                                "name": "Eclipse",
+                                "time_remaining": 3,
+                                "time_unit": "days",
+                                "description": "A shadow crosses the city",
+                            }
+                        ]
+                    }
+                },
+            )
+        )
+        engine = GameEngine(uow_factory=uow_factory, llm=llm)
+
+        result = await engine.resolve_turn(
+            ResolveTurnInput(
+                campaign_id=seed_campaign_and_actor["campaign_id"],
+                actor_id=seed_campaign_and_actor["actor_id"],
+                action="check horizon",
+            )
+        )
+        assert result.status == "ok"
+
+        with session_factory() as session:
+            campaign = session.get(Campaign, seed_campaign_and_actor["campaign_id"])
+            assert campaign is not None
+            state = campaign.state_json
+            assert "\"calendar_update\"" not in state
+            assert "\"calendar\"" in state
+            assert "Eclipse" in state
+
+    asyncio.run(run_test())
+
+
 def test_rewind_requires_snapshot_from_same_campaign(session_factory, uow_factory, seed_campaign_and_actor):
     async def run_test():
         llm = StubLLM(LLMTurnOutput(narration="Turn narration"))
