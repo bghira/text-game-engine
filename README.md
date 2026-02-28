@@ -1,22 +1,44 @@
 # text-game-engine
 
-Standalone text game engine with:
+Standalone Python package for running the Zork runtime extracted from
+`discord-tron-master`, with a built-in SQL persistence layer.
 
-- host-agnostic core turn resolution
-- SQL persistence layer with optimistic CAS fencing
-- durable inflight turn leases
-- timer lifecycle persistence
-- outbox event dispatch model
-- attachment text utility with GLM-5 token-aware chunking/summarization
+## Features
 
-See `SCHEMA.md` for persistence invariants.
+- Full `ZorkEmulator` runtime surface for standalone hosts (not Discord-only).
+- Core turn engine with optimistic CAS (`row_version`) and durable inflight leases.
+- SQLAlchemy persistence layer (models, repos, unit-of-work, schema bootstrap).
+- Timer lifecycle persistence (`scheduled_unbound -> scheduled_bound -> expired/cancelled -> consumed`).
+- Rewind + snapshot model with memory visibility watermark support.
+- Calendar events stored as absolute `fire_day` values (not countdown-only fields).
+- Attachment text ingestion and chunked summarization utilities.
+- Optional GLM-5 token counting utility (`glm_token_count`).
 
-## Attachment Utility
+## Install
 
-Use `AttachmentTextProcessor` for token-aware chunking/summarization and
-`extract_attachment_text` for `.txt` attachment decode/size handling.
+```bash
+git clone https://github.com/bghira/text-game-engine
+cd text-game-engine
+pip install -e .
+```
 
-`glm_token_count` is exposed as a utility and lazy-loads the GLM-5 tokenizer.
-Install optional tokenizer dependency with:
+Optional GLM tokenizer support:
 
-`pip install text-game-engine[glm]`
+```bash
+pip install -e ".[glm]"
+```
+
+## Documentation
+
+- SDK: [`docs/sdk.md`](docs/sdk.md)
+- Persistence: [`docs/persistence.md`](docs/persistence.md)
+- Examples index: [`docs/examples.md`](docs/examples.md)
+- Examples folder: [`examples/README.md`](examples/README.md)
+- Schema invariants: [`SCHEMA.md`](SCHEMA.md)
+- Migration checklist: [`MIGRATION_CHECKLIST.md`](MIGRATION_CHECKLIST.md)
+
+## Real Examples
+
+- Minimal engine turn resolution: [`examples/minimal_engine_turn.py`](examples/minimal_engine_turn.py)
+- Standalone Zork runtime flow: [`examples/zork_emulator_session.py`](examples/zork_emulator_session.py)
+- Attachment chunking/summarization flow: [`examples/attachment_processing.py`](examples/attachment_processing.py)
