@@ -323,6 +323,8 @@ def test_build_prompt_shape(session_factory, seed_campaign_and_actor):
     assert "CALENDAR & GAME TIME SYSTEM:" in system_prompt
     assert "CRITICAL — calendar_update.remove rules:" in system_prompt
     assert "Do NOT remove events just because they are overdue." in system_prompt
+    assert "stores fire_day" in system_prompt
+    assert "CALENDAR_REMINDERS" in user_prompt
     assert "CHARACTER ROSTER & PORTRAITS:" in system_prompt
     assert "CAMPAIGN:" in user_prompt
     assert "CURRENT_GAME_TIME:" in user_prompt
@@ -768,8 +770,7 @@ def test_context_shortcuts_calendar_and_roster(session_factory, seed_campaign_an
             campaign_state["calendar"] = [
                 {
                     "name": "Moonrise Ceremony",
-                    "time_remaining": 2,
-                    "time_unit": "days",
+                    "fire_day": 5,
                     "description": "Lanterns gather at the old plaza",
                 }
             ]
@@ -821,8 +822,7 @@ def test_calendar_update_keeps_overdue_and_requires_explicit_remove(
         "calendar": [
             {
                 "name": "Moonrise Ceremony",
-                "time_remaining": 0,
-                "time_unit": "days",
+                "fire_day": 2,
                 "description": "Late but still relevant",
             }
         ],
@@ -845,7 +845,7 @@ def test_calendar_update_keeps_overdue_and_requires_explicit_remove(
     assert isinstance(calendar, list)
     assert len([e for e in calendar if e.get("name") == "Moonrise Ceremony"]) == 1
     assert any(
-        e.get("name") == "Moonrise Ceremony" and e.get("time_remaining") == -1
+        e.get("name") == "Moonrise Ceremony" and e.get("fire_day") == 1
         for e in calendar
     )
 
