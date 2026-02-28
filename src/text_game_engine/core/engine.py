@@ -380,6 +380,68 @@ class GameEngine:
                 return raw[:120]
         return "unknown-room"
 
+    @staticmethod
+    def _calendar_resolve_fire_day(
+        current_day: int,
+        current_hour: int,
+        time_remaining: object,
+        time_unit: object,
+    ) -> int:
+        try:
+            day = int(current_day)
+        except (TypeError, ValueError):
+            day = 1
+        try:
+            hour = int(current_hour)
+        except (TypeError, ValueError):
+            hour = 8
+        day = max(1, day)
+        hour = min(23, max(0, hour))
+        try:
+            remaining = int(time_remaining)
+        except (TypeError, ValueError):
+            remaining = 1
+        unit = str(time_unit or "days").strip().lower()
+        if unit.startswith("hour"):
+            fire_day = day + ((hour + remaining) // 24)
+        else:
+            fire_day = day + remaining
+        return max(1, int(fire_day))
+
+    @classmethod
+    def _calendar_normalize_event(
+        cls,
+        event: Any,
+        *,
+        current_day: int,
+        current_hour: int,
+    ) -> dict[str, Any] | None:
+        if not isinstance(event, dict):
+            return None
+        name = str(event.get("name") or "").strip()
+        if not name:
+            return None
+        fire_day_raw = event.get("fire_day")
+        if isinstance(fire_day_raw, (int, float)) and not isinstance(fire_day_raw, bool):
+            fire_day = max(1, int(fire_day_raw))
+        else:
+            fire_day = cls._calendar_resolve_fire_day(
+                current_day=current_day,
+                current_hour=current_hour,
+                time_remaining=event.get("time_remaining", 1),
+                time_unit=event.get("time_unit", "days"),
+            )
+        normalized: dict[str, Any] = {
+            "name": name,
+            "fire_day": fire_day,
+            "description": str(event.get("description") or "")[:200],
+        }
+        for key in ("created_day", "created_hour"):
+            raw = event.get(key)
+            if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+                normalized[key] = int(raw)
+        return normalized
+
     def _apply_calendar_update(
         self,
         campaign_state: dict[str, Any],
@@ -388,10 +450,21 @@ class GameEngine:
         if not isinstance(calendar_update, dict):
             return campaign_state
 
-        calendar = list(campaign_state.get("calendar") or [])
+        calendar_raw = list(campaign_state.get("calendar") or [])
         game_time = campaign_state.get("game_time") or {}
         current_day = game_time.get("day", 1)
         current_hour = game_time.get("hour", 8)
+        day_int = int(current_day) if isinstance(current_day, (int, float)) else 1
+        hour_int = int(current_hour) if isinstance(current_hour, (int, float)) else 8
+        calendar: list[dict[str, Any]] = []
+        for event in calendar_raw:
+            normalized = self._calendar_normalize_event(
+                event,
+                current_day=day_int,
+                current_hour=hour_int,
+            )
+            if normalized is not None:
+                calendar.append(normalized)
 
         to_remove = calendar_update.get("remove")
         if isinstance(to_remove, list):
@@ -410,24 +483,36 @@ class GameEngine:
                 name = str(entry.get("name") or "").strip()
                 if not name:
                     continue
+                fire_day = entry.get("fire_day")
+                if isinstance(fire_day, (int, float)) and not isinstance(fire_day, bool):
+                    resolved_fire_day = max(1, int(fire_day))
+                else:
+                    resolved_fire_day = self._calendar_resolve_fire_day(
+                        current_day=day_int,
+                        current_hour=hour_int,
+                        time_remaining=entry.get("time_remaining", 1),
+                        time_unit=entry.get("time_unit", "days"),
+                    )
                 event = {
                     "name": name,
-                    "time_remaining": entry.get("time_remaining", 1),
-                    "time_unit": entry.get("time_unit", "days"),
+                    "fire_day": resolved_fire_day,
                     "created_day": current_day,
                     "created_hour": current_hour,
                     "description": str(entry.get("description") or "")[:200],
                 }
                 calendar.append(event)
 
-        calendar = [
-            event
-            for event in calendar
-            if not (
-                isinstance(event.get("time_remaining"), (int, float))
-                and event["time_remaining"] <= 0
-            )
-        ]
+        if isinstance(to_add, list):
+            seen_names: set[str] = set()
+            deduped: list[dict[str, Any]] = []
+            for event in reversed(calendar):
+                key = str(event.get("name", "")).strip().lower()
+                if key in seen_names:
+                    continue
+                seen_names.add(key)
+                deduped.append(event)
+            calendar = list(reversed(deduped))
+
         if len(calendar) > 10:
             calendar = calendar[-10:]
 

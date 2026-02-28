@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timedelta
+import json
 
 from sqlalchemy import select
 
@@ -224,10 +225,16 @@ def test_calendar_update_ops_are_applied_and_not_persisted_as_patch_key(
         with session_factory() as session:
             campaign = session.get(Campaign, seed_campaign_and_actor["campaign_id"])
             assert campaign is not None
-            state = campaign.state_json
-            assert "\"calendar_update\"" not in state
-            assert "\"calendar\"" in state
-            assert "Eclipse" in state
+            state_text = campaign.state_json
+            assert "\"calendar_update\"" not in state_text
+            assert "\"calendar\"" in state_text
+            assert "Eclipse" in state_text
+            state = json.loads(state_text or "{}")
+            calendar = state.get("calendar", [])
+            assert isinstance(calendar, list) and calendar
+            eclipse = next((entry for entry in calendar if entry.get("name") == "Eclipse"), None)
+            assert eclipse is not None
+            assert eclipse.get("fire_day") == 4
 
     asyncio.run(run_test())
 
