@@ -412,7 +412,23 @@ class ZorkEmulator:
         '- "calendar_update": {"add": [...], "remove": [...]} where each add entry is '
         '{"name": str, "time_remaining": int, "time_unit": "hours"|"days", "description": str} '
         "and each remove entry is a string matching an event name.\n"
-        "The harness enforces max 10 calendar events and auto-prunes expired ones.\n"
+        "CALENDAR EVENT LIFECYCLE:\n"
+        "Events should progress through phases based on time_remaining vs game_time:\n"
+        "1. UPCOMING — event is in the future. Mention it naturally when relevant (NPCs remind the player, "
+        "signs/clues reference it). Decrement time_remaining in calendar_update.add (re-add with updated value).\n"
+        "2. IMMINENT — time_remaining is 1 or less. Actively warn the player: NPCs urge action, "
+        "the environment reflects urgency. Narrate pressure to act. The player should feel they need to DO something.\n"
+        "3. OVERDUE — time_remaining reaches 0 or below. Do NOT remove the event. Instead, "
+        "set time_remaining to a negative number and narrate consequences escalating. "
+        "NPCs express disappointment, opportunities narrow, penalties mount. "
+        "The event stays on the calendar as a visible reminder of what the player neglected.\n"
+        "4. RESOLVED — ONLY remove an event when the player has DIRECTLY DEALT WITH IT "
+        "(attended, completed, deliberately abandoned) and the outcome has been narrated. "
+        "Do NOT silently prune events. Do NOT remove events just because they are overdue.\n\n"
+        "CRITICAL — calendar_update.remove rules:\n"
+        "- ONLY remove an event when it has been RESOLVED through player action in the current narration.\n"
+        "- NEVER remove events because time passed or they feel old. Overdue events stay and get worse.\n"
+        "- If you are unsure whether an event should be removed, do NOT remove it.\n"
         "Use calendar events for approaching deadlines, NPC appointments, world events, "
         "and anything with narrative timing pressure.\n"
     )
@@ -1610,7 +1626,7 @@ class ZorkEmulator:
                 guidance_context = (
                     "\nThe user gave this direction for the variants:\n"
                     f"{user_guidance}\n"
-                    "Follow these instructions closely when designing variants.\n"
+                    "Follow these instructions closely when designing the variants.\n"
                 )
 
             if is_known:
@@ -1629,31 +1645,46 @@ class ZorkEmulator:
                     f"called '{raw_name}'.\n"
                     f"{attachment_context}"
                     f"{guidance_context}"
-                    "Each variant should differ in tone, central conflict, or protagonist archetype."
+                    "Each variant should have a different tone, central conflict, or protagonist archetype. "
+                    "Be creative and specific with character names and chapter titles."
                 )
 
             result: dict[str, Any] = {}
+            self._zork_log(
+                f"SETUP VARIANT GENERATION campaign={campaign.id}",
+                f"is_known={is_known} raw_name={raw_name!r} work_desc={work_desc!r}\n"
+                f"--- SYSTEM ---\n{system_prompt}\n--- USER ---\n{user_prompt}",
+            )
             for attempt in range(2):
                 try:
                     cur_user = user_prompt
                     if attempt == 1:
                         cur_user = (
                             f"Generate 2-3 adventure storyline variants for an adult text-adventure "
-                            f"game inspired by '{raw_name}'.\n"
+                            f"game inspired by '{raw_name}'. All characters are adults. "
+                            "Focus on the setting, survival themes, and exploration.\n"
                             f"{imdb_context}"
                         )
+                        self._zork_log(f"SETUP VARIANT RETRY campaign={campaign.id}", cur_user)
                     response = await self._completion_port.complete(
                         system_prompt,
                         cur_user,
                         temperature=0.8,
                         max_tokens=3000,
                     )
+                    self._zork_log("SETUP VARIANT RAW RESPONSE", response or "(empty)")
                     response = self._clean_response(response or "{}")
                     json_text = self._extract_json(response)
                     result = self._parse_json_lenient(json_text) if json_text else {}
                     if isinstance(result.get("variants"), list) and result["variants"]:
                         break
-                except Exception:
+                except Exception as exc:
+                    self._logger.warning(
+                        "Storyline variant generation failed (attempt %s): %s",
+                        attempt,
+                        exc,
+                    )
+                    self._zork_log("SETUP VARIANT GENERATION FAILED", str(exc))
                     result = {}
             raw_variants = result.get("variants", [])
             if isinstance(raw_variants, list):
@@ -1675,11 +1706,22 @@ class ZorkEmulator:
                     )
 
         if not variants:
+            self._zork_log(
+                "SETUP VARIANT FALLBACK",
+                f"result keys={list(result.keys()) if isinstance(result, dict) else 'not-dict'}",
+            )
             top_imdb = imdb_results[0] if imdb_results else {}
             cast = top_imdb.get("cast", []) if isinstance(top_imdb, dict) else []
             main_char = cast[0] if isinstance(cast, list) and cast else "The Protagonist"
             npcs = cast[1:5] if isinstance(cast, list) and len(cast) > 1 else []
-            synopsis = str((top_imdb.get("description") if isinstance(top_imdb, dict) else "") or work_desc or "").strip()
+            synopsis = str(
+                (
+                    (top_imdb.get("synopsis") if isinstance(top_imdb, dict) else "")
+                    or (top_imdb.get("description") if isinstance(top_imdb, dict) else "")
+                    or work_desc
+                    or ""
+                )
+            ).strip()
             variants = [
                 {
                     "id": "variant-1",
@@ -1708,11 +1750,11 @@ class ZorkEmulator:
             if isinstance(chapters, list) and chapters:
                 titles = [str(ch.get("title", "?")) for ch in chapters if isinstance(ch, dict)]
                 if titles:
-                    lines.append(f"Chapters: {' -> '.join(titles)}")
+                    lines.append(f"Chapters: {' → '.join(titles)}")
             lines.append("")
         lines.append(
             "Reply with **1**, **2**, or **3** to pick your storyline, "
-            "or **retry: <guidance>** to regenerate."
+            "or **retry: <guidance>** to regenerate (e.g. `retry: make it darker`)."
         )
         return "\n".join(lines)
 
@@ -1784,6 +1826,44 @@ class ZorkEmulator:
         state["setup_data"] = setup_data
         return await self._setup_finalize(campaign, state, setup_data, user_id=actor_id)
 
+    @staticmethod
+    def _is_explicit_setup_no(message_text: str) -> tuple[bool, str]:
+        raw = (message_text or "").strip()
+        lowered = raw.lower()
+        if lowered in ("no", "n", "nope", "nah"):
+            return True, ""
+        if lowered.startswith(("no,", "no.", "no:", "no;", "no!", "no-", "nope ", "nah ")):
+            guidance = re.sub(r"^\s*(?:no|nope|nah|n)\b[\s,.:;!\-]*", "", raw, flags=re.IGNORECASE).strip()
+            return True, guidance
+        if lowered.startswith("no "):
+            tail = lowered[3:].lstrip()
+            if re.match(r"^(?:i|we|this|that|it|rather|prefer|want|novel|original|custom|homebrew)\b", tail):
+                guidance = re.sub(r"^\s*(?:no|nope|nah|n)\b[\s,.:;!\-]*", "", raw, flags=re.IGNORECASE).strip()
+                return True, guidance
+        return False, ""
+
+    @staticmethod
+    def _looks_like_novel_intent(message_text: str) -> bool:
+        lowered = (message_text or "").strip().lower()
+        if not lowered:
+            return False
+        markers = (
+            "my own",
+            "original",
+            "custom",
+            "homebrew",
+            "from scratch",
+            "made up",
+        )
+        if any(marker in lowered for marker in markers):
+            return True
+        return bool(
+            re.search(
+                r"\b(i(?:'d| would)? rather|i want|let'?s|make|do)\b.*\b(novel|original|custom|homebrew)\b",
+                lowered,
+            )
+        )
+
     async def _setup_handle_classify_confirm(
         self,
         campaign: Campaign,
@@ -1792,7 +1872,11 @@ class ZorkEmulator:
         message_text: str,
         attachments: list[Any] | None = None,
     ) -> str:
-        answer = (message_text or "").strip().lower()
+        raw_answer = (message_text or "").strip()
+        answer = raw_answer.lower()
+        user_guidance: str | None = None
+        explicit_no, no_guidance = self._is_explicit_setup_no(raw_answer)
+        novel_intent = self._looks_like_novel_intent(raw_answer)
         if answer in ("yes", "y", "correct", "yep", "yeah"):
             confirmed = str(setup_data.get("raw_name") or "").lower()
             old_results = setup_data.get("imdb_results", [])
@@ -1806,11 +1890,18 @@ class ZorkEmulator:
                 setup_data["imdb_results"] = [best] if best else [old_results[0]]
             if setup_data.get("imdb_results"):
                 setup_data["imdb_results"] = self._imdb_enrich_results(setup_data["imdb_results"])
-        elif answer in ("no", "n", "nope"):
+        elif explicit_no or answer in ("no", "n", "nope") or novel_intent:
             setup_data["is_known_work"] = False
             setup_data["work_type"] = None
-            setup_data["work_description"] = ""
             setup_data["imdb_results"] = []
+            if explicit_no and no_guidance:
+                user_guidance = no_guidance
+                setup_data["work_description"] = no_guidance
+            elif novel_intent:
+                user_guidance = raw_answer
+                setup_data["work_description"] = raw_answer
+            else:
+                setup_data["work_description"] = ""
         else:
             imdb_results = self._imdb_search(answer, max_results=3)
             result = {}
@@ -1844,7 +1935,7 @@ class ZorkEmulator:
             setup_data["work_description"] = result.get("work_description") or ""
             setup_data["raw_name"] = result.get("suggested_title") or answer.strip()
 
-            if not setup_data["is_known_work"] and imdb_results:
+            if not setup_data["is_known_work"] and imdb_results and not novel_intent:
                 top = imdb_results[0]
                 setup_data["is_known_work"] = True
                 setup_data["raw_name"] = top.get("title") or setup_data["raw_name"]
@@ -1876,7 +1967,11 @@ class ZorkEmulator:
                 if summary:
                     setup_data["attachment_summary"] = summary
 
-        variants_msg = await self._setup_generate_storyline_variants(campaign, setup_data)
+        variants_msg = await self._setup_generate_storyline_variants(
+            campaign,
+            setup_data,
+            user_guidance=user_guidance,
+        )
         state["setup_phase"] = "storyline_pick"
         state["setup_data"] = setup_data
         return variants_msg
@@ -4667,6 +4762,7 @@ class ZorkEmulator:
         campaign_state: Dict[str, object],
         calendar_update: dict,
     ) -> Dict[str, object]:
+        """Process calendar add/remove ops, enforce max 10 events, prune expired."""
         if not isinstance(calendar_update, dict):
             return campaign_state
         calendar = list(campaign_state.get("calendar") or [])
@@ -4701,14 +4797,17 @@ class ZorkEmulator:
                 }
                 calendar.append(event)
 
-        calendar = [
-            event
-            for event in calendar
-            if not (
-                isinstance(event.get("time_remaining"), (int, float))
-                and event["time_remaining"] <= 0
-            )
-        ]
+        if isinstance(to_add, list):
+            seen_names: set[str] = set()
+            deduped = []
+            for event in reversed(calendar):
+                key = str(event.get("name", "")).strip().lower()
+                if key in seen_names:
+                    continue
+                seen_names.add(key)
+                deduped.append(event)
+            calendar = list(reversed(deduped))
+
         if len(calendar) > 10:
             calendar = calendar[-10:]
 

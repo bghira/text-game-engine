@@ -50,6 +50,46 @@ class StubCompletionPort:
         return '{"narration":"ok"}'
 
 
+class NovelIntentProbeCompletionPort:
+    def __init__(self):
+        self.initial_classify_calls = 0
+        self.reclassify_calls = 0
+        self.variant_prompts = []
+
+    async def complete(self, system_prompt, prompt, *, temperature=0.8, max_tokens=2048):
+        if "You classify whether text references a known published work" in system_prompt:
+            self.initial_classify_calls += 1
+            return (
+                '{"is_known_work": true, "work_type": "film", '
+                '"work_description": "A hacker learns reality is simulated.", '
+                '"suggested_title": "The Matrix"}'
+            )
+        if system_prompt.startswith("Return JSON only: is_known_work"):
+            self.reclassify_calls += 1
+            return (
+                '{"is_known_work": true, "work_type": "film", '
+                '"work_description": "Reclassified known work.", '
+                '"suggested_title": "Unexpected Sequel"}'
+            )
+        if "creative game designer" in system_prompt:
+            self.variant_prompts.append(prompt)
+            return (
+                '{"variants":[{"id":"variant-1","title":"Original Arc",'
+                '"summary":"A wholly original campaign premise.",'
+                '"main_character":"Kara","essential_npcs":["Nox"],'
+                '"chapter_outline":[{"title":"Awaken","summary":"The world opens."}]}]}'
+            )
+        if "world-builder for interactive text-adventure campaigns" in system_prompt:
+            return (
+                '{"summary":"Setup summary","setting":"Original setting","tone":"mystery",'
+                '"default_persona":"A careful investigator.","landmarks":["Harbor"],'
+                '"story_outline":{"chapters":[{"title":"Awaken"}]},'
+                '"start_room":{"room_title":"Harbor","room_summary":"Fog and bells","room_description":"Fog rolls in.","exits":["market"],"location":"harbor"},'
+                '"opening_narration":"The bell tolls as fog closes in.","characters":{"guide":{"name":"Nox"}}}'
+            )
+        return '{"narration":"ok"}'
+
+
 class GuardRetryCompletionPort:
     def __init__(self):
         self.calls = 0
@@ -281,6 +321,8 @@ def test_build_prompt_shape(session_factory, seed_campaign_and_actor):
     assert "STRUCTURE REQUIREMENT:" in system_prompt
     assert "USE memory_search AGGRESSIVELY" in system_prompt
     assert "CALENDAR & GAME TIME SYSTEM:" in system_prompt
+    assert "CRITICAL — calendar_update.remove rules:" in system_prompt
+    assert "Do NOT remove events just because they are overdue." in system_prompt
     assert "CHARACTER ROSTER & PORTRAITS:" in system_prompt
     assert "CAMPAIGN:" in user_prompt
     assert "CURRENT_GAME_TIME:" in user_prompt
@@ -339,6 +381,8 @@ def test_setup_flow_with_attachment_and_confirm(session_factory, seed_campaign_a
             attachments=[StubAttachment("lore.txt", b"Neo wakes up in a false city.\n\nAgents hunt him.")],
         )
         assert "Choose a storyline variant" in variants_msg
+        assert "retry: <guidance>" in variants_msg
+        assert "retry: make it darker" in variants_msg
 
         done_msg = await compat.handle_setup_message(
             campaign_id=campaign.id,
@@ -351,6 +395,47 @@ def test_setup_flow_with_attachment_and_confirm(session_factory, seed_campaign_a
         assert compat.is_in_setup_mode(campaign2) is False
         state = compat.get_campaign_state(campaign2)
         assert state.get("setting") == "Neo-noir Seattle"
+
+    asyncio.run(run_test())
+
+
+def test_classify_confirm_negative_with_novel_guidance_skips_reclassify(
+    session_factory, seed_campaign_and_actor
+):
+    async def run_test():
+        probe = NovelIntentProbeCompletionPort()
+        compat = _build_compat(
+            session_factory,
+            completion_port=probe,
+            imdb_port=StubIMDB(),
+        )
+        campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
+
+        msg = await compat.start_campaign_setup(
+            campaign_id=campaign.id,
+            actor_id=seed_campaign_and_actor["actor_id"],
+            raw_name="Matrix",
+            on_rails=True,
+        )
+        assert "Is this correct?" in msg
+        assert probe.initial_classify_calls == 1
+
+        variants_msg = await compat.handle_setup_message(
+            campaign_id=campaign.id,
+            actor_id=seed_campaign_and_actor["actor_id"],
+            message_text="no, i'd rather do a novel thing where the moon is a prison colony",
+        )
+        assert "Choose a storyline variant" in variants_msg
+        assert probe.reclassify_calls == 0
+        assert probe.variant_prompts
+        assert "moon is a prison colony" in probe.variant_prompts[-1].lower()
+
+        with session_factory() as session:
+            row = session.get(Campaign, campaign.id)
+            state = json.loads(row.state_json or "{}")
+            setup = state.get("setup_data", {})
+            assert setup.get("is_known_work") is False
+            assert setup.get("imdb_results") == []
 
     asyncio.run(run_test())
 
@@ -725,6 +810,47 @@ def test_context_shortcuts_calendar_and_roster(session_factory, seed_campaign_an
         assert "Dock 9" in roster_resp
 
     asyncio.run(run_test())
+
+
+def test_calendar_update_keeps_overdue_and_requires_explicit_remove(
+    session_factory, seed_campaign_and_actor
+):
+    compat = _build_compat(session_factory)
+    campaign_state = {
+        "game_time": {"day": 2, "hour": 9},
+        "calendar": [
+            {
+                "name": "Moonrise Ceremony",
+                "time_remaining": 0,
+                "time_unit": "days",
+                "description": "Late but still relevant",
+            }
+        ],
+    }
+
+    updated = compat._apply_calendar_update(
+        campaign_state,
+        {
+            "add": [
+                {
+                    "name": "Moonrise Ceremony",
+                    "time_remaining": -1,
+                    "time_unit": "days",
+                    "description": "Consequences escalating",
+                }
+            ]
+        },
+    )
+    calendar = updated.get("calendar", [])
+    assert isinstance(calendar, list)
+    assert len([e for e in calendar if e.get("name") == "Moonrise Ceremony"]) == 1
+    assert any(
+        e.get("name") == "Moonrise Ceremony" and e.get("time_remaining") == -1
+        for e in calendar
+    )
+
+    removed = compat._apply_calendar_update(updated, {"remove": ["Moonrise Ceremony"]})
+    assert all(e.get("name") != "Moonrise Ceremony" for e in removed.get("calendar", []))
 
 
 def test_legacy_setup_signatures(session_factory, seed_campaign_and_actor):
