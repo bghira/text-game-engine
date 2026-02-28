@@ -17,13 +17,15 @@ Standalone Python package for running the Zork runtime extracted from
 ## Install
 
 ```bash
-pip install text-game-engine
+git clone https://github.com/bghira/text-game-engine
+cd text-game-engine
+pip install -e .
 ```
 
 Optional GLM tokenizer support:
 
 ```bash
-pip install text-game-engine[glm]
+pip install -e ".[glm]"
 ```
 
 ## Documentation
