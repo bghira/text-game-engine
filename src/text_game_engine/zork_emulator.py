@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import fnmatch
 import json
 import logging
 import os
@@ -185,6 +186,10 @@ class ZorkEmulator:
         "location",
         "room_id",
     }
+    SMS_STATE_KEY = "_sms_threads"
+    SMS_MAX_THREADS = 24
+    SMS_MAX_MESSAGES_PER_THREAD = 40
+    SMS_MAX_PREVIEW_CHARS = 120
     MODEL_STATE_EXCLUDE_KEYS = ROOM_STATE_KEYS | {
         "last_narration",
         "room_scene_images",
@@ -196,6 +201,7 @@ class ZorkEmulator:
         "current_scene",
         "setup_phase",
         "setup_data",
+        SMS_STATE_KEY,
     }
     PLAYER_STATE_EXCLUDE_KEYS = {"inventory", "room_description", PLAYER_STATS_KEY}
     _STALE_VALUE_PATTERNS = _COMPLETED_VALUES | {
@@ -219,9 +225,18 @@ class ZorkEmulator:
         "your inventory:",
         "current inventory:",
     )
+    RESPONSE_STYLE_NOTE = (
+        "[SYSTEM NOTE: FOR THIS RESPONSE ONLY: use classic Zork style. Minimal words. "
+        "Advance one concrete beat only. No recap of unchanged facts. No literary prose, "
+        "no novelistic inner monologue, no comic-book melodrama. Keep NPC output actionable "
+        "(intent, decision, question, or action), not repetitive reaction text. "
+        "As game master, you may know when the player is lying; only let an NPC reveal or react to that "
+        "if that NPC plausibly knows in this scene (direct evidence, prior established knowledge, or in-scene disclosure). "
+        "Do not leak off-screen NPC communications into current NPC dialogue unless continuity clearly supports it.]"
+    )
     SYSTEM_PROMPT = (
         "You are the ZorkEmulator, a classic text-adventure GM with light RPG rules. "
-        "You describe outcomes in second person, terse but vivid. You track rooms, "
+        "You describe outcomes in second person, terse and concrete. You track rooms, "
         "objects, exits, and consequences. Each player is a distinct character and "
         "may be in a different location or timeline than other players. You never break character. "
         "This is an adult-oriented game. You may include mature themes, explicit content, violence, "
@@ -240,7 +255,7 @@ class ZorkEmulator:
         "Examples of CORRECT structure:\n"
         '  {"marcus": {"mood": "angry", "location": "courtyard"}, "west_gate": {"status": "barred"}}\n'
         "Examples of WRONG structure (never do this):\n"
-        '  {"marcus_mood": "angry", "marcus_location": "courtyard", "west_gate_status": "barred"})\n'
+        '  {"marcus_mood": "angry", "marcus_location": "courtyard", "west_gate_status": "barred"}\n'
         "- summary_update: string (one or two sentences of lasting changes)\n"
         "- xp_awarded: integer (0-10)\n"
         "- player_state_update: object (optional, player state patches)\n"
@@ -249,6 +264,7 @@ class ZorkEmulator:
         "- set_timer_event: string (optional; what happens when the timer expires)\n"
         "- set_timer_interruptible: boolean (optional; default true)\n"
         "- set_timer_interrupt_action: string or null (optional; context for interruption handling)\n"
+        '- set_timer_interrupt_scope: "local"|"global" (optional; default "global")\n'
         "- give_item: object (REQUIRED when the acting player gives/hands/passes an item to another player character. "
         "Keys: 'item' (string, exact item name from acting player's inventory), "
         "'to_discord_mention' (string, discord_mention of the recipient from PARTY_SNAPSHOT, e.g. '<@123456>'). "
@@ -263,12 +279,22 @@ class ZorkEmulator:
         "current_status, allegiance, relationship. On subsequent turns only mutable fields are accepted: "
         "location, current_status, allegiance, relationship, deceased_reason, and any other dynamic key. "
         "Immutable fields (name, personality, background, appearance) are locked at creation and silently ignored on updates. "
+        "To remove a character from the roster, set that character slug to null in character_updates "
+        "or set it to {'remove': true}. "
         "Set deceased_reason to a string when a character dies. "
         "WORLD_CHARACTERS in the prompt shows the current NPC roster — use it for continuity.)\n\n"
         "Rules:\n"
         "- Return ONLY the JSON object. No markdown, no code fences, no text before or after the JSON.\n"
         "- Do NOT repeat the narration outside the JSON object.\n"
         "- Keep narration under 1800 characters.\n"
+        "- Write in classic Zork style: concise, concrete, and gameplay-forward.\n"
+        "- Keep narration minimal by default (roughly 1-4 sentences, usually 30-120 words).\n"
+        "- No literary flourish: avoid poetic language, novel-style interior monologue, melodrama, or comic-book framing.\n"
+        "- DELTA MODE: each turn should add NEW developments only. Do not recap unchanged context from WORLD_SUMMARY or RECENT_TURNS.\n"
+        "- Do not re-state the player's action in paraphrase unless needed for immediate clarity.\n"
+        "- Avoid repetitive recap loops: at most one brief callback sentence to prior events, then move the scene forward.\n"
+        "- Keep diction plain and direct; prioritize immediate consequences and available choices.\n"
+        "- RECENT_TURNS includes turn/time tags like [TURN #N | Day D HH:MM]. Use them to track pacing and chronology.\n"
         "- If WORLD_SUMMARY is empty, invent a strong starting room and seed the world.\n"
         "- Use player_state_update for player-specific location and status.\n"
         "- Use player_state_update.room_title for a short location title (e.g. 'Penthouse Suite, Escala') whenever location changes.\n"
@@ -318,7 +344,13 @@ class ZorkEmulator:
         "  In ALL other cases, treat other player characters as scenery — they exist but do nothing until THEY act.\n"
         "  This turn's narration concerns ONLY the acting player identified by PLAYER_ACTION.\n"
         "- When mentioning a player character in narration, use their Discord mention from PARTY_SNAPSHOT followed by their name in parentheses, e.g. '<@123456> (Bruce Wayne)'. This pings the player in Discord so they know they were referenced.\n"
-        "- NEVER skip or fast-forward time when a player sleeps, rests, or waits. Narrate only the moment of settling in (closing eyes, finding a spot to rest). Do NOT write 'hours pass', 'you wake at dawn', or advance to morning/next day. Other players share this world and time must not jump for one player's action. End the turn in the present moment.\n"
+        "- Respect explicit player intent for routine actions (sleep, rest, wait). If nothing established in WORLD_STATE/RECENT_TURNS blocks it, the action succeeds.\n"
+        "- For sleep/rest/wait, do NOT invent refusal or conflict (insomnia, sudden danger, interruptions) unless it is already established by prior events, active timers, or immediate scene facts.\n"
+        "- If time cannot safely jump because the campaign timeline is shared, still honor intent by ending with the player sleeping/resting in the present moment.\n"
+        "- Only advance to later times (e.g. morning) when the player explicitly requests it AND the jump is consistent with established world timing.\n"
+        "- Causality first: do not introduce new pursuers, attacks, disasters, media attention, or environmental threats without concrete setup in prior turns/state.\n"
+        "- Escalations must follow a believable chain of evidence and opportunity (how they found the player, why now, and through what channel).\n"
+        "- No omniscient coincidence pressure: avoid out-of-nowhere helicopters, enemy arrivals, or wildlife hazards unless foreshadowed or logically triggered.\n"
     )
     GUARDRAILS_SYSTEM_PROMPT = (
         "\nSTRICT RAILS MODE IS ENABLED.\n"
@@ -340,40 +372,78 @@ class ZorkEmulator:
         '- "set_timer_interrupt_action": string or null (what should happen when the player interrupts '
         "the timer by acting; null means just cancel silently; a description means the system will "
         "feed it back to you as context on the next turn so you can narrate the interruption)\n"
+        '- "set_timer_interrupt_scope": "local"|"global" (default "global"; local means only the acting player can interrupt, global means any player in the campaign can interrupt)\n'
         "These go ALONGSIDE narration/state_update/etc in the same JSON object. Example:\n"
         '{"narration": "The ceiling groans ominously. Dust rains down...", '
         '"state_update": {"ceiling_status": "cracking"}, "summary_update": "Ceiling is unstable.", "xp_awarded": 0, '
         '"player_state_update": {"room_summary": "A crumbling chamber with a failing ceiling."}, '
         '"set_timer_delay": 120, "set_timer_event": "The ceiling collapses, burying the room in rubble.", '
         '"set_timer_interruptible": true, '
-        '"set_timer_interrupt_action": "The player escapes just as cracks widen overhead."}\n'
+        '"set_timer_interrupt_action": "The player escapes just as cracks widen overhead.", '
+        '"set_timer_interrupt_scope": "local"}\n'
         "The system shows a live countdown in Discord. "
         "If the player acts before it expires, the timer is cancelled (if interruptible). "
         "If the player does NOT act in time, the system auto-fires the event.\n"
         "PURPOSE: Timed events should FORCE THE PLAYER TO MAKE A DECISION or DRAG THEM WHERE THEY NEED TO BE.\n"
         "- Use timers to push the story forward when the player is stalling, idle, or refusing to engage.\n"
+        "- Use ACTIVE_PLAYER_LOCATION and PARTY_SNAPSHOT to decide scope and narrative impact.\n"
         "- NPCs should grab, escort, or coerce the player. Environments should shift and force movement.\n"
         "- The event should advance the plot: move the player to the next location, "
         "force an encounter, have an NPC intervene, or change the scene decisively.\n"
         "- Do NOT use timers for trivial flavor. They should always have real consequences that change game state.\n"
-        "- Set interruptible=false for events the player cannot avoid (e.g. an earthquake, a mandatory roll call).\n"
+        "- Timer events must be grounded in established scene facts (known NPCs, known hazards, known locations).\n"
+        "- Do NOT spawn unrelated antagonists, wildlife attacks, or media response solely to create urgency.\n"
+        "- Set interruptible=false for events the player cannot avoid (e.g. structural collapse already in motion, a trap already sprung, mandatory roll call).\n"
+        "- Use interrupt_scope=local for hazards anchored to the active player's immediate room/situation.\n"
+        "- Use interrupt_scope=global for campaign-wide clocks where any player can intervene.\n"
+        "- Prefer non-interruptible timers for true forced beats; do not default everything to interruptible.\n"
         "Rules:\n"
         "- Use ~60s for urgent, ~120s for moderate, ~180-300s for slow-building tension.\n"
         "- Use whenever the scene has a deadline, the player is stalling, an NPC is impatient, "
         "or the world should move without the player.\n"
         "- Your narration should hint at urgency narratively (e.g. 'the footsteps grow louder') but NEVER include countdowns, timestamps, emoji clocks, or explicit seconds. The system adds its own countdown display automatically.\n"
-        "- Use at least once every few turns when dramatic pacing allows. Do not use on consecutive turns.\n"
+        "- No quota: only set a timer when the current scene has a believable, already-grounded clock.\n"
     )
     MEMORY_TOOL_PROMPT = (
         "\nYou have a memory_search tool. To use it, return ONLY:\n"
         '{"tool_call": "memory_search", "queries": ["query1", "query2", ...]}\n'
-        "No other keys alongside tool_call. You may provide one or more queries.\n"
+        "No other keys alongside tool_call except optional 'category'. You may provide one or more queries.\n"
+        "Optional category scope example:\n"
+        '{"tool_call": "memory_search", "category": "char:marcus-blackwell", "queries": ["penthouse", "deal"]}\n'
+        "If results are weak or empty, you may immediately call memory_search again with refined queries.\n"
+        "\nTOOL USAGE POLICY (HIGH PRIORITY):\n"
+        "- On MOST turns, call at least one tool BEFORE final narration/state JSON.\n"
+        "- Default behavior: call memory_search first.\n"
+        "- If PLAYER_ACTION involves phone/text/call/off-scene contact, use sms_list/sms_read before narrating; "
+        "use sms_write when sending or replying.\n"
+        "- Only skip tools for trivial immediate physical follow-ups where continuity risk is near zero.\n"
+        "- If unsure what to query, use current location + active NPC names + key nouns from PLAYER_ACTION.\n"
+        "\nYou also have a memory_terms tool for wildcard term/category listing. Use it BEFORE storing memories:\n"
+        '{"tool_call": "memory_terms", "wildcard": "marcus*"}\n'
+        "This returns existing category/term buckets so you can avoid duplicates.\n"
+        "\nYou also have a memory_turn tool for full turn text retrieval by turn number:\n"
+        '{"tool_call": "memory_turn", "turn_id": 1234}\n'
+        "Use this immediately after memory_search when a hit is relevant and you need exact wording/details.\n"
+        "\nYou also have a memory_store tool for curated long-term memories:\n"
+        '{"tool_call": "memory_store", "category": "char:marcus-blackwell", "term": "marcus", "memory": "Marcus admitted he forged the ledger."}\n'
+        "Categories should be character-keyed when possible (e.g. 'char:alice', 'char:marcus-blackwell'). "
+        "A category can contain multiple memories.\n"
+        "When category is provided in memory_search, curated memories in that category are vector searched.\n"
+        "\nYou also have SMS tools for in-game communications with off-scene NPCs:\n"
+        "- List SMS threads:\n"
+        '{"tool_call": "sms_list", "wildcard": "*"}\n'
+        "- Read one thread:\n"
+        '{"tool_call": "sms_read", "thread": "saul", "limit": 20}\n'
+        "- Write/send an SMS entry:\n"
+        '{"tool_call": "sms_write", "thread": "saul", "from": "Dale", "to": "Saul", "message": "Meet me at Dock 9."}\n'
+        "SMS continuity rule: do NOT leak scene context into SMS content unless the SMS explicitly mentions it.\n"
+        "NPC SMS responses/knowledge must be limited to what that thread and established continuity plausibly reveal.\n"
         "Use SEPARATE queries for each character or topic — do NOT combine multiple subjects into one query.\n"
         "Example: to recall Marcus and Anastasia, use:\n"
         '{"tool_call": "memory_search", "queries": ["Marcus", "Anastasia"]}\n'
         'NOT: {"tool_call": "memory_search", "queries": ["Marcus Anastasia relationship"]}\n'
         "USE memory_search AGGRESSIVELY — it is cheap and fast. Prefer searching too often over guessing.\n"
-        "You SHOULD use memory_search on MOST turns. Specifically:\n"
+        "You MUST use memory_search on MOST turns. Specifically:\n"
         "- ANY time a character, NPC, or named entity appears or is mentioned — even if they were in recent turns. "
         "Memory may contain richer detail than the truncated recent context.\n"
         "- ANY time the player references past events, locations, objects, or conversations.\n"
@@ -415,9 +485,10 @@ class ZorkEmulator:
         '{"name": str, "time_remaining": int, "time_unit": "hours"|"days", "description": str} '
         "and each remove entry is a string matching an event name.\n"
         "HARNESS BEHAVIOR:\n"
-        "- The harness converts add entries into absolute due dates and stores fire_day (the game day an event fires).\n"
+        "- The harness converts add entries into absolute due dates and stores fire_day + fire_hour (the exact in-game deadline).\n"
         "- Do NOT decrement counters manually by re-adding events each turn. The harness computes remaining days automatically.\n"
-        "- You will receive CALENDAR_REMINDERS in the prompt for imminent/overdue events.\n"
+        "- You will receive CALENDAR_REMINDERS in the prompt for imminent/overdue events, including hour-level countdowns near deadline.\n"
+        "- CALENDAR_REMINDERS are sparse urgency signals. Do NOT echo them every turn; only surface them in narration when relevant to the current action/scene, when the player asks, or when the event is immediate.\n"
         "CALENDAR EVENT LIFECYCLE:\n"
         "Events should progress through phases based on fire_day vs CURRENT_GAME_TIME.day:\n"
         "1. UPCOMING — event is in the future. Mention it naturally when relevant (NPCs remind the player, "
@@ -465,6 +536,11 @@ class ZorkEmulator:
         "Use simple ASCII only: - | + . # / \\ and letters.\n"
         "Include other player markers (A, B, C, ...) and add a Legend at the bottom.\n"
         "In the Legend, use PLAYER_NAME for @ and character_name from OTHER_PLAYERS for each marker.\n"
+        "Treat PLAYER_LOCATION_KEY, OTHER_PLAYERS[*].location_key, and WORLD_CHARACTER_LOCATIONS[*].location_key "
+        "as authoritative location IDs.\n"
+        "Only place entities in the same room/box when location_key is exactly equal.\n"
+        "Do NOT nest one distinct location_key area inside another.\n"
+        "If multiple location keys are active, draw separate rooms/areas connected by neutral separators only.\n"
     )
     IMDB_SUGGEST_URL = "https://v2.sg.media-imdb.com/suggestion/{first}/{query}.json"
     IMDB_TIMEOUT = 5
@@ -581,6 +657,47 @@ class ZorkEmulator:
         except (TypeError, ValueError):
             return default
         return parsed if parsed >= 0 else default
+
+    @classmethod
+    def _extract_game_time_snapshot(cls, campaign_state: Dict[str, object]) -> Dict[str, int]:
+        game_time = campaign_state.get("game_time") if isinstance(campaign_state, dict) else {}
+        if not isinstance(game_time, dict):
+            game_time = {}
+        day = cls._coerce_non_negative_int(game_time.get("day", 1), default=1) or 1
+        hour = cls._coerce_non_negative_int(game_time.get("hour", 8), default=8)
+        minute = cls._coerce_non_negative_int(game_time.get("minute", 0), default=0)
+        return {
+            "day": max(1, day),
+            "hour": min(23, max(0, hour)),
+            "minute": min(59, max(0, minute)),
+        }
+
+    @classmethod
+    def _turn_context_prefix(cls, turn: Turn) -> str:
+        turn_number = int(getattr(turn, "id", 0) or 0)
+        meta = parse_json_dict(getattr(turn, "meta_json", "{}"))
+        game_time = meta.get("game_time") if isinstance(meta, dict) else None
+        if isinstance(game_time, dict):
+            day = cls._coerce_non_negative_int(game_time.get("day", 1), default=1) or 1
+            hour = cls._coerce_non_negative_int(game_time.get("hour", 0), default=0)
+            minute = cls._coerce_non_negative_int(game_time.get("minute", 0), default=0)
+            hour = min(23, max(0, hour))
+            minute = min(59, max(0, minute))
+            return f"[TURN #{turn_number} | Day {day} {hour:02d}:{minute:02d}]"
+        return f"[TURN #{turn_number}]"
+
+    @staticmethod
+    def _normalize_timer_interrupt_scope(value: object) -> str:
+        if isinstance(value, str) and value.strip().lower() == "local":
+            return "local"
+        return "global"
+
+    def _timer_can_be_interrupted_by(self, pending: dict[str, Any], actor_id: str) -> bool:
+        scope = self._normalize_timer_interrupt_scope(pending.get("interrupt_scope"))
+        if scope != "local":
+            return True
+        timer_actor_id = str(pending.get("interrupt_actor_id") or "").strip()
+        return bool(timer_actor_id) and timer_actor_id == str(actor_id or "").strip()
 
     def _default_player_stats(self) -> dict[str, object]:
         return {
@@ -3161,7 +3278,12 @@ class ZorkEmulator:
             should_end = True
         try:
             pending = self._pending_timers.get(campaign_id)
-            if pending is not None and pending.get("interruptible", True):
+            can_interrupt = (
+                pending is not None
+                and pending.get("interruptible", True)
+                and self._timer_can_be_interrupted_by(pending, actor_id)
+            )
+            if can_interrupt:
                 cancelled_timer = self.cancel_pending_timer(campaign_id)
                 with self._session_factory() as session:
                     row = (
@@ -3182,6 +3304,11 @@ class ZorkEmulator:
                     if isinstance(interrupt_action, str) and interrupt_action.strip():
                         interrupt_note += f' Interruption context: "{interrupt_action.strip()}"'
                     with self._session_factory() as session:
+                        campaign = session.get(Campaign, campaign_id)
+                        campaign_state = parse_json_dict(campaign.state_json) if campaign is not None else {}
+                        turn_meta = self._dump_json(
+                            {"game_time": self._extract_game_time_snapshot(campaign_state)}
+                        )
                         session.add(
                             Turn(
                                 campaign_id=campaign_id,
@@ -3189,6 +3316,7 @@ class ZorkEmulator:
                                 actor_id=actor_id,
                                 kind="narrator",
                                 content=interrupt_note,
+                                meta_json=turn_meta,
                             )
                         )
                         session.commit()
@@ -3226,6 +3354,7 @@ class ZorkEmulator:
                     give_item=result.give_item,
                     pre_inventory_rich=pre_inventory_rich,
                 )
+                self._sync_main_party_room_state(campaign_id, actor_id)
                 timer_delay_seconds: int | None = None
                 if result.timer_instruction is not None:
                     timer_delay_seconds = int(result.timer_instruction.delay_seconds)
@@ -3250,6 +3379,10 @@ class ZorkEmulator:
                         event_description=result.timer_instruction.event_text,
                         interruptible=bool(result.timer_instruction.interruptible),
                         interrupt_action=result.timer_instruction.interrupt_action,
+                        interrupt_scope=self._normalize_timer_interrupt_scope(
+                            getattr(result.timer_instruction, "interrupt_scope", "global")
+                        ),
+                        interrupt_actor_id=actor_id,
                     )
                 portrait_channel_ref: str | None = None
                 if session_id is not None:
@@ -3327,7 +3460,17 @@ class ZorkEmulator:
                 expiry_ts = int(time.time()) + delay_seconds
                 event_hint = str(getattr(timer_instruction, "event_text", "") or "Something happens")
                 interruptible = bool(getattr(timer_instruction, "interruptible", True))
-                interrupt_hint = "act to prevent!" if interruptible else "unavoidable"
+                interrupt_scope = self._normalize_timer_interrupt_scope(
+                    getattr(timer_instruction, "interrupt_scope", "global")
+                )
+                if interruptible:
+                    interrupt_hint = (
+                        "acting player can prevent"
+                        if interrupt_scope == "local"
+                        else "act to prevent!"
+                    )
+                else:
+                    interrupt_hint = "unavoidable"
                 decorated = (
                     f"{decorated}\n\n"
                     f"⏰ <t:{expiry_ts}:R>: {event_hint} ({interrupt_hint})"
@@ -3384,6 +3527,51 @@ class ZorkEmulator:
             row.updated_at = datetime.utcnow()
             session.commit()
 
+    def _sync_main_party_room_state(self, campaign_id: str, source_actor_id: str) -> None:
+        with self._session_factory() as session:
+            source_player = (
+                session.query(Player)
+                .filter(Player.campaign_id == campaign_id)
+                .filter(Player.actor_id == source_actor_id)
+                .first()
+            )
+            if source_player is None:
+                return
+            source_state = parse_json_dict(source_player.state_json)
+            source_party = str(source_state.get("party_status") or "").strip().lower()
+            if source_party != "main_party":
+                return
+            has_room_context = any(
+                source_state.get(key)
+                for key in ("room_id", "location", "room_title", "room_summary", "room_description")
+            )
+            if not has_room_context:
+                return
+            targets = (
+                session.query(Player)
+                .filter(Player.campaign_id == campaign_id)
+                .filter(Player.actor_id != source_actor_id)
+                .all()
+            )
+            changed = False
+            for target in targets:
+                target_state = parse_json_dict(target.state_json)
+                if str(target_state.get("party_status") or "").strip().lower() != "main_party":
+                    continue
+                before = dict(target_state)
+                for key in self.ROOM_STATE_KEYS:
+                    src_val = source_state.get(key)
+                    if src_val is None:
+                        target_state.pop(key, None)
+                    else:
+                        target_state[key] = src_val
+                if target_state != before:
+                    target.state_json = self._dump_json(target_state)
+                    target.updated_at = datetime.utcnow()
+                    changed = True
+            if changed:
+                session.commit()
+
     def _record_simple_turn_pair(
         self,
         *,
@@ -3394,6 +3582,10 @@ class ZorkEmulator:
         narration: str,
     ) -> None:
         with self._session_factory() as session:
+            campaign = session.get(Campaign, campaign_id)
+            campaign_state = parse_json_dict(campaign.state_json) if campaign is not None else {}
+            game_time_snapshot = self._extract_game_time_snapshot(campaign_state)
+            turn_meta = self._dump_json({"game_time": game_time_snapshot})
             session.add(
                 Turn(
                     campaign_id=campaign_id,
@@ -3401,6 +3593,7 @@ class ZorkEmulator:
                     actor_id=actor_id,
                     kind="player",
                     content=action_text,
+                    meta_json=turn_meta,
                 )
             )
             session.add(
@@ -3410,9 +3603,9 @@ class ZorkEmulator:
                     actor_id=actor_id,
                     kind="narrator",
                     content=narration,
+                    meta_json=turn_meta,
                 )
             )
-            campaign = session.get(Campaign, campaign_id)
             if campaign is not None:
                 campaign.last_narration = narration
                 campaign.updated_at = datetime.utcnow()
@@ -3767,17 +3960,23 @@ class ZorkEmulator:
                     lines.append("**Upcoming Events:**")
                     for event in calendar_entries:
                         days_remaining = int(event.get("days_remaining", 0))
+                        hours_remaining = int(event.get("hours_remaining", days_remaining * 24))
                         fire_day = int(event.get("fire_day", 1))
+                        fire_hour = max(0, min(23, int(event.get("fire_hour", 23))))
                         desc = str(event.get("description", "") or "")
-                        if days_remaining < 0:
-                            eta = f"overdue by {abs(days_remaining)} day(s)"
-                        elif days_remaining == 0:
-                            eta = "fires today"
-                        elif days_remaining == 1:
-                            eta = "fires tomorrow"
+                        if hours_remaining < 0:
+                            eta = f"overdue by {abs(hours_remaining)} hour(s)"
+                        elif hours_remaining == 0:
+                            eta = "fires now"
+                        elif hours_remaining < 48:
+                            eta = f"fires in {hours_remaining} hour(s)"
                         else:
-                            eta = f"fires in {days_remaining} days"
-                        line = f"- **{event.get('name', 'Unknown')}** - Day {fire_day} ({eta})"
+                            eta_days = (hours_remaining + 23) // 24
+                            eta = f"fires in {eta_days} day(s)"
+                        line = (
+                            f"- **{event.get('name', 'Unknown')}** - "
+                            f"Day {fire_day}, {fire_hour:02d}:00 ({eta})"
+                        )
                         if desc:
                             line += f" ({desc})"
                         lines.append(line)
@@ -3798,7 +3997,6 @@ class ZorkEmulator:
                     status = char.get("current_status", "")
                     background = str(char.get("background", "") or "")
                     origin = background.split(".")[0].strip() if background else ""
-                    portrait = char.get("image_url", "")
                     deceased = char.get("deceased_reason")
                     entry = f"- **{name}** ({slug})"
                     if deceased:
@@ -3809,8 +4007,6 @@ class ZorkEmulator:
                             entry += f" | {status}"
                     if origin:
                         entry += f"\n  *{origin}.*"
-                    if portrait:
-                        entry += f"\n  Portrait: {portrait}"
                     lines.append(entry)
                 return "\n".join(lines)
 
@@ -4208,6 +4404,8 @@ class ZorkEmulator:
         event_description: str,
         interruptible: bool = True,
         interrupt_action: str | None = None,
+        interrupt_scope: str = "global",
+        interrupt_actor_id: str | None = None,
     ) -> None:
         task = asyncio.create_task(
             self._timer_task(campaign_id, channel_id, delay_seconds, event_description)
@@ -4220,6 +4418,8 @@ class ZorkEmulator:
             "delay": delay_seconds,
             "interruptible": interruptible,
             "interrupt_action": interrupt_action,
+            "interrupt_scope": self._normalize_timer_interrupt_scope(interrupt_scope),
+            "interrupt_actor_id": str(interrupt_actor_id or "").strip() or None,
         }
 
     async def _timer_task(
@@ -4308,6 +4508,7 @@ class ZorkEmulator:
         )
         if result.status != "ok":
             return
+        self._sync_main_party_room_state(campaign_id, active_actor_id)
         await self._enqueue_new_character_portraits(
             campaign_id=campaign_id,
             actor_id=active_actor_id,
@@ -4422,12 +4623,22 @@ class ZorkEmulator:
         if not isinstance(chapters, list) or not chapters:
             return None
 
-        current_chapter = campaign_state.get("current_chapter", 0)
-        current_scene = campaign_state.get("current_scene", 0)
-        if not isinstance(current_chapter, int):
-            current_chapter = 0
-        if not isinstance(current_scene, int):
-            current_scene = 0
+        current_chapter = self._coerce_non_negative_int(
+            campaign_state.get("current_chapter", 0), default=0
+        )
+        current_scene = self._coerce_non_negative_int(
+            campaign_state.get("current_scene", 0), default=0
+        )
+        current_chapter = min(current_chapter, max(len(chapters) - 1, 0))
+
+        def _preview(value: object, max_chars: int = 320) -> str:
+            text = str(value or "").strip()
+            if len(text) <= max_chars:
+                return text
+            clipped = text[:max_chars].rsplit(" ", 1)[0].strip()
+            if not clipped:
+                clipped = text[:max_chars].strip()
+            return f"{clipped}..."
 
         lines: List[str] = []
         if current_chapter > 0 and current_chapter - 1 < len(chapters):
@@ -4454,12 +4665,30 @@ class ZorkEmulator:
                         lines.append(f"    Key characters: {', '.join(key_characters)}")
             lines.append("")
 
-        if current_chapter + 1 < len(chapters):
-            nxt = chapters[current_chapter + 1]
-            lines.append(f"NEXT CHAPTER: {nxt.get('title', 'Untitled')}")
-            summary = nxt.get("summary", "")
-            if summary:
-                lines.append(f"  Preview: {summary[:200]}")
+        for offset in range(1, 4):
+            idx = current_chapter + offset
+            if idx >= len(chapters):
+                break
+            nxt = chapters[idx]
+            label = "NEXT CHAPTER" if offset == 1 else f"UPCOMING CHAPTER {offset}"
+            lines.append(f"{label}: {nxt.get('title', 'Untitled')}")
+            preview = _preview(nxt.get("summary", ""))
+            if preview:
+                lines.append(f"  Preview: {preview}")
+            nxt_scenes = nxt.get("scenes")
+            if isinstance(nxt_scenes, list):
+                titles = []
+                for scene in nxt_scenes[:3]:
+                    if not isinstance(scene, dict):
+                        continue
+                    title = str(scene.get("title", "Untitled")).strip() or "Untitled"
+                    titles.append(title)
+                if titles:
+                    lines.append(f"  Early scenes: {', '.join(titles)}")
+            lines.append("")
+
+        while lines and not lines[-1]:
+            lines.pop()
         return "\n".join(lines) if lines else None
 
     def _split_room_state(
@@ -4735,34 +4964,115 @@ class ZorkEmulator:
     def _apply_character_updates(
         self,
         existing: Dict[str, dict],
-        updates: Dict[str, dict],
+        updates: Dict[str, object],
         on_rails: bool = False,
     ) -> Dict[str, dict]:
         if not isinstance(updates, dict):
             return existing
-        for slug, fields in updates.items():
-            if not isinstance(fields, dict):
-                continue
-            slug = str(slug).strip()
+        for raw_slug, fields in updates.items():
+            slug = str(raw_slug).strip()
             if not slug:
                 continue
-            if slug in existing:
+
+            target_slug = self._resolve_existing_character_slug(existing, slug)
+
+            delete_requested = (
+                fields is None
+                or (
+                    isinstance(fields, str)
+                    and fields.strip().lower() in {"delete", "remove", "null"}
+                )
+                or (
+                    isinstance(fields, dict)
+                    and bool(
+                        fields.get("remove")
+                        or fields.get("delete")
+                        or fields.get("_delete")
+                        or fields.get("deleted")
+                    )
+                )
+            )
+            if delete_requested:
+                existing.pop(target_slug or slug, None)
+                continue
+            if not isinstance(fields, dict):
+                continue
+            if target_slug in existing:
                 for key, value in fields.items():
                     if key not in self.IMMUTABLE_CHARACTER_FIELDS:
-                        existing[slug][key] = value
+                        existing[target_slug][key] = value
             else:
                 if on_rails:
                     continue
                 existing[slug] = dict(fields)
         return existing
 
+    def _resolve_existing_character_slug(
+        self,
+        existing: Dict[str, dict],
+        raw_slug: object,
+    ) -> Optional[str]:
+        slug = str(raw_slug or "").strip()
+        if not slug:
+            return None
+        canonical = re.sub(r"[^a-z0-9]+", "-", slug.lower()).strip("-")
+        if slug in existing:
+            return slug
+        if canonical and canonical in existing:
+            return canonical
+        partial_matches: List[str] = []
+        for existing_slug, existing_fields in existing.items():
+            existing_canonical = re.sub(
+                r"[^a-z0-9]+", "-", str(existing_slug).lower()
+            ).strip("-")
+            if canonical and canonical == existing_canonical:
+                return existing_slug
+            if canonical and (
+                existing_canonical.startswith(canonical)
+                or canonical in existing_canonical
+            ):
+                partial_matches.append(existing_slug)
+            if isinstance(existing_fields, dict):
+                name_canonical = re.sub(
+                    r"[^a-z0-9]+", "-",
+                    str(existing_fields.get("name") or "").lower(),
+                ).strip("-")
+                if canonical and canonical == name_canonical:
+                    return existing_slug
+                if canonical and (
+                    name_canonical.startswith(canonical)
+                    or canonical in name_canonical
+                ):
+                    partial_matches.append(existing_slug)
+        if canonical:
+            unique_matches = list(dict.fromkeys(partial_matches))
+            if len(unique_matches) == 1:
+                return unique_matches[0]
+        return None
+
+    def _character_updates_from_state_nulls(
+        self,
+        state_update: object,
+        existing_chars: Dict[str, dict],
+    ) -> Dict[str, object]:
+        out: Dict[str, object] = {}
+        if not isinstance(state_update, dict) or not isinstance(existing_chars, dict):
+            return out
+        for key, value in state_update.items():
+            if value is not None:
+                continue
+            resolved = self._resolve_existing_character_slug(existing_chars, key)
+            if resolved:
+                out[resolved] = None
+        return out
+
     @staticmethod
-    def _calendar_resolve_fire_day(
+    def _calendar_resolve_fire_point(
         current_day: int,
         current_hour: int,
         time_remaining: object,
         time_unit: object,
-    ) -> int:
+    ) -> tuple[int, int]:
         try:
             day = int(current_day)
         except (TypeError, ValueError):
@@ -4778,11 +5088,30 @@ class ZorkEmulator:
         except (TypeError, ValueError):
             remaining = 1
         unit = str(time_unit or "days").strip().lower()
+        base_hours = (day - 1) * 24 + hour
         if unit.startswith("hour"):
-            fire_day = day + ((hour + remaining) // 24)
+            fire_abs_hours = base_hours + remaining
         else:
-            fire_day = day + remaining
-        return max(1, int(fire_day))
+            fire_abs_hours = base_hours + (remaining * 24)
+        fire_abs_hours = max(0, int(fire_abs_hours))
+        fire_day = (fire_abs_hours // 24) + 1
+        fire_hour = fire_abs_hours % 24
+        return max(1, int(fire_day)), min(23, max(0, int(fire_hour)))
+
+    @staticmethod
+    def _calendar_resolve_fire_day(
+        current_day: int,
+        current_hour: int,
+        time_remaining: object,
+        time_unit: object,
+    ) -> int:
+        fire_day, _ = ZorkEmulator._calendar_resolve_fire_point(
+            current_day=current_day,
+            current_hour=current_hour,
+            time_remaining=time_remaining,
+            time_unit=time_unit,
+        )
+        return fire_day
 
     @classmethod
     def _calendar_normalize_event(
@@ -4798,10 +5127,23 @@ class ZorkEmulator:
         if not name:
             return None
         fire_day_raw = event.get("fire_day")
-        if isinstance(fire_day_raw, (int, float)) and not isinstance(fire_day_raw, bool):
+        fire_hour_raw = event.get("fire_hour")
+        if (
+            isinstance(fire_day_raw, (int, float))
+            and not isinstance(fire_day_raw, bool)
+            and isinstance(fire_hour_raw, (int, float))
+            and not isinstance(fire_hour_raw, bool)
+        ):
             fire_day = max(1, int(fire_day_raw))
+            fire_hour = min(23, max(0, int(fire_hour_raw)))
+        elif isinstance(fire_day_raw, (int, float)) and not isinstance(
+            fire_day_raw, bool
+        ):
+            fire_day = max(1, int(fire_day_raw))
+            # Backward compatibility for legacy day-only events.
+            fire_hour = 23
         else:
-            fire_day = cls._calendar_resolve_fire_day(
+            fire_day, fire_hour = cls._calendar_resolve_fire_point(
                 current_day=current_day,
                 current_hour=current_hour,
                 time_remaining=event.get("time_remaining", 1),
@@ -4810,6 +5152,7 @@ class ZorkEmulator:
         normalized: dict[str, object] = {
             "name": name,
             "fire_day": fire_day,
+            "fire_hour": fire_hour,
             "description": str(event.get("description") or "")[:200],
         }
         for key in ("created_day", "created_hour"):
@@ -4842,40 +5185,232 @@ class ZorkEmulator:
             if normalized is None:
                 continue
             fire_day = int(normalized.get("fire_day", current_day))
+            fire_hour = cls._coerce_non_negative_int(
+                normalized.get("fire_hour", 23), default=23
+            )
+            fire_hour = min(23, max(0, fire_hour))
+            hours_remaining = ((fire_day - current_day) * 24) + (fire_hour - current_hour)
             days_remaining = fire_day - current_day
-            if days_remaining < 0:
+            if hours_remaining < 0:
                 status = "overdue"
             elif days_remaining == 0:
                 status = "today"
-            elif days_remaining == 1:
+            elif hours_remaining <= 24:
                 status = "imminent"
             else:
                 status = "upcoming"
             view = dict(normalized)
             view["days_remaining"] = days_remaining
+            view["hours_remaining"] = hours_remaining
             view["status"] = status
             entries.append(view)
-        entries.sort(key=lambda item: (int(item.get("fire_day", current_day)), str(item.get("name", "")).lower()))
+        entries.sort(
+            key=lambda item: (
+                int(item.get("fire_day", current_day)),
+                int(item.get("fire_hour", 23)),
+                str(item.get("name", "")).lower(),
+            )
+        )
         return entries
 
     @staticmethod
     def _calendar_reminder_text(calendar_entries: list[dict[str, object]]) -> str:
         if not calendar_entries:
             return "None"
+
+        def _should_surface(hours: int) -> bool:
+            # Keep reminders sparse to avoid repetitive narration every turn.
+            if hours == 0:
+                return True
+            if hours < 0:
+                overdue = abs(hours)
+                if overdue <= 3:
+                    return True
+                if overdue in {6, 12, 24}:
+                    return True
+                return overdue % 24 == 0 and overdue <= (24 * 7)
+            # Future reminders only at milestone deadlines.
+            return hours in {24, 12, 6, 3, 2, 1}
+
         alerts = []
         for event in calendar_entries:
-            days = int(event.get("days_remaining", 0))
+            hours = int(event.get("hours_remaining", 0))
             name = str(event.get("name", "Unknown"))
             fire_day = int(event.get("fire_day", 1))
-            if days > 1:
+            fire_hour = max(0, min(23, int(event.get("fire_hour", 23))))
+            if not _should_surface(hours):
                 continue
-            if days < 0:
-                alerts.append(f"- OVERDUE: {name} (was Day {fire_day}; {abs(days)} day(s) overdue)")
-            elif days == 0:
-                alerts.append(f"- TODAY: {name} (fires on Day {fire_day})")
+            if hours < 0:
+                alerts.append(
+                    f"- OVERDUE: {name} (was Day {fire_day}, {fire_hour:02d}:00; {abs(hours)} hour(s) overdue)"
+                )
+            elif hours == 0:
+                alerts.append(
+                    f"- NOW: {name} (fires at Day {fire_day}, {fire_hour:02d}:00)"
+                )
             else:
-                alerts.append(f"- TOMORROW: {name} (fires on Day {fire_day})")
+                alerts.append(
+                    f"- SOON: {name} (fires in {hours} hour(s) at Day {fire_day}, {fire_hour:02d}:00)"
+                )
+        alerts = alerts[:2]
         return "\n".join(alerts) if alerts else "None"
+
+    @classmethod
+    def _sms_normalize_thread_key(cls, value: object) -> str:
+        text = re.sub(r"\s+", " ", str(value or "").strip().lower())
+        if not text:
+            return ""
+        return re.sub(r"[^a-z0-9]+", "-", text).strip("-")[:80]
+
+    @classmethod
+    def _sms_threads_from_state(cls, campaign_state: Dict[str, object]) -> Dict[str, dict]:
+        raw = campaign_state.get(cls.SMS_STATE_KEY) if isinstance(campaign_state, dict) else {}
+        if not isinstance(raw, dict):
+            raw = {}
+        threads: Dict[str, dict] = {}
+        for raw_key, raw_value in raw.items():
+            key = cls._sms_normalize_thread_key(raw_key)
+            if not key or not isinstance(raw_value, dict):
+                continue
+            label = str(raw_value.get("label") or raw_key).strip()[:80] or key
+            raw_messages = raw_value.get("messages")
+            if not isinstance(raw_messages, list):
+                raw_messages = []
+            messages = []
+            for msg in raw_messages[-cls.SMS_MAX_MESSAGES_PER_THREAD :]:
+                if not isinstance(msg, dict):
+                    continue
+                text = str(msg.get("message") or "").strip()
+                if not text:
+                    continue
+                messages.append(
+                    {
+                        "from": str(msg.get("from") or "Unknown")[:80],
+                        "to": str(msg.get("to") or "")[:80],
+                        "message": text[:500],
+                        "day": cls._coerce_non_negative_int(msg.get("day", 1), default=1) or 1,
+                        "hour": min(
+                            23,
+                            max(0, cls._coerce_non_negative_int(msg.get("hour", 0), default=0)),
+                        ),
+                        "minute": min(
+                            59,
+                            max(0, cls._coerce_non_negative_int(msg.get("minute", 0), default=0)),
+                        ),
+                        "turn_id": cls._coerce_non_negative_int(msg.get("turn_id", 0), default=0),
+                    }
+                )
+            threads[key] = {"label": label, "messages": messages}
+        return threads
+
+    @classmethod
+    def _sms_list_threads(
+        cls,
+        campaign_state: Dict[str, object],
+        wildcard: str = "*",
+        limit: int = 20,
+    ) -> list[dict[str, object]]:
+        threads = cls._sms_threads_from_state(campaign_state)
+        pattern = str(wildcard or "*").strip().lower() or "*"
+        out: list[dict[str, object]] = []
+        for key in reversed(list(threads.keys())):
+            row = threads.get(key) or {}
+            label = str(row.get("label") or key)
+            if pattern != "*":
+                if not fnmatch.fnmatch(key, pattern) and not fnmatch.fnmatch(
+                    label.lower(), pattern
+                ):
+                    continue
+            messages = row.get("messages")
+            if not isinstance(messages, list):
+                messages = []
+            last = messages[-1] if messages else {}
+            preview = str(last.get("message") or "").strip()
+            if len(preview) > cls.SMS_MAX_PREVIEW_CHARS:
+                preview = preview[: cls.SMS_MAX_PREVIEW_CHARS - 1].rstrip() + "…"
+            out.append(
+                {
+                    "thread": key,
+                    "label": label,
+                    "count": len(messages),
+                    "last_from": str(last.get("from") or ""),
+                    "last_preview": preview,
+                    "day": cls._coerce_non_negative_int(last.get("day", 0), default=0),
+                    "hour": cls._coerce_non_negative_int(last.get("hour", 0), default=0),
+                    "minute": cls._coerce_non_negative_int(last.get("minute", 0), default=0),
+                }
+            )
+            if len(out) >= max(1, int(limit or 20)):
+                break
+        return out
+
+    @classmethod
+    def _sms_read_thread(
+        cls,
+        campaign_state: Dict[str, object],
+        thread: str,
+        limit: int = 20,
+    ) -> tuple[str | None, str | None, list[dict[str, object]]]:
+        threads = cls._sms_threads_from_state(campaign_state)
+        if not threads:
+            return None, None, []
+        query_key = cls._sms_normalize_thread_key(thread)
+        selected_key = query_key if query_key in threads else None
+        if selected_key is None and query_key:
+            for key in threads.keys():
+                if query_key in key:
+                    selected_key = key
+                    break
+        if selected_key is None:
+            return None, None, []
+        row = threads.get(selected_key) or {}
+        messages = row.get("messages")
+        if not isinstance(messages, list):
+            messages = []
+        capped = messages[-max(1, min(40, int(limit or 20))) :]
+        return selected_key, str(row.get("label") or selected_key), list(capped)
+
+    @classmethod
+    def _sms_write(
+        cls,
+        campaign_state: Dict[str, object],
+        *,
+        thread: str,
+        sender: str,
+        recipient: str,
+        message: str,
+        game_time: Dict[str, int],
+        turn_id: int = 0,
+    ) -> tuple[str, str, dict[str, object]]:
+        threads = cls._sms_threads_from_state(campaign_state)
+        thread_key = cls._sms_normalize_thread_key(thread or recipient or sender or "unknown")
+        if not thread_key:
+            thread_key = "unknown"
+        existing = threads.pop(
+            thread_key,
+            {"label": thread or recipient or sender or thread_key, "messages": []},
+        )
+        label = str(existing.get("label") or thread or recipient or sender or thread_key).strip()[:80] or thread_key
+        messages = existing.get("messages")
+        if not isinstance(messages, list):
+            messages = []
+        entry = {
+            "from": str(sender or "Unknown")[:80],
+            "to": str(recipient or "")[:80],
+            "message": str(message or "").strip()[:500],
+            "day": cls._coerce_non_negative_int(game_time.get("day", 1), default=1) or 1,
+            "hour": min(23, max(0, cls._coerce_non_negative_int(game_time.get("hour", 0), default=0))),
+            "minute": min(59, max(0, cls._coerce_non_negative_int(game_time.get("minute", 0), default=0))),
+            "turn_id": max(0, int(turn_id or 0)),
+        }
+        messages.append(entry)
+        messages = messages[-cls.SMS_MAX_MESSAGES_PER_THREAD :]
+        threads[thread_key] = {"label": label, "messages": messages}
+        while len(threads) > cls.SMS_MAX_THREADS:
+            oldest_key = next(iter(threads))
+            threads.pop(oldest_key, None)
+        campaign_state[cls.SMS_STATE_KEY] = threads
+        return thread_key, label, entry
 
     def _apply_calendar_update(
         self,
@@ -4917,10 +5452,22 @@ class ZorkEmulator:
                 if not name:
                     continue
                 fire_day = entry.get("fire_day")
-                if isinstance(fire_day, (int, float)) and not isinstance(fire_day, bool):
+                fire_hour = entry.get("fire_hour")
+                if (
+                    isinstance(fire_day, (int, float))
+                    and not isinstance(fire_day, bool)
+                    and isinstance(fire_hour, (int, float))
+                    and not isinstance(fire_hour, bool)
+                ):
                     resolved_fire_day = max(1, int(fire_day))
+                    resolved_fire_hour = min(23, max(0, int(fire_hour)))
+                elif isinstance(fire_day, (int, float)) and not isinstance(
+                    fire_day, bool
+                ):
+                    resolved_fire_day = max(1, int(fire_day))
+                    resolved_fire_hour = 23
                 else:
-                    resolved_fire_day = self._calendar_resolve_fire_day(
+                    resolved_fire_day, resolved_fire_hour = self._calendar_resolve_fire_point(
                         current_day=int(current_day) if isinstance(current_day, (int, float)) else 1,
                         current_hour=int(current_hour) if isinstance(current_hour, (int, float)) else 8,
                         time_remaining=entry.get("time_remaining", 1),
@@ -4929,6 +5476,7 @@ class ZorkEmulator:
                 event = {
                     "name": name,
                     "fire_day": resolved_fire_day,
+                    "fire_hour": resolved_fire_hour,
                     "created_day": current_day,
                     "created_hour": current_hour,
                     "description": str(entry.get("description") or "")[:200],
@@ -5137,6 +5685,30 @@ class ZorkEmulator:
             lines.append(line.rstrip())
         return "\n".join(lines).strip()
 
+    def _map_location_components(
+        self,
+        location_value: object,
+        room_title_value: object,
+        room_summary_value: object,
+    ) -> dict[str, str]:
+        location = str(location_value or "").strip()
+        room_title = str(room_title_value or "").strip()
+        room_summary = str(room_summary_value or "").strip()
+        summary_first = room_summary.splitlines()[0].strip() if room_summary else ""
+        if "." in summary_first:
+            summary_first = summary_first.split(".", 1)[0].strip()
+        display = room_title or location or summary_first
+        display = re.sub(r"\s+", " ", display).strip()[:120]
+        key_source = location or room_title or display
+        key = re.sub(r"[^a-z0-9]+", "-", key_source.lower()).strip("-")[:80]
+        hint = re.sub(r"\s+", " ", room_summary).strip()[:180]
+        has_data = bool(location or room_title or room_summary)
+        return {
+            "key": key or ("unknown-location" if has_data else ""),
+            "display": display or ("Unknown" if has_data else ""),
+            "hint": hint,
+        }
+
     def _apply_state_update(self, state: dict[str, object], update: dict[str, object]) -> dict[str, object]:
         if not isinstance(update, dict):
             return state
@@ -5241,17 +5813,18 @@ class ZorkEmulator:
             content = (turn.content or "").strip()
             if not content:
                 continue
+            turn_prefix = self._turn_context_prefix(turn)
             if turn.kind == "player":
                 if ooc_re.match(content):
                     continue
-                clipped = self._trim_text(content, self.MAX_TURN_CHARS)
+                clipped = content
                 clipped = self._strip_inventory_mentions(clipped)
                 name = player_names.get(turn.actor_id or "")
                 if name:
                     label = f"PLAYER ({name.upper()})"
                 else:
                     label = "PLAYER"
-                recent_lines.append(f"{label}: {clipped}")
+                recent_lines.append(f"{turn_prefix} {label}: {clipped}")
             elif turn.kind == "narrator":
                 if content.lower() in error_phrases:
                     continue
@@ -5266,8 +5839,7 @@ class ZorkEmulator:
                 clipped = "\n".join(clipped_lines).strip()
                 if not clipped:
                     continue
-                clipped = self._trim_text(clipped, self.MAX_TURN_CHARS)
-                recent_lines.append(f"NARRATOR: {clipped}")
+                recent_lines.append(f"{turn_prefix} NARRATOR: {clipped}")
         recent_text = "\n".join(recent_lines) if recent_lines else "None"
 
         rails_context = self._build_rails_context(player_state, party_snapshot)
@@ -5283,6 +5855,11 @@ class ZorkEmulator:
 
         active_name = str(player_state.get("character_name") or "").strip()
         action_label = f"PLAYER_ACTION ({active_name.upper()})" if active_name else "PLAYER_ACTION"
+        active_location_context = {
+            "room_title": player_state.get("room_title"),
+            "location": player_state.get("location"),
+            "room_summary": player_state.get("room_summary"),
+        }
 
         user_prompt = (
             f"CAMPAIGN: {campaign.name}\n"
@@ -5294,6 +5871,7 @@ class ZorkEmulator:
             f"WORLD_STATE: {self._dump_json(model_state)}\n"
             f"CURRENT_GAME_TIME: {self._dump_json(game_time)}\n"
             f"SPEED_MULTIPLIER: {speed_mult}\n"
+            f"ACTIVE_PLAYER_LOCATION: {self._dump_json(active_location_context)}\n"
             f"CALENDAR: {self._dump_json(calendar_for_prompt)}\n"
             f"CALENDAR_REMINDERS:\n{calendar_reminders}\n"
         )
@@ -5304,6 +5882,7 @@ class ZorkEmulator:
             f"PLAYER_CARD: {self._dump_json(player_card)}\n"
             f"PARTY_SNAPSHOT: {self._dump_json(party_snapshot)}\n"
             f"RECENT_TURNS:\n{recent_text}\n"
+            f"{self.RESPONSE_STYLE_NOTE}\n"
             f"{action_label}: {action}\n"
         )
         system_prompt = self.SYSTEM_PROMPT
@@ -5375,8 +5954,10 @@ class ZorkEmulator:
         player_state = self.get_player_state(player)
         room_summary = player_state.get("room_summary")
         room_title = player_state.get("room_title")
+        location = player_state.get("location")
         exits = player_state.get("exits")
-        if not room_summary and not room_title:
+        player_loc = self._map_location_components(location, room_title, room_summary)
+        if not player_loc["display"]:
             return "No map data yet. Try `look` first."
 
         marker_data = self._assign_player_markers(others, resolved_actor_id)
@@ -5384,8 +5965,12 @@ class ZorkEmulator:
         for entry in marker_data:
             other = entry["player"]
             other_state = self.get_player_state(other)
-            other_room = other_state.get("room_summary") or other_state.get("room_title") or other_state.get("location")
-            if not other_room:
+            other_loc = self._map_location_components(
+                other_state.get("location"),
+                other_state.get("room_title"),
+                other_state.get("room_summary"),
+            )
+            if not other_loc["display"]:
                 continue
             other_name = other_state.get("character_name") or f"Adventurer-{str(other.actor_id)[-4:]}"
             other_entries.append(
@@ -5393,7 +5978,10 @@ class ZorkEmulator:
                     "marker": entry["marker"],
                     "user_id": other.actor_id,
                     "character_name": other_name,
-                    "room": other_room,
+                    "room": other_loc["display"],
+                    "location_key": other_loc["key"],
+                    "location_display": other_loc["display"],
+                    "location_hint": other_loc["hint"],
                     "party_status": other_state.get("party_status"),
                 }
             )
@@ -5406,7 +5994,7 @@ class ZorkEmulator:
         landmarks_text = ", ".join(landmarks) if isinstance(landmarks, list) and landmarks else "none"
 
         characters = self.get_campaign_characters(campaign)
-        char_entries = []
+        char_entries: list[dict[str, str]] = []
         if isinstance(characters, dict):
             for slug, info in list(characters.items())[:20]:
                 if not isinstance(info, dict):
@@ -5414,9 +6002,19 @@ class ZorkEmulator:
                 if info.get("deceased_reason"):
                     continue
                 char_name = info.get("name", slug)
-                char_loc = info.get("location", "unknown")
-                char_entries.append(f"{char_name} ({char_loc})")
-        chars_text = ", ".join(char_entries) if char_entries else "none"
+                char_loc = self._map_location_components(
+                    info.get("location"),
+                    "",
+                    "",
+                )
+                char_entries.append(
+                    {
+                        "name": str(char_name),
+                        "location_key": char_loc["key"] or "unknown-location",
+                        "location_display": char_loc["display"] or "Unknown",
+                    }
+                )
+        chars_text = self._dump_json(char_entries) if char_entries else "[]"
 
         story_progress = ""
         outline = campaign_state.get("story_outline")
@@ -5442,18 +6040,24 @@ class ZorkEmulator:
         map_prompt = (
             f"CAMPAIGN: {campaign.name}\n"
             f"PLAYER_NAME: {player_name}\n"
+            f"PLAYER_LOCATION_KEY: {player_loc['key']}\n"
+            f"PLAYER_LOCATION_DISPLAY: {player_loc['display']}\n"
             f"PLAYER_ROOM_TITLE: {room_title or 'Unknown'}\n"
             f"PLAYER_ROOM_SUMMARY: {room_summary or ''}\n"
             f"PLAYER_EXITS: {exits or []}\n"
             f"WORLD_SUMMARY: {self._trim_text(campaign.summary or '', 1200)}\n"
             f"WORLD_STATE: {self._dump_json(model_state)}\n"
             f"LANDMARKS: {landmarks_text}\n"
-            f"WORLD_CHARACTERS: {chars_text}\n"
+            f"WORLD_CHARACTER_LOCATIONS: {chars_text}\n"
         )
         if story_progress:
             map_prompt += f"STORY_PROGRESS: {story_progress}\n"
         map_prompt += (
             f"OTHER_PLAYERS: {self._dump_json(other_entries)}\n"
+            "MAP_SPATIAL_RULES:\n"
+            "- location_key is authoritative for grouping entities.\n"
+            "- Same location_key means same room/area.\n"
+            "- Different location_key means separate rooms/areas; never nest them.\n"
             "Draw a compact map with @ marking the player's location.\n"
         )
 
@@ -5469,6 +6073,119 @@ class ZorkEmulator:
         if not ascii_map:
             return "Map is foggy. Try again."
         return ascii_map
+
+    # ------------------------------------------------------------------
+    # Memory tool compatibility
+    # ------------------------------------------------------------------
+
+    def list_memory_terms(
+        self,
+        campaign_id: str,
+        wildcard: str = "%",
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        if self._memory_port is None:
+            return []
+        try:
+            return self._memory_port.list_terms(campaign_id, wildcard=wildcard, limit=limit)
+        except Exception:
+            return []
+
+    def store_memory(
+        self,
+        campaign_id: str,
+        *,
+        category: str,
+        memory: str,
+        term: str | None = None,
+    ) -> tuple[bool, str]:
+        if self._memory_port is None:
+            return False, "memory_port_unavailable"
+        try:
+            return self._memory_port.store_memory(
+                campaign_id,
+                category=category,
+                memory=memory,
+                term=term,
+            )
+        except Exception:
+            return False, "error"
+
+    def search_curated_memories(
+        self,
+        query: str,
+        campaign_id: str,
+        *,
+        category: str | None = None,
+        top_k: int = 5,
+    ) -> list[tuple[str, str, float]]:
+        if self._memory_port is None:
+            return []
+        try:
+            return self._memory_port.search_curated(
+                query=query,
+                campaign_id=campaign_id,
+                category=category,
+                top_k=top_k,
+            )
+        except Exception:
+            return []
+
+    def list_sms_threads(
+        self,
+        campaign_id: str,
+        wildcard: str = "*",
+        limit: int = 20,
+    ) -> list[dict[str, object]]:
+        with self._session_factory() as session:
+            campaign = session.get(Campaign, str(campaign_id))
+            if campaign is None:
+                return []
+            state = self.get_campaign_state(campaign)
+        return self._sms_list_threads(state, wildcard=wildcard, limit=limit)
+
+    def read_sms_thread(
+        self,
+        campaign_id: str,
+        thread: str,
+        limit: int = 20,
+    ) -> tuple[str | None, str | None, list[dict[str, object]]]:
+        with self._session_factory() as session:
+            campaign = session.get(Campaign, str(campaign_id))
+            if campaign is None:
+                return None, None, []
+            state = self.get_campaign_state(campaign)
+        return self._sms_read_thread(state, thread=thread, limit=limit)
+
+    def write_sms_thread(
+        self,
+        campaign_id: str,
+        *,
+        thread: str,
+        sender: str,
+        recipient: str,
+        message: str,
+        turn_id: int = 0,
+    ) -> tuple[bool, str]:
+        with self._session_factory() as session:
+            campaign = session.get(Campaign, str(campaign_id))
+            if campaign is None:
+                return False, "campaign_not_found"
+            campaign_state = self.get_campaign_state(campaign)
+            game_time = self._extract_game_time_snapshot(campaign_state)
+            self._sms_write(
+                campaign_state,
+                thread=thread,
+                sender=sender,
+                recipient=recipient,
+                message=message,
+                game_time=game_time,
+                turn_id=turn_id,
+            )
+            campaign.state_json = self._dump_json(campaign_state)
+            campaign.updated_at = datetime.utcnow()
+            session.commit()
+        return True, "stored"
 
     # ------------------------------------------------------------------
     # Memory visibility compatibility

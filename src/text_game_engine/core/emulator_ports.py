@@ -46,6 +46,34 @@ class MemorySearchPort(Protocol):
     def delete_turns_after(self, campaign_id: str, turn_id: int) -> int:
         ...
 
+    def list_terms(
+        self,
+        campaign_id: str,
+        wildcard: str = "%",
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        ...
+
+    def store_memory(
+        self,
+        campaign_id: str,
+        *,
+        category: str,
+        memory: str,
+        term: str | None = None,
+    ) -> tuple[bool, str]:
+        ...
+
+    def search_curated(
+        self,
+        query: str,
+        campaign_id: str,
+        *,
+        category: str | None = None,
+        top_k: int = 5,
+    ) -> list[tuple[str, str, float]]:
+        ...
+
 
 class IMDBLookupPort(Protocol):
     def search(self, query: str, max_results: int = 3) -> list[dict]:

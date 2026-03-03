@@ -11,6 +11,7 @@ class TimerInstruction:
     event_text: str
     interruptible: bool = True
     interrupt_action: Optional[str] = None
+    interrupt_scope: str = "global"
 
 
 @dataclass
