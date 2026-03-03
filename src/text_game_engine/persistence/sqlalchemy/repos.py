@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 from sqlalchemy import delete, select, update
@@ -33,7 +33,7 @@ class CampaignRepo:
     ) -> bool:
         update_values = dict(values)
         update_values["row_version"] = Campaign.row_version + 1
-        update_values["updated_at"] = datetime.utcnow()
+        update_values["updated_at"] = datetime.now(timezone.utc).replace(tzinfo=None)
         stmt = (
             update(Campaign)
             .where(Campaign.id == campaign_id)
@@ -209,7 +209,7 @@ class TimerRepo:
                 external_message_id=external_message_id,
                 external_channel_id=external_channel_id,
                 external_thread_id=external_thread_id,
-                updated_at=datetime.utcnow(),
+                updated_at=datetime.now(timezone.utc).replace(tzinfo=None),
             )
         )
         result = self.session.execute(stmt)

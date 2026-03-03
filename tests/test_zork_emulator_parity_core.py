@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import json
 import re
 import time
@@ -322,6 +322,12 @@ def test_json_parsing_helpers(session_factory, seed_campaign_and_actor):
 
     cleaned = compat._clean_response("prefix ```json\n{\"x\":1}\n``` suffix")
     assert cleaned == '{"x":1}'
+
+    truncated = '{"tool_call":"memory_search","queries":["Elizabeth"]'
+    repaired = compat._clean_response(truncated)
+    parsed = compat._parse_json_lenient(repaired)
+    assert parsed.get("tool_call") == "memory_search"
+    assert parsed.get("queries") == ["Elizabeth"]
 
 
 def test_build_prompt_shape(session_factory, seed_campaign_and_actor):
@@ -1307,7 +1313,7 @@ def test_timed_event_race_guard_skips_when_recent_player_turn(
                     actor_id=seed_campaign_and_actor["actor_id"],
                     kind="player",
                     content="look",
-                    created_at=datetime.utcnow(),
+                    created_at=datetime.now(timezone.utc).replace(tzinfo=None),
                 )
             )
             session.commit()

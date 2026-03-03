@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import json
 
 from sqlalchemy import select
@@ -39,7 +39,7 @@ def test_phase_c_cas_conflict_rolls_back_all_writes(
             with uow_factory() as uow:
                 c = uow.campaigns.get(seed_campaign_and_actor["campaign_id"])
                 c.row_version += 1
-                c.updated_at = datetime.utcnow()
+                c.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
                 uow.commit()
 
         result = await engine.resolve_turn(
@@ -76,7 +76,7 @@ def test_single_auto_retry_then_conflict_response(
             with uow_factory() as uow:
                 c = uow.campaigns.get(seed_campaign_and_actor["campaign_id"])
                 c.row_version += 1
-                c.updated_at = datetime.utcnow()
+                c.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
                 uow.commit()
 
         result = await engine.resolve_turn(
@@ -94,7 +94,7 @@ def test_single_auto_retry_then_conflict_response(
 
 
 def test_timer_transition_idempotency(uow_factory, seed_campaign_and_actor):
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
     with uow_factory() as uow:
         timer = uow.timers.schedule(
             campaign_id=seed_campaign_and_actor["campaign_id"],
@@ -110,10 +110,10 @@ def test_timer_transition_idempotency(uow_factory, seed_campaign_and_actor):
     with uow_factory() as uow:
         assert uow.timers.attach_message(timer_id, "msg-1", "chan-1", None) is True
         assert uow.timers.attach_message(timer_id, "msg-2", "chan-1", None) is True
-        assert uow.timers.mark_expired(timer_id, datetime.utcnow()) is True
-        assert uow.timers.mark_expired(timer_id, datetime.utcnow()) is False
-        assert uow.timers.mark_consumed(timer_id, datetime.utcnow()) is True
-        assert uow.timers.mark_consumed(timer_id, datetime.utcnow()) is False
+        assert uow.timers.mark_expired(timer_id, datetime.now(timezone.utc).replace(tzinfo=None)) is True
+        assert uow.timers.mark_expired(timer_id, datetime.now(timezone.utc).replace(tzinfo=None)) is False
+        assert uow.timers.mark_consumed(timer_id, datetime.now(timezone.utc).replace(tzinfo=None)) is True
+        assert uow.timers.mark_consumed(timer_id, datetime.now(timezone.utc).replace(tzinfo=None)) is False
         uow.commit()
 
 
@@ -225,6 +225,30 @@ def test_give_item_unresolved_nonfatal_compat(session_factory, uow_factory, seed
         with session_factory() as session:
             events = session.execute(select(OutboxEvent).where(OutboxEvent.event_type == "give_item_unresolved")).scalars().all()
             assert len(events) == 1
+
+    asyncio.run(run_test())
+
+
+def test_engine_fallback_narration_uses_state_updates(session_factory, uow_factory, seed_campaign_and_actor):
+    async def run_test():
+        llm = StubLLM(
+            LLMTurnOutput(
+                narration="",
+                player_state_update={"room_summary": "Hotel room with ocean view."},
+                state_update={"victorville": {"visitation_timer": "26_minutes_remaining"}},
+            )
+        )
+        engine = GameEngine(uow_factory=uow_factory, llm=llm)
+
+        result = await engine.resolve_turn(
+            ResolveTurnInput(
+                campaign_id=seed_campaign_and_actor["campaign_id"],
+                actor_id=seed_campaign_and_actor["actor_id"],
+                action="look",
+            )
+        )
+        assert result.status == "ok"
+        assert result.narration == "Hotel room with ocean view."
 
     asyncio.run(run_test())
 
@@ -421,8 +445,8 @@ def test_rewind_requires_snapshot_from_same_campaign(session_factory, uow_factor
                 state_json="{}",
                 characters_json="{}",
                 row_version=1,
-                created_at=datetime.utcnow(),
-                updated_at=datetime.utcnow(),
+                created_at=datetime.now(timezone.utc).replace(tzinfo=None),
+                updated_at=datetime.now(timezone.utc).replace(tzinfo=None),
             )
             session.add(other_campaign)
             session.add(
@@ -431,8 +455,8 @@ def test_rewind_requires_snapshot_from_same_campaign(session_factory, uow_factor
                     display_name="Other",
                     kind="human",
                     metadata_json="{}",
-                    created_at=datetime.utcnow(),
-                    updated_at=datetime.utcnow(),
+                    created_at=datetime.now(timezone.utc).replace(tzinfo=None),
+                    updated_at=datetime.now(timezone.utc).replace(tzinfo=None),
                 )
             )
             session.commit()
