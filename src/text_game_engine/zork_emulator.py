@@ -295,6 +295,7 @@ class ZorkEmulator:
         "- Avoid repetitive recap loops: at most one brief callback sentence to prior events, then move the scene forward.\n"
         "- Keep diction plain and direct; prioritize immediate consequences and available choices.\n"
         "- RECENT_TURNS includes turn/time tags like [TURN #N | Day D HH:MM]. Use them to track pacing and chronology.\n"
+        "- CURRENTLY_ATTENTIVE_PLAYERS lists players active within ATTENTION_WINDOW_SECONDS. Use it to pace time and scene focus.\n"
         "- If WORLD_SUMMARY is empty, invent a strong starting room and seed the world.\n"
         "- Use player_state_update for player-specific location and status.\n"
         "- Use player_state_update.room_title for a short location title (e.g. 'Penthouse Suite, Escala') whenever location changes.\n"
@@ -474,6 +475,9 @@ class ZorkEmulator:
         "Every turn, you MUST advance game_time in state_update by a plausible amount "
         "(minutes for quick actions, hours for travel, etc.). "
         "Scale the advance by SPEED_MULTIPLIER — at 2x, time passes roughly twice as fast per turn.\n"
+        "Use CURRENTLY_ATTENTIVE_PLAYERS for pacing: if only one player is attentive and no immediate deadline is active, "
+        "prefer larger jumps (15-90 minutes or to the next meaningful beat) instead of repeated 5-10 minute increments.\n"
+        "If multiple players are currently attentive in the same campaign, keep finer-grained time only when needed to preserve shared-scene coherence.\n"
         "Update these fields in state_update:\n"
         '- "game_time": {"day": int, "hour": int (0-23), "minute": int (0-59), '
         '"period": "morning"|"afternoon"|"evening"|"night", '
@@ -1088,6 +1092,47 @@ class ZorkEmulator:
         attention_seconds = self._coerce_non_negative_int(stats.get(self.PLAYER_STATS_ATTENTION_SECONDS_KEY), 0)
         stats["attention_hours"] = round(attention_seconds / 3600.0, 2)
         return stats
+
+    def _build_currently_attentive_players_for_prompt(
+        self,
+        campaign_id: str,
+        limit: int | None = None,
+    ) -> list[dict[str, object]]:
+        now_dt = self._now()
+        max_rows = limit if isinstance(limit, int) and limit > 0 else self.MAX_PARTY_CONTEXT_PLAYERS
+        with self._session_factory() as session:
+            rows = (
+                session.query(Player)
+                .filter(Player.campaign_id == campaign_id)
+                .order_by(Player.last_active_at.desc())
+                .all()
+            )
+        out: list[dict[str, object]] = []
+        for row in rows:
+            player_state = self.get_player_state(row)
+            stats = self._get_player_stats_from_state(player_state)
+            last_message_at = self._parse_utc_timestamp(
+                stats.get(self.PLAYER_STATS_LAST_MESSAGE_AT_KEY)
+            )
+            if last_message_at is None:
+                continue
+            since_seconds = int((now_dt - last_message_at).total_seconds())
+            if since_seconds < 0 or since_seconds > self.ATTENTION_WINDOW_SECONDS:
+                continue
+            name = str(player_state.get("character_name") or "").strip()
+            out.append(
+                {
+                    "actor_id": row.actor_id,
+                    "name": name or None,
+                    "seconds_since_last_message": since_seconds,
+                    "attention_seconds_total": self._coerce_non_negative_int(
+                        stats.get(self.PLAYER_STATS_ATTENTION_SECONDS_KEY), 0
+                    ),
+                }
+            )
+            if len(out) >= max_rows:
+                break
+        return out
 
     def _normalize_campaign_name(self, name: str) -> str:
         return normalize_campaign_name(name)
@@ -5852,6 +5897,9 @@ class ZorkEmulator:
         speed_mult = state.get("speed_multiplier", 1.0)
         calendar_for_prompt = self._calendar_for_prompt(state)
         calendar_reminders = self._calendar_reminder_text(calendar_for_prompt)
+        currently_attentive = self._build_currently_attentive_players_for_prompt(
+            campaign.id
+        )
 
         active_name = str(player_state.get("character_name") or "").strip()
         action_label = f"PLAYER_ACTION ({active_name.upper()})" if active_name else "PLAYER_ACTION"
@@ -5871,6 +5919,8 @@ class ZorkEmulator:
             f"WORLD_STATE: {self._dump_json(model_state)}\n"
             f"CURRENT_GAME_TIME: {self._dump_json(game_time)}\n"
             f"SPEED_MULTIPLIER: {speed_mult}\n"
+            f"ATTENTION_WINDOW_SECONDS: {self.ATTENTION_WINDOW_SECONDS}\n"
+            f"CURRENTLY_ATTENTIVE_PLAYERS: {self._dump_json(currently_attentive)}\n"
             f"ACTIVE_PLAYER_LOCATION: {self._dump_json(active_location_context)}\n"
             f"CALENDAR: {self._dump_json(calendar_for_prompt)}\n"
             f"CALENDAR_REMINDERS:\n{calendar_reminders}\n"
