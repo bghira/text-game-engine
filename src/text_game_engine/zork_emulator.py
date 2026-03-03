@@ -190,6 +190,7 @@ class ZorkEmulator:
     SMS_MAX_THREADS = 24
     SMS_MAX_MESSAGES_PER_THREAD = 40
     SMS_MAX_PREVIEW_CHARS = 120
+    TURN_TIME_INDEX_KEY = "_turn_time_index"
     MODEL_STATE_EXCLUDE_KEYS = ROOM_STATE_KEYS | {
         "last_narration",
         "room_scene_images",
@@ -201,7 +202,11 @@ class ZorkEmulator:
         "current_scene",
         "setup_phase",
         "setup_data",
+        "speed_multiplier",
+        "game_time",
+        "calendar",
         SMS_STATE_KEY,
+        TURN_TIME_INDEX_KEY,
     }
     PLAYER_STATE_EXCLUDE_KEYS = {"inventory", "room_description", PLAYER_STATS_KEY}
     _STALE_VALUE_PATTERNS = _COMPLETED_VALUES | {
@@ -295,6 +300,7 @@ class ZorkEmulator:
         "- Avoid repetitive recap loops: at most one brief callback sentence to prior events, then move the scene forward.\n"
         "- Keep diction plain and direct; prioritize immediate consequences and available choices.\n"
         "- RECENT_TURNS includes turn/time tags like [TURN #N | Day D HH:MM]. Use them to track pacing and chronology.\n"
+        "- CURRENTLY_ATTENTIVE_PLAYERS lists players active within ATTENTION_WINDOW_SECONDS. Use it to pace time and scene focus.\n"
         "- If WORLD_SUMMARY is empty, invent a strong starting room and seed the world.\n"
         "- Use player_state_update for player-specific location and status.\n"
         "- Use player_state_update.room_title for a short location title (e.g. 'Penthouse Suite, Escala') whenever location changes.\n"
@@ -474,6 +480,9 @@ class ZorkEmulator:
         "Every turn, you MUST advance game_time in state_update by a plausible amount "
         "(minutes for quick actions, hours for travel, etc.). "
         "Scale the advance by SPEED_MULTIPLIER — at 2x, time passes roughly twice as fast per turn.\n"
+        "Use CURRENTLY_ATTENTIVE_PLAYERS for pacing: if only one player is attentive and no immediate deadline is active, "
+        "prefer larger jumps (15-90 minutes or to the next meaningful beat) instead of repeated 5-10 minute increments.\n"
+        "If multiple players are currently attentive in the same campaign, keep finer-grained time only when needed to preserve shared-scene coherence.\n"
         "Update these fields in state_update:\n"
         '- "game_time": {"day": int, "hour": int (0-23), "minute": int (0-59), '
         '"period": "morning"|"afternoon"|"evening"|"night", '
@@ -559,6 +568,9 @@ class ZorkEmulator:
         media_port: MediaGenerationPort | None = None,
     ):
         self._engine = game_engine
+        # Inject player-state sanitizer into the engine if it accepts one.
+        if hasattr(game_engine, "_player_state_sanitizer") and game_engine._player_state_sanitizer is None:
+            game_engine._player_state_sanitizer = self._sanitize_player_state_update
         self._session_factory = session_factory
         self._claims: dict[tuple[str, str], TurnClaim] = {}
         self._completion_port = completion_port
@@ -625,7 +637,7 @@ class ZorkEmulator:
 
     @staticmethod
     def _now() -> datetime:
-        return datetime.utcnow()
+        return datetime.now(timezone.utc).replace(tzinfo=None)
 
     @staticmethod
     def _format_utc_timestamp(value: datetime) -> str:
@@ -881,7 +893,7 @@ class ZorkEmulator:
             meta["active_campaign_id"] = active_campaign_id
             channel_row.enabled = True
             self._store_session_metadata(channel_row, meta)
-            channel_row.updated_at = datetime.utcnow()
+            channel_row.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
             session.commit()
             campaign = session.get(Campaign, active_campaign_id)
             return channel_row, campaign
@@ -924,7 +936,7 @@ class ZorkEmulator:
             campaign = self.get_or_create_campaign(str(guild_id), normalized, actor_id)
             meta["active_campaign_id"] = campaign.id
             self._store_session_metadata(channel_row, meta)
-            channel_row.updated_at = datetime.utcnow()
+            channel_row.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
             session.commit()
             return campaign, True, None
 
@@ -1051,8 +1063,8 @@ class ZorkEmulator:
             row = session.get(Player, player.id)
             if row is not None:
                 row.state_json = self._dump_json(player_state)
-                row.updated_at = datetime.utcnow()
-                row.last_active_at = datetime.utcnow()
+                row.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
+                row.last_active_at = datetime.now(timezone.utc).replace(tzinfo=None)
                 session.commit()
                 player.state_json = row.state_json
                 player.updated_at = row.updated_at
@@ -1076,7 +1088,7 @@ class ZorkEmulator:
             row = session.get(Player, player.id)
             if row is not None:
                 row.state_json = self._dump_json(player_state)
-                row.updated_at = datetime.utcnow()
+                row.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
                 session.commit()
                 player.state_json = row.state_json
                 player.updated_at = row.updated_at
@@ -1088,6 +1100,47 @@ class ZorkEmulator:
         attention_seconds = self._coerce_non_negative_int(stats.get(self.PLAYER_STATS_ATTENTION_SECONDS_KEY), 0)
         stats["attention_hours"] = round(attention_seconds / 3600.0, 2)
         return stats
+
+    def _build_currently_attentive_players_for_prompt(
+        self,
+        campaign_id: str,
+        limit: int | None = None,
+    ) -> list[dict[str, object]]:
+        now_dt = self._now()
+        max_rows = limit if isinstance(limit, int) and limit > 0 else self.MAX_PARTY_CONTEXT_PLAYERS
+        with self._session_factory() as session:
+            rows = (
+                session.query(Player)
+                .filter(Player.campaign_id == campaign_id)
+                .order_by(Player.last_active_at.desc())
+                .all()
+            )
+        out: list[dict[str, object]] = []
+        for row in rows:
+            player_state = self.get_player_state(row)
+            stats = self._get_player_stats_from_state(player_state)
+            last_message_at = self._parse_utc_timestamp(
+                stats.get(self.PLAYER_STATS_LAST_MESSAGE_AT_KEY)
+            )
+            if last_message_at is None:
+                continue
+            since_seconds = int((now_dt - last_message_at).total_seconds())
+            if since_seconds < 0 or since_seconds > self.ATTENTION_WINDOW_SECONDS:
+                continue
+            name = str(player_state.get("character_name") or "").strip()
+            out.append(
+                {
+                    "actor_id": row.actor_id,
+                    "name": name or None,
+                    "seconds_since_last_message": since_seconds,
+                    "attention_seconds_total": self._coerce_non_negative_int(
+                        stats.get(self.PLAYER_STATS_ATTENTION_SECONDS_KEY), 0
+                    ),
+                }
+            )
+            if len(out) >= max_rows:
+                break
+        return out
 
     def _normalize_campaign_name(self, name: str) -> str:
         return normalize_campaign_name(name)
@@ -1559,7 +1612,7 @@ class ZorkEmulator:
             state["setup_phase"] = "classify_confirm"
             state["setup_data"] = setup_data
             campaign.state_json = self._dump_json(state)
-            campaign.updated_at = datetime.utcnow()
+            campaign.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
             session.commit()
         if is_known:
             return (
@@ -1651,7 +1704,7 @@ class ZorkEmulator:
                 result = "Setup cleared. You can now play normally."
 
             campaign.state_json = self._dump_json(state)
-            campaign.updated_at = datetime.utcnow()
+            campaign.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
             session.commit()
             return result
 
@@ -2289,7 +2342,7 @@ class ZorkEmulator:
                         if value is not None:
                             player_state[key] = value
                 player.state_json = self._dump_json(player_state)
-                player.updated_at = datetime.utcnow()
+                player.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
             if owns_session:
                 active_session.commit()
         finally:
@@ -2373,7 +2426,7 @@ class ZorkEmulator:
             if row is None:
                 return False
             row.state_json = self._dump_json(campaign_state)
-            row.updated_at = datetime.utcnow()
+            row.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
             session.commit()
             campaign.state_json = row.state_json
             campaign.updated_at = row.updated_at
@@ -2431,12 +2484,12 @@ class ZorkEmulator:
                 return False
             room_images[room_key] = {
                 "url": image_url.strip(),
-                "updated": datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+                "updated": datetime.now(timezone.utc).replace(tzinfo=None, microsecond=0).isoformat() + "Z",
                 "prompt": (scene_prompt or "").strip(),
             }
             campaign_state[self.ROOM_IMAGE_STATE_KEY] = room_images
             campaign.state_json = self._dump_json(campaign_state)
-            campaign.updated_at = datetime.utcnow()
+            campaign.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
             session.commit()
             return True
 
@@ -2464,9 +2517,9 @@ class ZorkEmulator:
             player_state["pending_avatar_url"] = image_url.strip()
             if isinstance(avatar_prompt, str) and avatar_prompt.strip():
                 player_state["pending_avatar_prompt"] = self._trim_text(avatar_prompt.strip(), 500)
-            player_state["pending_avatar_generated_at"] = datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+            player_state["pending_avatar_generated_at"] = datetime.now(timezone.utc).replace(tzinfo=None, microsecond=0).isoformat() + "Z"
             player.state_json = self._dump_json(player_state)
-            player.updated_at = datetime.utcnow()
+            player.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
             session.commit()
             return True
 
@@ -2489,7 +2542,7 @@ class ZorkEmulator:
             player_state.pop("pending_avatar_prompt", None)
             player_state.pop("pending_avatar_generated_at", None)
             player.state_json = self._dump_json(player_state)
-            player.updated_at = datetime.utcnow()
+            player.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
             session.commit()
             return True, f"Avatar accepted: {player_state.get('avatar_url')}"
 
@@ -2509,7 +2562,7 @@ class ZorkEmulator:
             player_state.pop("pending_avatar_prompt", None)
             player_state.pop("pending_avatar_generated_at", None)
             player.state_json = self._dump_json(player_state)
-            player.updated_at = datetime.utcnow()
+            player.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
             session.commit()
             if had_pending:
                 return True, "Pending avatar discarded."
@@ -3010,7 +3063,7 @@ class ZorkEmulator:
             if row is None:
                 return False, "Player not found."
             row.state_json = self._dump_json(player_state)
-            row.updated_at = datetime.utcnow()
+            row.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
             session.commit()
             player.state_json = row.state_json
             player.updated_at = row.updated_at
@@ -3117,7 +3170,7 @@ class ZorkEmulator:
                 return False
             character["image_url"] = image_url.strip()
             campaign.characters_json = self._dump_json(characters)
-            campaign.updated_at = datetime.utcnow()
+            campaign.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
             session.commit()
         return True
 
@@ -3132,7 +3185,7 @@ class ZorkEmulator:
         with self._session_factory() as session:
             row = session.get(Player, player.id)
             row.attributes_json = self._dump_json(attrs)
-            row.updated_at = datetime.utcnow()
+            row.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
             session.commit()
         return True, "Attribute updated."
 
@@ -3144,7 +3197,7 @@ class ZorkEmulator:
             row = session.get(Player, player.id)
             row.xp -= needed
             row.level += 1
-            row.updated_at = datetime.utcnow()
+            row.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
             session.commit()
             return True, f"Leveled up to {row.level}."
 
@@ -3479,7 +3532,7 @@ class ZorkEmulator:
             campaign = session.get(Campaign, campaign_id)
             if campaign is not None:
                 campaign.last_narration = decorated
-                campaign.updated_at = datetime.utcnow()
+                campaign.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
 
             narrator_turn = (
                 session.query(Turn)
@@ -3524,7 +3577,7 @@ class ZorkEmulator:
             if row is None:
                 return
             row.state_json = self._dump_json(player_state)
-            row.updated_at = datetime.utcnow()
+            row.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
             session.commit()
 
     def _sync_main_party_room_state(self, campaign_id: str, source_actor_id: str) -> None:
@@ -3567,7 +3620,7 @@ class ZorkEmulator:
                         target_state[key] = src_val
                 if target_state != before:
                     target.state_json = self._dump_json(target_state)
-                    target.updated_at = datetime.utcnow()
+                    target.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
                     changed = True
             if changed:
                 session.commit()
@@ -3608,7 +3661,7 @@ class ZorkEmulator:
             )
             if campaign is not None:
                 campaign.last_narration = narration
-                campaign.updated_at = datetime.utcnow()
+                campaign.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
             session.commit()
 
     def _apply_give_item_transfer(
@@ -3731,8 +3784,8 @@ class ZorkEmulator:
                 origin_hint=f"Received from <@{actor_id}>",
             )
             target_player.state_json = self._dump_json(target_state)
-            target_player.updated_at = datetime.utcnow()
-            source_player.updated_at = datetime.utcnow()
+            target_player.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
+            source_player.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
             session.commit()
 
     async def _enqueue_new_character_portraits(
@@ -3986,29 +4039,7 @@ class ZorkEmulator:
 
             if action_clean in ("roster", "characters", "npcs"):
                 characters = self.get_campaign_characters(campaign_obj)
-                if not characters:
-                    return "No characters in the roster yet."
-                lines = ["**Character Roster:**"]
-                for slug, char in characters.items():
-                    if not isinstance(char, dict):
-                        continue
-                    name = char.get("name", slug)
-                    location = char.get("location", "unknown")
-                    status = char.get("current_status", "")
-                    background = str(char.get("background", "") or "")
-                    origin = background.split(".")[0].strip() if background else ""
-                    deceased = char.get("deceased_reason")
-                    entry = f"- **{name}** ({slug})"
-                    if deceased:
-                        entry += f" [DECEASED: {deceased}]"
-                    else:
-                        entry += f" - {location}"
-                        if status:
-                            entry += f" | {status}"
-                    if origin:
-                        entry += f"\n  *{origin}.*"
-                    lines.append(entry)
-                return "\n".join(lines)
+                return self.format_roster(characters)
 
             return await self._play_action_with_ids(
                 campaign_id=str(resolved_campaign_id),
@@ -4108,7 +4139,7 @@ class ZorkEmulator:
             campaign.last_narration = snapshot.campaign_last_narration
             campaign.memory_visible_max_turn_id = target_turn_id
             campaign.row_version = max(int(campaign.row_version), 0) + 1
-            campaign.updated_at = datetime.utcnow()
+            campaign.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
 
             players_data = self._load_json(snapshot.players_json, [])
             if isinstance(players_data, dict):
@@ -4131,7 +4162,7 @@ class ZorkEmulator:
                 player.xp = int(pdata.get("xp", player.xp))
                 player.attributes_json = str(pdata.get("attributes_json", player.attributes_json))
                 player.state_json = str(pdata.get("state_json", player.state_json))
-                player.updated_at = datetime.utcnow()
+                player.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
 
             scoped_session_ids = [
                 row.id
@@ -4256,7 +4287,7 @@ class ZorkEmulator:
             timer.external_message_id = str(message_id)
             timer.external_channel_id = str(channel_id) if channel_id is not None else None
             timer.external_thread_id = str(thread_id) if thread_id is not None else None
-            timer.updated_at = datetime.utcnow()
+            timer.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
             session.commit()
             pending = self._pending_timers.get(campaign_id)
             if pending is not None:
@@ -4288,7 +4319,7 @@ class ZorkEmulator:
             if row is None:
                 return False
             row.state_json = self._dump_json(campaign_state)
-            row.updated_at = datetime.utcnow()
+            row.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
             session.commit()
             campaign.state_json = row.state_json
             campaign.updated_at = row.updated_at
@@ -4310,7 +4341,7 @@ class ZorkEmulator:
             if row is None:
                 return False
             row.state_json = self._dump_json(campaign_state)
-            row.updated_at = datetime.utcnow()
+            row.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
             session.commit()
             campaign.state_json = row.state_json
             campaign.updated_at = row.updated_at
@@ -4332,7 +4363,7 @@ class ZorkEmulator:
             if row is None:
                 return False
             row.state_json = self._dump_json(campaign_state)
-            row.updated_at = datetime.utcnow()
+            row.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
             session.commit()
             campaign.state_json = row.state_json
             campaign.updated_at = row.updated_at
@@ -4361,7 +4392,7 @@ class ZorkEmulator:
             if row is None:
                 return False
             row.state_json = self._dump_json(campaign_state)
-            row.updated_at = datetime.utcnow()
+            row.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
             session.commit()
             campaign.state_json = row.state_json
             campaign.updated_at = row.updated_at
@@ -4480,7 +4511,7 @@ class ZorkEmulator:
                 if latest_turn is not None and latest_turn.kind == "player":
                     created_at = latest_turn.created_at
                     if created_at is not None:
-                        age_seconds = (datetime.utcnow() - created_at).total_seconds()
+                        age_seconds = (datetime.now(timezone.utc).replace(tzinfo=None) - created_at).total_seconds()
                         if age_seconds < 5:
                             return
                 active_player = (
@@ -5500,6 +5531,31 @@ class ZorkEmulator:
         campaign_state["calendar"] = calendar
         return campaign_state
 
+    @classmethod
+    def format_roster(cls, characters: Dict[str, dict]) -> str:
+        """Format the character roster for display. Shared by intercepted and cog paths."""
+        if not characters:
+            return "No characters in the roster yet."
+        lines = ["**Character Roster:**"]
+        for slug, char in characters.items():
+            name = char.get("name", slug)
+            loc = char.get("location", "unknown")
+            status = char.get("current_status", "")
+            bg = char.get("background", "")
+            origin = bg.split(".")[0].strip() if bg else ""
+            deceased = char.get("deceased_reason")
+            entry = f"- **{name}** ({slug})"
+            if deceased:
+                entry += f" [DECEASED: {deceased}]"
+            else:
+                entry += f" — {loc}"
+                if status:
+                    entry += f" | {status}"
+            if origin:
+                entry += f"\n  *{origin}.*"
+            lines.append(entry)
+        return "\n".join(lines)
+
     def _build_characters_for_prompt(
         self,
         characters: Dict[str, dict],
@@ -5670,10 +5726,21 @@ class ZorkEmulator:
     def _clean_response(self, response: str) -> str:
         if not response:
             return response
-        json_text = self._extract_json(response)
+        cleaned = response.strip()
+        json_text = self._extract_json(cleaned)
         if json_text:
             return json_text
-        return response.strip()
+        # Repair common truncated-object case from the model:
+        # starts with '{' but omitted the final closing brace.
+        if cleaned.startswith("{") and not cleaned.endswith("}"):
+            repaired = f"{cleaned}}}"
+            try:
+                parsed = self._parse_json_lenient(repaired)
+                if isinstance(parsed, dict) and parsed:
+                    return repaired
+            except Exception:
+                pass
+        return cleaned
 
     def _extract_ascii_map(self, text: str) -> str:
         if not text:
@@ -5852,6 +5919,9 @@ class ZorkEmulator:
         speed_mult = state.get("speed_multiplier", 1.0)
         calendar_for_prompt = self._calendar_for_prompt(state)
         calendar_reminders = self._calendar_reminder_text(calendar_for_prompt)
+        currently_attentive = self._build_currently_attentive_players_for_prompt(
+            campaign.id
+        )
 
         active_name = str(player_state.get("character_name") or "").strip()
         action_label = f"PLAYER_ACTION ({active_name.upper()})" if active_name else "PLAYER_ACTION"
@@ -5871,6 +5941,8 @@ class ZorkEmulator:
             f"WORLD_STATE: {self._dump_json(model_state)}\n"
             f"CURRENT_GAME_TIME: {self._dump_json(game_time)}\n"
             f"SPEED_MULTIPLIER: {speed_mult}\n"
+            f"ATTENTION_WINDOW_SECONDS: {self.ATTENTION_WINDOW_SECONDS}\n"
+            f"CURRENTLY_ATTENTIVE_PLAYERS: {self._dump_json(currently_attentive)}\n"
             f"ACTIVE_PLAYER_LOCATION: {self._dump_json(active_location_context)}\n"
             f"CALENDAR: {self._dump_json(calendar_for_prompt)}\n"
             f"CALENDAR_REMINDERS:\n{calendar_reminders}\n"
@@ -6183,7 +6255,7 @@ class ZorkEmulator:
                 turn_id=turn_id,
             )
             campaign.state_json = self._dump_json(campaign_state)
-            campaign.updated_at = datetime.utcnow()
+            campaign.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
             session.commit()
         return True, "stored"
 

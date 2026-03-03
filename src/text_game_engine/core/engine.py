@@ -5,7 +5,7 @@ import json
 import re
 import uuid
 from dataclasses import asdict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable
 
 from .errors import StaleClaimError, TurnBusyError
@@ -23,13 +23,17 @@ class GameEngine:
         clock: Callable[[], datetime] | None = None,
         lease_ttl_seconds: int = 90,
         max_conflict_retries: int = 1,
+        player_state_sanitizer: Callable[
+            [dict[str, Any], dict[str, Any], str, str], dict[str, Any]
+        ] | None = None,
     ):
         self._uow_factory = uow_factory
         self._llm = llm
         self._actor_resolver = actor_resolver
-        self._clock = clock or datetime.utcnow
+        self._clock = clock or (lambda: datetime.now(timezone.utc).replace(tzinfo=None))
         self._lease_ttl_seconds = lease_ttl_seconds
         self._max_conflict_retries = max_conflict_retries
+        self._player_state_sanitizer = player_state_sanitizer
 
     async def resolve_turn(
         self,
@@ -240,18 +244,35 @@ class GameEngine:
             merged_character_updates = dict(state_null_character_updates)
             if isinstance(llm_output.character_updates, dict):
                 merged_character_updates.update(llm_output.character_updates)
+            _on_rails = bool(campaign_state.get("on_rails"))
             campaign_characters = self._apply_character_updates(
                 campaign_characters,
                 merged_character_updates,
+                on_rails=_on_rails,
             )
-            player_state = apply_patch(player_state, llm_output.player_state_update or {})
+            raw_player_update = llm_output.player_state_update or {}
+            if self._player_state_sanitizer is not None and isinstance(raw_player_update, dict):
+                raw_player_update = self._player_state_sanitizer(
+                    player_state,
+                    raw_player_update,
+                    turn_input.action,
+                    llm_output.narration or "",
+                )
+            player_state = apply_patch(player_state, raw_player_update)
             post_turn_game_time = self._extract_game_time_snapshot(campaign_state)
 
             summary = campaign.summary or ""
             if isinstance(llm_output.summary_update, str) and llm_output.summary_update.strip():
                 summary = (summary + "\n" + llm_output.summary_update.strip()).strip()
 
-            narration = (llm_output.narration or "").strip() or "The world shifts, but nothing clear emerges."
+            narration = (llm_output.narration or "").strip()
+            if not narration:
+                narration = self._fallback_narration_from_updates(
+                    summary_update=llm_output.summary_update,
+                    state_update=llm_output.state_update,
+                    player_state_update=llm_output.player_state_update,
+                    character_updates=llm_output.character_updates,
+                ) or "The world shifts, but nothing clear emerges."
 
             # give_item compatibility path - unresolved targets are non-fatal.
             give_item_payload: dict[str, Any] | None = None
@@ -411,11 +432,38 @@ class GameEngine:
                 return raw[:120]
         return "unknown-room"
 
+    @staticmethod
+    def _fallback_narration_from_updates(
+        *,
+        summary_update: object,
+        state_update: object,
+        player_state_update: object,
+        character_updates: object,
+    ) -> str:
+        if isinstance(player_state_update, dict):
+            room_summary = str(player_state_update.get("room_summary") or "").strip()
+            if room_summary:
+                return room_summary[:300]
+            room_title = str(player_state_update.get("room_title") or "").strip()
+            if room_title:
+                return f"{room_title}."
+        summary_line = str(summary_update or "").strip()
+        if summary_line:
+            return summary_line.splitlines()[0][:300]
+        if isinstance(character_updates, dict) and character_updates:
+            return "Character roster updated."
+        if isinstance(state_update, dict) and state_update:
+            return "Noted."
+        if isinstance(player_state_update, dict) and player_state_update:
+            return "Noted."
+        return ""
+
     @classmethod
     def _apply_character_updates(
         cls,
         existing: dict[str, Any],
         updates: dict[str, Any],
+        on_rails: bool = False,
     ) -> dict[str, Any]:
         merged = dict(existing) if isinstance(existing, dict) else {}
         if not isinstance(updates, dict):
@@ -449,7 +497,17 @@ class GameEngine:
 
             if not isinstance(fields, dict):
                 continue
-            merged[target_slug or slug] = fields
+            if target_slug and target_slug in merged:
+                # Existing character — only accept mutable fields.
+                _IMMUTABLE = {"name", "personality", "background", "appearance"}
+                for key, value in fields.items():
+                    if key not in _IMMUTABLE:
+                        merged[target_slug][key] = value
+            else:
+                if on_rails:
+                    continue
+                # New character — store everything.
+                merged[slug] = dict(fields)
         return merged
 
     @classmethod

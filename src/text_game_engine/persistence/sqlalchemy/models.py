@@ -20,7 +20,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
-from .base import Base, TimestampMixin
+from .base import Base, TimestampMixin, _utc_now
 
 
 TurnIDType = BigInteger().with_variant(Integer, "sqlite")
@@ -121,7 +121,7 @@ class Turn(Base):
     external_message_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     external_user_message_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
 
-    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=_utc_now)
 
 
 Index("ix_tge_turn_campaign_id_desc", Turn.campaign_id, Turn.id.desc())
@@ -141,7 +141,7 @@ class Snapshot(Base):
     campaign_last_narration: Mapped[str | None] = mapped_column(Text, nullable=True)
     players_json: Mapped[str] = mapped_column(Text, nullable=False)
 
-    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=_utc_now)
 
 
 Index("ix_tge_snapshot_campaign_turn", Snapshot.campaign_id, Snapshot.turn_id.desc())
@@ -228,7 +228,7 @@ class Embedding(Base):
     kind: Mapped[str] = mapped_column(String(32), nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)
     embedding: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=_utc_now)
 
 
 Index("ix_tge_embedding_campaign", Embedding.campaign_id)

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 
 import pytest
 from sqlalchemy import text
@@ -44,8 +44,8 @@ def seed_campaign_and_actor(session_factory):
             characters_json="{}",
             row_version=1,
             memory_visible_max_turn_id=None,
-            created_at=datetime.utcnow(),
-            updated_at=datetime.utcnow(),
+            created_at=datetime.now(timezone.utc).replace(tzinfo=None),
+            updated_at=datetime.now(timezone.utc).replace(tzinfo=None),
         )
         session.add(actor)
         session.add(campaign)
