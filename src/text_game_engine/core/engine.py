@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import uuid
 from dataclasses import asdict
 from datetime import datetime, timedelta
@@ -163,6 +164,12 @@ class GameEngine:
                 player = uow.players.create(turn_input.campaign_id, turn_input.actor_id)
 
             turns = uow.turns.recent(turn_input.campaign_id, limit=24)
+            def _turn_meta_payload(turn_obj):
+                meta = parse_json_dict(getattr(turn_obj, "meta_json", "{}"))
+                if not isinstance(meta, dict):
+                    return None
+                game_time = meta.get("game_time")
+                return game_time if isinstance(game_time, dict) else None
             context = TurnContext(
                 campaign_id=turn_input.campaign_id,
                 actor_id=turn_input.actor_id,
@@ -177,9 +184,11 @@ class GameEngine:
                 recent_turns=[
                     {
                         "id": t.id,
+                        "turn_number": t.id,
                         "kind": t.kind,
                         "actor_id": t.actor_id,
                         "content": t.content,
+                        "in_game_time": _turn_meta_payload(t),
                         "created_at": t.created_at.isoformat() if t.created_at else None,
                     }
                     for t in turns
@@ -214,13 +223,29 @@ class GameEngine:
             campaign_state = parse_json_dict(campaign.state_json)
             campaign_characters = parse_json_dict(campaign.characters_json)
             player_state = parse_json_dict(player.state_json)
+            pre_turn_game_time = self._extract_game_time_snapshot(context.campaign_state)
 
             campaign_state_update = dict(llm_output.state_update or {})
+            campaign_state_update = self._normalize_story_progress_update(
+                campaign_state,
+                campaign_state_update,
+            )
             calendar_update = campaign_state_update.pop("calendar_update", None)
             campaign_state = apply_patch(campaign_state, campaign_state_update)
             campaign_state = self._apply_calendar_update(campaign_state, calendar_update)
-            campaign_characters = apply_patch(campaign_characters, llm_output.character_updates or {})
+            state_null_character_updates = self._character_updates_from_state_nulls(
+                campaign_state_update,
+                campaign_characters,
+            )
+            merged_character_updates = dict(state_null_character_updates)
+            if isinstance(llm_output.character_updates, dict):
+                merged_character_updates.update(llm_output.character_updates)
+            campaign_characters = self._apply_character_updates(
+                campaign_characters,
+                merged_character_updates,
+            )
             player_state = apply_patch(player_state, llm_output.player_state_update or {})
+            post_turn_game_time = self._extract_game_time_snapshot(campaign_state)
 
             summary = campaign.summary or ""
             if isinstance(llm_output.summary_update, str) and llm_output.summary_update.strip():
@@ -260,6 +285,7 @@ class GameEngine:
                     actor_id=turn_input.actor_id,
                     kind="player",
                     content=turn_input.action,
+                    meta_json=dump_json({"game_time": pre_turn_game_time}),
                 )
             narrator_turn = uow.turns.add(
                 campaign_id=turn_input.campaign_id,
@@ -267,6 +293,7 @@ class GameEngine:
                 actor_id=turn_input.actor_id,
                 kind="narrator",
                 content=narration,
+                meta_json=dump_json({"game_time": post_turn_game_time}),
             )
 
             timer_instruction = llm_output.timer_instruction if turn_input.allow_timer_instruction else None
@@ -294,6 +321,10 @@ class GameEngine:
                             "due_at": due_at.isoformat(),
                             "event_text": timer_instruction.event_text,
                             "interruptible": bool(timer_instruction.interruptible),
+                            "interrupt_scope": str(
+                                getattr(timer_instruction, "interrupt_scope", "global")
+                                or "global"
+                            ),
                         }
                     ),
                 )
@@ -380,13 +411,190 @@ class GameEngine:
                 return raw[:120]
         return "unknown-room"
 
+    @classmethod
+    def _apply_character_updates(
+        cls,
+        existing: dict[str, Any],
+        updates: dict[str, Any],
+    ) -> dict[str, Any]:
+        merged = dict(existing) if isinstance(existing, dict) else {}
+        if not isinstance(updates, dict):
+            return merged
+        for raw_slug, fields in updates.items():
+            slug = str(raw_slug).strip()
+            if not slug:
+                continue
+
+            target_slug = cls._resolve_existing_character_slug(merged, slug)
+
+            delete_requested = (
+                fields is None
+                or (
+                    isinstance(fields, str)
+                    and fields.strip().lower() in {"delete", "remove", "null"}
+                )
+                or (
+                    isinstance(fields, dict)
+                    and bool(
+                        fields.get("remove")
+                        or fields.get("delete")
+                        or fields.get("_delete")
+                        or fields.get("deleted")
+                    )
+                )
+            )
+            if delete_requested:
+                merged.pop(target_slug or slug, None)
+                continue
+
+            if not isinstance(fields, dict):
+                continue
+            merged[target_slug or slug] = fields
+        return merged
+
+    @classmethod
+    def _resolve_existing_character_slug(
+        cls,
+        existing: dict[str, Any],
+        raw_slug: object,
+    ) -> str | None:
+        slug = str(raw_slug or "").strip()
+        if not slug:
+            return None
+        canonical = re.sub(r"[^a-z0-9]+", "-", slug.lower()).strip("-")
+        if slug in existing:
+            return slug
+        if canonical and canonical in existing:
+            return canonical
+        partial_matches: list[str] = []
+        for existing_slug, existing_fields in existing.items():
+            existing_canonical = re.sub(
+                r"[^a-z0-9]+", "-", str(existing_slug).lower()
+            ).strip("-")
+            if canonical and canonical == existing_canonical:
+                return str(existing_slug)
+            if canonical and (
+                existing_canonical.startswith(canonical)
+                or canonical in existing_canonical
+            ):
+                partial_matches.append(str(existing_slug))
+            if isinstance(existing_fields, dict):
+                name_canonical = re.sub(
+                    r"[^a-z0-9]+", "-",
+                    str(existing_fields.get("name") or "").lower(),
+                ).strip("-")
+                if canonical and canonical == name_canonical:
+                    return str(existing_slug)
+                if canonical and (
+                    name_canonical.startswith(canonical)
+                    or canonical in name_canonical
+                ):
+                    partial_matches.append(str(existing_slug))
+        if canonical:
+            unique_matches = list(dict.fromkeys(partial_matches))
+            if len(unique_matches) == 1:
+                return unique_matches[0]
+        return None
+
+    @classmethod
+    def _character_updates_from_state_nulls(
+        cls,
+        state_update: dict[str, Any] | Any,
+        existing_chars: dict[str, Any],
+    ) -> dict[str, Any]:
+        out: dict[str, Any] = {}
+        if not isinstance(state_update, dict) or not isinstance(existing_chars, dict):
+            return out
+        for key, value in state_update.items():
+            if value is not None:
+                continue
+            resolved = cls._resolve_existing_character_slug(existing_chars, key)
+            if resolved:
+                out[resolved] = None
+        return out
+
     @staticmethod
-    def _calendar_resolve_fire_day(
+    def _extract_game_time_snapshot(state: dict[str, Any] | None) -> dict[str, int]:
+        game_time = state.get("game_time") if isinstance(state, dict) else {}
+        if not isinstance(game_time, dict):
+            game_time = {}
+        try:
+            day = int(game_time.get("day", 1))
+        except (TypeError, ValueError):
+            day = 1
+        try:
+            hour = int(game_time.get("hour", 8))
+        except (TypeError, ValueError):
+            hour = 8
+        try:
+            minute = int(game_time.get("minute", 0))
+        except (TypeError, ValueError):
+            minute = 0
+        day = max(1, day)
+        hour = min(23, max(0, hour))
+        minute = min(59, max(0, minute))
+        return {"day": day, "hour": hour, "minute": minute}
+
+    @staticmethod
+    def _coerce_non_negative_int(value: object, default: int = 0) -> int:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return default
+        return parsed if parsed >= 0 else default
+
+    def _normalize_story_progress_update(
+        self,
+        campaign_state: dict[str, Any],
+        state_update: dict[str, Any],
+    ) -> dict[str, Any]:
+        if not isinstance(state_update, dict):
+            return {}
+        if not isinstance(campaign_state, dict):
+            return state_update
+
+        outline = campaign_state.get("story_outline")
+        chapters = outline.get("chapters") if isinstance(outline, dict) else []
+        if not isinstance(chapters, list) or not chapters:
+            return state_update
+
+        out = dict(state_update)
+        old_ch = self._coerce_non_negative_int(campaign_state.get("current_chapter", 0), default=0)
+        old_ch = min(old_ch, len(chapters) - 1)
+
+        has_ch = "current_chapter" in out
+        has_sc = "current_scene" in out
+
+        if has_ch:
+            ch = self._coerce_non_negative_int(out.get("current_chapter"), default=old_ch)
+            out["current_chapter"] = min(ch, len(chapters) - 1)
+
+        if has_sc:
+            scene_ch = out.get("current_chapter", old_ch)
+            scene_ch = self._coerce_non_negative_int(scene_ch, default=old_ch)
+            scene_ch = min(scene_ch, len(chapters) - 1)
+            raw_scene = out.get("current_scene")
+            sc = self._coerce_non_negative_int(raw_scene, default=0)
+            chapter_scenes = chapters[scene_ch].get("scenes", [])
+            if isinstance(chapter_scenes, list) and chapter_scenes:
+                sc = min(sc, len(chapter_scenes) - 1)
+            else:
+                sc = 0
+            out["current_scene"] = sc
+
+        # Chapter transition defaults to first scene unless model explicitly sets one.
+        if has_ch and not has_sc and out.get("current_chapter") != old_ch:
+            out["current_scene"] = 0
+
+        return out
+
+    @staticmethod
+    def _calendar_resolve_fire_point(
         current_day: int,
         current_hour: int,
         time_remaining: object,
         time_unit: object,
-    ) -> int:
+    ) -> tuple[int, int]:
         try:
             day = int(current_day)
         except (TypeError, ValueError):
@@ -402,11 +610,30 @@ class GameEngine:
         except (TypeError, ValueError):
             remaining = 1
         unit = str(time_unit or "days").strip().lower()
+        base_hours = (day - 1) * 24 + hour
         if unit.startswith("hour"):
-            fire_day = day + ((hour + remaining) // 24)
+            fire_abs_hours = base_hours + remaining
         else:
-            fire_day = day + remaining
-        return max(1, int(fire_day))
+            fire_abs_hours = base_hours + (remaining * 24)
+        fire_abs_hours = max(0, int(fire_abs_hours))
+        fire_day = (fire_abs_hours // 24) + 1
+        fire_hour = fire_abs_hours % 24
+        return max(1, int(fire_day)), min(23, max(0, int(fire_hour)))
+
+    @staticmethod
+    def _calendar_resolve_fire_day(
+        current_day: int,
+        current_hour: int,
+        time_remaining: object,
+        time_unit: object,
+    ) -> int:
+        fire_day, _ = GameEngine._calendar_resolve_fire_point(
+            current_day=current_day,
+            current_hour=current_hour,
+            time_remaining=time_remaining,
+            time_unit=time_unit,
+        )
+        return fire_day
 
     @classmethod
     def _calendar_normalize_event(
@@ -422,10 +649,23 @@ class GameEngine:
         if not name:
             return None
         fire_day_raw = event.get("fire_day")
-        if isinstance(fire_day_raw, (int, float)) and not isinstance(fire_day_raw, bool):
+        fire_hour_raw = event.get("fire_hour")
+        if (
+            isinstance(fire_day_raw, (int, float))
+            and not isinstance(fire_day_raw, bool)
+            and isinstance(fire_hour_raw, (int, float))
+            and not isinstance(fire_hour_raw, bool)
+        ):
             fire_day = max(1, int(fire_day_raw))
+            fire_hour = min(23, max(0, int(fire_hour_raw)))
+        elif isinstance(fire_day_raw, (int, float)) and not isinstance(
+            fire_day_raw, bool
+        ):
+            fire_day = max(1, int(fire_day_raw))
+            # Backward compatibility for legacy day-only events.
+            fire_hour = 23
         else:
-            fire_day = cls._calendar_resolve_fire_day(
+            fire_day, fire_hour = cls._calendar_resolve_fire_point(
                 current_day=current_day,
                 current_hour=current_hour,
                 time_remaining=event.get("time_remaining", 1),
@@ -434,6 +674,7 @@ class GameEngine:
         normalized: dict[str, Any] = {
             "name": name,
             "fire_day": fire_day,
+            "fire_hour": fire_hour,
             "description": str(event.get("description") or "")[:200],
         }
         for key in ("created_day", "created_hour"):
@@ -484,10 +725,22 @@ class GameEngine:
                 if not name:
                     continue
                 fire_day = entry.get("fire_day")
-                if isinstance(fire_day, (int, float)) and not isinstance(fire_day, bool):
+                fire_hour = entry.get("fire_hour")
+                if (
+                    isinstance(fire_day, (int, float))
+                    and not isinstance(fire_day, bool)
+                    and isinstance(fire_hour, (int, float))
+                    and not isinstance(fire_hour, bool)
+                ):
                     resolved_fire_day = max(1, int(fire_day))
+                    resolved_fire_hour = min(23, max(0, int(fire_hour)))
+                elif isinstance(fire_day, (int, float)) and not isinstance(
+                    fire_day, bool
+                ):
+                    resolved_fire_day = max(1, int(fire_day))
+                    resolved_fire_hour = 23
                 else:
-                    resolved_fire_day = self._calendar_resolve_fire_day(
+                    resolved_fire_day, resolved_fire_hour = self._calendar_resolve_fire_point(
                         current_day=day_int,
                         current_hour=hour_int,
                         time_remaining=entry.get("time_remaining", 1),
@@ -496,6 +749,7 @@ class GameEngine:
                 event = {
                     "name": name,
                     "fire_day": resolved_fire_day,
+                    "fire_hour": resolved_fire_hour,
                     "created_day": current_day,
                     "created_hour": current_hour,
                     "description": str(entry.get("description") or "")[:200],

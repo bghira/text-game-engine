@@ -117,6 +117,45 @@ def test_timer_transition_idempotency(uow_factory, seed_campaign_and_actor):
         uow.commit()
 
 
+def test_timer_outbox_includes_interrupt_scope(session_factory, uow_factory, seed_campaign_and_actor):
+    async def run_test():
+        llm = StubLLM(
+            LLMTurnOutput(
+                narration="A siren ramps up.",
+                timer_instruction=TimerInstruction(
+                    delay_seconds=90,
+                    event_text="Blast doors lock.",
+                    interruptible=True,
+                    interrupt_scope="local",
+                ),
+            )
+        )
+        engine = GameEngine(uow_factory=uow_factory, llm=llm)
+
+        result = await engine.resolve_turn(
+            ResolveTurnInput(
+                campaign_id=seed_campaign_and_actor["campaign_id"],
+                actor_id=seed_campaign_and_actor["actor_id"],
+                action="wait",
+            )
+        )
+        assert result.status == "ok"
+
+        with session_factory() as session:
+            outbox = (
+                session.query(OutboxEvent)
+                .filter(OutboxEvent.campaign_id == seed_campaign_and_actor["campaign_id"])
+                .filter(OutboxEvent.event_type == "timer_scheduled")
+                .order_by(OutboxEvent.id.desc())
+                .first()
+            )
+            assert outbox is not None
+            payload = json.loads(outbox.payload_json or "{}")
+            assert payload.get("interrupt_scope") == "local"
+
+    asyncio.run(run_test())
+
+
 def test_memory_visibility_filter_after_rewind(session_factory, uow_factory, seed_campaign_and_actor):
     async def run_test():
         llm = StubLLM(LLMTurnOutput(narration="Turn narration"))
@@ -235,6 +274,125 @@ def test_calendar_update_ops_are_applied_and_not_persisted_as_patch_key(
             eclipse = next((entry for entry in calendar if entry.get("name") == "Eclipse"), None)
             assert eclipse is not None
             assert eclipse.get("fire_day") == 4
+            assert eclipse.get("fire_hour") == 8
+
+    asyncio.run(run_test())
+
+
+def test_story_progress_state_update_coerces_string_indices_and_clamps(
+    session_factory, uow_factory, seed_campaign_and_actor
+):
+    async def run_test():
+        with session_factory() as session:
+            campaign = session.get(Campaign, seed_campaign_and_actor["campaign_id"])
+            campaign.state_json = json.dumps(
+                {
+                    "current_chapter": 0,
+                    "current_scene": 0,
+                    "story_outline": {
+                        "chapters": [
+                            {"title": "One", "scenes": [{"title": "S1"}]},
+                            {"title": "Two", "scenes": [{"title": "S2-1"}, {"title": "S2-2"}]},
+                        ]
+                    },
+                }
+            )
+            session.commit()
+
+        llm = StubLLM(
+            LLMTurnOutput(
+                narration="Advance chapter and scene.",
+                state_update={"current_chapter": "1", "current_scene": "99"},
+            )
+        )
+        engine = GameEngine(uow_factory=uow_factory, llm=llm)
+
+        result = await engine.resolve_turn(
+            ResolveTurnInput(
+                campaign_id=seed_campaign_and_actor["campaign_id"],
+                actor_id=seed_campaign_and_actor["actor_id"],
+                action="continue",
+            )
+        )
+        assert result.status == "ok"
+
+        with session_factory() as session:
+            campaign = session.get(Campaign, seed_campaign_and_actor["campaign_id"])
+            state = json.loads(campaign.state_json or "{}")
+            assert state.get("current_chapter") == 1
+            # chapter 2 has two scenes -> max valid index is 1
+            assert state.get("current_scene") == 1
+
+    asyncio.run(run_test())
+
+
+def test_character_updates_null_removes_character(session_factory, uow_factory, seed_campaign_and_actor):
+    async def run_test():
+        with session_factory() as session:
+            campaign = session.get(Campaign, seed_campaign_and_actor["campaign_id"])
+            campaign.characters_json = json.dumps(
+                {
+                    "mira-guide": {"name": "Mira", "location": "Dock 9"},
+                    "jet-smuggler": {"name": "Jet", "location": "Market"},
+                }
+            )
+            session.commit()
+
+        llm = StubLLM(
+            LLMTurnOutput(
+                narration="Mira departs the story.",
+                character_updates={"mira-guide": None},
+            )
+        )
+        engine = GameEngine(uow_factory=uow_factory, llm=llm)
+
+        result = await engine.resolve_turn(
+            ResolveTurnInput(
+                campaign_id=seed_campaign_and_actor["campaign_id"],
+                actor_id=seed_campaign_and_actor["actor_id"],
+                action="continue",
+            )
+        )
+        assert result.status == "ok"
+
+        with session_factory() as session:
+            campaign = session.get(Campaign, seed_campaign_and_actor["campaign_id"])
+            characters = json.loads(campaign.characters_json or "{}")
+            assert "mira-guide" not in characters
+            assert "jet-smuggler" in characters
+
+        with session_factory() as session:
+            campaign = session.get(Campaign, seed_campaign_and_actor["campaign_id"])
+            campaign.characters_json = json.dumps(
+                {
+                    "rhea-sage": {"name": "Rhea Sage", "location": "Tower"},
+                    "jet-smuggler": {"name": "Jet", "location": "Market"},
+                }
+            )
+            session.commit()
+
+        llm2 = StubLLM(
+            LLMTurnOutput(
+                narration="Rhea exits the campaign.",
+                state_update={"Rhea": None},
+            )
+        )
+        engine2 = GameEngine(uow_factory=uow_factory, llm=llm2)
+
+        result2 = await engine2.resolve_turn(
+            ResolveTurnInput(
+                campaign_id=seed_campaign_and_actor["campaign_id"],
+                actor_id=seed_campaign_and_actor["actor_id"],
+                action="continue",
+            )
+        )
+        assert result2.status == "ok"
+
+        with session_factory() as session:
+            campaign = session.get(Campaign, seed_campaign_and_actor["campaign_id"])
+            characters = json.loads(campaign.characters_json or "{}")
+            assert "rhea-sage" not in characters
+            assert "jet-smuggler" in characters
 
     asyncio.run(run_test())
 

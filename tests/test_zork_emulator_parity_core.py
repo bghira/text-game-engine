@@ -50,6 +50,20 @@ class StubCompletionPort:
         return '{"narration":"ok"}'
 
 
+class CaptureMapCompletionPort:
+    def __init__(self):
+        self.calls = []
+
+    async def complete(self, system_prompt, prompt, *, temperature=0.8, max_tokens=2048):
+        self.calls.append(
+            {
+                "system_prompt": system_prompt,
+                "prompt": prompt,
+            }
+        )
+        return "@\nLEGEND:\n@ Neo"
+
+
 class NovelIntentProbeCompletionPort:
     def __init__(self):
         self.initial_classify_calls = 0
@@ -320,17 +334,107 @@ def test_build_prompt_shape(session_factory, seed_campaign_and_actor):
     assert "You are the ZorkEmulator" in system_prompt
     assert "STRUCTURE REQUIREMENT:" in system_prompt
     assert "USE memory_search AGGRESSIVELY" in system_prompt
+    assert '{"tool_call": "memory_terms"' in system_prompt
+    assert '{"tool_call": "memory_turn"' in system_prompt
+    assert '{"tool_call": "memory_store"' in system_prompt
+    assert '{"tool_call": "sms_list"' in system_prompt
+    assert '{"tool_call": "sms_read"' in system_prompt
+    assert '{"tool_call": "sms_write"' in system_prompt
+    assert "character-keyed" in system_prompt
+    assert "set that character slug to null in character_updates" in system_prompt
     assert "CALENDAR & GAME TIME SYSTEM:" in system_prompt
     assert "CRITICAL — calendar_update.remove rules:" in system_prompt
     assert "Do NOT remove events just because they are overdue." in system_prompt
-    assert "stores fire_day" in system_prompt
+    assert "stores fire_day + fire_hour" in system_prompt
     assert "CALENDAR_REMINDERS" in user_prompt
+    assert "ACTIVE_PLAYER_LOCATION:" in user_prompt
     assert "CHARACTER ROSTER & PORTRAITS:" in system_prompt
+    assert '"set_timer_interrupt_scope": "local"|"global"' in system_prompt
+    assert "Use ACTIVE_PLAYER_LOCATION and PARTY_SNAPSHOT to decide scope" in system_prompt
     assert "CAMPAIGN:" in user_prompt
     assert "CURRENT_GAME_TIME:" in user_prompt
     assert "SPEED_MULTIPLIER:" in user_prompt
     assert "CALENDAR:" in user_prompt
     assert "PLAYER_ACTION:" in user_prompt
+
+
+def test_recent_turns_include_turn_number_and_in_game_time(session_factory, seed_campaign_and_actor):
+    compat = _build_compat(session_factory)
+    campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
+    player = compat.get_or_create_player(seed_campaign_and_actor["campaign_id"], seed_campaign_and_actor["actor_id"])
+    with session_factory() as session:
+        row = session.get(Campaign, campaign.id)
+        state = json.loads(row.state_json or "{}")
+        state["game_time"] = {"day": 2, "hour": 14, "minute": 30, "period": "afternoon"}
+        row.state_json = compat._dump_json(state)
+        session.commit()
+
+    compat._record_simple_turn_pair(
+        campaign_id=campaign.id,
+        actor_id=seed_campaign_and_actor["actor_id"],
+        session_id=None,
+        action_text="look around",
+        narration="A brass gate hums with static.",
+    )
+    campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
+    turns = compat.get_recent_turns(seed_campaign_and_actor["campaign_id"])
+    _, user_prompt = compat.build_prompt(campaign, player, "look", turns)
+
+    assert "[TURN #" in user_prompt
+    assert "Day 2 14:30" in user_prompt
+
+
+def test_sms_thread_roundtrip(session_factory, seed_campaign_and_actor):
+    compat = _build_compat(session_factory)
+    campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
+
+    ok, status = compat.write_sms_thread(
+        campaign.id,
+        thread="saul",
+        sender="Dale",
+        recipient="Saul",
+        message="Meet me at Dock 9.",
+    )
+    assert ok is True
+    assert status == "stored"
+
+    listing = compat.list_sms_threads(campaign.id, wildcard="sa*", limit=10)
+    assert listing
+    assert listing[0]["thread"] == "saul"
+    assert listing[0]["last_preview"].startswith("Meet me")
+
+    thread_key, thread_label, messages = compat.read_sms_thread(campaign.id, "saul", limit=10)
+    assert thread_key == "saul"
+    assert thread_label is not None
+    assert messages
+    assert messages[-1]["from"] == "Dale"
+    assert messages[-1]["to"] == "Saul"
+    assert "Dock 9" in messages[-1]["message"]
+
+
+def test_recent_turns_keep_full_content(session_factory, seed_campaign_and_actor):
+    compat = _build_compat(session_factory)
+    campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
+    player = compat.get_or_create_player(seed_campaign_and_actor["campaign_id"], seed_campaign_and_actor["actor_id"])
+    long_narration = "BEGIN_MARKER " + ("alpha " * 260) + "END_MARKER"
+
+    with session_factory() as session:
+        session.add(
+            Turn(
+                campaign_id=campaign.id,
+                session_id=None,
+                actor_id=player.actor_id,
+                kind="narrator",
+                content=long_narration,
+            )
+        )
+        session.commit()
+
+    turns = compat.get_recent_turns(seed_campaign_and_actor["campaign_id"])
+    _system_prompt, user_prompt = compat.build_prompt(campaign, player, "look", turns)
+    assert "BEGIN_MARKER" in user_prompt
+    assert "END_MARKER" in user_prompt
+    assert "...[truncated]" not in user_prompt
 
 
 def test_build_prompt_seeds_default_game_time(session_factory, seed_campaign_and_actor):
@@ -350,6 +454,79 @@ def test_build_prompt_seeds_default_game_time(session_factory, seed_campaign_and
     assert game_time.get("date_label") == "Day 1, Morning"
     assert '"day": 1' in user_prompt
     assert "CURRENT_GAME_TIME:" in user_prompt
+
+
+def test_story_context_includes_next_three_and_coerces_progress_indices(session_factory, seed_campaign_and_actor):
+    compat = _build_compat(session_factory)
+
+    campaign_state = {
+        "current_chapter": "1",
+        "current_scene": "2",
+        "story_outline": {
+            "chapters": [
+                {"title": "Ch1", "summary": "one", "scenes": [{"title": "A1"}]},
+                {"title": "Ch2", "summary": "two", "scenes": [{"title": "B1"}, {"title": "B2"}, {"title": "B3"}]},
+                {"title": "Ch3", "summary": "three", "scenes": [{"title": "C1"}]},
+                {"title": "Ch4", "summary": "four", "scenes": [{"title": "D1"}]},
+                {"title": "Ch5", "summary": "five", "scenes": [{"title": "E1"}]},
+            ]
+        },
+    }
+
+    story_context = compat._build_story_context(campaign_state)
+    assert story_context is not None
+    assert "CURRENT CHAPTER: Ch2" in story_context
+    assert "Scene 3: B3 >>> CURRENT SCENE <<<" in story_context
+    assert "NEXT CHAPTER: Ch3" in story_context
+    assert "UPCOMING CHAPTER 2: Ch4" in story_context
+    assert "UPCOMING CHAPTER 3: Ch5" in story_context
+
+
+def test_generate_map_prompt_uses_authoritative_location_keys(session_factory, seed_campaign_and_actor):
+    async def run_test():
+        map_port = CaptureMapCompletionPort()
+        compat = _build_compat(session_factory, completion_port=map_port)
+        campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
+        primary = compat.get_or_create_player(campaign.id, seed_campaign_and_actor["actor_id"])
+        other = compat.get_or_create_player(campaign.id, "actor-2")
+        with session_factory() as session:
+            primary_row = session.get(Player, primary.id)
+            primary_row.state_json = compat._dump_json(
+                {
+                    "character_name": "Dale",
+                    "location": "chp-cruiser",
+                    "room_title": "CHP Cruiser - En Route",
+                    "room_summary": "Back seat of a patrol cruiser heading toward LA.",
+                }
+            )
+            other_row = session.get(Player, other.id)
+            other_row.state_json = compat._dump_json(
+                {
+                    "character_name": "Arsipea",
+                    "location": "victorville-facility",
+                    "room_title": "Victorville Federal Facility - Visitor B",
+                    "room_summary": "Institutional visitor room under fluorescent lights.",
+                }
+            )
+            campaign_row = session.get(Campaign, campaign.id)
+            campaign_row.characters_json = compat._dump_json(
+                {
+                    "warden-rollins": {"name": "Rollins", "location": "victorville-facility"},
+                    "driver-hobbs": {"name": "Hobbs", "location": "chp-cruiser"},
+                }
+            )
+            session.commit()
+
+        map_text = await compat.generate_map(campaign.id, actor_id=seed_campaign_and_actor["actor_id"])
+        assert map_text
+        assert map_port.calls
+        prompt = map_port.calls[-1]["prompt"]
+        assert "PLAYER_LOCATION_KEY:" in prompt
+        assert "WORLD_CHARACTER_LOCATIONS:" in prompt
+        assert '"location_key"' in prompt
+        assert "MAP_SPATIAL_RULES:" in prompt
+
+    asyncio.run(run_test())
 
 
 def test_prompt_budget_constants_match_upstream_latest():
@@ -587,6 +764,30 @@ def test_character_portrait_helpers(session_factory, seed_campaign_and_actor):
     assert "Character portrait of Mira." in prompt
 
 
+def test_apply_character_updates_remove_slug_on_null(session_factory, seed_campaign_and_actor):
+    compat = _build_compat(session_factory)
+    existing = {
+        "mira-guide": {"name": "Mira", "location": "Dock 9"},
+        "jet-smuggler": {"name": "Jet", "location": "Market"},
+    }
+    updated = compat._apply_character_updates(
+        existing,
+        {"mira-guide": None, "jet-smuggler": {"current_status": "watchful"}},
+    )
+    assert "mira-guide" not in updated
+    assert updated["jet-smuggler"]["current_status"] == "watchful"
+    updated2 = compat._apply_character_updates(
+        {"mira-guide": {"name": "Mira", "location": "Dock 9"}},
+        {"Mira Guide": {"remove": True}},
+    )
+    assert "mira-guide" not in updated2
+    derived = compat._character_updates_from_state_nulls(
+        {"Mira": None, "irrelevant_state_key": None},
+        {"mira-guide": {"name": "Mira", "location": "Dock 9"}},
+    )
+    assert derived == {"mira-guide": None}
+
+
 def test_new_character_auto_enqueues_portrait(
     uow_factory,
     session_factory,
@@ -766,11 +967,12 @@ def test_context_shortcuts_calendar_and_roster(session_factory, seed_campaign_an
             player_row.state_json = compat._dump_json({"party_status": "main_party"})
             campaign_row = session.get(Campaign, campaign.id)
             campaign_state = compat.get_campaign_state(campaign)
-            campaign_state["game_time"] = {"day": 3, "period": "evening"}
+            campaign_state["game_time"] = {"day": 3, "hour": 19, "period": "evening"}
             campaign_state["calendar"] = [
                 {
                     "name": "Moonrise Ceremony",
-                    "fire_day": 5,
+                    "fire_day": 3,
+                    "fire_hour": 22,
                     "description": "Lanterns gather at the old plaza",
                 }
             ]
@@ -782,6 +984,7 @@ def test_context_shortcuts_calendar_and_roster(session_factory, seed_campaign_an
                         "location": "Dock 9",
                         "current_status": "watchful",
                         "background": "A veteran smuggler. Knows every back alley.",
+                        "image_url": "https://example.com/mira.png",
                     }
                 }
             )
@@ -798,6 +1001,7 @@ def test_context_shortcuts_calendar_and_roster(session_factory, seed_campaign_an
         assert calendar_resp is not None
         assert "**Game Time:** Day 3, Evening" in calendar_resp
         assert "Moonrise Ceremony" in calendar_resp
+        assert "fires in 3 hour(s)" in calendar_resp
 
         roster_resp = await compat.play_action(
             ctx,
@@ -809,6 +1013,98 @@ def test_context_shortcuts_calendar_and_roster(session_factory, seed_campaign_an
         assert "**Character Roster:**" in roster_resp
         assert "Mira" in roster_resp
         assert "Dock 9" in roster_resp
+        assert "Portrait:" not in roster_resp
+        assert "https://example.com/mira.png" not in roster_resp
+
+    asyncio.run(run_test())
+
+
+def test_calendar_reminders_suppress_non_milestone_hours(session_factory, seed_campaign_and_actor):
+    compat = _build_compat(session_factory)
+    text = compat._calendar_reminder_text(
+        [
+            {
+                "name": "Media Exposure Fallout",
+                "hours_remaining": 30,
+                "fire_day": 5,
+                "fire_hour": 14,
+            }
+        ]
+    )
+    assert text == "None"
+
+
+def test_calendar_reminders_include_milestone_hours(session_factory, seed_campaign_and_actor):
+    compat = _build_compat(session_factory)
+    text = compat._calendar_reminder_text(
+        [
+            {
+                "name": "Media Exposure Fallout",
+                "hours_remaining": 24,
+                "fire_day": 5,
+                "fire_hour": 14,
+            }
+        ]
+    )
+    assert "SOON: Media Exposure Fallout" in text
+    assert "fires in 24 hour(s)" in text
+
+
+def test_main_party_location_sync_updates_other_players(
+    uow_factory,
+    session_factory,
+    seed_campaign_and_actor,
+):
+    async def run_test():
+        llm = StubLLM(
+            LLMTurnOutput(
+                narration="You enter Visitor Room B.",
+                player_state_update={
+                    "location": "visitor-room-b",
+                    "room_title": "Visitor Room B",
+                    "room_summary": "Inside Visitor Room B with Arsipea.",
+                    "room_description": "A bolted table under fluorescent lights.",
+                    "exits": ["hallway"],
+                },
+            )
+        )
+        engine = GameEngine(uow_factory=uow_factory, llm=llm)
+        compat = ZorkEmulator(game_engine=engine, session_factory=session_factory)
+        campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
+        _p1 = compat.get_or_create_player(campaign.id, seed_campaign_and_actor["actor_id"])
+        p2 = compat.get_or_create_player(campaign.id, "actor-2")
+        with session_factory() as session:
+            p1_row = (
+                session.query(Player)
+                .filter(Player.campaign_id == campaign.id)
+                .filter(Player.actor_id == seed_campaign_and_actor["actor_id"])
+                .first()
+            )
+            p1_row.state_json = compat._dump_json({"party_status": "main_party"})
+            p2_row = session.get(Player, p2.id)
+            p2_row.state_json = compat._dump_json(
+                {
+                    "party_status": "main_party",
+                    "location": "chp-cruiser",
+                    "room_title": "CHP Cruiser",
+                    "room_summary": "Back seat of a patrol cruiser.",
+                }
+            )
+            session.commit()
+
+        out = await compat.play_action(
+            campaign_id=campaign.id,
+            actor_id=seed_campaign_and_actor["actor_id"],
+            action="look",
+        )
+        assert out is not None
+
+        with session_factory() as session:
+            p2_row = session.get(Player, p2.id)
+            p2_state = json.loads(p2_row.state_json or "{}")
+            assert p2_state.get("location") == "visitor-room-b"
+            assert p2_state.get("room_title") == "Visitor Room B"
+            assert "Visitor Room B" in str(p2_state.get("room_summary") or "")
 
     asyncio.run(run_test())
 
@@ -1081,6 +1377,76 @@ def test_play_action_appends_inventory_and_timer_and_persists(
             snapshot = session.query(Snapshot).filter(Snapshot.turn_id == narrator_turn.id).first()
             assert snapshot is not None
             assert snapshot.campaign_last_narration == narration
+
+    asyncio.run(run_test())
+
+
+def test_local_timer_only_owner_can_interrupt(session_factory, seed_campaign_and_actor):
+    async def run_test():
+        compat = _build_compat(session_factory)
+        campaign_id = seed_campaign_and_actor["campaign_id"]
+        owner_actor_id = seed_campaign_and_actor["actor_id"]
+        other_actor_id = "actor-2"
+        compat.get_or_create_player(campaign_id, owner_actor_id)
+        compat.get_or_create_player(campaign_id, other_actor_id)
+
+        compat._schedule_timer(
+            campaign_id=campaign_id,
+            channel_id="chan-1",
+            delay_seconds=300,
+            event_description="Guards close in on the alley.",
+            interruptible=True,
+            interrupt_scope="local",
+            interrupt_actor_id=owner_actor_id,
+        )
+
+        narration_other = await compat.play_action(
+            campaign_id=campaign_id,
+            actor_id=other_actor_id,
+            action="wait",
+        )
+        assert narration_other is not None
+        pending_after_other = compat._pending_timers.get(campaign_id)
+        assert pending_after_other is not None
+        assert pending_after_other.get("interrupt_scope") == "local"
+
+        narration_owner = await compat.play_action(
+            campaign_id=campaign_id,
+            actor_id=owner_actor_id,
+            action="duck behind crates",
+        )
+        assert narration_owner is not None
+        assert compat._pending_timers.get(campaign_id) is None
+
+    asyncio.run(run_test())
+
+
+def test_global_timer_can_be_interrupted_by_any_player(session_factory, seed_campaign_and_actor):
+    async def run_test():
+        compat = _build_compat(session_factory)
+        campaign_id = seed_campaign_and_actor["campaign_id"]
+        owner_actor_id = seed_campaign_and_actor["actor_id"]
+        other_actor_id = "actor-2"
+        compat.get_or_create_player(campaign_id, owner_actor_id)
+        compat.get_or_create_player(campaign_id, other_actor_id)
+
+        compat._schedule_timer(
+            campaign_id=campaign_id,
+            channel_id="chan-1",
+            delay_seconds=300,
+            event_description="The alarm countdown begins.",
+            interruptible=True,
+            interrupt_scope="global",
+            interrupt_actor_id=owner_actor_id,
+        )
+
+        narration_other = await compat.play_action(
+            campaign_id=campaign_id,
+            actor_id=other_actor_id,
+            action="slam the console switch",
+        )
+        assert narration_other is not None
+        assert compat._pending_timers.get(campaign_id) is None
 
     asyncio.run(run_test())
 
