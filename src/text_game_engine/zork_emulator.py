@@ -100,6 +100,9 @@ class ZorkEmulator:
     SCENE_IMAGE_PRESERVE_PREFIX = (
         "preserving all scene image details from scene in image x"
     )
+    TIMER_REALTIME_SCALE = 0.2
+    TIMER_REALTIME_MIN_SECONDS = 5
+    TIMER_REALTIME_MAX_SECONDS = 120
     PROCESSING_EMOJI = "🤔"
 
     MAIN_PARTY_TOKEN = "main party"
@@ -273,6 +276,7 @@ class ZorkEmulator:
         "This is an adult-oriented game. You may include mature themes, explicit content, violence, "
         "dark humor, and adult situations when appropriate to the story and player actions.\n\n"
         "Return ONLY valid JSON with these keys:\n"
+        "- reasoning: string (first key in final turn JSON; concise internal grounding for this turn: what evidence/context you used, which actors are involved, and why the chosen outcome follows)\n"
         "- narration: string (what the player sees)\n"
         "- state_update: object (world state patches; set a key to null to remove it when no longer relevant. "
         "IMPORTANT: WORLD_STATE has a size budget. Actively prune stale keys every turn by setting them to null. "
@@ -321,6 +325,8 @@ class ZorkEmulator:
         "WORLD_CHARACTERS in the prompt shows the current NPC roster — use it for continuity.)\n\n"
         "Rules:\n"
         "- Return ONLY the JSON object. No markdown, no code fences, no text before or after the JSON.\n"
+        "- In final non-tool responses, include reasoning and put it as the first key.\n"
+        "- Keep reasoning concise (roughly 1-4 short sentences, <=1200 chars).\n"
         "- Do NOT repeat the narration outside the JSON object.\n"
         "- Keep narration under 1800 characters.\n"
         "- Write in classic Zork style: concise, concrete, and gameplay-forward.\n"
@@ -3547,6 +3553,9 @@ class ZorkEmulator:
                     if speed > 0:
                         timer_delay_seconds = int(timer_delay_seconds / speed)
                     timer_delay_seconds = max(15, min(300, timer_delay_seconds))
+                    timer_delay_seconds = self._compress_realtime_timer_delay(
+                        timer_delay_seconds
+                    )
                 if result.timer_instruction is not None and session_id is not None:
                     with self._session_factory() as session:
                         sess = session.get(GameSession, session_id)
@@ -3651,7 +3660,9 @@ class ZorkEmulator:
                 delay_seconds = (
                     int(timer_delay_seconds)
                     if timer_delay_seconds is not None
-                    else max(0, int(getattr(timer_instruction, "delay_seconds", 0) or 0))
+                    else self._compress_realtime_timer_delay(
+                        int(getattr(timer_instruction, "delay_seconds", 0) or 0)
+                    )
                 )
                 expiry_ts = int(time.time()) + delay_seconds
                 event_hint = str(getattr(timer_instruction, "event_text", "") or "Something happens")
@@ -4524,6 +4535,19 @@ class ZorkEmulator:
         except (TypeError, ValueError):
             return 1.0
 
+    @classmethod
+    def _compress_realtime_timer_delay(cls, delay_seconds: object) -> int:
+        try:
+            raw = int(delay_seconds)
+        except (TypeError, ValueError):
+            raw = 60
+        raw = max(1, raw)
+        compressed = int(round(raw * float(cls.TIMER_REALTIME_SCALE)))
+        return max(
+            int(cls.TIMER_REALTIME_MIN_SECONDS),
+            min(int(cls.TIMER_REALTIME_MAX_SECONDS), compressed),
+        )
+
     def set_speed_multiplier(self, campaign: Campaign | None, multiplier: float) -> bool:
         if campaign is None:
             return False
@@ -4582,7 +4606,12 @@ class ZorkEmulator:
         interrupt_actor_id: str | None = None,
     ) -> None:
         task = asyncio.create_task(
-            self._timer_task(campaign_id, channel_id, delay_seconds, event_description)
+            self._timer_task(
+                campaign_id,
+                channel_id,
+                delay_seconds,
+                event_description,
+            )
         )
         self._pending_timers[campaign_id] = {
             "task": task,
@@ -4619,8 +4648,18 @@ class ZorkEmulator:
                         f"⚠️ *Timer expired - {event_description}*",
                     )
                 )
+        preferred_actor_id = None
+        if timer_ctx is not None:
+            raw_actor_id = timer_ctx.get("interrupt_actor_id")
+            if raw_actor_id is not None:
+                preferred_actor_id = str(raw_actor_id).strip() or None
         try:
-            await self._execute_timed_event(campaign_id, channel_id, event_description)
+            await self._execute_timed_event(
+                campaign_id,
+                channel_id,
+                event_description,
+                preferred_actor_id=preferred_actor_id,
+            )
         except Exception:
             self._logger.exception(
                 "Zork timed event failed: campaign=%s event=%r",
@@ -4633,6 +4672,7 @@ class ZorkEmulator:
         campaign_id: str,
         channel_id: str,
         event_description: str,
+        preferred_actor_id: str | None = None,
     ) -> None:
         active_actor_id: str | None = None
         pre_character_slugs: set[str] = set()
@@ -4657,12 +4697,21 @@ class ZorkEmulator:
                         age_seconds = (datetime.now(timezone.utc).replace(tzinfo=None) - created_at).total_seconds()
                         if age_seconds < 5:
                             return
-                active_player = (
-                    session.query(Player)
-                    .filter(Player.campaign_id == campaign_id)
-                    .order_by(Player.last_active_at.desc())
-                    .first()
-                )
+                active_player = None
+                if preferred_actor_id:
+                    active_player = (
+                        session.query(Player)
+                        .filter(Player.campaign_id == campaign_id)
+                        .filter(Player.actor_id == preferred_actor_id)
+                        .first()
+                    )
+                if active_player is None:
+                    active_player = (
+                        session.query(Player)
+                        .filter(Player.campaign_id == campaign_id)
+                        .order_by(Player.last_active_at.desc())
+                        .first()
+                    )
                 if active_player is None:
                     return
                 active_actor_id = active_player.actor_id
@@ -4690,6 +4739,17 @@ class ZorkEmulator:
             channel_id=channel_id,
         )
         narration = self._strip_narration_footer(result.narration or "")
+        if (
+            " ".join(str(narration or "").lower().split())
+            == "the world shifts, but nothing clear emerges."
+        ):
+            self._logger.warning(
+                "Timed event generic fallback: campaign=%s actor=%s event=%r",
+                campaign_id,
+                active_actor_id,
+                event_description,
+            )
+            narration = str(event_description or "Something happens.").strip()
         if narration and self._timer_effects_port is not None:
             try:
                 await self._timer_effects_port.emit_timed_event(

@@ -377,21 +377,30 @@ class GameEngine:
             player.last_active_at = now
 
             if turn_input.record_player_turn:
+                player_turn_meta = {"game_time": pre_turn_game_time}
                 uow.turns.add(
                     campaign_id=turn_input.campaign_id,
                     session_id=turn_input.session_id,
                     actor_id=turn_input.actor_id,
                     kind="player",
                     content=turn_input.action,
-                    meta_json=dump_json({"game_time": pre_turn_game_time}),
+                    meta_json=dump_json(player_turn_meta),
                 )
+            reasoning_text: str | None = None
+            if isinstance(getattr(llm_output, "reasoning", None), str):
+                compact_reasoning = " ".join(llm_output.reasoning.strip().split())
+                if compact_reasoning:
+                    reasoning_text = compact_reasoning[:1200]
+            narrator_turn_meta = {"game_time": post_turn_game_time}
+            if reasoning_text:
+                narrator_turn_meta["reasoning"] = reasoning_text
             narrator_turn = uow.turns.add(
                 campaign_id=turn_input.campaign_id,
                 session_id=turn_input.session_id,
                 actor_id=turn_input.actor_id,
                 kind="narrator",
                 content=narration,
-                meta_json=dump_json({"game_time": post_turn_game_time}),
+                meta_json=dump_json(narrator_turn_meta),
             )
 
             timer_instruction = llm_output.timer_instruction if turn_input.allow_timer_instruction else None
