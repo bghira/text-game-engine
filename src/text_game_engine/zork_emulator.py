@@ -32,6 +32,7 @@ from .core.emulator_ports import (
 )
 from .core.engine import GameEngine
 from .core.normalize import normalize_campaign_name, parse_json_dict
+from .core.tokens import glm_token_count
 from .core.types import ResolveTurnInput
 from .persistence.sqlalchemy.models import (
     Actor,
@@ -78,7 +79,13 @@ class ZorkEmulator:
     XP_BASE = 100
     XP_PER_LEVEL = 50
     ATTENTION_WINDOW_SECONDS = 600
-    IMMUTABLE_CHARACTER_FIELDS = {"name", "personality", "background", "appearance"}
+    IMMUTABLE_CHARACTER_FIELDS = {
+        "name",
+        "personality",
+        "background",
+        "appearance",
+        "speech_style",
+    }
     ATTACHMENT_MAX_BYTES = 500_000
     ATTACHMENT_CHUNK_TOKENS = 2_000
     ATTACHMENT_MODEL_CTX_TOKENS = 200_000
@@ -86,9 +93,13 @@ class ZorkEmulator:
     ATTACHMENT_RESPONSE_RESERVE_TOKENS = 4_000
     ATTACHMENT_MAX_PARALLEL = 4
     ATTACHMENT_MAX_CHUNKS = 8
+    ATTACHMENT_MIN_SETUP_CHUNKS = 4
     ATTACHMENT_GUARD_TOKEN = "--COMPLETED SUMMARY--"
     DEFAULT_SCENE_IMAGE_MODEL = "black-forest-labs/FLUX.2-klein-4b"
     DEFAULT_AVATAR_IMAGE_MODEL = "black-forest-labs/FLUX.2-klein-4b"
+    SCENE_IMAGE_PRESERVE_PREFIX = (
+        "preserving all scene image details from scene in image x"
+    )
     PROCESSING_EMOJI = "🤔"
 
     MAIN_PARTY_TOKEN = "main party"
@@ -190,6 +201,13 @@ class ZorkEmulator:
     SMS_MAX_THREADS = 24
     SMS_MAX_MESSAGES_PER_THREAD = 40
     SMS_MAX_PREVIEW_CHARS = 120
+    SMS_READ_STATE_KEY = "_sms_read_state"
+    SMS_MESSAGE_SEQ_KEY = "_sms_message_seq"
+    CALENDAR_REMINDER_STATE_KEY = "_calendar_reminder_state"
+    AUTO_FIX_COUNTERS_KEY = "_auto_fix_counters"
+    MEMORY_SEARCH_USAGE_KEY = "_memory_search_term_usage"
+    MEMORY_SEARCH_USAGE_MAX_TERMS = 300
+    MEMORY_SEARCH_ROSTER_HINT_THRESHOLD = 3
     TURN_TIME_INDEX_KEY = "_turn_time_index"
     MODEL_STATE_EXCLUDE_KEYS = ROOM_STATE_KEYS | {
         "last_narration",
@@ -205,7 +223,12 @@ class ZorkEmulator:
         "speed_multiplier",
         "game_time",
         "calendar",
+        CALENDAR_REMINDER_STATE_KEY,
+        AUTO_FIX_COUNTERS_KEY,
+        MEMORY_SEARCH_USAGE_KEY,
         SMS_STATE_KEY,
+        SMS_READ_STATE_KEY,
+        SMS_MESSAGE_SEQ_KEY,
         TURN_TIME_INDEX_KEY,
     }
     PLAYER_STATE_EXCLUDE_KEYS = {"inventory", "room_description", PLAYER_STATS_KEY}
@@ -235,6 +258,9 @@ class ZorkEmulator:
         "Advance one concrete beat only. No recap of unchanged facts. No literary prose, "
         "no novelistic inner monologue, no comic-book melodrama. Keep NPC output actionable "
         "(intent, decision, question, or action), not repetitive reaction text. "
+        "ANTI-ECHO: do NOT restate, paraphrase, or mirror the player's just-written wording. "
+        "Do not quote the player's lines back to them unless one exact contested phrase is materially necessary. "
+        "Default: NPC first line must add new information, a decision, a demand, a consequence, or a direct question. "
         "As game master, you may know when the player is lying; only let an NPC reveal or react to that "
         "if that NPC plausibly knows in this scene (direct evidence, prior established knowledge, or in-scene disclosure). "
         "Do not leak off-screen NPC communications into current NPC dialogue unless continuity clearly supports it.]"
@@ -280,10 +306,15 @@ class ZorkEmulator:
         "- character_updates: object (optional; keyed by stable slug IDs like 'marcus-blackwell'. "
         "Use this to create or update NPCs in the world character tracker. "
         "Slug IDs must be lowercase-hyphenated, derived from the character name, and stable across turns. "
-        "On first appearance provide all fields: name, personality, background, appearance, location, "
-        "current_status, allegiance, relationship. On subsequent turns only mutable fields are accepted: "
-        "location, current_status, allegiance, relationship, deceased_reason, and any other dynamic key. "
-        "Immutable fields (name, personality, background, appearance) are locked at creation and silently ignored on updates. "
+        "On first appearance provide all fields: name, personality, background, appearance, speech_style, location, "
+        "current_status, allegiance, relationship. "
+        "speech_style should be 2-3 sentences on how the character talks: sentence length, vocabulary, verbal tics, and what they avoid saying. "
+        "On subsequent turns only mutable fields are accepted: "
+        "location, current_status, allegiance, relationship, relationships, deceased_reason, and any other dynamic key. "
+        "Immutable fields (name, personality, background, appearance, speech_style) are locked at creation and silently ignored on updates. "
+        "relationships is a map keyed by other character slug/name, e.g. "
+        "{\"deshawn\": {\"status\": \"partner\", \"knows_about\": [\"pregnancy\"], \"doesnt_know\": [\"blood-test-result\"], \"dynamic\": \"protective-but-autonomous\"}}. "
+        "Use it to track disclosures, secrets, and dynamic shifts.\n"
         "To remove a character from the roster, set that character slug to null in character_updates "
         "or set it to {'remove': true}. "
         "Set deceased_reason to a string when a character dies. "
@@ -306,6 +337,11 @@ class ZorkEmulator:
         "- Use player_state_update.room_title for a short location title (e.g. 'Penthouse Suite, Escala') whenever location changes.\n"
         "- Use player_state_update.room_description for a full room description only when location changes.\n"
         "- Use player_state_update.room_summary for a short one-line room summary for future context.\n"
+        "- CRITICAL — ROOM STATE COHERENCE: whenever the player's physical location changes (movement, teleport, time-skip, "
+        "reuniting with party, being picked up, waking in a new place, etc.) you MUST update ALL of: "
+        "location, room_title, room_summary, room_description, and exits in player_state_update. "
+        "ACTIVE_PLAYER_LOCATION reflects the CURRENT stored state — if it is stale/wrong, your response MUST correct it. "
+        "Narration alone does NOT move the player; only player_state_update changes their actual location.\n"
         "- Use player_state_update.exits as a short list of exits if applicable.\n"
         "- Use player_state_update for inventory, hp, or conditions.\n"
         "- Treat each player's inventory as private and never copy items from other players.\n"
@@ -315,6 +351,9 @@ class ZorkEmulator:
         "Respect item origins — never contradict or reinvent an item's backstory.\n"
         "- When a player must pick a path, accept only exact responses: 'main party' or 'new path'.\n"
         "- If the player has no room_summary or party_status, ask whether they are joining the main party or starting a new path, and set party_status accordingly.\n"
+        "- NEVER change party_status away from 'main_party' unless the player EXPLICITLY requests to split off or go solo. "
+        "Being in a different physical location does not make a player solo — party_status tracks NARRATIVE grouping intent, not proximity. "
+        "When a solo/split player reunites with the main group, immediately set party_status back to 'main_party'.\n"
         "- NEVER include any inventory listing, summary, or 'Inventory:' line in narration. The emulator appends authoritative inventory automatically. "
         "Do not list, enumerate, or summarise what the player is carrying anywhere in the narration text — not at the end, not inline, not as a parenthetical.\n"
         "- Do not repeat full room descriptions or inventory unless asked or the room changes.\n"
@@ -421,7 +460,10 @@ class ZorkEmulator:
         "- On MOST turns, call at least one tool BEFORE final narration/state JSON.\n"
         "- Default behavior: call memory_search first.\n"
         "- If PLAYER_ACTION involves phone/text/call/off-scene contact, use sms_list/sms_read before narrating; "
-        "use sms_write when sending or replying.\n"
+        "use sms_write when sending or replying. Use sms_schedule for delayed replies.\n"
+        "- CRITICAL SMS RULE: When an NPC replies via text/phone, you MUST call sms_write to record the NPC's reply "
+        "BEFORE outputting final narration. Both sides of a conversation must be in the SMS log. "
+        "If you narrate an NPC texting back but don't sms_write it, the reply is lost permanently.\n"
         "- Only skip tools for trivial immediate physical follow-ups where continuity risk is near zero.\n"
         "- If unsure what to query, use current location + active NPC names + key nouns from PLAYER_ACTION.\n"
         "\nYou also have a memory_terms tool for wildcard term/category listing. Use it BEFORE storing memories:\n"
@@ -442,6 +484,12 @@ class ZorkEmulator:
         '{"tool_call": "sms_read", "thread": "saul", "limit": 20}\n'
         "- Write/send an SMS entry:\n"
         '{"tool_call": "sms_write", "thread": "saul", "from": "Dale", "to": "Saul", "message": "Meet me at Dock 9."}\n'
+        "For NPC replies, immediately call sms_write again with from/to swapped:\n"
+        '{"tool_call": "sms_write", "thread": "saul", "from": "Saul", "to": "Dale", "message": "On my way."}\n'
+        "- Schedule a delayed incoming SMS (hidden until delivered, always uninterruptible):\n"
+        '{"tool_call": "sms_schedule", "thread": "saul", "from": "Saul", "to": "Dale", "message": "Traffic. 10 min.", "delay_seconds": 120}\n'
+        "sms_schedule is invisible to players at scheduling time. Do NOT narrate the delayed SMS as already received in the current response.\n"
+        "Use a stable contact thread slug for both directions (e.g. always `elizabeth` for Deshawn<->Elizabeth), not per-sender thread names.\n"
         "SMS continuity rule: do NOT leak scene context into SMS content unless the SMS explicitly mentions it.\n"
         "NPC SMS responses/knowledge must be limited to what that thread and established continuity plausibly reveal.\n"
         "Use SEPARATE queries for each character or topic — do NOT combine multiple subjects into one query.\n"
@@ -491,10 +539,12 @@ class ZorkEmulator:
         "Set period based on hour: 5-11=morning, 12-16=afternoon, 17-20=evening, 21-4=night.\n\n"
         "You may also return a calendar_update key (object) to manage scheduled events:\n"
         '- "calendar_update": {"add": [...], "remove": [...]} where each add entry is '
-        '{"name": str, "time_remaining": int, "time_unit": "hours"|"days", "description": str} '
+        '{"name": str, "time_remaining": int, "time_unit": "hours"|"days", "description": str, "known_by": [str, ...]} '
         "and each remove entry is a string matching an event name.\n"
         "HARNESS BEHAVIOR:\n"
         "- The harness converts add entries into absolute due dates and stores fire_day + fire_hour (the exact in-game deadline).\n"
+        "- known_by is optional. If provided, reminders are only injected when at least one known character is in the active scene.\n"
+        "- Keep known_by to character names from PARTY_SNAPSHOT / WORLD_CHARACTERS. Omit known_by for globally-known events.\n"
         "- Do NOT decrement counters manually by re-adding events each turn. The harness computes remaining days automatically.\n"
         "- You will receive CALENDAR_REMINDERS in the prompt for imminent/overdue events, including hour-level countdowns near deadline.\n"
         "- CALENDAR_REMINDERS are sparse urgency signals. Do NOT echo them every turn; only surface them in narration when relevant to the current action/scene, when the player asks, or when the event is immediate.\n"
@@ -601,6 +651,7 @@ class ZorkEmulator:
         )
         self._locks: dict[str, asyncio.Lock] = {}
         self._pending_timers: dict[str, dict[str, Any]] = {}
+        self._pending_sms_tasks: dict[str, set[asyncio.Task]] = {}
 
     # ------------------------------------------------------------------
     # Compatibility helpers
@@ -1388,6 +1439,50 @@ class ZorkEmulator:
             logger=self._logger,
         )
 
+    @classmethod
+    def _estimate_attachment_chunk_count(cls, text: str) -> int:
+        clean = str(text or "").strip()
+        if not clean:
+            return 0
+        total_tokens = glm_token_count(clean)
+        target_chunk_tokens = max(
+            cls.ATTACHMENT_CHUNK_TOKENS,
+            total_tokens // cls.ATTACHMENT_MAX_CHUNKS,
+        )
+        chars_per_tok = len(clean) / max(total_tokens, 1)
+        chunk_char_target = max(1, int(target_chunk_tokens * chars_per_tok))
+
+        paragraphs = clean.split("\n\n")
+        chunks: list[str] = []
+        current_chunk: list[str] = []
+        current_len = 0
+        for para in paragraphs:
+            para_len = len(para)
+            if current_len + para_len + 2 > chunk_char_target and current_chunk:
+                chunks.append("\n\n".join(current_chunk))
+                current_chunk = [para]
+                current_len = para_len
+            else:
+                current_chunk.append(para)
+                current_len += para_len + 2
+        if current_chunk:
+            chunks.append("\n\n".join(current_chunk))
+        return len(chunks)
+
+    @classmethod
+    def _attachment_setup_length_error(cls, text: str) -> str | None:
+        chunk_count = cls._estimate_attachment_chunk_count(text)
+        if chunk_count >= cls.ATTACHMENT_MIN_SETUP_CHUNKS:
+            return None
+        token_count = glm_token_count(str(text or ""))
+        min_tokens = cls.ATTACHMENT_CHUNK_TOKENS * cls.ATTACHMENT_MIN_SETUP_CHUNKS
+        return (
+            "Uploaded text is too short for setup ingestion "
+            f"({chunk_count}/{cls.ATTACHMENT_MIN_SETUP_CHUNKS} chunks, ~{token_count} tokens). "
+            f"Please upload a longer `.txt` file (about {min_tokens}+ tokens / "
+            f"{cls.ATTACHMENT_MIN_SETUP_CHUNKS}+ sections)."
+        )
+
     async def _summarise_long_text(self, text: str, ctx_message=None, channel=None) -> str:
         if not text:
             return ""
@@ -2139,15 +2234,23 @@ class ZorkEmulator:
             if isinstance(extracted, str) and extracted.startswith("ERROR:"):
                 return extracted
             if extracted:
-                summary = await self._summarise_long_text(extracted)
-                if summary:
-                    setup_data["attachment_summary"] = summary
+                short_msg = self._attachment_setup_length_error(extracted)
+                if short_msg:
+                    setup_data["attachment_notice"] = short_msg
+                else:
+                    summary = await self._summarise_long_text(extracted)
+                    if summary:
+                        setup_data["attachment_summary"] = summary
 
         variants_msg = await self._setup_generate_storyline_variants(
             campaign,
             setup_data,
             user_guidance=user_guidance,
         )
+        attachment_notice = str(setup_data.get("attachment_notice") or "").strip()
+        if attachment_notice:
+            variants_msg = f"{attachment_notice}\n\n{variants_msg}"
+            setup_data.pop("attachment_notice", None)
         state["setup_phase"] = "storyline_pick"
         state["setup_data"] = setup_data
         return variants_msg
@@ -2931,6 +3034,9 @@ class ZorkEmulator:
                             has_room_reference=has_room_reference,
                             avatar_refs=avatar_refs[: max(self.MAX_SCENE_REFERENCE_IMAGES - 1, 0)],
                         )
+        prefix = self.SCENE_IMAGE_PRESERVE_PREFIX.strip()
+        if prefix and not prompt_for_generation.lower().startswith(prefix.lower()):
+            prompt_for_generation = f"{prefix}. {prompt_for_generation}".strip()
 
         metadata = {
             "zork_scene": True,
@@ -3322,6 +3428,7 @@ class ZorkEmulator:
         should_end = False
         pre_inventory_rich: list[dict[str, str]] = []
         pre_character_slugs: set[str] = set()
+        sms_sender_name = f"Player {actor_id}"
         if manage_claim:
             cid, error_text = await self.begin_turn(campaign_id, actor_id)
             if error_text is not None:
@@ -3383,11 +3490,34 @@ class ZorkEmulator:
                 )
                 if row is not None:
                     pre_inventory_rich = self._get_inventory_rich(parse_json_dict(row.state_json))
+                    row_state = parse_json_dict(row.state_json)
+                    sms_sender_name = str(row_state.get("character_name") or f"Player {actor_id}")[:80]
                     self.record_player_message(row)
                 campaign_row = session.get(Campaign, campaign_id)
                 if campaign_row is not None:
                     pre_character_slugs = set(parse_json_dict(campaign_row.characters_json).keys())
             is_ooc = bool(re.match(r"\s*\[OOC\b", action or "", re.IGNORECASE))
+            if not is_ooc:
+                sms_intent = self._extract_inline_sms_intent(action)
+                if sms_intent is not None:
+                    sms_recipient, sms_message = sms_intent
+                    with self._session_factory() as session:
+                        campaign_row = session.get(Campaign, campaign_id)
+                        if campaign_row is not None:
+                            campaign_state = parse_json_dict(campaign_row.state_json)
+                            game_time = self._extract_game_time_snapshot(campaign_state)
+                            self._sms_write(
+                                campaign_state,
+                                thread=self._sms_normalize_thread_key(sms_recipient) or sms_recipient,
+                                sender=sms_sender_name,
+                                recipient=sms_recipient,
+                                message=sms_message,
+                                game_time=game_time,
+                                turn_id=0,
+                            )
+                            campaign_row.state_json = self._dump_json(campaign_state)
+                            campaign_row.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
+                            session.commit()
 
             result = await self._engine.resolve_turn(
                 ResolveTurnInput(
@@ -3489,6 +3619,7 @@ class ZorkEmulator:
         )
 
         with self._session_factory() as session:
+            campaign = session.get(Campaign, campaign_id)
             player = (
                 session.query(Player)
                 .filter(Player.campaign_id == campaign_id)
@@ -3496,6 +3627,8 @@ class ZorkEmulator:
                 .first()
             )
             player_state = self.get_player_state(player) if player is not None else {}
+            campaign_state = self.get_campaign_state(campaign) if campaign is not None else {}
+            post_turn_game_time = self._extract_game_time_snapshot(campaign_state)
             inventory_line = self._format_inventory(player_state) or "Inventory: empty"
 
             if not has_inventory_line:
@@ -3503,6 +3636,16 @@ class ZorkEmulator:
                     decorated = f"{decorated}\n\n{inventory_line}"
                 else:
                     decorated = inventory_line
+
+            sms_notice = self._sms_unread_hourly_notification(
+                campaign_state,
+                actor_id=actor_id,
+                player_state=player_state,
+                game_time=post_turn_game_time,
+            )
+            if sms_notice:
+                decorated = f"{decorated}\n\n{sms_notice}"
+                self._increment_auto_fix_counter(campaign_state, "sms_unread_notice")
 
             if timer_instruction is not None and not has_timer_line:
                 delay_seconds = (
@@ -3529,9 +3672,9 @@ class ZorkEmulator:
                     f"⏰ <t:{expiry_ts}:R>: {event_hint} ({interrupt_hint})"
                 )
 
-            campaign = session.get(Campaign, campaign_id)
             if campaign is not None:
                 campaign.last_narration = decorated
+                campaign.state_json = self._dump_json(campaign_state)
                 campaign.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
 
             narrator_turn = (
@@ -4930,6 +5073,8 @@ class ZorkEmulator:
                     cleaned["room_description"] = None
                 if "room_title" not in cleaned:
                     cleaned["room_title"] = None
+                if "room_summary" not in cleaned:
+                    cleaned["room_summary"] = None
         return cleaned
 
     def _strip_inventory_from_narration(self, narration: str) -> str:
@@ -5081,6 +5226,114 @@ class ZorkEmulator:
                 return unique_matches[0]
         return None
 
+    @staticmethod
+    def _memory_search_term_key(raw_term: object) -> str:
+        return re.sub(r"[^a-z0-9]+", "-", str(raw_term or "").lower()).strip("-")[:80]
+
+    @classmethod
+    def _memory_search_usage_from_state(cls, campaign_state: Dict[str, object]) -> Dict[str, dict]:
+        raw = campaign_state.get(cls.MEMORY_SEARCH_USAGE_KEY) if isinstance(campaign_state, dict) else {}
+        if not isinstance(raw, dict):
+            raw = {}
+        out: Dict[str, dict] = {}
+        for raw_key, raw_value in raw.items():
+            key = cls._memory_search_term_key(raw_key)
+            if not key or not isinstance(raw_value, dict):
+                continue
+            count = cls._coerce_non_negative_int(raw_value.get("count", 0), default=0)
+            if count <= 0:
+                continue
+            label = str(raw_value.get("label") or raw_key).strip()[:120] or key
+            out[key] = {"count": count, "label": label}
+        return out
+
+    @staticmethod
+    def _memory_search_term_looks_character_like(term_key: str) -> bool:
+        if not term_key:
+            return False
+        parts = [part for part in term_key.split("-") if part]
+        if not parts or len(parts) > 4:
+            return False
+        if len(term_key) < 3 or len(term_key) > 48:
+            return False
+        blocked = {
+            "where",
+            "what",
+            "when",
+            "why",
+            "how",
+            "room",
+            "scene",
+            "inventory",
+            "calendar",
+            "event",
+            "events",
+            "map",
+            "summary",
+            "story",
+            "chapter",
+            "turn",
+        }
+        return not any(part in blocked for part in parts)
+
+    def _record_memory_search_usage_for_campaign(
+        self,
+        campaign: Campaign,
+        queries: List[str],
+    ) -> List[Dict[str, object]]:
+        campaign_state = self.get_campaign_state(campaign)
+        usage = self._memory_search_usage_from_state(campaign_state)
+        updated_keys: List[str] = []
+
+        for query in queries[:8]:
+            query_text = str(query or "").strip()
+            if not query_text:
+                continue
+            term_key = self._memory_search_term_key(query_text)
+            if not term_key:
+                continue
+            row = usage.get(term_key, {"count": 0, "label": query_text[:120]})
+            row["count"] = self._coerce_non_negative_int(row.get("count", 0), default=0) + 1
+            if not str(row.get("label") or "").strip():
+                row["label"] = query_text[:120]
+            usage[term_key] = row
+            updated_keys.append(term_key)
+
+        if len(usage) > self.MEMORY_SEARCH_USAGE_MAX_TERMS:
+            ranked = sorted(
+                usage.items(),
+                key=lambda kv: (self._coerce_non_negative_int(kv[1].get("count", 0), default=0), kv[0]),
+                reverse=True,
+            )
+            usage = dict(ranked[: self.MEMORY_SEARCH_USAGE_MAX_TERMS])
+
+        campaign_state[self.MEMORY_SEARCH_USAGE_KEY] = usage
+        campaign.state_json = self._dump_json(campaign_state)
+
+        characters = self.get_campaign_characters(campaign)
+        hints: List[Dict[str, object]] = []
+        seen_hint_keys: set[str] = set()
+        for term_key in updated_keys:
+            if term_key in seen_hint_keys:
+                continue
+            seen_hint_keys.add(term_key)
+            row = usage.get(term_key) or {}
+            count = self._coerce_non_negative_int(row.get("count", 0), default=0)
+            if count < self.MEMORY_SEARCH_ROSTER_HINT_THRESHOLD:
+                continue
+            if not self._memory_search_term_looks_character_like(term_key):
+                continue
+            if isinstance(characters, dict) and self._resolve_existing_character_slug(characters, term_key):
+                continue
+            hints.append(
+                {
+                    "term": str(row.get("label") or term_key),
+                    "slug": term_key,
+                    "count": count,
+                }
+            )
+        return hints
+
     def _character_updates_from_state_nulls(
         self,
         state_update: object,
@@ -5185,6 +5438,7 @@ class ZorkEmulator:
             "fire_day": fire_day,
             "fire_hour": fire_hour,
             "description": str(event.get("description") or "")[:200],
+            "known_by": cls._calendar_known_by_from_event(event),
         }
         for key in ("created_day", "created_hour"):
             raw = event.get(key)
@@ -5207,6 +5461,7 @@ class ZorkEmulator:
         if not isinstance(calendar, list):
             calendar = []
         entries: list[dict[str, object]] = []
+        calendar_changed = False
         for raw in calendar:
             normalized = cls._calendar_normalize_event(
                 raw,
@@ -5220,6 +5475,27 @@ class ZorkEmulator:
                 normalized.get("fire_hour", 23), default=23
             )
             fire_hour = min(23, max(0, fire_hour))
+            if isinstance(raw, dict):
+                raw_fire_day = raw.get("fire_day")
+                raw_fire_hour = raw.get("fire_hour")
+                has_fire_day = isinstance(raw_fire_day, (int, float)) and not isinstance(
+                    raw_fire_day, bool
+                )
+                has_fire_hour = isinstance(raw_fire_hour, (int, float)) and not isinstance(
+                    raw_fire_hour, bool
+                )
+                if (not has_fire_day) or int(raw_fire_day) != fire_day:
+                    raw["fire_day"] = fire_day
+                    calendar_changed = True
+                if (not has_fire_hour) or int(raw_fire_hour) != fire_hour:
+                    raw["fire_hour"] = fire_hour
+                    calendar_changed = True
+                if "time_remaining" in raw:
+                    raw.pop("time_remaining", None)
+                    calendar_changed = True
+                if "time_unit" in raw:
+                    raw.pop("time_unit", None)
+                    calendar_changed = True
             hours_remaining = ((fire_day - current_day) * 24) + (fire_hour - current_hour)
             days_remaining = fire_day - current_day
             if hours_remaining < 0:
@@ -5242,34 +5518,90 @@ class ZorkEmulator:
                 str(item.get("name", "")).lower(),
             )
         )
+        if calendar_changed and isinstance(campaign_state, dict):
+            campaign_state["calendar"] = calendar
         return entries
 
-    @staticmethod
-    def _calendar_reminder_text(calendar_entries: list[dict[str, object]]) -> str:
+    @classmethod
+    def _calendar_reminder_text(
+        cls,
+        calendar_entries: list[dict[str, object]],
+        active_scene_names: list[str] | None = None,
+        campaign_state: dict[str, object] | None = None,
+    ) -> str:
         if not calendar_entries:
             return "None"
 
-        def _should_surface(hours: int) -> bool:
-            # Keep reminders sparse to avoid repetitive narration every turn.
+        def _event_key(event: dict[str, object]) -> str:
+            name = str(event.get("name", "")).strip().lower()
+            slug = re.sub(r"[^a-z0-9]+", "-", name).strip("-")[:80] or "event"
+            created_day = event.get("created_day")
+            created_hour = event.get("created_hour")
+            if isinstance(created_day, (int, float)) and not isinstance(
+                created_day, bool
+            ) and isinstance(created_hour, (int, float)) and not isinstance(
+                created_hour, bool
+            ):
+                return (
+                    f"{slug}:"
+                    f"{max(1, int(created_day))}:"
+                    f"{min(23, max(0, int(created_hour)))}"
+                )
+            desc = str(event.get("description", "")).strip().lower()
+            desc_slug = re.sub(r"[^a-z0-9]+", "-", desc).strip("-")[:40] or "na"
+            return f"{slug}:{desc_slug}"
+
+        def _reminder_bucket(hours: int) -> str | None:
             if hours == 0:
-                return True
+                return "now"
             if hours < 0:
                 overdue = abs(hours)
                 if overdue <= 3:
-                    return True
-                if overdue in {6, 12, 24}:
-                    return True
-                return overdue % 24 == 0 and overdue <= (24 * 7)
-            # Future reminders only at milestone deadlines.
-            return hours in {24, 12, 6, 3, 2, 1}
+                    return f"overdue_1h_{overdue}"
+                return f"overdue_6h_{overdue // 6}"
+            if hours > 24:
+                return f"future_12h_{hours // 12}"
+            if hours > 6:
+                return f"future_6h_{hours // 6}"
+            if hours > 1:
+                return f"future_2h_{hours // 2}"
+            return "future_1h_1"
 
         alerts = []
+        active_keys = {
+            cls._calendar_name_key(name)
+            for name in (active_scene_names or [])
+            if cls._calendar_name_key(name)
+        }
+        global_tokens = {"all", "any", "everyone", "global", "scene", "party"}
+        reminder_state: dict[str, object] = {}
+        if isinstance(campaign_state, dict):
+            raw_state = campaign_state.get(cls.CALENDAR_REMINDER_STATE_KEY)
+            if isinstance(raw_state, dict):
+                reminder_state = dict(raw_state)
+        current_event_keys: set[str] = set()
+        reminder_state_changed = False
         for event in calendar_entries:
+            known_by = cls._calendar_known_by_from_event(event)
+            if known_by:
+                known_keys = {
+                    cls._calendar_name_key(name)
+                    for name in known_by
+                    if cls._calendar_name_key(name)
+                }
+                if not (known_keys & global_tokens):
+                    if not active_keys or not (known_keys & active_keys):
+                        continue
             hours = int(event.get("hours_remaining", 0))
             name = str(event.get("name", "Unknown"))
             fire_day = int(event.get("fire_day", 1))
             fire_hour = max(0, min(23, int(event.get("fire_hour", 23))))
-            if not _should_surface(hours):
+            bucket = _reminder_bucket(hours)
+            if not bucket:
+                continue
+            event_key = _event_key(event)
+            current_event_keys.add(event_key)
+            if reminder_state.get(event_key) == bucket:
                 continue
             if hours < 0:
                 alerts.append(
@@ -5283,6 +5615,16 @@ class ZorkEmulator:
                 alerts.append(
                     f"- SOON: {name} (fires in {hours} hour(s) at Day {fire_day}, {fire_hour:02d}:00)"
                 )
+            reminder_state[event_key] = bucket
+            reminder_state_changed = True
+        if isinstance(campaign_state, dict):
+            stale_keys = [key for key in list(reminder_state.keys()) if key not in current_event_keys]
+            if stale_keys:
+                for key in stale_keys:
+                    reminder_state.pop(key, None)
+                reminder_state_changed = True
+            if reminder_state_changed:
+                campaign_state[cls.CALENDAR_REMINDER_STATE_KEY] = reminder_state
         alerts = alerts[:2]
         return "\n".join(alerts) if alerts else "None"
 
@@ -5329,6 +5671,7 @@ class ZorkEmulator:
                             max(0, cls._coerce_non_negative_int(msg.get("minute", 0), default=0)),
                         ),
                         "turn_id": cls._coerce_non_negative_int(msg.get("turn_id", 0), default=0),
+                        "seq": cls._coerce_non_negative_int(msg.get("seq", 0), default=0),
                     }
                 )
             threads[key] = {"label": label, "messages": messages}
@@ -5389,17 +5732,326 @@ class ZorkEmulator:
         selected_key = query_key if query_key in threads else None
         if selected_key is None and query_key:
             for key in threads.keys():
-                if query_key in key:
+                key_norm = cls._sms_normalize_thread_key(key)
+                if query_key in key_norm:
                     selected_key = key
                     break
-        if selected_key is None:
+        if selected_key is None and not query_key:
             return None, None, []
-        row = threads.get(selected_key) or {}
-        messages = row.get("messages")
-        if not isinstance(messages, list):
-            messages = []
-        capped = messages[-max(1, min(40, int(limit or 20))) :]
-        return selected_key, str(row.get("label") or selected_key), list(capped)
+
+        def _thread_matches(key: str, row: dict) -> bool:
+            if not query_key:
+                return False
+            key_norm = cls._sms_normalize_thread_key(key)
+            label_norm = cls._sms_normalize_thread_key(row.get("label"))
+            if query_key and (
+                query_key == key_norm
+                or query_key in key_norm
+                or query_key == label_norm
+                or query_key in label_norm
+            ):
+                return True
+            raw_messages = row.get("messages")
+            if not isinstance(raw_messages, list):
+                raw_messages = []
+            for msg in raw_messages:
+                if not isinstance(msg, dict):
+                    continue
+                from_norm = cls._sms_normalize_thread_key(msg.get("from"))
+                to_norm = cls._sms_normalize_thread_key(msg.get("to"))
+                if (from_norm and query_key in from_norm) or (to_norm and query_key in to_norm):
+                    return True
+            return False
+
+        matched_keys: list[str] = []
+        if selected_key is not None:
+            matched_keys.append(selected_key)
+        for key, row in threads.items():
+            if key in matched_keys or not isinstance(row, dict):
+                continue
+            if _thread_matches(key, row):
+                matched_keys.append(key)
+        if not matched_keys:
+            return None, None, []
+
+        merged_messages: list[dict[str, object]] = []
+        for key in matched_keys:
+            row = threads.get(key) or {}
+            messages = row.get("messages")
+            if not isinstance(messages, list):
+                messages = []
+            for msg in messages:
+                if not isinstance(msg, dict):
+                    continue
+                enriched = dict(msg)
+                enriched["thread"] = key
+                merged_messages.append(enriched)
+
+        merged_messages.sort(
+            key=lambda msg: (
+                cls._coerce_non_negative_int(msg.get("day", 0), default=0),
+                cls._coerce_non_negative_int(msg.get("hour", 0), default=0),
+                cls._coerce_non_negative_int(msg.get("minute", 0), default=0),
+                cls._coerce_non_negative_int(msg.get("turn_id", 0), default=0),
+            )
+        )
+        capped = merged_messages[-max(1, min(40, int(limit or 20))) :]
+
+        canonical_key = selected_key or query_key or matched_keys[0]
+        first_row = threads.get(matched_keys[0]) or {}
+        base_label = str(first_row.get("label") or matched_keys[0])
+        if len(matched_keys) <= 1:
+            resolved_label = base_label
+        else:
+            resolved_label = f"{base_label} (+{len(matched_keys) - 1} related thread(s))"
+        return canonical_key, resolved_label, list(capped)
+
+    @classmethod
+    def _sms_actor_key(cls, actor_id: object) -> str:
+        key = cls._sms_normalize_thread_key(f"actor-{actor_id}")
+        return key or "actor-unknown"
+
+    @classmethod
+    def _sms_player_aliases(
+        cls,
+        *,
+        actor_id: object,
+        player_state: Dict[str, object] | None,
+    ) -> set[str]:
+        aliases: set[str] = set()
+
+        def _add(raw: object) -> None:
+            text = str(raw or "").strip()
+            if not text:
+                return
+            norm = cls._sms_normalize_thread_key(text)
+            if norm:
+                aliases.add(norm)
+
+        actor_text = str(actor_id or "").strip()
+        _add(actor_text)
+        if actor_text:
+            _add(f"<@{actor_text}>")
+            _add(f"<@!{actor_text}>")
+            _add(f"player {actor_text}")
+        if isinstance(player_state, dict):
+            char_name = str(player_state.get("character_name") or "").strip()
+            _add(char_name)
+            for token in re.split(r"[\s\-]+", char_name):
+                if len(token) >= 3:
+                    _add(token)
+        return aliases
+
+    @classmethod
+    def _sms_read_state_from_campaign_state(
+        cls,
+        campaign_state: Dict[str, object],
+    ) -> Dict[str, Dict[str, object]]:
+        raw = campaign_state.get(cls.SMS_READ_STATE_KEY) if isinstance(campaign_state, dict) else {}
+        if not isinstance(raw, dict):
+            return {}
+        out: Dict[str, Dict[str, object]] = {}
+        for raw_actor_key, raw_row in raw.items():
+            actor_key = cls._sms_normalize_thread_key(raw_actor_key)
+            if not actor_key or not isinstance(raw_row, dict):
+                continue
+            row_threads = raw_row.get("threads")
+            if not isinstance(row_threads, dict):
+                row_threads = {}
+            cleaned_threads: Dict[str, int] = {}
+            for raw_thread_key, raw_marker in row_threads.items():
+                thread_key = cls._sms_normalize_thread_key(raw_thread_key)
+                if not thread_key:
+                    continue
+                marker = cls._coerce_non_negative_int(raw_marker, default=0)
+                cleaned_threads[thread_key] = marker
+            out[actor_key] = {
+                "threads": cleaned_threads,
+                "last_notified_abs_hour": cls._coerce_non_negative_int(
+                    raw_row.get("last_notified_abs_hour", -1),
+                    default=-1,
+                ),
+            }
+        return out
+
+    @classmethod
+    def _sms_mark_threads_read(
+        cls,
+        campaign_state: Dict[str, object],
+        *,
+        actor_id: object,
+        player_state: Dict[str, object] | None,
+        thread_markers: Dict[str, int],
+    ) -> bool:
+        if not isinstance(campaign_state, dict):
+            return False
+        if not isinstance(thread_markers, dict) or not thread_markers:
+            return False
+        actor_key = cls._sms_actor_key(actor_id)
+        state = cls._sms_read_state_from_campaign_state(campaign_state)
+        row = dict(state.get(actor_key) or {})
+        threads = row.get("threads")
+        if not isinstance(threads, dict):
+            threads = {}
+        changed = False
+        for raw_thread_key, raw_marker in thread_markers.items():
+            thread_key = cls._sms_normalize_thread_key(raw_thread_key)
+            if not thread_key:
+                continue
+            marker = cls._coerce_non_negative_int(raw_marker, default=0)
+            if marker <= 0:
+                continue
+            current = cls._coerce_non_negative_int(threads.get(thread_key, 0), default=0)
+            if marker > current:
+                threads[thread_key] = marker
+                changed = True
+        if not changed:
+            return False
+        row["threads"] = threads
+        state[actor_key] = row
+        campaign_state[cls.SMS_READ_STATE_KEY] = state
+        return True
+
+    @classmethod
+    def _sms_unread_summary_for_player(
+        cls,
+        campaign_state: Dict[str, object],
+        *,
+        actor_id: object,
+        player_state: Dict[str, object] | None,
+    ) -> Dict[str, object]:
+        aliases = cls._sms_player_aliases(actor_id=actor_id, player_state=player_state)
+        if not aliases:
+            return {"messages": 0, "threads": 0, "labels": []}
+        actor_key = cls._sms_actor_key(actor_id)
+        read_state = cls._sms_read_state_from_campaign_state(campaign_state)
+        actor_row = read_state.get(actor_key) or {}
+        read_threads = actor_row.get("threads")
+        if not isinstance(read_threads, dict):
+            read_threads = {}
+        threads = cls._sms_threads_from_state(campaign_state)
+        unread_messages = 0
+        unread_threads = 0
+        labels: list[str] = []
+        for thread_key, row in threads.items():
+            if not isinstance(row, dict):
+                continue
+            messages = row.get("messages")
+            if not isinstance(messages, list):
+                continue
+            seen_marker = cls._coerce_non_negative_int(read_threads.get(thread_key, 0), default=0)
+            thread_unread = 0
+            for msg in messages:
+                if not isinstance(msg, dict):
+                    continue
+                to_norm = cls._sms_normalize_thread_key(msg.get("to"))
+                if not to_norm or to_norm not in aliases:
+                    continue
+                seq = cls._coerce_non_negative_int(msg.get("seq", 0), default=0)
+                turn_id = cls._coerce_non_negative_int(msg.get("turn_id", 0), default=0)
+                marker = seq if seq > 0 else turn_id
+                if marker > seen_marker:
+                    thread_unread += 1
+            if thread_unread <= 0:
+                continue
+            unread_messages += thread_unread
+            unread_threads += 1
+            label = str(row.get("label") or thread_key).strip()
+            if label:
+                labels.append(label[:40])
+        deduped_labels: list[str] = []
+        seen_labels: set[str] = set()
+        for label in labels:
+            key = cls._sms_normalize_thread_key(label)
+            if not key or key in seen_labels:
+                continue
+            seen_labels.add(key)
+            deduped_labels.append(label)
+            if len(deduped_labels) >= 3:
+                break
+        return {
+            "messages": unread_messages,
+            "threads": unread_threads,
+            "labels": deduped_labels,
+            "last_notified_abs_hour": cls._coerce_non_negative_int(
+                actor_row.get("last_notified_abs_hour", -1),
+                default=-1,
+            ),
+        }
+
+    @classmethod
+    def _sms_unread_hourly_notification(
+        cls,
+        campaign_state: Dict[str, object],
+        *,
+        actor_id: object,
+        player_state: Dict[str, object] | None,
+        game_time: Dict[str, int] | None,
+    ) -> str | None:
+        if not isinstance(campaign_state, dict):
+            return None
+        summary = cls._sms_unread_summary_for_player(
+            campaign_state,
+            actor_id=actor_id,
+            player_state=player_state,
+        )
+        unread_messages = cls._coerce_non_negative_int(summary.get("messages", 0), default=0)
+        unread_threads = cls._coerce_non_negative_int(summary.get("threads", 0), default=0)
+        if unread_messages <= 0 or unread_threads <= 0:
+            return None
+        game_time_obj = game_time if isinstance(game_time, dict) else {}
+        day = max(1, cls._coerce_non_negative_int(game_time_obj.get("day", 1), default=1))
+        hour = min(
+            23,
+            max(0, cls._coerce_non_negative_int(game_time_obj.get("hour", 0), default=0)),
+        )
+        abs_hour = ((day - 1) * 24) + hour
+        actor_key = cls._sms_actor_key(actor_id)
+        read_state = cls._sms_read_state_from_campaign_state(campaign_state)
+        row = dict(read_state.get(actor_key) or {})
+        last_notified = cls._coerce_non_negative_int(
+            row.get("last_notified_abs_hour", -1),
+            default=-1,
+        )
+        if last_notified == abs_hour:
+            return None
+        row["last_notified_abs_hour"] = abs_hour
+        read_state[actor_key] = row
+        campaign_state[cls.SMS_READ_STATE_KEY] = read_state
+        labels = summary.get("labels") if isinstance(summary.get("labels"), list) else []
+        labels = [str(label).strip()[:40] for label in labels if str(label).strip()]
+        suffix = f" ({', '.join(labels[:2])})" if labels else ""
+        return (
+            f"📨 Unread SMS: {unread_messages} message(s) in "
+            f"{unread_threads} thread(s){suffix}."
+        )
+
+    @classmethod
+    def _extract_inline_sms_intent(
+        cls,
+        action: str,
+    ) -> tuple[str, str] | None:
+        text = str(action or "").strip()
+        if not text:
+            return None
+        m = re.match(
+            r"^\s*(?:i\s+)?(?:send\s+)?(?:sms|text|message)\s+(?:to\s+)?([^:\n]{1,120})\s*:\s*(.+?)\s*$",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if not m:
+            return None
+        recipient = str(m.group(1) or "").strip().strip("\"'` ")
+        message = str(m.group(2) or "").strip()
+        if (
+            len(message) >= 2
+            and message[0] == message[-1]
+            and message[0] in {'"', "'"}
+        ):
+            message = message[1:-1].strip()
+        if not recipient or not message:
+            return None
+        return recipient[:80], message[:500]
 
     @classmethod
     def _sms_write(
@@ -5433,7 +6085,29 @@ class ZorkEmulator:
             "hour": min(23, max(0, cls._coerce_non_negative_int(game_time.get("hour", 0), default=0))),
             "minute": min(59, max(0, cls._coerce_non_negative_int(game_time.get("minute", 0), default=0))),
             "turn_id": max(0, int(turn_id or 0)),
+            "seq": 0,
         }
+        if messages:
+            last = messages[-1]
+            if isinstance(last, dict):
+                if (
+                    str(last.get("from") or "") == str(entry.get("from") or "")
+                    and str(last.get("to") or "") == str(entry.get("to") or "")
+                    and str(last.get("message") or "") == str(entry.get("message") or "")
+                    and cls._coerce_non_negative_int(last.get("day", 0), default=0)
+                    == cls._coerce_non_negative_int(entry.get("day", 0), default=0)
+                    and cls._coerce_non_negative_int(last.get("hour", 0), default=0)
+                    == cls._coerce_non_negative_int(entry.get("hour", 0), default=0)
+                    and cls._coerce_non_negative_int(last.get("minute", 0), default=0)
+                    == cls._coerce_non_negative_int(entry.get("minute", 0), default=0)
+                ):
+                    threads[thread_key] = {"label": label, "messages": messages}
+                    campaign_state[cls.SMS_STATE_KEY] = threads
+                    return thread_key, label, dict(last)
+        next_seq = cls._coerce_non_negative_int(
+            campaign_state.get(cls.SMS_MESSAGE_SEQ_KEY, 0), default=0
+        ) + 1
+        entry["seq"] = max(1, next_seq)
         messages.append(entry)
         messages = messages[-cls.SMS_MAX_MESSAGES_PER_THREAD :]
         threads[thread_key] = {"label": label, "messages": messages}
@@ -5441,7 +6115,113 @@ class ZorkEmulator:
             oldest_key = next(iter(threads))
             threads.pop(oldest_key, None)
         campaign_state[cls.SMS_STATE_KEY] = threads
+        campaign_state[cls.SMS_MESSAGE_SEQ_KEY] = int(entry.get("seq", next_seq))
         return thread_key, label, entry
+
+    def _register_pending_sms_task(self, campaign_id: str, task: asyncio.Task) -> None:
+        bucket = self._pending_sms_tasks.setdefault(str(campaign_id), set())
+        bucket.add(task)
+
+        def _cleanup(done_task: asyncio.Task) -> None:
+            tasks = self._pending_sms_tasks.get(str(campaign_id))
+            if tasks is None:
+                return
+            tasks.discard(done_task)
+            if not tasks:
+                self._pending_sms_tasks.pop(str(campaign_id), None)
+
+        task.add_done_callback(_cleanup)
+
+    def cancel_pending_sms_deliveries(self, campaign_id: str) -> int:
+        tasks = self._pending_sms_tasks.pop(str(campaign_id), set())
+        cancelled = 0
+        for task in list(tasks):
+            if task is not None and not task.done():
+                task.cancel()
+                cancelled += 1
+        return cancelled
+
+    async def _sms_delivery_task(
+        self,
+        *,
+        campaign_id: str,
+        delay_seconds: int,
+        thread: str,
+        sender: str,
+        recipient: str,
+        message: str,
+        turn_id: int = 0,
+    ) -> None:
+        try:
+            await asyncio.sleep(max(0, int(delay_seconds)))
+        except asyncio.CancelledError:
+            return
+
+        with self._session_factory() as session:
+            campaign = session.get(Campaign, str(campaign_id))
+            if campaign is None:
+                return
+            campaign_state = self.get_campaign_state(campaign)
+            game_time = self._extract_game_time_snapshot(campaign_state)
+            effective_turn_id = max(0, int(turn_id or 0))
+            if effective_turn_id <= 0:
+                latest_turn = (
+                    session.query(Turn)
+                    .filter(Turn.campaign_id == str(campaign_id))
+                    .order_by(Turn.id.desc())
+                    .first()
+                )
+                effective_turn_id = int(latest_turn.id) if latest_turn is not None else 0
+            self._sms_write(
+                campaign_state,
+                thread=thread,
+                sender=sender,
+                recipient=recipient,
+                message=message,
+                game_time=game_time,
+                turn_id=effective_turn_id,
+            )
+            campaign.state_json = self._dump_json(campaign_state)
+            campaign.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
+            session.commit()
+
+    def schedule_sms_thread_delivery(
+        self,
+        campaign_id: str,
+        *,
+        thread: str,
+        sender: str,
+        recipient: str,
+        message: str,
+        delay_seconds: int,
+        turn_id: int = 0,
+    ) -> tuple[bool, str, int]:
+        thread_clean = str(thread or "").strip()[:80]
+        sender_clean = str(sender or "").strip()[:80]
+        recipient_clean = str(recipient or "").strip()[:80]
+        message_clean = str(message or "").strip()[:500]
+        if not thread_clean or not sender_clean or not recipient_clean or not message_clean:
+            return False, "invalid_payload", 0
+        try:
+            delay = max(0, min(86_400, int(delay_seconds)))
+        except Exception:
+            return False, "invalid_delay", 0
+        try:
+            task = asyncio.create_task(
+                self._sms_delivery_task(
+                    campaign_id=str(campaign_id),
+                    delay_seconds=delay,
+                    thread=thread_clean,
+                    sender=sender_clean,
+                    recipient=recipient_clean,
+                    message=message_clean,
+                    turn_id=max(0, int(turn_id or 0)),
+                )
+            )
+        except RuntimeError:
+            return False, "event_loop_unavailable", 0
+        self._register_pending_sms_task(str(campaign_id), task)
+        return True, "scheduled", delay
 
     def _apply_calendar_update(
         self,
@@ -5511,6 +6291,7 @@ class ZorkEmulator:
                     "created_day": current_day,
                     "created_hour": current_hour,
                     "description": str(entry.get("description") or "")[:200],
+                    "known_by": self._calendar_known_by_from_event(entry),
                 }
                 calendar.append(event)
 
@@ -5583,6 +6364,7 @@ class ZorkEmulator:
                 entry = {
                     "_slug": slug,
                     "name": char.get("name", slug),
+                    "speech_style": char.get("speech_style"),
                     "location": char.get("location"),
                     "current_status": char.get("current_status"),
                     "allegiance": char.get("allegiance"),
@@ -5812,6 +6594,84 @@ class ZorkEmulator:
             "strict_action_shape": "one concrete action grounded in current room and items",
         }
 
+    @classmethod
+    def _calendar_name_key(cls, value: object) -> str:
+        text = str(value or "").strip().lower()
+        if not text:
+            return ""
+        return re.sub(r"[^a-z0-9]+", "", text)
+
+    @classmethod
+    def _calendar_known_by_from_event(cls, event: object) -> list[str]:
+        if not isinstance(event, dict):
+            return []
+        raw_known_by = event.get("known_by")
+        items: list[object]
+        if isinstance(raw_known_by, list):
+            items = raw_known_by
+        elif isinstance(raw_known_by, str):
+            if "," in raw_known_by:
+                items = [chunk.strip() for chunk in raw_known_by.split(",")]
+            else:
+                items = [raw_known_by]
+        else:
+            items = []
+        out: list[str] = []
+        seen: set[str] = set()
+        for item in items:
+            name = str(item or "").strip()
+            if not name:
+                continue
+            key = cls._calendar_name_key(name)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            out.append(name[:80])
+            if len(out) >= 24:
+                break
+        return out
+
+    def _active_scene_character_names(
+        self,
+        player_state: dict[str, object],
+        party_snapshot: list[dict[str, object]],
+        characters_for_prompt: list[dict[str, object]],
+    ) -> list[str]:
+        names: list[str] = []
+        seen: set[str] = set()
+
+        def _add_name(raw_name: object) -> None:
+            text = str(raw_name or "").strip()
+            if not text:
+                return
+            key = self._calendar_name_key(text)
+            if not key or key in seen:
+                return
+            seen.add(key)
+            names.append(text[:80])
+
+        _add_name(player_state.get("character_name"))
+        for entry in party_snapshot:
+            if not isinstance(entry, dict):
+                continue
+            _add_name(entry.get("name"))
+
+        for entry in characters_for_prompt:
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("deceased_reason"):
+                continue
+            char_name = entry.get("name") or entry.get("_slug")
+            char_state = {
+                "location": entry.get("location"),
+                "room_title": entry.get("room_title"),
+                "room_summary": entry.get("room_summary"),
+                "room_id": entry.get("room_id"),
+            }
+            if self._same_scene(player_state, char_state):
+                _add_name(char_name)
+        return names
+
     def build_prompt(
         self,
         campaign: Campaign,
@@ -5915,10 +6775,44 @@ class ZorkEmulator:
         characters_for_prompt = self._fit_characters_to_budget(characters_for_prompt, self.MAX_CHARACTERS_CHARS)
         story_context = self._build_story_context(state)
         on_rails = bool(state.get("on_rails", False))
+        active_scene_names = self._active_scene_character_names(
+            player_state,
+            party_snapshot,
+            characters_for_prompt,
+        )
         game_time = state.get("game_time", {})
         speed_mult = state.get("speed_multiplier", 1.0)
+        calendar_state_before = json.dumps(
+            state.get("calendar") or [],
+            ensure_ascii=True,
+            sort_keys=True,
+        )
         calendar_for_prompt = self._calendar_for_prompt(state)
-        calendar_reminders = self._calendar_reminder_text(calendar_for_prompt)
+        calendar_state_after = json.dumps(
+            state.get("calendar") or [],
+            ensure_ascii=True,
+            sort_keys=True,
+        )
+        calendar_reminder_state_before = json.dumps(
+            state.get(self.CALENDAR_REMINDER_STATE_KEY) or {},
+            ensure_ascii=True,
+            sort_keys=True,
+        )
+        calendar_reminders = self._calendar_reminder_text(
+            calendar_for_prompt,
+            active_scene_names=active_scene_names,
+            campaign_state=state,
+        )
+        calendar_reminder_state_after = json.dumps(
+            state.get(self.CALENDAR_REMINDER_STATE_KEY) or {},
+            ensure_ascii=True,
+            sort_keys=True,
+        )
+        if (
+            calendar_reminder_state_after != calendar_reminder_state_before
+            or calendar_state_after != calendar_state_before
+        ):
+            campaign.state_json = self._dump_json(state)
         currently_attentive = self._build_currently_attentive_players_for_prompt(
             campaign.id
         )
@@ -6163,6 +7057,23 @@ class ZorkEmulator:
         except Exception:
             return []
 
+    def record_memory_search_usage(
+        self,
+        campaign_id: str,
+        queries: list[str],
+    ) -> list[dict[str, object]]:
+        cleaned_queries = [str(query or "").strip() for query in (queries or []) if str(query or "").strip()]
+        if not cleaned_queries:
+            return []
+        with self._session_factory() as session:
+            campaign = session.get(Campaign, str(campaign_id))
+            if campaign is None:
+                return []
+            hints = self._record_memory_search_usage_for_campaign(campaign, cleaned_queries)
+            campaign.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
+            session.commit()
+        return hints
+
     def store_memory(
         self,
         campaign_id: str,
@@ -6221,13 +7132,59 @@ class ZorkEmulator:
         campaign_id: str,
         thread: str,
         limit: int = 20,
+        viewer_actor_id: str | None = None,
     ) -> tuple[str | None, str | None, list[dict[str, object]]]:
         with self._session_factory() as session:
             campaign = session.get(Campaign, str(campaign_id))
             if campaign is None:
                 return None, None, []
             state = self.get_campaign_state(campaign)
-        return self._sms_read_thread(state, thread=thread, limit=limit)
+            canonical, label, messages = self._sms_read_thread(
+                state, thread=thread, limit=limit
+            )
+            if viewer_actor_id:
+                player = (
+                    session.query(Player)
+                    .filter(Player.campaign_id == str(campaign_id))
+                    .filter(Player.actor_id == str(viewer_actor_id))
+                    .first()
+                )
+                player_state = self.get_player_state(player) if player is not None else {}
+                thread_markers: dict[str, int] = {}
+                for msg in messages:
+                    if not isinstance(msg, dict):
+                        continue
+                    msg_thread = self._sms_normalize_thread_key(
+                        msg.get("thread") or canonical or thread
+                    )
+                    if not msg_thread:
+                        continue
+                    seq = self._coerce_non_negative_int(msg.get("seq", 0), default=0)
+                    turn_id = self._coerce_non_negative_int(
+                        msg.get("turn_id", 0), default=0
+                    )
+                    marker = seq if seq > 0 else turn_id
+                    if marker <= 0:
+                        continue
+                    prev = self._coerce_non_negative_int(
+                        thread_markers.get(msg_thread, 0), default=0
+                    )
+                    if marker > prev:
+                        thread_markers[msg_thread] = marker
+                if thread_markers:
+                    changed = self._sms_mark_threads_read(
+                        state,
+                        actor_id=viewer_actor_id,
+                        player_state=player_state,
+                        thread_markers=thread_markers,
+                    )
+                    if changed:
+                        campaign.state_json = self._dump_json(state)
+                        campaign.updated_at = datetime.now(timezone.utc).replace(
+                            tzinfo=None
+                        )
+                        session.commit()
+            return canonical, label, messages
 
     def write_sms_thread(
         self,

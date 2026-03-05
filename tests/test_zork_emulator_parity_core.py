@@ -346,6 +346,7 @@ def test_build_prompt_shape(session_factory, seed_campaign_and_actor):
     assert '{"tool_call": "sms_list"' in system_prompt
     assert '{"tool_call": "sms_read"' in system_prompt
     assert '{"tool_call": "sms_write"' in system_prompt
+    assert '{"tool_call": "sms_schedule"' in system_prompt
     assert "character-keyed" in system_prompt
     assert "set that character slug to null in character_updates" in system_prompt
     assert "CALENDAR & GAME TIME SYSTEM:" in system_prompt
@@ -366,6 +367,15 @@ def test_build_prompt_shape(session_factory, seed_campaign_and_actor):
     assert "PLAYER_ACTION:" in user_prompt
     assert "CURRENTLY_ATTENTIVE_PLAYERS lists players active within ATTENTION_WINDOW_SECONDS" in system_prompt
     assert "if only one player is attentive and no immediate deadline is active" in system_prompt
+
+
+def test_attachment_setup_length_error_for_short_upload(session_factory):
+    compat = _build_compat(session_factory)
+    short_text = "One short paragraph about a character.\n\nAnother short paragraph."
+    msg = compat._attachment_setup_length_error(short_text)
+    assert msg is not None
+    assert "too short for setup ingestion" in msg
+    assert "4" in msg
 
 
 def test_recent_turns_include_turn_number_and_in_game_time(session_factory, seed_campaign_and_actor):
@@ -436,6 +446,160 @@ def test_sms_thread_roundtrip(session_factory, seed_campaign_and_actor):
     assert messages[-1]["from"] == "Dale"
     assert messages[-1]["to"] == "Saul"
     assert "Dock 9" in messages[-1]["message"]
+
+
+def test_extract_inline_sms_intent_parses_action(session_factory):
+    compat = _build_compat(session_factory)
+    parsed = compat._extract_inline_sms_intent('i sms elizabeth: "what\'s your plan"')
+    assert parsed is not None
+    recipient, message = parsed
+    assert recipient == "elizabeth"
+    assert message == "what's your plan"
+
+
+def test_sms_write_deduplicates_identical_message_in_same_minute(session_factory, seed_campaign_and_actor):
+    compat = _build_compat(session_factory)
+    campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
+
+    with session_factory() as session:
+        row = session.get(Campaign, campaign.id)
+        state = compat.get_campaign_state(row)
+        state["game_time"] = {"day": 3, "hour": 9, "minute": 15}
+        row.state_json = compat._dump_json(state)
+        session.commit()
+
+    ok1, status1 = compat.write_sms_thread(
+        campaign.id,
+        thread="elizabeth",
+        sender="Deshawn",
+        recipient="Elizabeth",
+        message="what's your plan",
+    )
+    ok2, status2 = compat.write_sms_thread(
+        campaign.id,
+        thread="elizabeth",
+        sender="Deshawn",
+        recipient="Elizabeth",
+        message="what's your plan",
+    )
+    assert ok1 is True and status1 == "stored"
+    assert ok2 is True and status2 == "stored"
+
+    _thread_key, _label, messages = compat.read_sms_thread(campaign.id, "elizabeth", limit=20)
+    assert len(messages) == 1
+
+
+def test_sms_read_merges_related_threads_by_participant(session_factory, seed_campaign_and_actor):
+    compat = _build_compat(session_factory)
+    campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
+
+    ok1, status1 = compat.write_sms_thread(
+        campaign.id,
+        thread="elizabeth",
+        sender="Deshawn",
+        recipient="Elizabeth",
+        message="what you up to?",
+    )
+    ok2, status2 = compat.write_sms_thread(
+        campaign.id,
+        thread="deshawn",
+        sender="Elizabeth",
+        recipient="Deshawn",
+        message="in the writers room. hungry soon?",
+    )
+    assert ok1 is True and status1 == "stored"
+    assert ok2 is True and status2 == "stored"
+
+    thread_key, thread_label, messages = compat.read_sms_thread(campaign.id, "elizabeth", limit=20)
+    assert thread_key is not None
+    assert thread_label is not None
+    assert len(messages) >= 2
+    assert any(str(row.get("from")) == "Deshawn" and str(row.get("to")) == "Elizabeth" for row in messages)
+    assert any(str(row.get("from")) == "Elizabeth" and str(row.get("to")) == "Deshawn" for row in messages)
+
+
+def test_sms_schedule_delivers_later(session_factory, seed_campaign_and_actor):
+    compat = _build_compat(session_factory)
+    campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
+
+    async def run_case():
+        ok, reason, delay = compat.schedule_sms_thread_delivery(
+            campaign.id,
+            thread="elizabeth",
+            sender="Elizabeth",
+            recipient="Deshawn",
+            message="On my way.",
+            delay_seconds=0,
+        )
+        assert ok is True
+        assert reason == "scheduled"
+        assert delay == 0
+
+        _thread_key, _label, before = compat.read_sms_thread(campaign.id, "elizabeth", limit=20)
+        assert before == []
+
+        await asyncio.sleep(0.05)
+        _thread_key, _label, after = compat.read_sms_thread(campaign.id, "elizabeth", limit=20)
+        assert len(after) == 1
+        assert str(after[0].get("from")) == "Elizabeth"
+        assert str(after[0].get("to")) == "Deshawn"
+        assert str(after[0].get("message")) == "On my way."
+
+    asyncio.run(run_case())
+
+
+def test_sms_schedule_can_be_cancelled(session_factory, seed_campaign_and_actor):
+    compat = _build_compat(session_factory)
+    campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
+
+    async def run_case():
+        ok, reason, _delay = compat.schedule_sms_thread_delivery(
+            campaign.id,
+            thread="saul",
+            sender="Saul",
+            recipient="Dale",
+            message="Hold tight.",
+            delay_seconds=1,
+        )
+        assert ok is True
+        assert reason == "scheduled"
+        cancelled = compat.cancel_pending_sms_deliveries(campaign.id)
+        assert cancelled >= 1
+        await asyncio.sleep(0.1)
+        _thread_key, _label, messages = compat.read_sms_thread(campaign.id, "saul", limit=20)
+        assert messages == []
+
+    asyncio.run(run_case())
+
+
+def test_memory_search_usage_hint_recommends_roster_key_after_repeats(session_factory, seed_campaign_and_actor):
+    compat = _build_compat(session_factory)
+    campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
+
+    hints1 = compat.record_memory_search_usage(campaign.id, ["elizabeth"])
+    hints2 = compat.record_memory_search_usage(campaign.id, ["elizabeth"])
+    hints3 = compat.record_memory_search_usage(campaign.id, ["elizabeth"])
+
+    assert hints1 == []
+    assert hints2 == []
+    assert hints3
+    assert hints3[0]["slug"] == "elizabeth"
+    assert int(hints3[0]["count"]) >= 3
+
+
+def test_memory_search_usage_hint_skips_if_rostered(session_factory, seed_campaign_and_actor):
+    compat = _build_compat(session_factory)
+    campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
+
+    with session_factory() as session:
+        row = session.get(Campaign, campaign.id)
+        row.characters_json = compat._dump_json({"elizabeth": {"name": "Elizabeth Chen"}})
+        session.commit()
+
+    hints = []
+    for _ in range(3):
+        hints = compat.record_memory_search_usage(campaign.id, ["elizabeth"])
+    assert hints == []
 
 
 def test_recent_turns_keep_full_content(session_factory, seed_campaign_and_actor):
@@ -737,6 +901,7 @@ def test_inventory_delta_sanitization(session_factory, seed_campaign_and_actor):
     assert "Rusty Key" not in names
     assert cleaned["room_description"] is None
     assert cleaned["room_title"] is None
+    assert cleaned["room_summary"] is None
 
 
 def test_media_enqueue_hooks(session_factory, seed_campaign_and_actor):
@@ -1073,6 +1238,41 @@ def test_calendar_reminders_include_milestone_hours(session_factory, seed_campai
         ]
     )
     assert "SOON: Media Exposure Fallout" in text
+    assert "fires in 24 hour(s)" in text
+
+
+def test_calendar_reminders_respect_known_by_filter(session_factory, seed_campaign_and_actor):
+    compat = _build_compat(session_factory)
+    text = compat._calendar_reminder_text(
+        [
+            {
+                "name": "Blood Test",
+                "hours_remaining": 24,
+                "fire_day": 5,
+                "fire_hour": 11,
+                "known_by": ["Elizabeth", "Sasha"],
+            }
+        ],
+        active_scene_names=["Deshawn"],
+    )
+    assert text == "None"
+
+
+def test_calendar_reminders_surface_when_known_character_present(session_factory, seed_campaign_and_actor):
+    compat = _build_compat(session_factory)
+    text = compat._calendar_reminder_text(
+        [
+            {
+                "name": "Blood Test",
+                "hours_remaining": 24,
+                "fire_day": 5,
+                "fire_hour": 11,
+                "known_by": ["Elizabeth", "Sasha"],
+            }
+        ],
+        active_scene_names=["Elizabeth"],
+    )
+    assert "SOON: Blood Test" in text
     assert "fires in 24 hour(s)" in text
 
 
