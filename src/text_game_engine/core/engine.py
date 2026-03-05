@@ -15,6 +15,11 @@ from .types import ResolveTurnInput, ResolveTurnResult, RewindResult, TurnContex
 
 
 class GameEngine:
+    AUTO_FIX_COUNTERS_KEY = "_auto_fix_counters"
+    MIN_TURN_ADVANCE_MINUTES = 1
+    DEFAULT_TURN_ADVANCE_MINUTES = 5
+    MAX_TURN_ADVANCE_MINUTES = 180
+
     def __init__(
         self,
         uow_factory: Callable[[], Any],
@@ -34,6 +39,29 @@ class GameEngine:
         self._lease_ttl_seconds = lease_ttl_seconds
         self._max_conflict_retries = max_conflict_retries
         self._player_state_sanitizer = player_state_sanitizer
+
+    @classmethod
+    def _increment_auto_fix_counter(
+        cls,
+        campaign_state: dict[str, Any],
+        key: str,
+        amount: int = 1,
+    ) -> None:
+        if not isinstance(campaign_state, dict):
+            return
+        safe_key = re.sub(r"[^a-z0-9_]+", "_", str(key or "").strip().lower()).strip("_")
+        if not safe_key:
+            return
+        try:
+            safe_amount = max(1, int(amount))
+        except (TypeError, ValueError):
+            safe_amount = 1
+        counters = campaign_state.get(cls.AUTO_FIX_COUNTERS_KEY)
+        if not isinstance(counters, dict):
+            counters = {}
+            campaign_state[cls.AUTO_FIX_COUNTERS_KEY] = counters
+        current = cls._coerce_non_negative_int(counters.get(safe_key, 0), default=0)
+        counters[safe_key] = min(10**9, current + safe_amount)
 
     async def resolve_turn(
         self,
@@ -234,9 +262,17 @@ class GameEngine:
                 campaign_state,
                 campaign_state_update,
             )
-            calendar_update = campaign_state_update.pop("calendar_update", None)
-            campaign_state = apply_patch(campaign_state, campaign_state_update)
-            campaign_state = self._apply_calendar_update(campaign_state, calendar_update)
+            resolution_context = (
+                f"{turn_input.action}\n"
+                f"{str(llm_output.narration or '')}\n"
+                f"{str(llm_output.summary_update or '')}"
+            )
+            campaign_state_update = self._guard_state_null_character_prunes(
+                campaign_state_update,
+                campaign_characters,
+                resolution_context=resolution_context,
+                campaign_state=campaign_state,
+            )
             state_null_character_updates = self._character_updates_from_state_nulls(
                 campaign_state_update,
                 campaign_characters,
@@ -244,6 +280,26 @@ class GameEngine:
             merged_character_updates = dict(state_null_character_updates)
             if isinstance(llm_output.character_updates, dict):
                 merged_character_updates.update(llm_output.character_updates)
+            if merged_character_updates:
+                merged_character_updates = self._sanitize_character_removals(
+                    campaign_characters,
+                    merged_character_updates,
+                    resolution_context=resolution_context,
+                    campaign_state=campaign_state,
+                )
+            calendar_update = campaign_state_update.pop("calendar_update", None)
+            campaign_state = apply_patch(campaign_state, campaign_state_update)
+            campaign_state = self._apply_calendar_update(
+                campaign_state,
+                calendar_update,
+                resolution_context=resolution_context,
+            )
+            campaign_state = self._ensure_game_time_progress(
+                campaign_state,
+                pre_turn_game_time,
+                action_text=turn_input.action,
+                narration_text=llm_output.narration or "",
+            )
             _on_rails = bool(campaign_state.get("on_rails"))
             campaign_characters = self._apply_character_updates(
                 campaign_characters,
@@ -273,6 +329,27 @@ class GameEngine:
                     player_state_update=llm_output.player_state_update,
                     character_updates=llm_output.character_updates,
                 ) or "The world shifts, but nothing clear emerges."
+            active_char_sync = self._sync_active_player_character_location(
+                campaign_characters,
+                player_state=player_state,
+            )
+            world_char_sync = self._auto_sync_character_locations(
+                campaign_characters,
+                player_state=player_state,
+                narration_text=narration,
+            )
+            if active_char_sync:
+                self._increment_auto_fix_counter(
+                    campaign_state,
+                    "location_auto_sync_active_character",
+                    amount=active_char_sync,
+                )
+            if world_char_sync:
+                self._increment_auto_fix_counter(
+                    campaign_state,
+                    "location_auto_sync_world_characters",
+                    amount=world_char_sync,
+                )
 
             # give_item compatibility path - unresolved targets are non-fatal.
             give_item_payload: dict[str, Any] | None = None
@@ -499,7 +576,13 @@ class GameEngine:
                 continue
             if target_slug and target_slug in merged:
                 # Existing character — only accept mutable fields.
-                _IMMUTABLE = {"name", "personality", "background", "appearance"}
+                _IMMUTABLE = {
+                    "name",
+                    "personality",
+                    "background",
+                    "appearance",
+                    "speech_style",
+                }
                 for key, value in fields.items():
                     if key not in _IMMUTABLE:
                         merged[target_slug][key] = value
@@ -571,6 +654,191 @@ class GameEngine:
                 out[resolved] = None
         return out
 
+    @classmethod
+    def _character_delete_requested(cls, fields: object) -> bool:
+        return bool(
+            fields is None
+            or (
+                isinstance(fields, str)
+                and fields.strip().lower() in {"delete", "remove", "null"}
+            )
+            or (
+                isinstance(fields, dict)
+                and bool(
+                    fields.get("remove")
+                    or fields.get("delete")
+                    or fields.get("_delete")
+                    or fields.get("deleted")
+                )
+            )
+        )
+
+    @classmethod
+    def _character_delete_allowed(
+        cls,
+        *,
+        raw_slug: str,
+        fields: object,
+        existing_row: dict[str, Any] | None,
+        context_text: str,
+    ) -> bool:
+        context = " ".join(str(context_text or "").lower().split())
+        if not context:
+            return False
+        if isinstance(fields, dict) and str(fields.get("deceased_reason") or "").strip():
+            return True
+
+        remove_cues = (
+            "remove from roster",
+            "roster remove",
+            "remove character",
+            "delete character",
+            "drop character",
+            "purge duplicate",
+            "duplicate",
+            "cleanup roster",
+            "roster cleanup",
+            "retcon",
+            "written out",
+            "no longer in story",
+        )
+        death_cues = (
+            "dead",
+            "dies",
+            "died",
+            "killed",
+            "murdered",
+            "executed",
+            "corpse",
+            "funeral",
+            "deceased",
+        )
+        has_delete_intent = any(cue in context for cue in remove_cues) or any(
+            cue in context for cue in death_cues
+        )
+        if not has_delete_intent:
+            return False
+
+        aliases: list[str] = []
+        slug_alias = re.sub(r"[^a-z0-9]+", " ", str(raw_slug or "").lower()).strip()
+        if slug_alias:
+            aliases.append(slug_alias)
+        if isinstance(existing_row, dict):
+            name_alias = re.sub(
+                r"[^a-z0-9]+", " ",
+                str(existing_row.get("name") or "").lower(),
+            ).strip()
+            if name_alias:
+                aliases.append(name_alias)
+        for alias in aliases:
+            if alias and alias in context:
+                return True
+            tokens = [t for t in alias.split() if len(t) >= 4]
+            if any(token in context for token in tokens):
+                return True
+        return False
+
+    @classmethod
+    def _sanitize_character_removals(
+        cls,
+        existing_chars: dict[str, Any],
+        updates: object,
+        *,
+        resolution_context: str = "",
+        campaign_state: dict[str, Any] | None = None,
+        counter_key: str = "character_remove_blocked",
+    ) -> dict[str, Any]:
+        if not isinstance(updates, dict):
+            return {}
+        if not isinstance(existing_chars, dict):
+            return dict(updates)
+
+        context = " ".join(str(resolution_context or "").lower().split())
+        bulk_cleanup_cues = (
+            "duplicate",
+            "roster cleanup",
+            "cleanup roster",
+            "roster correction",
+            "purge",
+            "mass remove",
+            "bulk remove",
+        )
+        allow_bulk = any(cue in context for cue in bulk_cleanup_cues)
+
+        delete_rows: list[tuple[str, str, dict[str, Any] | None, object]] = []
+        for raw_slug, fields in updates.items():
+            if not cls._character_delete_requested(fields):
+                continue
+            raw_slug_text = str(raw_slug or "").strip()
+            resolved = cls._resolve_existing_character_slug(existing_chars, raw_slug_text)
+            target_slug = resolved or raw_slug_text
+            existing_row = existing_chars.get(target_slug)
+            delete_rows.append((raw_slug_text, target_slug, existing_row, fields))
+
+        blocked_raw_keys: set[str] = set()
+        if delete_rows and len(delete_rows) > 1 and not allow_bulk:
+            blocked_raw_keys.update(raw for raw, _target, _row, _fields in delete_rows)
+        else:
+            for raw_key, target_slug, existing_row, fields in delete_rows:
+                if not cls._character_delete_allowed(
+                    raw_slug=target_slug or raw_key,
+                    fields=fields,
+                    existing_row=existing_row if isinstance(existing_row, dict) else None,
+                    context_text=context,
+                ):
+                    blocked_raw_keys.add(raw_key)
+
+        if not blocked_raw_keys:
+            return dict(updates)
+
+        sanitized = {
+            k: v
+            for k, v in updates.items()
+            if str(k or "").strip() not in blocked_raw_keys
+        }
+        if isinstance(campaign_state, dict):
+            cls._increment_auto_fix_counter(
+                campaign_state,
+                counter_key,
+                amount=len(blocked_raw_keys),
+            )
+        return sanitized
+
+    @classmethod
+    def _guard_state_null_character_prunes(
+        cls,
+        state_update: object,
+        existing_chars: dict[str, Any],
+        *,
+        resolution_context: str = "",
+        campaign_state: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if not isinstance(state_update, dict):
+            return {}
+        if not isinstance(existing_chars, dict):
+            return dict(state_update)
+        candidate_deletes: dict[str, Any] = {}
+        for raw_key, value in state_update.items():
+            if value is not None:
+                continue
+            resolved = cls._resolve_existing_character_slug(existing_chars, raw_key)
+            if resolved:
+                candidate_deletes[str(raw_key)] = None
+        if not candidate_deletes:
+            return dict(state_update)
+        allowed_deletes = cls._sanitize_character_removals(
+            existing_chars,
+            candidate_deletes,
+            resolution_context=resolution_context,
+            campaign_state=campaign_state,
+            counter_key="state_character_prune_blocked",
+        )
+        out = dict(state_update)
+        for raw_key in candidate_deletes.keys():
+            if raw_key not in allowed_deletes:
+                out.pop(raw_key, None)
+        return out
+
     @staticmethod
     def _extract_game_time_snapshot(state: dict[str, Any] | None) -> dict[str, int]:
         game_time = state.get("game_time") if isinstance(state, dict) else {}
@@ -600,6 +868,281 @@ class GameEngine:
         except (TypeError, ValueError):
             return default
         return parsed if parsed >= 0 else default
+
+    @staticmethod
+    def _is_ooc_action_text(action_text: object) -> bool:
+        return bool(re.match(r"\s*\[OOC\b", str(action_text or ""), re.IGNORECASE))
+
+    @staticmethod
+    def _game_period_from_hour(hour: int) -> str:
+        if 5 <= hour <= 11:
+            return "morning"
+        if 12 <= hour <= 16:
+            return "afternoon"
+        if 17 <= hour <= 20:
+            return "evening"
+        return "night"
+
+    @classmethod
+    def _game_time_to_total_minutes(cls, game_time: dict[str, Any]) -> int:
+        day = cls._coerce_non_negative_int(game_time.get("day", 1), default=1) or 1
+        hour = min(
+            23,
+            max(0, cls._coerce_non_negative_int(game_time.get("hour", 0), default=0)),
+        )
+        minute = min(
+            59,
+            max(0, cls._coerce_non_negative_int(game_time.get("minute", 0), default=0)),
+        )
+        return ((max(1, day) - 1) * 24 * 60) + (hour * 60) + minute
+
+    @classmethod
+    def _game_time_from_total_minutes(cls, total_minutes: int) -> dict[str, Any]:
+        total = max(0, int(total_minutes))
+        day = (total // (24 * 60)) + 1
+        within = total % (24 * 60)
+        hour = within // 60
+        minute = within % 60
+        period = cls._game_period_from_hour(hour)
+        return {
+            "day": day,
+            "hour": hour,
+            "minute": minute,
+            "period": period,
+            "date_label": f"Day {day}, {period.title()}",
+        }
+
+    @classmethod
+    def _speed_multiplier_from_state(cls, campaign_state: dict[str, Any]) -> float:
+        raw = campaign_state.get("speed_multiplier", 1.0) if isinstance(campaign_state, dict) else 1.0
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            value = 1.0
+        if value <= 0:
+            return 1.0
+        return max(0.1, min(10.0, value))
+
+    @classmethod
+    def _estimate_turn_time_advance_minutes(cls, action_text: str, narration_text: str) -> int:
+        action_l = str(action_text or "").lower()
+        combined = f"{action_l}\n{str(narration_text or '').lower()}"
+        if any(token in combined for token in ("time skip", "timeskip", "time-skip")):
+            return 60
+        if any(
+            token in combined
+            for token in ("sleep", "rest", "nap", "wait", "travel", "drive", "ride", "fly", "journey")
+        ):
+            return 30
+        if any(token in combined for token in ("fight", "combat", "attack", "shoot", "chase", "run")):
+            return 8
+        if any(token in action_l for token in ("look", "examine", "inspect", "ask", "say", "talk")):
+            return 3
+        return cls.DEFAULT_TURN_ADVANCE_MINUTES
+
+    @classmethod
+    def _ensure_game_time_progress(
+        cls,
+        campaign_state: dict[str, Any],
+        pre_turn_game_time: dict[str, int],
+        *,
+        action_text: str,
+        narration_text: str,
+    ) -> dict[str, Any]:
+        if not isinstance(campaign_state, dict):
+            return campaign_state
+        pre_snapshot = (
+            pre_turn_game_time
+            if isinstance(pre_turn_game_time, dict)
+            else cls._extract_game_time_snapshot(campaign_state)
+        )
+        cur_snapshot = cls._extract_game_time_snapshot(campaign_state)
+        pre_total = cls._game_time_to_total_minutes(pre_snapshot)
+        cur_total = cls._game_time_to_total_minutes(cur_snapshot)
+
+        if cur_total > pre_total:
+            campaign_state["game_time"] = cls._game_time_from_total_minutes(cur_total)
+            return campaign_state
+        if cls._is_ooc_action_text(action_text):
+            campaign_state["game_time"] = cls._game_time_from_total_minutes(cur_total)
+            return campaign_state
+
+        base_minutes = cls._estimate_turn_time_advance_minutes(action_text, narration_text)
+        speed_multiplier = cls._speed_multiplier_from_state(campaign_state)
+        scaled = int(round(base_minutes * speed_multiplier))
+        delta_minutes = max(cls.MIN_TURN_ADVANCE_MINUTES, scaled)
+        delta_minutes = min(cls.MAX_TURN_ADVANCE_MINUTES, delta_minutes)
+        new_total = max(pre_total, cur_total) + delta_minutes
+        campaign_state["game_time"] = cls._game_time_from_total_minutes(new_total)
+        cls._increment_auto_fix_counter(campaign_state, "game_time_auto_advance")
+        return campaign_state
+
+    @staticmethod
+    def _normalize_location_text(value: object) -> str:
+        return re.sub(r"\s+", " ", str(value or "").strip())
+
+    @classmethod
+    def _resolve_player_location_for_state_sync(cls, player_state: dict[str, Any]) -> str:
+        if not isinstance(player_state, dict):
+            return ""
+        for key in ("location", "room_title", "room_summary"):
+            text = cls._normalize_location_text(player_state.get(key))
+            if text:
+                return text[:160]
+        return ""
+
+    @staticmethod
+    def _entity_name_candidates_for_sync(state_key: object, entity_state: dict[str, Any]) -> list[str]:
+        candidates: list[str] = []
+        raw_name = ""
+        if isinstance(entity_state, dict):
+            raw_name = str(entity_state.get("name") or "").strip().lower()
+        if raw_name:
+            candidates.append(re.sub(r"\s+", " ", raw_name))
+        key_text = re.sub(r"[_\-]+", " ", str(state_key or "").strip().lower())
+        key_text = re.sub(r"\s+", " ", key_text).strip()
+        if key_text:
+            candidates.append(key_text)
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for candidate in candidates:
+            if len(candidate) < 3 or candidate in seen:
+                continue
+            seen.add(candidate)
+            deduped.append(candidate)
+        return deduped
+
+    @classmethod
+    def _narration_implies_entity_with_player(cls, narration_text: str, name_candidates: list[str]) -> bool:
+        text = str(narration_text or "").strip().lower()
+        if not text or not name_candidates:
+            return False
+        cues = (
+            "at your heels",
+            "by your side",
+            "beside you",
+            "with you",
+            "follows you",
+            "following you",
+            "trailing you",
+            "walks with you",
+            "stays close",
+        )
+        if not any(cue in text for cue in cues):
+            return False
+        for name in name_candidates:
+            if re.search(rf"\b{re.escape(name)}\b", text):
+                return True
+        return False
+
+    @classmethod
+    def _narration_mentions_entity_in_active_scene(
+        cls,
+        narration_text: str,
+        name_candidates: list[str],
+    ) -> bool:
+        text = str(narration_text or "").strip().lower()
+        if not text or not name_candidates:
+            return False
+        remote_cues = (
+            "sms",
+            "text message",
+            "calls you",
+            "on the phone",
+            "voicemail",
+            "news feed",
+            "on tv",
+            "radio says",
+            "video call",
+        )
+        if any(cue in text for cue in remote_cues):
+            return False
+        presence_cues = (
+            "is here",
+            "in the room",
+            "across from you",
+            "beside you",
+            "nearby",
+            "waits",
+            "stands",
+            "sits",
+            "arrives",
+            "at the desk",
+            "at reception",
+        )
+        if not any(cue in text for cue in presence_cues):
+            return False
+        for name in name_candidates:
+            if re.search(rf"\b{re.escape(name)}\b", text):
+                return True
+        return False
+
+    @classmethod
+    def _sync_active_player_character_location(
+        cls,
+        campaign_characters: dict[str, Any],
+        *,
+        player_state: dict[str, Any],
+    ) -> int:
+        if not isinstance(campaign_characters, dict):
+            return 0
+        player_location = cls._resolve_player_location_for_state_sync(player_state)
+        if not player_location:
+            return 0
+        character_name = cls._normalize_location_text(player_state.get("character_name")).lower()
+        if not character_name:
+            return 0
+        target_slug = cls._resolve_existing_character_slug(campaign_characters, character_name)
+        if target_slug is None:
+            for slug, entry in campaign_characters.items():
+                if not isinstance(entry, dict):
+                    continue
+                entry_name = cls._normalize_location_text(entry.get("name")).lower()
+                if entry_name and entry_name == character_name:
+                    target_slug = slug
+                    break
+        if target_slug is None:
+            return 0
+        entry = campaign_characters.get(target_slug)
+        if not isinstance(entry, dict):
+            return 0
+        current_location = cls._normalize_location_text(entry.get("location"))
+        if current_location == player_location:
+            return 0
+        entry["location"] = player_location
+        return 1
+
+    @classmethod
+    def _auto_sync_character_locations(
+        cls,
+        campaign_characters: dict[str, Any],
+        *,
+        player_state: dict[str, Any],
+        narration_text: str,
+    ) -> int:
+        if not isinstance(campaign_characters, dict):
+            return 0
+        player_location = cls._resolve_player_location_for_state_sync(player_state)
+        if not player_location:
+            return 0
+        changed = 0
+        for slug, entry in campaign_characters.items():
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("deceased_reason"):
+                continue
+            current_location = cls._normalize_location_text(entry.get("location"))
+            if not current_location or current_location == player_location:
+                continue
+            names = cls._entity_name_candidates_for_sync(slug, entry)
+            if not (
+                cls._narration_implies_entity_with_player(narration_text, names)
+                or cls._narration_mentions_entity_in_active_scene(narration_text, names)
+            ):
+                continue
+            entry["location"] = player_location
+            changed += 1
+        return changed
 
     def _normalize_story_progress_update(
         self,
@@ -745,6 +1288,7 @@ class GameEngine:
         self,
         campaign_state: dict[str, Any],
         calendar_update: Any,
+        resolution_context: str = "",
     ) -> dict[str, Any]:
         if not isinstance(calendar_update, dict):
             return campaign_state
@@ -768,11 +1312,62 @@ class GameEngine:
         to_remove = calendar_update.get("remove")
         if isinstance(to_remove, list):
             remove_set = {str(name).strip().lower() for name in to_remove if name}
+            context_text = " ".join(str(resolution_context or "").lower().split())
+            allowed_remove_set: set[str] = set()
+            blocked = 0
+            for event in calendar:
+                name_raw = str(event.get("name", "")).strip()
+                if not name_raw:
+                    continue
+                key = name_raw.lower()
+                if key not in remove_set:
+                    continue
+                name_norm = re.sub(r"[^a-z0-9]+", " ", key).strip()
+                name_tokens = [t for t in name_norm.split() if len(t) > 2]
+                name_mentioned = (
+                    name_norm in context_text
+                    or any(token in context_text for token in name_tokens)
+                )
+                completion_cues = (
+                    "completed",
+                    "finished",
+                    "resolved",
+                    "result delivered",
+                    "results delivered",
+                    "outcome delivered",
+                    "concluded",
+                    "cancelled",
+                    "abandoned",
+                    "closed out",
+                )
+                premature_cues = (
+                    "arrives",
+                    "arrived",
+                    "in progress",
+                    "processing",
+                    "pending",
+                    "awaiting",
+                    "sample",
+                    "blood drawn",
+                    "not back yet",
+                )
+                has_completion = any(cue in context_text for cue in completion_cues)
+                has_premature = any(cue in context_text for cue in premature_cues)
+                if name_mentioned and has_completion and not has_premature:
+                    allowed_remove_set.add(key)
+                else:
+                    blocked += 1
             calendar = [
                 event
                 for event in calendar
-                if str(event.get("name", "")).strip().lower() not in remove_set
+                if str(event.get("name", "")).strip().lower() not in allowed_remove_set
             ]
+            if blocked > 0:
+                self._increment_auto_fix_counter(
+                    campaign_state,
+                    "calendar_remove_blocked",
+                    amount=blocked,
+                )
 
         to_add = calendar_update.get("add")
         if isinstance(to_add, list):
