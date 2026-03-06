@@ -21,3 +21,4 @@ PYTHONPATH=src python examples/<file>.py
 
 - Examples use in-memory SQLite for zero external setup.
 - Attachment example uses a stub completion port and a deterministic token counter for offline execution.
+- Native Ollama setup is documented in `docs/backends.md`.

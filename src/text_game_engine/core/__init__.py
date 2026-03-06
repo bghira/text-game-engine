@@ -1,4 +1,14 @@
 from .engine import GameEngine
+from ..backends import (
+    BackendTextCompletionPort,
+    ChatMessage,
+    CompletionRequest,
+    CompletionResult,
+    ModelBackend,
+    OllamaBackend,
+    build_backend,
+    build_text_completion_port,
+)
 from .attachments import (
     AttachmentLike,
     AttachmentProcessingConfig,
@@ -27,6 +37,14 @@ from .types import (
 
 __all__ = [
     "GameEngine",
+    "BackendTextCompletionPort",
+    "ChatMessage",
+    "CompletionRequest",
+    "CompletionResult",
+    "ModelBackend",
+    "OllamaBackend",
+    "build_backend",
+    "build_text_completion_port",
     "AttachmentLike",
     "AttachmentProcessingConfig",
     "AttachmentTextProcessor",

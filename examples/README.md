@@ -13,3 +13,7 @@ Files:
 - `minimal_engine_turn.py`: direct `GameEngine` turn resolution with persisted state inspection.
 - `zork_emulator_session.py`: standalone `ZorkEmulator` flow (`play_action` + inventory-decorated narration).
 - `attachment_processing.py`: attachment text extraction and chunked summarization.
+
+See also:
+
+- `docs/backends.md`: backend construction and native Ollama adapter usage.
