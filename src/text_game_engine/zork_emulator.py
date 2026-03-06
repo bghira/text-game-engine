@@ -636,7 +636,7 @@ class ZorkEmulator:
         '  {"tool_call": "source_browse", "document_key": "my-rulebook", "wildcard": "weapon*"}\n'
         "- Browse all source documents at once (omit document_key):\n"
         '  {"tool_call": "source_browse"}\n'
-        "source_browse returns a compact key index on the first unfiltered pass, up to 60 by default "
+        "source_browse returns a compact key index on the first unfiltered pass, up to 255 by default "
         "(adjustable via 'limit'). With a specific wildcard it returns the matching raw KEY: value lines.\n"
         "STRATEGY: for a rulebook you have not seen before, call source_browse with no wildcard first to see what keys exist, "
         "then use source_browse with a wildcard or memory_search with category 'source:<document_key>' for detail.\n"
@@ -1733,8 +1733,10 @@ class ZorkEmulator:
         for line in lines[:80]:
             if ":" not in line:
                 continue
-            key = line.split(":", 1)[0].strip()
-            if not key or len(key) > 140:
+            key, value = line.split(":", 1)
+            key = key.strip()
+            value = value.strip()
+            if not key or not value or len(key) > 140:
                 continue
             if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_\-\s]*", key):
                 rulebook_lines += 1
@@ -2522,9 +2524,9 @@ class ZorkEmulator:
                 wildcard_meta = f"wildcard={wildcard!r}"
                 if not wildcard_provided:
                     wildcard_meta = "wildcard=(omitted)"
-                limit = 60
+                limit = 255
                 try:
-                    limit = max(1, min(120, int(payload.get("limit") or 60)))
+                    limit = max(1, min(255, int(payload.get("limit") or 255)))
                 except (TypeError, ValueError):
                     pass
                 lines = SourceMaterialMemory.browse_source_keys(
@@ -8633,6 +8635,14 @@ class ZorkEmulator:
             )
             return 0, key
         source_mode = self._source_material_storage_mode(normalized_format)
+        duplicate_doc = SourceMaterialMemory.find_duplicate_source_material_document(
+            str(campaign_id),
+            chunks=chunks,
+            source_mode=source_mode,
+        )
+        if duplicate_doc:
+            existing_key = str(duplicate_doc.get("document_key") or "").strip() or "source-material"
+            return 0, existing_key
 
         return SourceMaterialMemory.store_source_material_chunks(
             str(campaign_id),

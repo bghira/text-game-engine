@@ -5,6 +5,7 @@ import os
 import re
 import sqlite3
 import threading
+import hashlib
 from typing import Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
@@ -134,6 +135,20 @@ class SourceMaterialMemory:
             deduped.append(str(unit).strip()[:8000])
         return deduped
 
+    @staticmethod
+    def _is_rulebook_fact_line(line: str) -> bool:
+        stripped = str(line or "").strip()
+        if ":" not in stripped:
+            return False
+        key, value = stripped.split(":", 1)
+        key = key.strip()
+        value = value.strip()
+        if not key or not value:
+            return False
+        if len(key) > 140:
+            return False
+        return bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 _/\-()&'.]*", key))
+
     @classmethod
     def source_material_units_from_chunks(cls, chunks: List[str]) -> List[str]:
         return cls.source_material_units_from_chunks_with_mode(chunks, mode="line")
@@ -156,10 +171,20 @@ class SourceMaterialMemory:
             if not raw.strip():
                 continue
             if source_mode == "rulebook":
+                current_fact: str | None = None
                 for line in raw.splitlines():
                     line_clean = line.strip()
-                    if line_clean:
-                        units.append(line_clean)
+                    if not line_clean:
+                        continue
+                    if cls._is_rulebook_fact_line(line_clean):
+                        if current_fact:
+                            units.append(current_fact)
+                        current_fact = line_clean
+                        continue
+                    if current_fact:
+                        current_fact = f"{current_fact} {line_clean}"
+                if current_fact:
+                    units.append(current_fact)
                 continue
             if source_mode == "story":
                 paragraphs = [line.strip() for line in raw.split("\n\n") if line.strip()]
@@ -237,6 +262,137 @@ class SourceMaterialMemory:
                 campaign_id,
             )
             return []
+
+    @classmethod
+    def get_source_material_document_units(
+        cls,
+        campaign_id: str,
+        document_key: str,
+    ) -> List[str]:
+        try:
+            key = str(document_key or "").strip()
+            if not key:
+                return []
+            conn = cls._get_conn()
+            rows = conn.execute(
+                """
+                SELECT chunk_text
+                FROM source_material_chunks
+                WHERE campaign_id = ? AND document_key = ?
+                ORDER BY chunk_index ASC
+                """,
+                (str(campaign_id), key),
+            ).fetchall()
+            return [
+                str(row[0] or "").strip()
+                for row in rows
+                if str(row[0] or "").strip()
+            ]
+        except Exception:
+            logger.exception(
+                "Source material: get document units failed for campaign %s key %s",
+                campaign_id,
+                document_key,
+            )
+            return []
+
+    @classmethod
+    def _source_units_signature(cls, units: List[str]) -> str:
+        normalized = "\n".join(
+            " ".join(str(unit or "").strip().lower().split())
+            for unit in units
+            if str(unit or "").strip()
+        )
+        return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+    @classmethod
+    def find_duplicate_source_material_document(
+        cls,
+        campaign_id: str,
+        *,
+        chunks: List[str],
+        source_mode: str = "line",
+    ) -> Optional[Dict[str, object]]:
+        try:
+            candidate_units = cls.source_material_units_from_chunks_with_mode(
+                chunks,
+                mode=source_mode,
+            )
+            if not candidate_units:
+                return None
+            candidate_sig = cls._source_units_signature(candidate_units)
+            for row in cls.list_source_material_documents(campaign_id, limit=200):
+                document_key = str(row.get("document_key") or "").strip()
+                if not document_key:
+                    continue
+                existing_units = cls.get_source_material_document_units(
+                    campaign_id,
+                    document_key,
+                )
+                if not existing_units:
+                    continue
+                if cls._source_units_signature(existing_units) != candidate_sig:
+                    continue
+                return {
+                    "document_key": document_key,
+                    "document_label": str(row.get("document_label") or ""),
+                    "chunk_count": int(row.get("chunk_count") or 0),
+                }
+            return None
+        except Exception:
+            logger.exception(
+                "Source material: duplicate document lookup failed for campaign %s",
+                campaign_id,
+            )
+            return None
+
+    @classmethod
+    def delete_source_material_document(
+        cls,
+        campaign_id: str,
+        document_key: str,
+    ) -> int:
+        try:
+            key = str(document_key or "").strip()
+            if not key:
+                return 0
+            conn = cls._get_conn()
+            cur = conn.execute(
+                """
+                DELETE FROM source_material_chunks
+                WHERE campaign_id = ? AND document_key = ?
+                """,
+                (str(campaign_id), key),
+            )
+            conn.commit()
+            return int(getattr(cur, "rowcount", 0) or 0)
+        except Exception:
+            logger.exception(
+                "Source material: delete document failed for campaign %s key %s",
+                campaign_id,
+                document_key,
+            )
+            return 0
+
+    @classmethod
+    def clear_source_material_documents(cls, campaign_id: str) -> int:
+        try:
+            conn = cls._get_conn()
+            cur = conn.execute(
+                """
+                DELETE FROM source_material_chunks
+                WHERE campaign_id = ?
+                """,
+                (str(campaign_id),),
+            )
+            conn.commit()
+            return int(getattr(cur, "rowcount", 0) or 0)
+        except Exception:
+            logger.exception(
+                "Source material: clear documents failed for campaign %s",
+                campaign_id,
+            )
+            return 0
 
     @classmethod
     def store_source_material_chunks(
@@ -410,7 +566,7 @@ class SourceMaterialMemory:
         *,
         document_key: Optional[str] = None,
         wildcard: str = "%",
-        limit: int = 60,
+        limit: int = 255,
     ) -> List[str]:
         """Return a compact source index or matching raw source lines.
 
