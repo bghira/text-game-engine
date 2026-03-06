@@ -112,23 +112,70 @@ class SourceMaterialMemory:
         return [s for s in out if s]
 
     @classmethod
+    def _normalize_source_unit_mode(cls, mode: str) -> str:
+        mode_clean = str(mode or "line").strip().lower()
+        if mode_clean in {"story", "paragraph", "paragraphs", "scene"}:
+            return "story"
+        if mode_clean in {"rulebook", "line", "lines"}:
+            return "rulebook"
+        if mode_clean in {"generic", "chunk", "chunked", "dump"}:
+            return "generic"
+        return "line"
+
+    @classmethod
+    def _dedupe_source_units(cls, units: List[str]) -> List[str]:
+        deduped: List[str] = []
+        seen = set()
+        for unit in units:
+            key = " ".join(str(unit or "").lower().split())
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            deduped.append(str(unit).strip()[:8000])
+        return deduped
+
+    @classmethod
     def source_material_units_from_chunks(cls, chunks: List[str]) -> List[str]:
+        return cls.source_material_units_from_chunks_with_mode(chunks, mode="line")
+
+    @classmethod
+    def source_material_units_from_chunks_with_mode(
+        cls, chunks: List[str], *, mode: str = "line"
+    ) -> List[str]:
+        """Convert source-material chunks into source lookup units.
+
+        Supported modes:
+        - line (default): one unit per non-empty line.
+        - story: split each chunk into paragraph units.
+        - generic: preserve chunk boundaries.
+        """
+        source_mode = cls._normalize_source_unit_mode(mode)
         units: List[str] = []
         for chunk in chunks or []:
             raw = str(chunk or "")
             if not raw.strip():
                 continue
-            units.extend(cls._split_source_line_fragments(raw))
-
-        deduped: List[str] = []
-        seen = set()
-        for unit in units:
-            key = " ".join(unit.lower().split())
-            if not key or key in seen:
+            if source_mode == "rulebook":
+                for line in raw.splitlines():
+                    line_clean = line.strip()
+                    if line_clean:
+                        units.append(line_clean)
                 continue
-            seen.add(key)
-            deduped.append(unit[:8000])
-        return deduped
+            if source_mode == "story":
+                paragraphs = [line.strip() for line in raw.split("\n\n") if line.strip()]
+                if not paragraphs:
+                    paragraphs = [raw]
+                for paragraph in paragraphs:
+                    paragraph_unit = " ".join(paragraph.split())
+                    if paragraph_unit:
+                        units.extend(cls._split_source_line_fragments(paragraph_unit))
+                continue
+
+            compact = " ".join(raw.split())
+            if compact:
+                units.extend(cls._split_source_line_fragments(compact))
+
+        return cls._dedupe_source_units(units)
 
     @classmethod
     def list_source_material_documents(
@@ -155,12 +202,32 @@ class SourceMaterialMemory:
             ).fetchall()
             out: List[Dict[str, object]] = []
             for document_key, document_label, count, last_at in rows:
+                sample_chunk = ""
+                if document_key:
+                    sample_rows = conn.execute(
+                        """
+                        SELECT chunk_text
+                        FROM source_material_chunks
+                        WHERE campaign_id = ? AND document_key = ?
+                        ORDER BY chunk_index ASC
+                        LIMIT 6
+                        """,
+                        (str(campaign_id), document_key),
+                    ).fetchall()
+                    sample_parts = [
+                        str(sample_row[0] or "").strip()
+                        for sample_row in sample_rows
+                        if str(sample_row[0] or "").strip()
+                    ]
+                    if sample_parts:
+                        sample_chunk = "\n".join(sample_parts)
                 out.append(
                     {
                         "document_key": str(document_key or ""),
                         "document_label": str(document_label or ""),
                         "chunk_count": int(count or 0),
                         "last_at": str(last_at or ""),
+                        "sample_chunk": sample_chunk,
                     }
                 )
             return out
@@ -178,6 +245,7 @@ class SourceMaterialMemory:
         *,
         document_label: str,
         chunks: List[str],
+        source_mode: str = "line",
         replace_document: bool = True,
     ) -> Tuple[int, str]:
         try:
@@ -185,6 +253,7 @@ class SourceMaterialMemory:
             if not label:
                 label = "source-material"
             document_key = cls._normalize_source_document_key(label)
+            mode = cls._normalize_source_unit_mode(source_mode)
             clean_chunks = [
                 str(chunk or "").strip()[:8000]
                 for chunk in (chunks or [])
@@ -192,7 +261,9 @@ class SourceMaterialMemory:
             ]
             if not clean_chunks:
                 return 0, document_key
-            sentence_units = cls.source_material_units_from_chunks(clean_chunks)
+            sentence_units = cls.source_material_units_from_chunks_with_mode(
+                clean_chunks, mode=mode
+            )
             if not sentence_units:
                 return 0, document_key
 
@@ -324,6 +395,91 @@ class SourceMaterialMemory:
         except Exception:
             logger.exception(
                 "Source material: search failed for campaign %s",
+                campaign_id,
+            )
+            return []
+
+    # ------------------------------------------------------------------
+    # Browse source keys (rulebook key-snippet index)
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def browse_source_keys(
+        cls,
+        campaign_id: str,
+        *,
+        document_key: Optional[str] = None,
+        wildcard: str = "%",
+        limit: int = 60,
+    ) -> List[str]:
+        """Return a compact source index or matching raw source lines.
+
+        When *wildcard* is omitted / broad (``*`` or ``%``), return a compact
+        key listing so the model can see the document taxonomy without burning
+        context on full fact bodies. When *wildcard* is specific, return the
+        raw matching source lines.
+        """
+        try:
+            conn = cls._get_conn()
+            pattern = str(wildcard or "%").strip()
+            if not pattern or pattern == "*":
+                pattern = "%"
+            else:
+                pattern = pattern.replace("*", "%")
+            broad_browse = pattern in {"%", "%%"}
+            key = str(document_key or "").strip()
+            if key:
+                rows = conn.execute(
+                    """
+                    SELECT document_key, chunk_text
+                    FROM source_material_chunks
+                    WHERE campaign_id = ? AND document_key = ?
+                      AND chunk_text LIKE ? ESCAPE '\\'
+                    ORDER BY chunk_index ASC
+                    LIMIT ?
+                    """,
+                    (str(campaign_id), key, pattern, max(1, int(limit))),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT document_key, chunk_text
+                    FROM source_material_chunks
+                    WHERE campaign_id = ?
+                      AND chunk_text LIKE ? ESCAPE '\\'
+                    ORDER BY document_key ASC, chunk_index ASC
+                    LIMIT ?
+                    """,
+                    (str(campaign_id), pattern, max(1, int(limit))),
+                ).fetchall()
+            cleaned_rows = []
+            for row_doc_key, row_chunk_text in rows:
+                chunk_text = str(row_chunk_text or "").strip()
+                if not chunk_text:
+                    continue
+                cleaned_rows.append((str(row_doc_key or "").strip(), chunk_text))
+            if not broad_browse:
+                return [chunk_text for _, chunk_text in cleaned_rows]
+
+            compact: List[str] = []
+            seen = set()
+            for row_doc_key, chunk_text in cleaned_rows:
+                key_text = chunk_text
+                if ":" in chunk_text:
+                    key_text = chunk_text.split(":", 1)[0].strip() or chunk_text
+                if key:
+                    line = key_text
+                else:
+                    line = f"{row_doc_key}: {key_text}" if row_doc_key else key_text
+                normalized = " ".join(line.lower().split())
+                if not normalized or normalized in seen:
+                    continue
+                seen.add(normalized)
+                compact.append(line)
+            return compact
+        except Exception:
+            logger.exception(
+                "Source material: browse_source_keys failed for campaign %s",
                 campaign_id,
             )
             return []

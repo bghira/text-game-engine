@@ -30,6 +30,7 @@ pip install -e ".[glm]"
 
 ## Documentation
 
+- Source material authoring: [`docs/source-material.md`](docs/source-material.md)
 - SDK: [`docs/sdk.md`](docs/sdk.md)
 - Persistence: [`docs/persistence.md`](docs/persistence.md)
 - Examples index: [`docs/examples.md`](docs/examples.md)
