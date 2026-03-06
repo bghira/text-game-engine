@@ -411,7 +411,7 @@ class SourceMaterialMemory:
             document_key = cls._normalize_source_document_key(label)
             mode = cls._normalize_source_unit_mode(source_mode)
             clean_chunks = [
-                str(chunk or "").strip()[:8000]
+                str(chunk or "").strip()
                 for chunk in (chunks or [])
                 if str(chunk or "").strip()
             ]
