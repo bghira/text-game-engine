@@ -76,16 +76,16 @@ async def extract_attachment_text(
         raw = await txt_att.read()
     except Exception as exc:
         log.warning("Attachment read failed: %s", exc)
-        return None
+        return "ERROR:Could not read attached `.txt` file. Please re-upload and try again."
     if not raw:
-        return None
+        return "ERROR:Attached `.txt` file is empty."
 
     try:
         text = raw.decode("utf-8")
     except UnicodeDecodeError:
         text = raw.decode("latin-1")
     text = text.strip()
-    return text if text else None
+    return text if text else "ERROR:Attached `.txt` file is empty."
 
 
 class AttachmentTextProcessor:
@@ -106,6 +106,44 @@ class AttachmentTextProcessor:
         self._token_count = token_count
         self._config = config or AttachmentProcessingConfig()
         self._logger = logger or logging.getLogger(__name__)
+
+    def _fallback_summary(self, text: str) -> str:
+        clean = str(text or "").strip()
+        if not clean:
+            return ""
+        cfg = self._config
+        total_tokens = self._token_count(clean)
+        target_chunk_tokens = max(cfg.attachment_chunk_tokens, total_tokens // max(cfg.attachment_max_chunks, 1))
+        chars_per_tok = len(clean) / max(total_tokens, 1)
+        chunk_char_target = max(1, int(target_chunk_tokens * chars_per_tok))
+        paragraphs = clean.split("\n\n")
+        chunks: list[str] = []
+        current_chunk: list[str] = []
+        current_len = 0
+        for para in paragraphs:
+            para_len = len(para)
+            if current_len + para_len + 2 > chunk_char_target and current_chunk:
+                chunks.append("\n\n".join(current_chunk))
+                current_chunk = [para]
+                current_len = para_len
+            else:
+                current_chunk.append(para)
+                current_len += para_len + 2
+        if current_chunk:
+            chunks.append("\n\n".join(current_chunk))
+        if not chunks:
+            return ""
+        selected = chunks[:6]
+        lines = ["Fallback extraction from uploaded source text (automated summary failed):"]
+        for idx, chunk in enumerate(selected, start=1):
+            snippet = " ".join(str(chunk or "").split())
+            if len(snippet) > 1200:
+                snippet = snippet[:1200].rsplit(" ", 1)[0].strip() + "..."
+            lines.append(f"[Excerpt {idx}/{len(selected)}] {snippet}")
+        result = "\n\n".join(lines).strip()
+        if len(result) > 9000:
+            result = result[:9000].rsplit(" ", 1)[0].strip() + "..."
+        return result
 
     async def summarise_long_text(
         self,
@@ -205,8 +243,18 @@ class AttachmentTextProcessor:
         summaries = [summary for summary in summaries if summary]
         if not summaries:
             self._logger.error("All chunk summaries failed")
-            await self._notify(progress, "Summary failed - continuing without attachment.")
-            return ""
+            fallback = self._fallback_summary(text)
+            if fallback:
+                self._logger.warning(
+                    "ATTACHMENT SUMMARY FALLBACK text_len=%s fallback_chars=%s",
+                    len(text),
+                    len(fallback),
+                )
+            if fallback:
+                await self._notify(progress, "Summary model failed - using direct source excerpts fallback.")
+            else:
+                await self._notify(progress, "Summary failed - continuing without attachment.")
+            return fallback
 
         joined = "\n\n".join(summaries)
         joined_tokens = self._token_count(joined)
@@ -302,4 +350,3 @@ class AttachmentTextProcessor:
                 await maybe
         except Exception:
             return
-

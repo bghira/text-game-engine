@@ -23,6 +23,7 @@ from .core.attachments import (
     AttachmentTextProcessor,
     extract_attachment_text,
 )
+from .core.source_material_memory import SourceMaterialMemory
 from .core.emulator_ports import (
     IMDBLookupPort,
     MediaGenerationPort,
@@ -93,8 +94,10 @@ class ZorkEmulator:
     ATTACHMENT_RESPONSE_RESERVE_TOKENS = 4_000
     ATTACHMENT_MAX_PARALLEL = 4
     ATTACHMENT_MAX_CHUNKS = 8
-    ATTACHMENT_MIN_SETUP_CHUNKS = 4
+    ATTACHMENT_MIN_SETUP_CHUNKS = 1
     ATTACHMENT_GUARD_TOKEN = "--COMPLETED SUMMARY--"
+    SOURCE_MATERIAL_CATEGORY = "source"
+    SOURCE_MATERIAL_MAX_DOCS_IN_PROMPT = 8
     DEFAULT_SCENE_IMAGE_MODEL = "black-forest-labs/FLUX.2-klein-4b"
     DEFAULT_AVATAR_IMAGE_MODEL = "black-forest-labs/FLUX.2-klein-4b"
     SCENE_IMAGE_PRESERVE_PREFIX = (
@@ -224,6 +227,7 @@ class ZorkEmulator:
         "setup_phase",
         "setup_data",
         "speed_multiplier",
+        "difficulty",
         "game_time",
         "calendar",
         CALENDAR_REMINDER_STATE_KEY,
@@ -268,6 +272,31 @@ class ZorkEmulator:
         "if that NPC plausibly knows in this scene (direct evidence, prior established knowledge, or in-scene disclosure). "
         "Do not leak off-screen NPC communications into current NPC dialogue unless continuity clearly supports it.]"
     )
+    DIFFICULTY_LEVELS = (
+        "story",
+        "easy",
+        "medium",
+        "normal",
+        "hard",
+        "impossible",
+    )
+    DIFFICULTY_NOTES = {
+        "story": (
+            "Dream mode. Be maximally generous: default to success, soften or skip failure states, and keep progress flowing even after weak or vague actions."
+        ),
+        "easy": (
+            "Be forgiving and player-favoring. Allow broad creative actions, use mild consequences, and offer helpful affordances when actions are underspecified."
+        ),
+        "medium": (
+            "Balanced challenge with lenient interpretation. Require plausible actions, but provide recovery paths and partial successes frequently."
+        ),
+        "hard": (
+            "Demand strong grounding. Enforce constraints, resources, and consequences; failed or risky actions should fail or cost something when unsupported."
+        ),
+        "impossible": (
+            "Strict mode. Player freedom is minimal: movement/travel must use currently listed exits. If an action is not explicitly supported by present exits/objects/state, reject it and ask for a valid action."
+        ),
+    }
     SYSTEM_PROMPT = (
         "You are the ZorkEmulator, a classic text-adventure GM with light RPG rules. "
         "You describe outcomes in second person, terse and concrete. You track rooms, "
@@ -414,6 +443,14 @@ class ZorkEmulator:
         "- Causality first: do not introduce new pursuers, attacks, disasters, media attention, or environmental threats without concrete setup in prior turns/state.\n"
         "- Escalations must follow a believable chain of evidence and opportunity (how they found the player, why now, and through what channel).\n"
         "- No omniscient coincidence pressure: avoid out-of-nowhere helicopters, enemy arrivals, or wildlife hazards unless foreshadowed or logically triggered.\n"
+        "- NPCs pursue established characterization first and plot second. Characters are not plot-delivery devices.\n"
+        "- If a character's established personality conflicts with advancing the current storyline, personality wins.\n"
+        "- Let the player drive story direction. If the player rejects a premise, adapt the premise instead of making NPCs more insistent.\n"
+        "- REFUSAL RESPECT: a clear player refusal ('no', 'not interested', decline) ends that offer in the current scene unless the player reopens it.\n"
+        "- Do NOT run pressure loops where new NPCs repeatedly re-pitch the same offer after refusal.\n"
+        "- Do NOT escalate environmental hardship (property damage, theft risk, safety collapse, social pressure) just to coerce acceptance of an optional deal.\n"
+        "- Do NOT assert debts, obligations, or contracts unless they were explicitly accepted earlier and grounded in WORLD_STATE/RECENT_TURNS.\n"
+        "- NPCs may disagree with the player, but must pursue their own goals through plausible actions, not narrative coercion to force a 'yes'.\n"
     )
     GUARDRAILS_SYSTEM_PROMPT = (
         "\nSTRICT RAILS MODE IS ENABLED.\n"
@@ -467,6 +504,31 @@ class ZorkEmulator:
         "- Your narration should hint at urgency narratively (e.g. 'the footsteps grow louder') but NEVER include countdowns, timestamps, emoji clocks, or explicit seconds. The system adds its own countdown display automatically.\n"
         "- No quota: only set a timer when the current scene has a believable, already-grounded clock.\n"
     )
+    MEMORY_LOOKUP_MIN_SUMMARY_CHARS = MAX_SUMMARY_CHARS
+    MEMORY_TOOL_DISABLED_PROMPT = (
+        "\nEARLY-CAMPAIGN MEMORY MODE:\n"
+        "- Long-term memory lookup tools are disabled for this turn because WORLD_SUMMARY is still within context budget.\n"
+        "- Source-material memory search should only be enabled when the current player action explicitly asks for canon recall/details.\n"
+        "- Do NOT call memory_search, memory_terms, memory_turn, or memory_store.\n"
+        "- Use WORLD_SUMMARY, WORLD_STATE, WORLD_CHARACTERS, PARTY_SNAPSHOT, and RECENT_TURNS directly.\n"
+    )
+    SMS_TOOL_PROMPT = (
+        "\nYou also have SMS tools for in-game communications with off-scene NPCs:\n"
+        "- List SMS threads:\n"
+        '{"tool_call": "sms_list", "wildcard": "*"}\n'
+        "- Read one thread:\n"
+        '{"tool_call": "sms_read", "thread": "saul", "limit": 20}\n'
+        "- Write/send an SMS entry:\n"
+        '{"tool_call": "sms_write", "thread": "saul", "from": "Dale", "to": "Saul", "message": "Meet me at Dock 9."}\n'
+        "For NPC replies, immediately call sms_write again with from/to swapped:\n"
+        '{"tool_call": "sms_write", "thread": "saul", "from": "Saul", "to": "Dale", "message": "On my way."}\n'
+        "- Schedule a delayed incoming SMS (hidden until delivered, always uninterruptible):\n"
+        '{"tool_call": "sms_schedule", "thread": "saul", "from": "Saul", "to": "Dale", "message": "Traffic. 10 min.", "delay_seconds": 120}\n'
+        "sms_schedule is invisible to players at scheduling time. Do NOT narrate the delayed SMS as already received in the current response.\n"
+        "Use a stable contact thread slug for both directions (e.g. always `elizabeth` for Deshawn<->Elizabeth), not per-sender thread names.\n"
+        "SMS continuity rule: do NOT leak scene context into SMS content unless the SMS explicitly mentions it.\n"
+        "NPC SMS responses/knowledge must be limited to what that thread and established continuity plausibly reveal.\n"
+    )
     MEMORY_TOOL_PROMPT = (
         "\nYou have a memory_search tool. To use it, return ONLY:\n"
         '{"tool_call": "memory_search", "queries": ["query1", "query2", ...]}\n'
@@ -495,6 +557,13 @@ class ZorkEmulator:
         "Categories should be character-keyed when possible (e.g. 'char:alice', 'char:marcus-blackwell'). "
         "A category can contain multiple memories.\n"
         "When category is provided in memory_search, curated memories in that category are vector searched.\n"
+        "When SOURCE_MATERIAL_DOCS is present, source canon is indexed in vector memory as newline-level snippets. "
+        "Use memory_search with category 'source' to query canon snippets before narrating key plot facts:\n"
+        '{"tool_call": "memory_search", "category": "source", "queries": ["character name", "location", "event"]}\n'
+        "You can also scope one source document with category 'source:<document_key>' when SOURCE_MATERIAL_DOCS provides keys.\n"
+        "By default source search returns only the single best matching snippet. "
+        "For expanded context windows, memory_search supports optional before_lines/after_lines "
+        "(defaults: 0/0; set ranges only when needed).\n"
         "\nYou also have SMS tools for in-game communications with off-scene NPCs:\n"
         "- List SMS threads:\n"
         '{"tool_call": "sms_list", "wildcard": "*"}\n'
@@ -1442,6 +1511,9 @@ class ZorkEmulator:
 
     async def _extract_attachment_text(self, message) -> Optional[str]:
         attachments = getattr(message, "attachments", None)
+        if not attachments:
+            inner_message = getattr(message, "message", None)
+            attachments = getattr(inner_message, "attachments", None)
         return await extract_attachment_text(
             attachments,
             config=AttachmentProcessingConfig(
@@ -1456,6 +1528,22 @@ class ZorkEmulator:
             ),
             logger=self._logger,
         )
+
+    @staticmethod
+    def _extract_attachment_label(
+        attachments: list[Any] | None,
+        fallback: str = "source-material",
+    ) -> str:
+        for att in attachments or []:
+            filename = str(getattr(att, "filename", "") or "").strip()
+            if not filename.lower().endswith(".txt"):
+                continue
+            stem = filename.rsplit("/", 1)[-1]
+            stem = stem[:-4] if stem.lower().endswith(".txt") else stem
+            stem = " ".join(stem.replace("_", " ").replace("-", " ").split())
+            if stem:
+                return stem[:120]
+        return str(fallback or "source-material").strip()[:120] or "source-material"
 
     @classmethod
     def _estimate_attachment_chunk_count(cls, text: str) -> int:
@@ -1489,17 +1577,36 @@ class ZorkEmulator:
 
     @classmethod
     def _attachment_setup_length_error(cls, text: str) -> str | None:
-        chunk_count = cls._estimate_attachment_chunk_count(text)
-        if chunk_count >= cls.ATTACHMENT_MIN_SETUP_CHUNKS:
-            return None
-        token_count = glm_token_count(str(text or ""))
-        min_tokens = cls.ATTACHMENT_CHUNK_TOKENS * cls.ATTACHMENT_MIN_SETUP_CHUNKS
-        return (
-            "Uploaded text is too short for setup ingestion "
-            f"({chunk_count}/{cls.ATTACHMENT_MIN_SETUP_CHUNKS} chunks, ~{token_count} tokens). "
-            f"Please upload a longer `.txt` file (about {min_tokens}+ tokens / "
-            f"{cls.ATTACHMENT_MIN_SETUP_CHUNKS}+ sections)."
+        # Short setup attachments are accepted; no minimum chunk threshold.
+        return None
+
+    @classmethod
+    def _source_material_prompt_payload(cls, campaign_id: str) -> Dict[str, object]:
+        docs = SourceMaterialMemory.list_source_material_documents(
+            str(campaign_id),
+            limit=cls.SOURCE_MATERIAL_MAX_DOCS_IN_PROMPT,
         )
+        total_chunk_count = 0
+        compact_docs = []
+        for row in docs:
+            try:
+                chunk_count = int(row.get("chunk_count") or 0)
+            except (TypeError, ValueError):
+                chunk_count = 0
+            total_chunk_count += chunk_count
+            compact_docs.append(
+                {
+                    "document_key": str(row.get("document_key") or ""),
+                    "document_label": str(row.get("document_label") or ""),
+                    "chunk_count": chunk_count,
+                }
+            )
+        return {
+            "available": bool(compact_docs),
+            "document_count": len(compact_docs),
+            "chunk_count": total_chunk_count,
+            "docs": compact_docs,
+        }
 
     async def _summarise_long_text(self, text: str, ctx_message=None, channel=None) -> str:
         if not text:
@@ -1634,14 +1741,19 @@ class ZorkEmulator:
             actor_id = "system"
         if attachment_text is None and attachment_summary is not None:
             attachment_text = attachment_summary
+        has_source_material = bool(str(attachment_text or "").strip())
 
         with self._session_factory() as session:
             campaign = session.get(Campaign, campaign_id)
             if campaign is None:
                 return "Campaign not found."
             state = parse_json_dict(campaign.state_json)
-            imdb_results = self._imdb_search(raw_name, max_results=3)
-            imdb_text = self._format_imdb_results(imdb_results)
+            if has_source_material:
+                imdb_results = []
+                imdb_text = ""
+            else:
+                imdb_results = self._imdb_search(raw_name, max_results=3)
+                imdb_text = self._format_imdb_results(imdb_results)
 
             imdb_context = ""
             if imdb_text:
@@ -1695,7 +1807,7 @@ class ZorkEmulator:
                 work_desc = result.get("work_description") or ""
                 suggested = result.get("suggested_title") or raw_name
 
-            if not is_known and imdb_results:
+            if not has_source_material and not is_known and imdb_results:
                 top = imdb_results[0]
                 top = self._imdb_enrich_results([top])[0]
                 is_known = True
@@ -1714,13 +1826,33 @@ class ZorkEmulator:
                 "is_known_work": is_known,
                 "work_type": work_type,
                 "work_description": work_desc,
-                "imdb_results": imdb_results or [],
+                "imdb_results": (imdb_results or []) if not has_source_material else [],
                 "requested_by": actor_id,
                 "on_rails_requested": bool(on_rails),
                 "default_persona": await self.generate_campaign_persona(raw_name),
             }
             if attachment_text:
                 setup_data["attachment_summary"] = attachment_text
+                try:
+                    source_chunks, _, _, _, _ = self._chunk_text_by_tokens(
+                        attachment_text
+                    )
+                    if source_chunks:
+                        _stored_count, source_key = (
+                            SourceMaterialMemory.store_source_material_chunks(
+                                str(campaign.id),
+                                document_label=str(raw_name or "source-material"),
+                                chunks=source_chunks,
+                                replace_document=True,
+                            )
+                        )
+                        if _stored_count > 0:
+                            setup_data["source_material_document_key"] = source_key
+                except Exception:
+                    self._logger.exception(
+                        "Start setup source-material indexing failed for campaign %s",
+                        campaign.id,
+                    )
 
             state["setup_phase"] = "classify_confirm"
             state["setup_data"] = setup_data
@@ -1728,16 +1860,22 @@ class ZorkEmulator:
             campaign.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
             session.commit()
         if is_known:
-            return (
+            msg = (
                 f"I recognize **{setup_data['raw_name']}** as a known {work_type or 'work'}.\n"
                 f"_{work_desc}_\n\n"
                 "Is this correct? Reply **yes** to confirm, or tell me what it actually is."
             )
-        return (
+        else:
+            msg = (
             f"I don't recognize **{raw_name}** as a known published work. "
             "I'll treat it as an original setting.\n\n"
             "Is this correct? Reply **yes** to confirm, or tell me what it actually is."
-        )
+            )
+        if attachment_text:
+            msg += (
+                "\n\nAttached source text was loaded and will be used during setup generation."
+            )
+        return msg
 
     async def handle_setup_message(
         self,
@@ -1949,10 +2087,9 @@ class ZorkEmulator:
                     cur_user = user_prompt
                     if attempt == 1:
                         cur_user = (
-                            f"Generate 2-3 adventure storyline variants for an adult text-adventure "
-                            f"game inspired by '{raw_name}'. All characters are adults. "
-                            "Focus on the setting, survival themes, and exploration.\n"
-                            f"{imdb_context}"
+                            f"{user_prompt}\n\n"
+                            "FORMAT REPAIR: Your previous response was invalid or incomplete JSON. "
+                            "Return ONLY one valid JSON object with key 'variants' and no trailing text."
                         )
                         self._zork_log(f"SETUP VARIANT RETRY campaign={campaign.id}", cur_user)
                     response = await self._completion_port.complete(
@@ -2192,7 +2329,15 @@ class ZorkEmulator:
             else:
                 setup_data["work_description"] = ""
         else:
-            imdb_results = self._imdb_search(answer, max_results=3)
+            has_source_material = bool(
+                str(setup_data.get("attachment_summary") or "").strip()
+                or str(setup_data.get("source_material_document_key") or "").strip()
+            )
+            imdb_results = (
+                []
+                if has_source_material
+                else self._imdb_search(answer, max_results=3)
+            )
             result = {}
             if self._completion_port is not None:
                 imdb_context = ""
@@ -2224,14 +2369,19 @@ class ZorkEmulator:
             setup_data["work_description"] = result.get("work_description") or ""
             setup_data["raw_name"] = result.get("suggested_title") or answer.strip()
 
-            if not setup_data["is_known_work"] and imdb_results and not novel_intent:
+            if (
+                not has_source_material
+                and not setup_data["is_known_work"]
+                and imdb_results
+                and not novel_intent
+            ):
                 top = imdb_results[0]
                 setup_data["is_known_work"] = True
                 setup_data["raw_name"] = top.get("title") or setup_data["raw_name"]
                 setup_data["work_type"] = (str(top.get("type") or "").lower().replace(" ", "_")) or "other"
                 setup_data["work_description"] = str(top.get("description") or setup_data["work_description"] or "")
             confirmed = str(setup_data.get("raw_name") or "").lower()
-            if imdb_results and confirmed:
+            if (not has_source_material) and imdb_results and confirmed:
                 best = None
                 for row in imdb_results:
                     title = str(row.get("title") or "").lower()
@@ -2241,6 +2391,8 @@ class ZorkEmulator:
                 setup_data["imdb_results"] = [best] if best else [imdb_results[0]]
             else:
                 setup_data["imdb_results"] = imdb_results
+            if has_source_material:
+                setup_data["imdb_results"] = []
             if setup_data.get("imdb_results"):
                 setup_data["imdb_results"] = self._imdb_enrich_results(setup_data["imdb_results"])
                 top = setup_data["imdb_results"][0]
@@ -2252,23 +2404,35 @@ class ZorkEmulator:
             if isinstance(extracted, str) and extracted.startswith("ERROR:"):
                 return extracted
             if extracted:
-                short_msg = self._attachment_setup_length_error(extracted)
-                if short_msg:
-                    setup_data["attachment_notice"] = short_msg
-                else:
-                    summary = await self._summarise_long_text(extracted)
-                    if summary:
-                        setup_data["attachment_summary"] = summary
+                try:
+                    source_label = self._extract_attachment_label(
+                        attachments,
+                        fallback=str(setup_data.get("raw_name") or "source-material"),
+                    )
+                    source_chunks, _, _, _, _ = self._chunk_text_by_tokens(extracted)
+                    if source_chunks:
+                        stored_count, source_key = SourceMaterialMemory.store_source_material_chunks(
+                            str(campaign.id),
+                            document_label=source_label,
+                            chunks=source_chunks,
+                            replace_document=True,
+                        )
+                        if stored_count > 0:
+                            setup_data["source_material_document_key"] = source_key
+                except Exception:
+                    self._logger.exception(
+                        "Setup source-material indexing failed for campaign %s",
+                        campaign.id,
+                    )
+                summary = await self._summarise_long_text(extracted)
+                if summary:
+                    setup_data["attachment_summary"] = summary
 
         variants_msg = await self._setup_generate_storyline_variants(
             campaign,
             setup_data,
             user_guidance=user_guidance,
         )
-        attachment_notice = str(setup_data.get("attachment_notice") or "").strip()
-        if attachment_notice:
-            variants_msg = f"{attachment_notice}\n\n{variants_msg}"
-            setup_data.pop("attachment_notice", None)
         state["setup_phase"] = "storyline_pick"
         state["setup_data"] = setup_data
         return variants_msg
@@ -2347,6 +2511,8 @@ class ZorkEmulator:
                         cur_user = (
                             f"Build the complete world for an adult text-adventure game inspired by '{raw_name}'.\n"
                             f"{imdb_context}"
+                            f"{attachment_context}"
+                            "Source-material summary (if present) is authoritative; keep names, locations, and plot faithful to it.\n"
                             f"Chosen storyline:\n{self._dump_json(chosen)}"
                         )
                     response = await self._completion_port.complete(
@@ -4577,6 +4743,56 @@ class ZorkEmulator:
             campaign.updated_at = row.updated_at
         return True
 
+    @classmethod
+    def normalize_difficulty(cls, value: object) -> str:
+        text = " ".join(str(value or "").strip().lower().split())
+        if text in cls.DIFFICULTY_LEVELS:
+            return text
+        aliases = {
+            "default": "normal",
+            "std": "normal",
+            "story mode": "story",
+            "easy mode": "easy",
+            "medium mode": "medium",
+            "normal mode": "normal",
+            "hard mode": "hard",
+            "impossible mode": "impossible",
+        }
+        return aliases.get(text, "normal")
+
+    def get_difficulty(self, campaign: Campaign | None) -> str:
+        if campaign is None:
+            return "normal"
+        campaign_state = self.get_campaign_state(campaign)
+        return self.normalize_difficulty(campaign_state.get("difficulty", "normal"))
+
+    def set_difficulty(self, campaign: Campaign | None, difficulty: str) -> bool:
+        if campaign is None:
+            return False
+        normalized = self.normalize_difficulty(difficulty)
+        campaign_state = self.get_campaign_state(campaign)
+        campaign_state["difficulty"] = normalized
+        with self._session_factory() as session:
+            row = session.get(Campaign, campaign.id)
+            if row is None:
+                return False
+            row.state_json = self._dump_json(campaign_state)
+            row.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
+            session.commit()
+            campaign.state_json = row.state_json
+            campaign.updated_at = row.updated_at
+        return True
+
+    @classmethod
+    def _difficulty_response_note(cls, difficulty: object) -> str:
+        normalized = cls.normalize_difficulty(difficulty)
+        note = cls.DIFFICULTY_NOTES.get(normalized)
+        if not note:
+            return ""
+        return (
+            f"[SYSTEM NOTE: FOR THIS RESPONSE ONLY: difficulty={normalized}. {note}]"
+        )
+
     def cancel_pending_timer(self, campaign_id: str) -> dict[str, Any] | None:
         ctx_dict = self._pending_timers.pop(campaign_id, None)
         if ctx_dict is None:
@@ -6744,6 +6960,46 @@ class ZorkEmulator:
                 _add_name(char_name)
         return names
 
+    @classmethod
+    def _memory_lookup_enabled_for_prompt(
+        cls,
+        summary_text: object,
+        *,
+        source_material_available: bool = False,
+        action_text: object = None,
+    ) -> bool:
+        text = " ".join(str(action_text or "").strip().lower().split())
+        source_lookup_requested = (
+            bool(text)
+            and not bool(re.match(r"\s*\[ooc\b", text, re.IGNORECASE))
+            and any(
+                marker in text
+                for marker in (
+                    "remember",
+                    "recall",
+                    "what happened",
+                    "previously",
+                    "backstory",
+                    "history",
+                    "who is",
+                    "what is",
+                    "according to",
+                    "from the book",
+                    "from source",
+                    "source material",
+                    "canon",
+                    "lore",
+                    "look up",
+                )
+            )
+        )
+        summary_len = len(str(summary_text or "").strip())
+        if summary_len >= cls.MEMORY_LOOKUP_MIN_SUMMARY_CHARS:
+            return True
+        if source_material_available and source_lookup_requested:
+            return True
+        return False
+
     def build_prompt(
         self,
         campaign: Campaign,
@@ -6854,6 +7110,11 @@ class ZorkEmulator:
         )
         game_time = state.get("game_time", {})
         speed_mult = state.get("speed_multiplier", 1.0)
+        difficulty = self.normalize_difficulty(state.get("difficulty", "normal"))
+        difficulty_note = self._difficulty_response_note(difficulty)
+        response_style_note = self.RESPONSE_STYLE_NOTE
+        if difficulty_note:
+            response_style_note = f"{response_style_note}\n{difficulty_note}"
         calendar_state_before = json.dumps(
             state.get("calendar") or [],
             ensure_ascii=True,
@@ -6888,6 +7149,12 @@ class ZorkEmulator:
         currently_attentive = self._build_currently_attentive_players_for_prompt(
             campaign.id
         )
+        source_payload = self._source_material_prompt_payload(campaign.id)
+        memory_lookup_enabled = self._memory_lookup_enabled_for_prompt(
+            summary,
+            source_material_available=bool(source_payload.get("available")),
+            action_text=action,
+        )
 
         active_name = str(player_state.get("character_name") or "").strip()
         action_label = f"PLAYER_ACTION ({active_name.upper()})" if active_name else "PLAYER_ACTION"
@@ -6907,12 +7174,20 @@ class ZorkEmulator:
             f"WORLD_STATE: {self._dump_json(model_state)}\n"
             f"CURRENT_GAME_TIME: {self._dump_json(game_time)}\n"
             f"SPEED_MULTIPLIER: {speed_mult}\n"
+            f"DIFFICULTY: {difficulty}\n"
             f"ATTENTION_WINDOW_SECONDS: {self.ATTENTION_WINDOW_SECONDS}\n"
             f"CURRENTLY_ATTENTIVE_PLAYERS: {self._dump_json(currently_attentive)}\n"
             f"ACTIVE_PLAYER_LOCATION: {self._dump_json(active_location_context)}\n"
             f"CALENDAR: {self._dump_json(calendar_for_prompt)}\n"
             f"CALENDAR_REMINDERS:\n{calendar_reminders}\n"
+            f"MEMORY_LOOKUP_ENABLED: {str(memory_lookup_enabled).lower()}\n"
         )
+        if source_payload.get("available"):
+            user_prompt += (
+                f"SOURCE_MATERIAL_DOCS: {self._dump_json(source_payload.get('docs') or [])}\n"
+                f"SOURCE_MATERIAL_SNIPPET_COUNT: {source_payload.get('chunk_count')}\n"
+                f"SOURCE_MATERIAL_CHUNK_COUNT: {source_payload.get('chunk_count')}\n"
+            )
         if story_context:
             user_prompt += f"STORY_CONTEXT:\n{story_context}\n"
         user_prompt += (
@@ -6920,7 +7195,7 @@ class ZorkEmulator:
             f"PLAYER_CARD: {self._dump_json(player_card)}\n"
             f"PARTY_SNAPSHOT: {self._dump_json(party_snapshot)}\n"
             f"RECENT_TURNS:\n{recent_text}\n"
-            f"{self.RESPONSE_STYLE_NOTE}\n"
+            f"{response_style_note}\n"
             f"{action_label}: {action}\n"
         )
         system_prompt = self.SYSTEM_PROMPT
@@ -6928,7 +7203,11 @@ class ZorkEmulator:
             system_prompt = f"{system_prompt}{self.GUARDRAILS_SYSTEM_PROMPT}"
         if on_rails:
             system_prompt = f"{system_prompt}{self.ON_RAILS_SYSTEM_PROMPT}"
-        system_prompt = f"{system_prompt}{self.MEMORY_TOOL_PROMPT}"
+        if memory_lookup_enabled:
+            system_prompt = f"{system_prompt}{self.MEMORY_TOOL_PROMPT}"
+        else:
+            system_prompt = f"{system_prompt}{self.MEMORY_TOOL_DISABLED_PROMPT}"
+            system_prompt = f"{system_prompt}{self.SMS_TOOL_PROMPT}"
         if state.get("timed_events_enabled", True):
             system_prompt = f"{system_prompt}{self.TIMER_TOOL_PROMPT}"
         if story_context:
@@ -7185,6 +7464,62 @@ class ZorkEmulator:
             )
         except Exception:
             return []
+
+    def list_source_material_documents(
+        self,
+        campaign_id: str,
+        *,
+        limit: int = 20,
+    ) -> list[dict[str, object]]:
+        return SourceMaterialMemory.list_source_material_documents(
+            str(campaign_id),
+            limit=max(1, int(limit)),
+        )
+
+    def ingest_source_material_text(
+        self,
+        campaign_id: str,
+        *,
+        document_label: str,
+        text: str,
+        replace_document: bool = True,
+    ) -> tuple[int, str]:
+        chunks, _, _, _, _ = self._chunk_text_by_tokens(str(text or ""))
+        if not chunks:
+            return 0, "source-material"
+        return SourceMaterialMemory.store_source_material_chunks(
+            str(campaign_id),
+            document_label=str(document_label or "source-material"),
+            chunks=chunks,
+            replace_document=bool(replace_document),
+        )
+
+    def search_source_material(
+        self,
+        query: str,
+        campaign_id: str,
+        *,
+        document_key: str | None = None,
+        top_k: int = 5,
+        before_lines: int = 0,
+        after_lines: int = 0,
+    ) -> list[tuple[str, str, int, str, float]]:
+        try:
+            before_n = max(0, int(before_lines))
+        except Exception:
+            before_n = 0
+        try:
+            after_n = max(0, int(after_lines))
+        except Exception:
+            after_n = 0
+        return SourceMaterialMemory.search_source_material(
+            query,
+            str(campaign_id),
+            document_key=document_key,
+            top_k=max(1, int(top_k)),
+            before_lines=before_n,
+            after_lines=after_n,
+        )
 
     def list_sms_threads(
         self,
