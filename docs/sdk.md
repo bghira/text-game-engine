@@ -6,10 +6,17 @@ This document lists the primary public APIs for `text-game-engine`.
 
 ```python
 from text_game_engine import (
+    BackendTextCompletionPort,
     GameEngine,
     ZorkEmulator,
     AttachmentProcessingConfig,
     AttachmentTextProcessor,
+    ChatMessage,
+    CompletionRequest,
+    CompletionResult,
+    OllamaBackend,
+    build_backend,
+    build_text_completion_port,
     extract_attachment_text,
     glm_token_count,
     TextCompletionPort,
@@ -103,6 +110,33 @@ Tokenizer utility:
 
 - `glm_token_count(text: str) -> int` in `src/text_game_engine/core/tokens.py`
 - Uses `zai-org/GLM-5` when `transformers` is installed, otherwise fallback estimate.
+
+## Backend Utilities
+
+Source: `src/text_game_engine/backends/`
+
+- `OllamaBackend(...)`
+- `build_backend(provider, **config) -> ModelBackend`
+- `build_text_completion_port(provider, **config) -> BackendTextCompletionPort`
+- `BackendTextCompletionPort(backend, model=None)`
+- `ChatMessage`
+- `CompletionRequest`
+- `CompletionResult`
+
+Example:
+
+```python
+from text_game_engine import BackendTextCompletionPort, OllamaBackend
+
+backend = OllamaBackend(
+    model="qwen2.5:14b",
+    base_url="http://127.0.0.1:11434",
+    keep_alive="30m",
+)
+completion_port = BackendTextCompletionPort(backend)
+```
+
+This adapter targets the emulator-facing `TextCompletionPort`. `GameEngine` turn resolution still uses `LLMPort`.
 
 ## Port Interfaces
 

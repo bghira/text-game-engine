@@ -30,6 +30,8 @@ pip install -e ".[glm]"
 
 ## Documentation
 
+- Backends: [`docs/backends.md`](docs/backends.md)
+- Source material authoring: [`docs/source-material.md`](docs/source-material.md)
 - SDK: [`docs/sdk.md`](docs/sdk.md)
 - Persistence: [`docs/persistence.md`](docs/persistence.md)
 - Examples index: [`docs/examples.md`](docs/examples.md)
@@ -42,3 +44,16 @@ pip install -e ".[glm]"
 - Minimal engine turn resolution: [`examples/minimal_engine_turn.py`](examples/minimal_engine_turn.py)
 - Standalone Zork runtime flow: [`examples/zork_emulator_session.py`](examples/zork_emulator_session.py)
 - Attachment chunking/summarization flow: [`examples/attachment_processing.py`](examples/attachment_processing.py)
+
+## Ollama
+
+Native Ollama support is available through the backend layer:
+
+```python
+from text_game_engine import BackendTextCompletionPort, OllamaBackend
+
+backend = OllamaBackend(model="llama3.1")
+completion_port = BackendTextCompletionPort(backend)
+```
+
+Pass `completion_port` into `ZorkEmulator(...)` for setup, summarization, map generation, and other emulator-side completions.

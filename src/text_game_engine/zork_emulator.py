@@ -12,6 +12,7 @@ from datetime import datetime, timedelta, timezone
 import re
 import threading
 from typing import Any, Dict, List, Optional, Tuple
+import requests
 from urllib import error as urllib_error
 from urllib import parse as urllib_parse
 from urllib import request as urllib_request
@@ -22,7 +23,9 @@ from .core.attachments import (
     AttachmentProcessingConfig,
     AttachmentTextProcessor,
     extract_attachment_text,
+    extract_attachment_texts,
 )
+from .core.source_material_memory import SourceMaterialMemory
 from .core.emulator_ports import (
     IMDBLookupPort,
     MediaGenerationPort,
@@ -87,14 +90,62 @@ class ZorkEmulator:
         "speech_style",
     }
     ATTACHMENT_MAX_BYTES = 500_000
-    ATTACHMENT_CHUNK_TOKENS = 2_000
+    ATTACHMENT_CHUNK_TOKENS = 50_000
     ATTACHMENT_MODEL_CTX_TOKENS = 200_000
     ATTACHMENT_PROMPT_OVERHEAD_TOKENS = 6_000
-    ATTACHMENT_RESPONSE_RESERVE_TOKENS = 4_000
+    ATTACHMENT_RESPONSE_RESERVE_TOKENS = 90_000
+    ATTACHMENT_SUMMARY_MAX_TOKENS = 90_000
     ATTACHMENT_MAX_PARALLEL = 4
     ATTACHMENT_MAX_CHUNKS = 8
-    ATTACHMENT_MIN_SETUP_CHUNKS = 4
+    ATTACHMENT_MIN_SETUP_CHUNKS = 1
     ATTACHMENT_GUARD_TOKEN = "--COMPLETED SUMMARY--"
+    SETUP_GENRE_TEMPLATES = {
+        "upbeat": "Warm and optimistic — good things happen to people who try.",
+        "rom-com": "Romantic comedy — charm, miscommunication, and a satisfying payoff.",
+        "horror": "Dread, tension, and things that should not be.",
+        "noir": "Cynical narration, moral grey areas, rain-slicked streets.",
+        "thriller": "High stakes, ticking clocks, and dangerous people.",
+        "spaghetti-western": "Dusty standoffs, laconic antiheroes, Morricone energy.",
+        "psychedelic": "Reality is negotiable. Expect the unexpected.",
+        "buddy-comedy": "Two clashing personalities, one shared problem.",
+        "absurd": "Logic is optional. Commit to the bit.",
+        "detective-novel": "Clues, red herrings, and a mystery that rewards attention.",
+        "epic-fantasy": "Grand quests, ancient powers, and a world worth saving.",
+        "sci-fi": "Technology, exploration, and questions about what it means to be human.",
+        "dreamlike-fantasy": "Surreal, poetic, and just slightly impossible.",
+    }
+    # Behind the Name usage codes for name_generate tool.
+    NAME_ORIGIN_CODES = {
+        "african": "afr", "albanian": "alb", "arabic": "ara", "armenian": "arm",
+        "azerbaijani": "aze", "basque": "bas", "bengali": "ben", "bosnian": "bos",
+        "breton": "bre", "bulgarian": "bul", "catalan": "cat", "chinese": "chi",
+        "croatian": "cro", "czech": "cze", "danish": "dan", "dutch": "dut",
+        "english": "eng", "estonian": "est", "filipino": "fil", "finnish": "fin",
+        "french": "fre", "galician": "gal", "georgian": "geo", "german": "ger",
+        "greek": "gre", "hawaiian": "haw", "hebrew": "heb", "hindi": "hin",
+        "hungarian": "hun", "icelandic": "ice", "igbo": "igb", "indian": "ind",
+        "indonesian": "ins", "irish": "ire", "italian": "ita", "japanese": "jpn",
+        "kazakh": "kaz", "korean": "kor", "latvian": "lat", "lithuanian": "lth",
+        "macedonian": "mac", "malay": "mly", "maori": "mao", "native-american": "nam",
+        "norwegian": "nor", "persian": "per", "polish": "pol", "portuguese": "por",
+        "romanian": "rum", "russian": "rus", "scottish": "sco", "serbian": "ser",
+        "slovak": "slk", "slovene": "sln", "spanish": "spa", "swahili": "swa",
+        "swedish": "swe", "thai": "tha", "turkish": "tur", "ukrainian": "ukr",
+        "urdu": "urd", "vietnamese": "vie", "welsh": "wel", "yoruba": "yor",
+    }
+    NAME_GENERATE_URL = "https://www.behindthename.com/random/random.php"
+    SOURCE_MATERIAL_CATEGORY = "source"
+    SOURCE_MATERIAL_MAX_DOCS_IN_PROMPT = 8
+    SOURCE_MATERIAL_FORMAT_STORY = "story"
+    SOURCE_MATERIAL_FORMAT_RULEBOOK = "rulebook"
+    SOURCE_MATERIAL_FORMAT_GENERIC = "generic"
+    SOURCE_MATERIAL_MODE_MAP = {
+        SOURCE_MATERIAL_FORMAT_RULEBOOK: "rulebook",
+        SOURCE_MATERIAL_FORMAT_STORY: "story",
+        SOURCE_MATERIAL_FORMAT_GENERIC: "generic",
+    }
+    AUTO_RULEBOOK_DOCUMENT_LABEL = "campaign-rulebook"
+    AUTO_RULEBOOK_MAX_TOKENS = 16_000
     DEFAULT_SCENE_IMAGE_MODEL = "black-forest-labs/FLUX.2-klein-4b"
     DEFAULT_AVATAR_IMAGE_MODEL = "black-forest-labs/FLUX.2-klein-4b"
     SCENE_IMAGE_PRESERVE_PREFIX = (
@@ -224,6 +275,7 @@ class ZorkEmulator:
         "setup_phase",
         "setup_data",
         "speed_multiplier",
+        "difficulty",
         "game_time",
         "calendar",
         CALENDAR_REMINDER_STATE_KEY,
@@ -268,6 +320,32 @@ class ZorkEmulator:
         "if that NPC plausibly knows in this scene (direct evidence, prior established knowledge, or in-scene disclosure). "
         "Do not leak off-screen NPC communications into current NPC dialogue unless continuity clearly supports it.]"
     )
+    DIFFICULTY_LEVELS = (
+        "story",
+        "easy",
+        "medium",
+        "normal",
+        "hard",
+        "impossible",
+    )
+    DIFFICULTY_NOTES = {
+        "story": (
+            "Dream mode. Be maximally generous: default to success, soften or skip failure states, and keep progress flowing even after weak or vague actions."
+        ),
+        "easy": (
+            "Be forgiving and player-favoring. Allow broad creative actions, use mild consequences, and offer helpful affordances when actions are underspecified."
+        ),
+        "medium": (
+            "Balanced challenge with lenient interpretation. Require plausible actions, but provide recovery paths and partial successes frequently."
+        ),
+        "hard": (
+            "Demand strong grounding. Enforce constraints, resources, and consequences; failed or risky actions should fail or cost something when unsupported."
+        ),
+        "impossible": (
+            "The world is unforgiving and nothing is free. Resources are scarce, NPCs are self-interested, and mistakes have lasting consequences. "
+            "Movement/travel must use currently listed exits. If an action is not supported by present exits/objects/state, it fails — narrate the failure and let the player try something else."
+        ),
+    }
     SYSTEM_PROMPT = (
         "You are the ZorkEmulator, a classic text-adventure GM with light RPG rules. "
         "You describe outcomes in second person, terse and concrete. You track rooms, "
@@ -279,9 +357,12 @@ class ZorkEmulator:
         "- reasoning: string (first key in final turn JSON; concise internal grounding for this turn: what evidence/context you used, which actors are involved, and why the chosen outcome follows)\n"
         "- narration: string (what the player sees)\n"
         "- state_update: object (world state patches; set a key to null to remove it when no longer relevant. "
-        "IMPORTANT: WORLD_STATE has a size budget. Actively prune stale keys every turn by setting them to null. "
-        "Remove: completed/concluded events, expired countdowns/ETAs, booleans for past events that no longer affect gameplay, "
-        "and any scene-specific state from scenes the player has left. Only keep state that is CURRENTLY ACTIVE and relevant.\n"
+        "IMPORTANT: WORLD_STATE has a size budget. Actively prune stale WORLD_STATE keys every turn by setting them to null. "
+        "This cleanup rule applies to transient world-state only (events, countdowns, one-off flags, scene-local state) — "
+        "NOT to WORLD_CHARACTERS roster entries. "
+        "Remove from state_update: completed/concluded events, expired countdowns/ETAs, booleans for past events that no longer affect gameplay, "
+        "and scene-specific state from scenes the player has left. Only keep state that is CURRENTLY ACTIVE and relevant. "
+        "CRITICAL: state_update is NEVER a roster-deletion mechanism. Do NOT remove characters via state_update.\n"
         "STRUCTURE REQUIREMENT: State keys MUST be organized as nested objects keyed by the concept, entity, or character being tracked. "
         "NEVER use flat underscore-joined keys like 'guard_captain_mood' or 'throne_room_door_locked'. "
         'Instead, nest them: {"guard_captain": {"mood": "suspicious"}, "throne_room": {"door_locked": true}}. '
@@ -319,8 +400,14 @@ class ZorkEmulator:
         "relationships is a map keyed by other character slug/name, e.g. "
         "{\"deshawn\": {\"status\": \"partner\", \"knows_about\": [\"pregnancy\"], \"doesnt_know\": [\"blood-test-result\"], \"dynamic\": \"protective-but-autonomous\"}}. "
         "Use it to track disclosures, secrets, and dynamic shifts.\n"
-        "To remove a character from the roster, set that character slug to null in character_updates "
+        "To remove a character from the roster, use character_updates ONLY: set that character slug to null "
         "or set it to {'remove': true}. "
+        "NEVER use state_update.<character_slug>=null for roster removal. "
+        "If you need to remove both world-state keys and a roster entry, do both explicitly: "
+        "state_update for world-state cleanup, character_updates for roster deletion. "
+        "Do NOT remove characters just because they are off-scene, quiet, or not recently mentioned. "
+        "Roster removal is only for explicit player/admin cleanup requests, confirmed duplicate merges, death/permanent departure, or true invalid entries. "
+        "Prefer updating location/current_status over deleting the character.\n"
         "Set deceased_reason to a string when a character dies. "
         "WORLD_CHARACTERS in the prompt shows the current NPC roster — use it for continuity.)\n\n"
         "Rules:\n"
@@ -374,6 +461,10 @@ class ZorkEmulator:
         "  * If CAMPAIGN references a known movie/book/show, use the MAIN CHARACTER/PROTAGONIST's canonical name.\n"
         "  * Otherwise, create an appropriate name for this setting.\n"
         "  Set it in player_state_update.character_name.\n"
+        "- GM-RULE-NAMES: for newly created original characters, avoid generic AI-default names. "
+        "Do not default to names like Morgan, Chen, Mendoza, Rollins, Nakamura, Kai, or River unless source canon explicitly requires them. "
+        "Prefer distinctive, specific names with personality. "
+        "Use the name_generate tool to get real culturally-appropriate names when introducing new NPCs.\n"
         "- PLAYER_CARD.state.character_name is ALWAYS the correct name for this player. Ignore any old names in WORLD_SUMMARY.\n"
         "- For other visible characters, always use the 'name' field from PARTY_SNAPSHOT. Never rename or confuse them.\n"
         "- Minimize mechanical text in narration. Do not narrate exits, room_summary, or state changes unless dramatically relevant.\n"
@@ -399,9 +490,31 @@ class ZorkEmulator:
         "- For sleep/rest/wait, do NOT invent refusal or conflict (insomnia, sudden danger, interruptions) unless it is already established by prior events, active timers, or immediate scene facts.\n"
         "- If time cannot safely jump because the campaign timeline is shared, still honor intent by ending with the player sleeping/resting in the present moment.\n"
         "- Only advance to later times (e.g. morning) when the player explicitly requests it AND the jump is consistent with established world timing.\n"
+        "- REASONING CHECKS (must be reflected in reasoning):\n"
+        "  * Calendar removals: only remove events that THIS turn's action/narration directly resolved.\n"
+        "  * Movement consistency: if any NPC/entity moves in narration, include matching location updates in character_updates/state_update.\n"
         "- Causality first: do not introduce new pursuers, attacks, disasters, media attention, or environmental threats without concrete setup in prior turns/state.\n"
         "- Escalations must follow a believable chain of evidence and opportunity (how they found the player, why now, and through what channel).\n"
         "- No omniscient coincidence pressure: avoid out-of-nowhere helicopters, enemy arrivals, or wildlife hazards unless foreshadowed or logically triggered.\n"
+        "- NPCs pursue established characterization first and plot second. Characters are not plot-delivery devices.\n"
+        "- If a character's established personality conflicts with advancing the current storyline, personality wins.\n"
+        "- Let the player drive story direction. If the player rejects a premise, adapt the premise instead of making NPCs more insistent.\n"
+        "- REFUSAL RESPECT: a clear player refusal ('no', 'not interested', decline) ends that offer in the current scene unless the player reopens it.\n"
+        "- Do NOT run pressure loops where new NPCs repeatedly re-pitch the same offer after refusal.\n"
+        "- Do NOT escalate environmental hardship (property damage, theft risk, safety collapse, social pressure) just to coerce acceptance of an optional deal.\n"
+        "- Do NOT assert debts, obligations, or contracts unless they were explicitly accepted earlier and grounded in WORLD_STATE/RECENT_TURNS.\n"
+        "- NPCs may disagree with the player, but must pursue their own goals through plausible actions, not narrative coercion to force a 'yes'.\n"
+        "- ANTI-PATTERN: Do not default NPCs to romantic or sexual availability.\n"
+        "- Physical contact (tracing fingers, lingering looks, soft touches, leaning close) must be motivated by established relationship history and current emotional state.\n"
+        "- Most human interactions are not foreplay. NPCs should behave like people with their own priorities unless the scene has organically built to intimacy through player and NPC choices.\n"
+        "- GM ETHOS — BE ON THE PLAYER'S SIDE:\n"
+        "  * Your job is to make the player feel clever, not stupid. Reward creative or unexpected actions with interesting outcomes, even partial ones.\n"
+        "  * When a player tries something the rules don't cover, find the most fun plausible interpretation rather than the most restrictive one.\n"
+        "  * Surprises should feel like discoveries, not punishments. The world reacts to the player — it doesn't lie in wait for them.\n"
+        "  * Make the world feel alive: NPCs have routines, places change between visits, minor choices ripple forward.\n"
+        "  * Pacing is a gift. Know when to linger on a moment and when to cut to the next beat. Not every action needs a full scene.\n"
+        "  * The best turns leave the player wanting to type their next move immediately.\n"
+        "- Tone lock: match narration to WORLD_STATE.tone. Player humor is allowed, but ambient world/NPC behavior should remain tonally consistent unless the story explicitly shifts tone.\n"
     )
     GUARDRAILS_SYSTEM_PROMPT = (
         "\nSTRICT RAILS MODE IS ENABLED.\n"
@@ -455,6 +568,31 @@ class ZorkEmulator:
         "- Your narration should hint at urgency narratively (e.g. 'the footsteps grow louder') but NEVER include countdowns, timestamps, emoji clocks, or explicit seconds. The system adds its own countdown display automatically.\n"
         "- No quota: only set a timer when the current scene has a believable, already-grounded clock.\n"
     )
+    MEMORY_LOOKUP_MIN_SUMMARY_CHARS = MAX_SUMMARY_CHARS
+    MEMORY_TOOL_DISABLED_PROMPT = (
+        "\nEARLY-CAMPAIGN MEMORY MODE:\n"
+        "- Long-term memory lookup tools are disabled for this turn because WORLD_SUMMARY is still within context budget.\n"
+        "- Source-material memory search should only be enabled when the current player action explicitly asks for canon recall/details.\n"
+        "- Do NOT call memory_search, memory_terms, memory_turn, or memory_store.\n"
+        "- Use WORLD_SUMMARY, WORLD_STATE, WORLD_CHARACTERS, PARTY_SNAPSHOT, and RECENT_TURNS directly.\n"
+    )
+    SMS_TOOL_PROMPT = (
+        "\nYou also have SMS tools for in-game communications with off-scene NPCs:\n"
+        "- List SMS threads:\n"
+        '{"tool_call": "sms_list", "wildcard": "*"}\n'
+        "- Read one thread:\n"
+        '{"tool_call": "sms_read", "thread": "saul", "limit": 20}\n'
+        "- Write/send an SMS entry:\n"
+        '{"tool_call": "sms_write", "thread": "saul", "from": "Dale", "to": "Saul", "message": "Meet me at Dock 9."}\n'
+        "For NPC replies, immediately call sms_write again with from/to swapped:\n"
+        '{"tool_call": "sms_write", "thread": "saul", "from": "Saul", "to": "Dale", "message": "On my way."}\n'
+        "- Schedule a delayed incoming SMS (hidden until delivered, always uninterruptible):\n"
+        '{"tool_call": "sms_schedule", "thread": "saul", "from": "Saul", "to": "Dale", "message": "Traffic. 10 min.", "delay_seconds": 120}\n'
+        "sms_schedule is invisible to players at scheduling time. Do NOT narrate the delayed SMS as already received in the current response.\n"
+        "Use a stable contact thread slug for both directions (e.g. always `elizabeth` for Deshawn<->Elizabeth), not per-sender thread names.\n"
+        "SMS continuity rule: do NOT leak scene context into SMS content unless the SMS explicitly mentions it.\n"
+        "NPC SMS responses/knowledge must be limited to what that thread and established continuity plausibly reveal.\n"
+    )
     MEMORY_TOOL_PROMPT = (
         "\nYou have a memory_search tool. To use it, return ONLY:\n"
         '{"tool_call": "memory_search", "queries": ["query1", "query2", ...]}\n'
@@ -483,6 +621,40 @@ class ZorkEmulator:
         "Categories should be character-keyed when possible (e.g. 'char:alice', 'char:marcus-blackwell'). "
         "A category can contain multiple memories.\n"
         "When category is provided in memory_search, curated memories in that category are vector searched.\n"
+        "When SOURCE_MATERIAL_DOCS is present, source canon is indexed in vector memory.\n"
+        "Each source doc has one format: story, rulebook, or generic.\n"
+        "Use memory_search with category 'source' for canon facts before narration.\n"
+        '{"tool_call": "memory_search", "category": "source", "queries": ["character name", "location", "event"]}\n'
+        "You can scope one source document with category 'source:<document_key>' when SOURCE_MATERIAL_DOCS provides keys.\n"
+        "Format notes: rulebook = line facts in KEY: value form; story = prose/scripted scenes; generic = mixed notes.\n"
+        "Default return is one snippet. For surrounding context use before_lines and after_lines (defaults 0/0).\n"
+        "\nRULEBOOK BROWSING — source_browse tool:\n"
+        "Rulebook-format documents are key-snippet indexes. Use source_browse to list entries before drilling into specifics.\n"
+        "- List ALL keys in a rulebook document (default when you have no specific lead):\n"
+        '  {"tool_call": "source_browse", "document_key": "my-rulebook"}\n'
+        "- Filter keys by wildcard (when you know what you are looking for):\n"
+        '  {"tool_call": "source_browse", "document_key": "my-rulebook", "wildcard": "weapon*"}\n'
+        "- Browse all source documents at once (omit document_key):\n"
+        '  {"tool_call": "source_browse"}\n'
+        "source_browse returns a compact key index on the first unfiltered pass, up to 255 by default "
+        "(adjustable via 'limit'). With a specific wildcard it returns the matching raw KEY: value lines.\n"
+        "STRATEGY: for a rulebook you have not seen before, call source_browse with no wildcard first to see what keys exist, "
+        "then use source_browse with a wildcard or memory_search with category 'source:<document_key>' for detail.\n"
+        "\nNAME GENERATION — name_generate tool:\n"
+        "When introducing a new NPC, use name_generate to get real culturally-appropriate names instead of inventing them.\n"
+        "- Generate names filtered by cultural origin:\n"
+        '  {"tool_call": "name_generate", "origins": ["italian", "arabic"], "gender": "f", "context": "confident bartender in her 40s"}\n'
+        "- Generate names with no origin filter:\n"
+        '  {"tool_call": "name_generate", "gender": "m", "count": 5}\n'
+        "Parameters:\n"
+        '  origins: array of origin strings (e.g. "english", "korean", "spanish", "nigerian"). '
+        "Multiple origins are combined. Omit for any origin.\n"
+        '  gender: "m", "f", or "both" (default "both")\n'
+        "  count: 1-6 names (default 5)\n"
+        "  context: brief character concept to help you evaluate the results (not sent to the name service)\n"
+        "Review the returned names against your character concept — ethnicity, sound, mood, setting — "
+        "and pick the best fit. Call again with different origins if none work.\n"
+        "IMPORTANT: ALWAYS use this tool when creating new original NPCs. Do not invent names from your training data.\n"
         "\nYou also have SMS tools for in-game communications with off-scene NPCs:\n"
         "- List SMS threads:\n"
         '{"tool_call": "sms_list", "wildcard": "*"}\n'
@@ -647,6 +819,7 @@ class ZorkEmulator:
                     attachment_model_ctx_tokens=self.ATTACHMENT_MODEL_CTX_TOKENS,
                     attachment_prompt_overhead_tokens=self.ATTACHMENT_PROMPT_OVERHEAD_TOKENS,
                     attachment_response_reserve_tokens=self.ATTACHMENT_RESPONSE_RESERVE_TOKENS,
+                    attachment_summary_max_tokens=self.ATTACHMENT_SUMMARY_MAX_TOKENS,
                     attachment_max_parallel=self.ATTACHMENT_MAX_PARALLEL,
                     attachment_guard_token=self.ATTACHMENT_GUARD_TOKEN,
                     attachment_max_chunks=self.ATTACHMENT_MAX_CHUNKS,
@@ -1250,6 +1423,57 @@ class ZorkEmulator:
             return self.DEFAULT_CAMPAIGN_PERSONA
         return self.DEFAULT_CAMPAIGN_PERSONA
 
+    # ── Name Generation ──────────────────────────────────────────────────
+
+    def _fetch_random_names(
+        self,
+        origins: List[str] | None = None,
+        gender: str = "both",
+        count: int = 5,
+    ) -> List[str]:
+        """Fetch random names from behindthename.com.
+
+        *origins* is a list of human-friendly keys (e.g. ``["italian", "arabic"]``).
+        Returns a list of first-name strings, or empty on failure.
+        """
+        params: dict = {
+            "number": str(max(1, min(6, int(count)))),
+            "gender": gender if gender in ("m", "f", "both") else "both",
+            "surname": "",
+        }
+        if origins:
+            resolved_any = False
+            for origin in origins:
+                code = self.NAME_ORIGIN_CODES.get(
+                    origin.strip().lower().replace(" ", "-")
+                )
+                if code:
+                    params[f"usage_{code}"] = "1"
+                    resolved_any = True
+            if not resolved_any:
+                params["all"] = "yes"
+        else:
+            params["all"] = "yes"
+
+        try:
+            resp = requests.get(self.NAME_GENERATE_URL, params=params, timeout=6)
+            resp.raise_for_status()
+            names = re.findall(r"\[([A-Z][^\]]+)\]\(/name/", resp.text)
+            if not names:
+                names = re.findall(
+                    r'<a\b[^>]*href="/name/[^"]+"[^>]*class="plain"[^>]*>([^<]+)</a>',
+                    resp.text,
+                )
+            if not names:
+                names = re.findall(
+                    r'<a\b[^>]*class="plain"[^>]*href="/name/[^"]+"[^>]*>([^<]+)</a>',
+                    resp.text,
+                )
+            return [n.strip() for n in names if n.strip()][:count]
+        except Exception:
+            logger.warning("name_generate: behindthename.com fetch failed")
+            return []
+
     def _imdb_search_single(self, query: str, max_results: int = 3) -> list[dict[str, Any]]:
         clean = re.sub(r"[^\w\s]", "", query.strip().lower())
         if not clean:
@@ -1430,6 +1654,9 @@ class ZorkEmulator:
 
     async def _extract_attachment_text(self, message) -> Optional[str]:
         attachments = getattr(message, "attachments", None)
+        if not attachments:
+            inner_message = getattr(message, "message", None)
+            attachments = getattr(inner_message, "attachments", None)
         return await extract_attachment_text(
             attachments,
             config=AttachmentProcessingConfig(
@@ -1438,6 +1665,7 @@ class ZorkEmulator:
                 attachment_model_ctx_tokens=self.ATTACHMENT_MODEL_CTX_TOKENS,
                 attachment_prompt_overhead_tokens=self.ATTACHMENT_PROMPT_OVERHEAD_TOKENS,
                 attachment_response_reserve_tokens=self.ATTACHMENT_RESPONSE_RESERVE_TOKENS,
+                attachment_summary_max_tokens=self.ATTACHMENT_SUMMARY_MAX_TOKENS,
                 attachment_max_parallel=self.ATTACHMENT_MAX_PARALLEL,
                 attachment_guard_token=self.ATTACHMENT_GUARD_TOKEN,
                 attachment_max_chunks=self.ATTACHMENT_MAX_CHUNKS,
@@ -1445,51 +1673,368 @@ class ZorkEmulator:
             logger=self._logger,
         )
 
+    @staticmethod
+    def _extract_attachment_label(
+        attachments: list[Any] | None,
+        fallback: str = "source-material",
+    ) -> str:
+        for att in attachments or []:
+            filename = str(getattr(att, "filename", "") or "").strip()
+            if not filename.lower().endswith(".txt"):
+                continue
+            stem = filename.rsplit("/", 1)[-1]
+            stem = stem[:-4] if stem.lower().endswith(".txt") else stem
+            stem = " ".join(stem.replace("_", " ").replace("-", " ").split())
+            if stem:
+                return stem[:120]
+        return str(fallback or "source-material").strip()[:120] or "source-material"
+
+    @classmethod
+    def _normalize_source_material_format(cls, raw_format: str) -> str:
+        normalized = str(raw_format or "").strip().lower()
+        normalized = re.sub(r"[^a-z0-9\s-]", "", normalized)
+        normalized = re.sub(r"\s+", " ", normalized).strip()
+        if normalized in {"rulebook", "rule-book", "rule_book", "factbook", "rule"}:
+            return cls.SOURCE_MATERIAL_FORMAT_RULEBOOK
+        if normalized in {
+            "story",
+            "scripted",
+            "story-scripted",
+            "story mode",
+            "script",
+            "scripted story",
+            "narrative",
+        }:
+            return cls.SOURCE_MATERIAL_FORMAT_STORY
+        if normalized in {
+            "generic",
+            "other",
+            "dumps",
+            "dump",
+            "notes",
+            "unknown",
+        }:
+            return cls.SOURCE_MATERIAL_FORMAT_GENERIC
+        if (
+            "rulebook" in normalized
+            or "open set" in normalized
+            or "open-set" in normalized
+            or "openset" in normalized
+        ):
+            return cls.SOURCE_MATERIAL_FORMAT_RULEBOOK
+        if "script" in normalized or "story" in normalized:
+            return cls.SOURCE_MATERIAL_FORMAT_STORY
+        if "generic" in normalized or "dump" in normalized:
+            return cls.SOURCE_MATERIAL_FORMAT_GENERIC
+        return cls.SOURCE_MATERIAL_FORMAT_GENERIC
+
+    @classmethod
+    def _source_material_format_heuristic(cls, sample: str) -> str:
+        sample_text = str(sample or "").strip()
+        lines = [line.strip() for line in str(sample or "").splitlines() if line.strip()]
+        if not lines:
+            return cls.SOURCE_MATERIAL_FORMAT_GENERIC
+
+        rulebook_lines = 0
+        for line in lines[:80]:
+            if ":" not in line:
+                continue
+            key, value = line.split(":", 1)
+            key = key.strip()
+            value = value.strip()
+            if not key or not value or len(key) > 140:
+                continue
+            if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_\-\s]*", key):
+                rulebook_lines += 1
+
+        if len(lines) == 1 and rulebook_lines == 1:
+            return cls.SOURCE_MATERIAL_FORMAT_RULEBOOK
+
+        if len(lines) >= 4 and rulebook_lines >= max(2, len(lines) * 0.45):
+            return cls.SOURCE_MATERIAL_FORMAT_RULEBOOK
+
+        if "\n\n" in sample_text:
+            return cls.SOURCE_MATERIAL_FORMAT_STORY
+
+        if len(sample_text.split()) >= 140 and any(len(line) > 120 for line in lines):
+            return cls.SOURCE_MATERIAL_FORMAT_STORY
+
+        return cls.SOURCE_MATERIAL_FORMAT_GENERIC
+
+    @classmethod
+    def _source_material_storage_mode(cls, source_format: str) -> str:
+        return cls.SOURCE_MATERIAL_MODE_MAP.get(
+            cls._normalize_source_material_format(source_format),
+            cls.SOURCE_MATERIAL_MODE_MAP[cls.SOURCE_MATERIAL_FORMAT_GENERIC],
+        )
+
+    async def _classify_source_material_format(self, sample_text: str) -> str:
+        sample = str(sample_text or "").strip()
+        if not sample:
+            return self.SOURCE_MATERIAL_FORMAT_GENERIC
+        if self._completion_port is None:
+            return self._source_material_format_heuristic(sample)
+
+        system_prompt = (
+            "Classify the attached source material into exactly one of three categories.\n"
+            "Valid values: story, rulebook, generic.\n"
+            "story = scripted narrative, prose, scenes, dialogue, or outline text.\n"
+            'rulebook = open-set fact list where each fact is usually one line in "KEY: fact" form.\n'
+            "generic = everything else (notes, dumps, mixed structure).\n"
+            'Return ONLY JSON: {"source_material_format": "story|rulebook|generic"}.\n'
+            "Do not include markdown, explanation, or extra keys."
+        )
+        user_prompt = (
+            "Classify this sample from an uploaded source text.\n"
+            "Sample:\n"
+            f"{sample[:4000]}\n"
+            "Return only one JSON key `source_material_format`."
+        )
+        response = None
+        parsed = {}
+        try:
+            response = await self._completion_port.complete(
+                system_prompt,
+                user_prompt,
+                temperature=0.2,
+                max_tokens=120,
+            )
+            response = self._clean_response(response or "")
+            json_text = self._extract_json(response)
+            if json_text:
+                parsed = self._parse_json_lenient(json_text)
+        except Exception as exc:
+            self._logger.warning(
+                "Source material classification failed (LLM parse): %s",
+                exc,
+            )
+
+        if not isinstance(parsed, dict):
+            parsed = {}
+
+        if not parsed:
+            return self._source_material_format_heuristic(sample)
+
+        resolved_format = self._normalize_source_material_format(
+            str(
+                parsed.get("source_material_format")
+                or parsed.get("format")
+                or parsed.get("type")
+                or ""
+            )
+        )
+        if resolved_format:
+            return resolved_format
+        return self._source_material_format_heuristic(sample)
+
     @classmethod
     def _estimate_attachment_chunk_count(cls, text: str) -> int:
+        chunks, _, _, _, _ = cls._chunk_text_by_tokens(text)
+        return len(chunks)
+
+    @staticmethod
+    def _is_attachment_header_line(line: str) -> bool:
+        stripped = str(line or "").strip()
+        if not stripped:
+            return False
+        if re.match(r"^#{1,6}\s+\S", stripped):
+            return True
+        return bool(re.match(r"^[A-Z0-9][A-Z0-9 _/\-()&'.]{1,80}:\s*$", stripped))
+
+    @staticmethod
+    def _is_attachment_indented_line(line: str) -> bool:
+        raw = str(line or "").rstrip("\n")
+        return bool(re.match(r"^(?:\t+|\s{4,})\S", raw))
+
+    @classmethod
+    def _split_attachment_structural_blocks(cls, text: str) -> list[str]:
         clean = str(text or "").strip()
         if not clean:
-            return 0
+            return []
+        lines = clean.splitlines()
+        blocks: list[str] = []
+        current: list[str] = []
+
+        def flush_current() -> None:
+            if not current:
+                return
+            block = "\n".join(current).strip()
+            current.clear()
+            if block:
+                blocks.append(block)
+
+        for raw_line in lines:
+            line = raw_line.rstrip()
+            stripped = line.strip()
+            if not stripped:
+                flush_current()
+                continue
+            if cls._is_attachment_header_line(line):
+                flush_current()
+                blocks.append(stripped)
+                continue
+            if cls._is_attachment_indented_line(raw_line):
+                flush_current()
+                blocks.append(line)
+                continue
+            current.append(line)
+        flush_current()
+        return blocks or [clean]
+
+    @classmethod
+    def _hard_wrap_attachment_text(
+        cls,
+        text: str,
+        *,
+        target_chunk_tokens: int,
+    ) -> list[str]:
+        clean = str(text or "").strip()
+        if not clean:
+            return []
+        chars_per_tok = max(len(clean) / max(glm_token_count(clean), 1), 1.0)
+        target_chars = max(512, int(target_chunk_tokens * chars_per_tok))
+        out: list[str] = []
+        start = 0
+        length = len(clean)
+        while start < length:
+            end = min(length, start + target_chars)
+            if end < length:
+                window = clean[start:end]
+                breakpoints = [
+                    window.rfind("\n\n"),
+                    window.rfind("\n"),
+                    window.rfind("    "),
+                    window.rfind("\t"),
+                    window.rfind(" "),
+                ]
+                best_break = max(breakpoints)
+                if best_break > max(256, target_chars // 3):
+                    end = start + best_break
+            piece = clean[start:end].strip()
+            if piece:
+                out.append(piece)
+            start = max(end, start + 1)
+            while start < length and clean[start].isspace():
+                start += 1
+        return out
+
+    @classmethod
+    def _pack_attachment_chunks(
+        cls,
+        segments: list[str],
+        *,
+        target_chunk_tokens: int,
+    ) -> list[str]:
+        packed: list[str] = []
+        current: list[str] = []
+
+        def flush_current() -> None:
+            if not current:
+                return
+            block = "\n\n".join(current).strip()
+            current.clear()
+            if block:
+                packed.append(block)
+
+        for segment in segments:
+            piece = str(segment or "").strip()
+            if not piece:
+                continue
+            piece_tokens = glm_token_count(piece)
+            if piece_tokens > target_chunk_tokens:
+                flush_current()
+                packed.extend(
+                    cls._hard_wrap_attachment_text(
+                        piece,
+                        target_chunk_tokens=target_chunk_tokens,
+                    )
+                )
+                continue
+            if not current:
+                current.append(piece)
+                continue
+            candidate = "\n\n".join([*current, piece]).strip()
+            if glm_token_count(candidate) <= target_chunk_tokens:
+                current.append(piece)
+                continue
+            flush_current()
+            current.append(piece)
+        flush_current()
+        return packed
+
+    @classmethod
+    def _chunk_text_by_tokens(
+        cls,
+        text: str,
+        *,
+        min_chunk_tokens: Optional[int] = None,
+        max_chunks: Optional[int] = None,
+    ) -> Tuple[List[str], int, int, float, int]:
+        clean = str(text or "").strip()
+        if not clean:
+            return [], 0, 0, 0.0, 0
         total_tokens = glm_token_count(clean)
-        target_chunk_tokens = max(
-            cls.ATTACHMENT_CHUNK_TOKENS,
-            total_tokens // cls.ATTACHMENT_MAX_CHUNKS,
-        )
+        chunk_floor = max(1, int(min_chunk_tokens or cls.ATTACHMENT_CHUNK_TOKENS))
+        chunk_limit = max(1, int(max_chunks or cls.ATTACHMENT_MAX_CHUNKS))
+        target_chunk_tokens = max(chunk_floor, total_tokens // chunk_limit)
         chars_per_tok = len(clean) / max(total_tokens, 1)
         chunk_char_target = max(1, int(target_chunk_tokens * chars_per_tok))
-
-        paragraphs = clean.split("\n\n")
-        chunks: list[str] = []
-        current_chunk: list[str] = []
-        current_len = 0
-        for para in paragraphs:
-            para_len = len(para)
-            if current_len + para_len + 2 > chunk_char_target and current_chunk:
-                chunks.append("\n\n".join(current_chunk))
-                current_chunk = [para]
-                current_len = para_len
-            else:
-                current_chunk.append(para)
-                current_len += para_len + 2
-        if current_chunk:
-            chunks.append("\n\n".join(current_chunk))
-        return len(chunks)
+        blocks = cls._split_attachment_structural_blocks(clean)
+        chunks = cls._pack_attachment_chunks(
+            blocks,
+            target_chunk_tokens=target_chunk_tokens,
+        )
+        if not chunks:
+            chunks = cls._hard_wrap_attachment_text(
+                clean,
+                target_chunk_tokens=target_chunk_tokens,
+            )
+        return chunks, total_tokens, target_chunk_tokens, chars_per_tok, chunk_char_target
 
     @classmethod
     def _attachment_setup_length_error(cls, text: str) -> str | None:
-        chunk_count = cls._estimate_attachment_chunk_count(text)
-        if chunk_count >= cls.ATTACHMENT_MIN_SETUP_CHUNKS:
-            return None
-        token_count = glm_token_count(str(text or ""))
-        min_tokens = cls.ATTACHMENT_CHUNK_TOKENS * cls.ATTACHMENT_MIN_SETUP_CHUNKS
-        return (
-            "Uploaded text is too short for setup ingestion "
-            f"({chunk_count}/{cls.ATTACHMENT_MIN_SETUP_CHUNKS} chunks, ~{token_count} tokens). "
-            f"Please upload a longer `.txt` file (about {min_tokens}+ tokens / "
-            f"{cls.ATTACHMENT_MIN_SETUP_CHUNKS}+ sections)."
-        )
+        # Short setup attachments are accepted; no minimum chunk threshold.
+        return None
 
-    async def _summarise_long_text(self, text: str, ctx_message=None, channel=None) -> str:
+    @classmethod
+    def _source_material_prompt_payload(cls, campaign_id: str) -> Dict[str, object]:
+        docs = SourceMaterialMemory.list_source_material_documents(
+            str(campaign_id),
+            limit=cls.SOURCE_MATERIAL_MAX_DOCS_IN_PROMPT,
+        )
+        total_chunk_count = 0
+        compact_docs = []
+        for row in docs:
+            try:
+                chunk_count = int(row.get("chunk_count") or 0)
+            except (TypeError, ValueError):
+                chunk_count = 0
+            total_chunk_count += chunk_count
+            source_format = cls._source_material_format_heuristic(
+                str(row.get("sample_chunk") or "")
+            )
+            compact_docs.append(
+                {
+                    "document_key": str(row.get("document_key") or ""),
+                    "document_label": str(row.get("document_label") or ""),
+                    "chunk_count": chunk_count,
+                    "format": source_format,
+                }
+            )
+        return {
+            "available": bool(compact_docs),
+            "document_count": len(compact_docs),
+            "chunk_count": total_chunk_count,
+            "docs": compact_docs,
+        }
+
+    async def _summarise_long_text(
+        self,
+        text: str,
+        ctx_message=None,
+        channel=None,
+        summary_instructions: str | None = None,
+    ) -> str:
         if not text:
             return ""
         if self._attachment_processor is None:
@@ -1516,6 +2061,7 @@ class ZorkEmulator:
         summary = await self._attachment_processor.summarise_long_text(
             text,
             progress=_progress if progress_channel is not None else None,
+            summary_instructions=summary_instructions,
         )
         if status_message is not None and hasattr(status_message, "delete"):
             try:
@@ -1606,6 +2152,9 @@ class ZorkEmulator:
         attachment_text: str | None = None,
         attachment_summary: str | None = None,
         on_rails: bool = False,
+        use_imdb: bool | None = None,
+        attachment_summary_instructions: str | None = None,
+        ingest_source_material: bool = True,
     ) -> str:
         # Legacy compatibility: start_campaign_setup(campaign, raw_name, attachment_summary=...)
         if isinstance(campaign_id, Campaign):
@@ -1622,14 +2171,21 @@ class ZorkEmulator:
             actor_id = "system"
         if attachment_text is None and attachment_summary is not None:
             attachment_text = attachment_summary
+        effective_use_imdb = (
+            bool(use_imdb) if isinstance(use_imdb, bool) else False
+        )
 
         with self._session_factory() as session:
             campaign = session.get(Campaign, campaign_id)
             if campaign is None:
                 return "Campaign not found."
             state = parse_json_dict(campaign.state_json)
-            imdb_results = self._imdb_search(raw_name, max_results=3)
-            imdb_text = self._format_imdb_results(imdb_results)
+            if not effective_use_imdb:
+                imdb_results = []
+                imdb_text = ""
+            else:
+                imdb_results = self._imdb_search(raw_name, max_results=3)
+                imdb_text = self._format_imdb_results(imdb_results)
 
             imdb_context = ""
             if imdb_text:
@@ -1683,7 +2239,7 @@ class ZorkEmulator:
                 work_desc = result.get("work_description") or ""
                 suggested = result.get("suggested_title") or raw_name
 
-            if not is_known and imdb_results:
+            if effective_use_imdb and not is_known and imdb_results:
                 top = imdb_results[0]
                 top = self._imdb_enrich_results([top])[0]
                 is_known = True
@@ -1702,13 +2258,51 @@ class ZorkEmulator:
                 "is_known_work": is_known,
                 "work_type": work_type,
                 "work_description": work_desc,
-                "imdb_results": imdb_results or [],
+                "imdb_results": (imdb_results or []) if effective_use_imdb else [],
+                "use_imdb": effective_use_imdb,
+                "imdb_opt_in_explicit": bool(use_imdb is True),
                 "requested_by": actor_id,
                 "on_rails_requested": bool(on_rails),
                 "default_persona": await self.generate_campaign_persona(raw_name),
             }
             if attachment_text:
                 setup_data["attachment_summary"] = attachment_text
+            if attachment_summary_instructions:
+                setup_data["attachment_summary_instructions"] = str(
+                    attachment_summary_instructions
+                )[:600]
+            if attachment_text and ingest_source_material:
+                try:
+                    source_chunks, _, _, _, _ = self._chunk_text_by_tokens(
+                        attachment_text
+                    )
+                    if source_chunks:
+                        classification_chunk = source_chunks[0]
+                        try:
+                            source_format = await self._classify_source_material_format(
+                                classification_chunk
+                            )
+                        except Exception as exc:
+                            self._logger.warning(
+                                "Source material classification crashed during setup; defaulting generic: %s",
+                                exc,
+                            )
+                            source_format = self.SOURCE_MATERIAL_FORMAT_GENERIC
+                        source_format = self._normalize_source_material_format(source_format)
+                        stored_count, source_key = self.ingest_source_material_text(
+                            str(campaign.id),
+                            document_label=str(raw_name or "source-material"),
+                            text=attachment_text,
+                            source_format=source_format,
+                            replace_document=True,
+                        )
+                        if stored_count > 0:
+                            setup_data["source_material_document_key"] = source_key
+                except Exception:
+                    self._logger.exception(
+                        "Start setup source-material indexing failed for campaign %s",
+                        campaign.id,
+                    )
 
             state["setup_phase"] = "classify_confirm"
             state["setup_data"] = setup_data
@@ -1716,16 +2310,22 @@ class ZorkEmulator:
             campaign.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
             session.commit()
         if is_known:
-            return (
+            msg = (
                 f"I recognize **{setup_data['raw_name']}** as a known {work_type or 'work'}.\n"
                 f"_{work_desc}_\n\n"
                 "Is this correct? Reply **yes** to confirm, or tell me what it actually is."
             )
-        return (
+        else:
+            msg = (
             f"I don't recognize **{raw_name}** as a known published work. "
             "I'll treat it as an original setting.\n\n"
             "Is this correct? Reply **yes** to confirm, or tell me what it actually is."
-        )
+            )
+        if attachment_text:
+            msg += (
+                "\n\nAttached source text was loaded and will be used during setup generation."
+            )
+        return msg
 
     async def handle_setup_message(
         self,
@@ -1774,6 +2374,13 @@ class ZorkEmulator:
                     setup_data,
                     clean_text,
                     attachments=attachments,
+                )
+            elif phase == "genre_pick":
+                result = await self._setup_handle_genre_pick(
+                    campaign,
+                    state,
+                    setup_data,
+                    clean_text,
                 )
             elif phase == "storyline_pick":
                 result = await self._setup_handle_storyline_pick(
@@ -1865,6 +2472,354 @@ class ZorkEmulator:
         except Exception:
             return base
 
+    async def _setup_tool_loop(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        campaign: Campaign,
+        *,
+        temperature: float = 0.8,
+        max_tokens: int = 3000,
+        max_tool_steps: int = 6,
+        final_response_instruction: str = "Return your final JSON now.",
+    ) -> str:
+        """Run a lightweight tool loop for setup LLM calls.
+
+        Supports ``source_browse``, ``memory_search`` (source-scoped), and
+        ``name_generate`` so the model can inspect ingested source material
+        before producing its final JSON response.  Returns the raw final
+        response string.
+        """
+        if self._completion_port is None:
+            return "{}"
+        augmented_prompt = user_prompt
+
+        for _step in range(max_tool_steps + 1):
+            response = await self._completion_port.complete(
+                system_prompt,
+                augmented_prompt,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+            if not response:
+                return "{}"
+            response = self._clean_response(response)
+            json_text = self._extract_json(response)
+            if not json_text:
+                return response
+            try:
+                payload = self._parse_json_lenient(json_text)
+            except Exception:
+                return response
+            if not self._is_tool_call(payload):
+                return response
+
+            tool_name = str(payload.get("tool_call") or "").strip()
+            tool_result = ""
+
+            if tool_name == "source_browse":
+                doc_key = str(payload.get("document_key") or "").strip()[:120]
+                wildcard_raw = payload.get("wildcard")
+                wildcard = (
+                    str(wildcard_raw).strip()[:120]
+                    if wildcard_raw is not None
+                    else ""
+                )
+                wildcard_provided = bool(wildcard)
+                wildcard = wildcard or "%"
+                wildcard_meta = f"wildcard={wildcard!r}"
+                if not wildcard_provided:
+                    wildcard_meta = "wildcard=(omitted)"
+                limit = 255
+                try:
+                    limit = max(1, min(255, int(payload.get("limit") or 255)))
+                except (TypeError, ValueError):
+                    pass
+                lines = SourceMaterialMemory.browse_source_keys(
+                    str(campaign.id),
+                    document_key=doc_key or None,
+                    wildcard=wildcard,
+                    limit=limit,
+                )
+                if lines:
+                    tool_result = (
+                        f"SOURCE_BROWSE_RESULT "
+                        f"(document_key={doc_key or '*'!r}, "
+                        f"{wildcard_meta}, "
+                        f"showing {len(lines)}):\n"
+                        + "\n".join(lines)
+                    )
+                else:
+                    tool_result = (
+                        f"SOURCE_BROWSE_RESULT "
+                        f"(document_key={doc_key or '*'!r}, "
+                        f"{wildcard_meta}): no entries found"
+                    )
+
+            elif tool_name == "memory_search":
+                raw_queries = payload.get("queries") or []
+                if not raw_queries:
+                    legacy = str(payload.get("query") or "").strip()
+                    if legacy:
+                        raw_queries = [legacy]
+                queries = [
+                    str(q).strip()[:200]
+                    for q in (raw_queries if isinstance(raw_queries, list) else [raw_queries])
+                    if str(q or "").strip()
+                ][:6]
+                category = str(payload.get("category") or "source").strip()
+                if not category.startswith("source"):
+                    category = "source"
+                doc_key_scope = None
+                if category.startswith("source:"):
+                    doc_key_scope = category.split(":", 1)[1].strip() or None
+                before_lines = 0
+                after_lines = 0
+                try:
+                    before_lines = max(0, min(10, int(payload.get("before_lines") or 0)))
+                except (TypeError, ValueError):
+                    pass
+                try:
+                    after_lines = max(0, min(10, int(payload.get("after_lines") or 0)))
+                except (TypeError, ValueError):
+                    pass
+                hits: list[str] = []
+                for q in queries:
+                    results = SourceMaterialMemory.search_source_material(
+                        q,
+                        str(campaign.id),
+                        document_key=doc_key_scope,
+                        top_k=5,
+                        before_lines=before_lines,
+                        after_lines=after_lines,
+                    )
+                    for doc_k, doc_l, idx, text, score in results:
+                        if score >= 0.35:
+                            hits.append(f"[{doc_k}#{idx} score={score:.2f}] {text}")
+                if hits:
+                    tool_result = (
+                        "SOURCE_SEARCH_RESULT:\n" + "\n".join(hits[:20])
+                    )
+                else:
+                    tool_result = "SOURCE_SEARCH_RESULT: no relevant hits"
+
+            elif tool_name == "name_generate":
+                raw_origins = payload.get("origins") or []
+                if isinstance(raw_origins, str):
+                    raw_origins = [raw_origins]
+                origins = [
+                    str(o).strip().lower()
+                    for o in raw_origins
+                    if str(o or "").strip()
+                ][:4]
+                ng_gender = str(payload.get("gender") or "both").strip().lower()
+                ng_count = 5
+                try:
+                    ng_count = max(1, min(6, int(payload.get("count") or 5)))
+                except (TypeError, ValueError):
+                    pass
+                ng_context = str(payload.get("context") or "").strip()[:300]
+                names = self._fetch_random_names(
+                    origins=origins or None,
+                    gender=ng_gender,
+                    count=ng_count,
+                )
+                if names:
+                    tool_result = (
+                        f"NAME_GENERATE_RESULT "
+                        f"(origins={origins or 'any'}, gender={ng_gender}):\n"
+                        + "\n".join(f"- {n}" for n in names)
+                    )
+                    if ng_context:
+                        tool_result += f"\nEvaluate against: {ng_context}"
+                    tool_result += (
+                        "\nPick the best fit or call name_generate again "
+                        "with different origins/gender."
+                    )
+                else:
+                    tool_result = (
+                        f"NAME_GENERATE_RESULT (origins={origins or 'any'}): "
+                        "no names returned — try broader origins."
+                    )
+
+            else:
+                tool_result = (
+                    f"UNKNOWN_TOOL: '{tool_name}' is not available during setup. "
+                    "Available tools: source_browse, memory_search, name_generate. "
+                    f"{final_response_instruction}"
+                )
+
+            self._zork_log(
+                f"SETUP TOOL LOOP step={_step} tool={tool_name}",
+                tool_result[:2000],
+            )
+            augmented_prompt = f"{augmented_prompt}\n{tool_result}\n"
+
+        # Exhausted steps — force final response.
+        augmented_prompt = (
+            f"{augmented_prompt}\n"
+            f"TOOL_CHAIN_LIMIT: Stop calling tools. {final_response_instruction}\n"
+        )
+        response = await self._completion_port.complete(
+            system_prompt, augmented_prompt, temperature=temperature, max_tokens=max_tokens
+        )
+        return self._clean_response(response or "{}")
+
+    def _normalize_generated_rulebook_lines(self, raw_text: str) -> list[str]:
+        entries: list[str] = []
+        current = ""
+        for raw_line in str(raw_text or "").splitlines():
+            line = " ".join(str(raw_line or "").strip().split())
+            if not line:
+                continue
+            if line.startswith("```"):
+                continue
+            if re.fullmatch(r"[=\-_*#\s]{3,}", line):
+                continue
+            if re.match(r"^[A-Z][A-Z0-9-]{1,80}:\s*\S", line):
+                if current:
+                    entries.append(current)
+                current = line
+                continue
+            if current:
+                current = f"{current} {line}".strip()
+        if current:
+            entries.append(current)
+        cleaned: list[str] = []
+        for entry in entries:
+            compact = re.sub(r"\s+", " ", str(entry or "")).strip()
+            if re.match(r"^[A-Z][A-Z0-9-]{1,80}:\s+\S", compact):
+                cleaned.append(compact[:8000])
+        return cleaned
+
+    def _auto_rulebook_source_index_hint(self, source_payload: dict[str, Any]) -> str:
+        if not source_payload.get("available"):
+            return ""
+        doc_lines = []
+        for doc in source_payload.get("docs") or []:
+            if str(doc.get("document_label") or "") == self.AUTO_RULEBOOK_DOCUMENT_LABEL:
+                continue
+            doc_lines.append(
+                f"  - document_key='{doc.get('document_key')}' "
+                f"label='{doc.get('document_label')}' "
+                f"format='{doc.get('format')}' "
+                f"snippets={doc.get('chunk_count')}"
+            )
+        if not doc_lines:
+            return ""
+        return (
+            "\nEXISTING_SOURCE_INDEX:\n"
+            + "\n".join(doc_lines)
+            + "\nIf you need canonical facts from these source docs, inspect them before writing the rulebook.\n"
+            "Start by enumerating keys with:\n"
+            '  {"tool_call": "source_browse"}\n'
+            "Then query specific facts with:\n"
+            '  {"tool_call": "memory_search", "category": "source", "queries": ["keyword"]}\n'
+        )
+
+    async def _generate_campaign_rulebook(
+        self,
+        campaign: Campaign,
+        setup_data: dict[str, Any],
+        chosen: dict[str, Any],
+        world: dict[str, Any],
+    ) -> tuple[int, str]:
+        if self._completion_port is None:
+            return 0, ""
+        attachment_summary = str(setup_data.get("attachment_summary") or "").strip()
+        source_payload = self._source_material_prompt_payload(str(campaign.id))
+        source_index_hint = self._auto_rulebook_source_index_hint(source_payload)
+        source_tool_instructions = ""
+        if source_index_hint:
+            source_tool_instructions = (
+                "\nYou may inspect existing source material before writing the new rulebook.\n"
+                "To list all keys in available docs:\n"
+                '  {"tool_call": "source_browse"}\n'
+                "To browse one doc:\n"
+                '  {"tool_call": "source_browse", "document_key": "doc-key"}\n'
+                "To filter keys by wildcard:\n"
+                '  {"tool_call": "source_browse", "document_key": "doc-key", "wildcard": "char-*"}\n'
+                "To semantic-search source material:\n"
+                '  {"tool_call": "memory_search", "category": "source", "queries": ["query1", "query2"]}\n'
+                "To call a tool, return ONLY the JSON tool_call object. Otherwise return ONLY the final rulebook text.\n"
+            )
+
+        genre_context = ""
+        genre_pref = setup_data.get("genre_preference")
+        if isinstance(genre_pref, dict):
+            genre_value = str(genre_pref.get("value") or "").strip()
+            if genre_value:
+                genre_context = f"\nGenre direction: {genre_value}\n"
+
+        system_prompt = (
+            "You convert campaign setup material into a retrievable rulebook for an interactive text adventure.\n"
+            "Output ONLY plain text rulebook lines. No markdown. No headers. No bullets. No numbering.\n"
+            "Every output line must be fully self-contained and independently retrievable.\n"
+            "Format every line exactly as CATEGORY-TAG: fact text\n"
+            "Each line should usually be 50-200 words.\n"
+            "Convert story summaries, plot chapters, character notes, and attachment prose into reusable rules and facts.\n"
+            "Do not write scripts or scene transcripts. Do not rely on adjacent lines for context.\n"
+            "Use these category families when relevant: TONE, SCENE, SETTING, CHAR, PLOT, INTERACTION, GM-RULE, and venue-specific tags such as BLUE-ROOM or RED-ROOM.\n"
+            "Required coverage:\n"
+            "- TONE, TONE-RULES, SCENE-OPENING, SETTING-[MAIN]\n"
+            "- For each named character: CHAR-[NAME], CHAR-[NAME]-PERSONALITY, CHAR-[NAME]-DIALOGUE\n"
+            "- For each important plotline: PLOT-[SHORTNAME]\n"
+            "- For major cast first impressions: INTERACTION-NEWCOMER-[NAME]\n"
+            "- GM-RULE-NO-RAILROADING, GM-RULE-[GENRE]-FIRST, GM-RULE-CHARACTERS-FIRST, GM-RULE-PACING, GM-RULE-NAMES, GM-RULE-NO-RECYCLING-NAMES, GM-RULE-ENSEMBLE, GM-RULE-DIALOGUE-OVER-DESCRIPTION, GM-RULE-ALTERNATIVES\n"
+            "If the setting involves intimacy, vulnerability, or explicit consent norms, include TONE-CONSENT and GM-RULE-CONSENT-ENFORCEMENT.\n"
+            "If the setting has money, rooms, rentals, or prices, include GM-RULE-MONEY.\n"
+            "Dialogue lines must show distinct voice. Running jokes, recurring habits, venue rules, and notable recurring objects should become separate retrievable facts when important.\n"
+            "Avoid generic AI-default names for any new characters. Ban list: Morgan, Kai, River, Sage, Quinn, Riley, Jordan, Avery, Harper, Rowan, Blake, Skyler, Ash, Nova, Zara, Milo, Ezra, Luna; surnames: Chen, Mendoza, Nakamura, Patel, Rollins, Kim, Santos, Okafor, Volkov, Johansson, Delacroix, Venn, Sands, Kade, Park.\n"
+            "Preserve player agency, kindness, and genre tone. Unless the genre explicitly demands otherwise, do not invent trauma hooks or coercive plot pressure.\n"
+            f"{source_tool_instructions}"
+        )
+        user_prompt = (
+            f"Generate a rulebook for campaign '{setup_data.get('raw_name') or campaign.name}'.\n"
+            f"{genre_context}"
+            f"{source_index_hint}"
+            "Use the chosen storyline, expanded world JSON, and any detailed attachment summary below.\n"
+            "If the attachment summary is a story-generator prompt or setup note, translate it into concise retrievable rulebook facts instead of copying it as prose.\n"
+            "If existing source docs contain canonical facts, merge them faithfully into this synthesized rulebook.\n\n"
+            f"Chosen storyline:\n{self._dump_json(chosen)}\n\n"
+            f"Expanded world JSON:\n{self._dump_json(world)}\n\n"
+            f"Detailed attachment summary:\n{attachment_summary or '(none)'}\n"
+        )
+        self._zork_log(
+            f"SETUP RULEBOOK GENERATION campaign={campaign.id}",
+            f"--- SYSTEM ---\n{system_prompt}\n--- USER ---\n{user_prompt}",
+        )
+        try:
+            response = await self._setup_tool_loop(
+                system_prompt,
+                user_prompt,
+                campaign,
+                temperature=0.5,
+                max_tokens=self.AUTO_RULEBOOK_MAX_TOKENS,
+                final_response_instruction="Return your final rulebook text now.",
+            )
+        except Exception as exc:
+            self._logger.warning("Campaign rulebook generation failed: %s", exc)
+            self._zork_log("SETUP RULEBOOK GENERATION FAILED", str(exc))
+            return 0, ""
+        self._zork_log("SETUP RULEBOOK RAW RESPONSE", response or "(empty)")
+        normalized_lines = self._normalize_generated_rulebook_lines(response or "")
+        if not normalized_lines:
+            return 0, ""
+        stored_count, document_key = self.ingest_source_material_text(
+            str(campaign.id),
+            document_label=self.AUTO_RULEBOOK_DOCUMENT_LABEL,
+            text="\n".join(normalized_lines),
+            source_format=self.SOURCE_MATERIAL_FORMAT_RULEBOOK,
+            replace_document=True,
+        )
+        if stored_count <= 0:
+            self._zork_log(
+                "SETUP RULEBOOK INGEST FAILED",
+                f"document_key={document_key!r}",
+            )
+            return 0, ""
+        return len(normalized_lines), document_key
+
     async def _setup_generate_storyline_variants(
         self,
         campaign: Campaign,
@@ -1880,10 +2835,104 @@ class ZorkEmulator:
             imdb_results = []
         attachment_summary = str(setup_data.get("attachment_summary") or "").strip()
 
+        # Build source material index hint if docs are available.
+        source_payload = self._source_material_prompt_payload(str(campaign.id))
+        source_index_hint = ""
+        if source_payload.get("available"):
+            docs = source_payload.get("docs") or []
+            doc_formats = {
+                str(doc.get("format") or "generic").strip().lower() for doc in docs
+            }
+            has_rulebook = "rulebook" in doc_formats
+            doc_lines = []
+            for doc in docs:
+                doc_lines.append(
+                    f"  - document_key='{doc.get('document_key')}' "
+                    f"label='{doc.get('document_label')}' "
+                    f"format='{doc.get('format')}' "
+                    f"snippets={doc.get('chunk_count')}"
+                )
+            browse_instruction = (
+                "  Start by enumerating source keys so you know what is available:"
+                "\n  {\"tool_call\": \"source_browse\"}\n"
+                "  Then query only what you need with memory_search.\n"
+            )
+            if has_rulebook:
+                browse_instruction = (
+                    "  Mandatory first step (before any semantic search):"
+                    "\n  {\"tool_call\": \"source_browse\"}\n"
+                    "  (omit wildcard/document filters on this first pass to list all keys).\n"
+                )
+            source_index_hint = (
+                "\nSOURCE_MATERIAL_INDEX: "
+                f"{source_payload.get('document_count')} document(s), "
+                f"{source_payload.get('chunk_count')} total snippet(s).\n"
+                + "\n".join(doc_lines)
+                + "\nIMPORTANT: Before generating variants, browse the source material to understand "
+                "characters, locations, tone, and rules.\n"
+                + browse_instruction
+                + "Then drill into specific entries with:\n"
+                '  {"tool_call": "memory_search", "category": "source", "queries": ["keyword"]}\n'
+                "Only return your final variants JSON after you have reviewed the source material.\n"
+                "If any source document is rulebook-formatted, do not skip source_browse for keys.\n"
+            )
+
+        name_tool_instructions = (
+            "\nYou have a name_generate tool for culturally-appropriate character names.\n"
+            "To generate names filtered by origin:\n"
+            '  {"tool_call": "name_generate", "origins": ["italian"], "gender": "f", "context": "tough bouncer"}\n'
+            "To call a tool, return ONLY the JSON tool_call object (no other keys). "
+            "You will receive the results and can call more tools or return your final response.\n"
+            "Use name_generate for ALL new original characters instead of inventing names.\n"
+        )
+        source_tool_instructions = name_tool_instructions
+        if source_payload.get("available"):
+            docs = source_payload.get("docs") or []
+            has_only_generic = all(
+                str(doc.get("format") or "generic").strip().lower() == "generic"
+                for doc in docs
+            )
+            if has_only_generic:
+                source_tool_instructions = (
+                    "\nYou have tools for source-material exploration, but this source material "
+                    "is currently classified as generic and already summarized in attachment text.\n"
+                    "Only call source tools when you need exact wording beyond the summary:\n"
+                    '  {"tool_call": "memory_search", "category": "source", "queries": ["keyword"]}\n'
+                    "To generate culturally-appropriate character names:\n"
+                    '  {"tool_call": "name_generate", "origins": ["italian"], "gender": "f", "context": "tough bouncer"}\n'
+                    "To call a tool, return ONLY the JSON tool_call object (no other keys). "
+                    "You will receive the results and can call more tools or return your final response.\n"
+                    "Use name_generate for ALL new original characters instead of inventing names.\n"
+                )
+            else:
+                source_tool_instructions = (
+                    "\nYou have tools to inspect ingested source material before generating your response.\n"
+                    "MANDATORY: first, enumerate keys before semantic search:\n"
+                    '  {"tool_call": "source_browse"}\n'
+                    "(omit wildcard on first pass; do not filter yet).\n"
+                    "If you need one document only:\n"
+                    '  {"tool_call": "source_browse", "document_key": "doc-key"}\n'
+                    "After browsing, drill into specifics:\n"
+                    '  {"tool_call": "memory_search", "category": "source", "queries": ["query1", "query2"]}\n'
+                    "To filter entries by wildcard only after initial listing:\n"
+                    '  {"tool_call": "source_browse", "wildcard": "keyword*"}\n'
+                    "To generate culturally-appropriate character names:\n"
+                    '  {"tool_call": "name_generate", "origins": ["italian"], "gender": "f", "context": "tough bouncer"}\n'
+                    "To call a tool, return ONLY the JSON tool_call object (no other keys). "
+                    "You will receive the results and can call more tools or return your final response.\n"
+                    "ALWAYS browse source material before generating variants — "
+                    "the summary alone may not capture all characters, rules, or locations.\n"
+                    "Use name_generate for ALL new original characters instead of inventing names.\n"
+                )
+
         variants: list[dict[str, Any]] = []
+        result: dict[str, Any] = {}
         if self._completion_port is not None:
             system_prompt = (
                 "You are a creative game designer who builds interactive text-adventure campaigns.\n"
+                "For non-canonical/original characters, choose distinctive specific names; avoid generic defaults "
+                "(Morgan, Chen, Mendoza, Rollins, Nakamura, Kai, River) unless source canon requires them.\n"
+                f"{source_tool_instructions}"
                 "Return ONLY valid JSON with key 'variants' containing 2-3 objects.\n"
                 "Each object must include: id, title, summary, main_character, essential_npcs, chapter_outline.\n"
                 "No markdown, no code fences."
@@ -1905,6 +2954,23 @@ class ZorkEmulator:
                     f"{user_guidance}\n"
                     "Follow these instructions closely when designing the variants.\n"
                 )
+            genre_context = ""
+            genre_pref = setup_data.get("genre_preference")
+            if isinstance(genre_pref, dict):
+                genre_value = str(genre_pref.get("value") or "").strip()
+                genre_kind = str(genre_pref.get("kind") or "").strip().lower()
+                if genre_value:
+                    if genre_kind == "custom":
+                        genre_context = (
+                            "\nGenre direction (custom):\n"
+                            f"{genre_value}\n"
+                            "Treat this as a hard style/tone preference while staying coherent.\n"
+                        )
+                    else:
+                        genre_context = (
+                            f"\nGenre direction: {genre_value}\n"
+                            "Prioritize this tone and genre conventions in all variants.\n"
+                        )
 
             if is_known:
                 user_prompt = (
@@ -1913,6 +2979,8 @@ class ZorkEmulator:
                     f"Description: {work_desc}\n"
                     f"{imdb_context}"
                     f"{attachment_context}"
+                    f"{source_index_hint}"
+                    f"{genre_context}"
                     f"{guidance_context}"
                     "Use actual characters, locations, and plot points from the source work."
                 )
@@ -1921,12 +2989,13 @@ class ZorkEmulator:
                     f"Generate 2-3 storyline variants for an original text-adventure campaign "
                     f"called '{raw_name}'.\n"
                     f"{attachment_context}"
+                    f"{source_index_hint}"
+                    f"{genre_context}"
                     f"{guidance_context}"
                     "Each variant should have a different tone, central conflict, or protagonist archetype. "
                     "Be creative and specific with character names and chapter titles."
                 )
 
-            result: dict[str, Any] = {}
             self._zork_log(
                 f"SETUP VARIANT GENERATION campaign={campaign.id}",
                 f"is_known={is_known} raw_name={raw_name!r} work_desc={work_desc!r}\n"
@@ -1937,20 +3006,21 @@ class ZorkEmulator:
                     cur_user = user_prompt
                     if attempt == 1:
                         cur_user = (
-                            f"Generate 2-3 adventure storyline variants for an adult text-adventure "
-                            f"game inspired by '{raw_name}'. All characters are adults. "
-                            "Focus on the setting, survival themes, and exploration.\n"
-                            f"{imdb_context}"
+                            f"{user_prompt}\n\n"
+                            "FORMAT REPAIR: Your previous response was invalid or incomplete JSON. "
+                            "Return ONLY one valid JSON object with key 'variants' and no trailing text."
                         )
-                        self._zork_log(f"SETUP VARIANT RETRY campaign={campaign.id}", cur_user)
-                    response = await self._completion_port.complete(
+                        self._zork_log(
+                            f"SETUP VARIANT RETRY campaign={campaign.id}", cur_user
+                        )
+                    response = await self._setup_tool_loop(
                         system_prompt,
                         cur_user,
+                        campaign,
                         temperature=0.8,
                         max_tokens=3000,
                     )
                     self._zork_log("SETUP VARIANT RAW RESPONSE", response or "(empty)")
-                    response = self._clean_response(response or "{}")
                     json_text = self._extract_json(response)
                     result = self._parse_json_lenient(json_text) if json_text else {}
                     if isinstance(result.get("variants"), list) and result["variants"]:
@@ -2141,6 +3211,48 @@ class ZorkEmulator:
             )
         )
 
+    @classmethod
+    def _setup_genre_prompt(cls) -> str:
+        lines = ["Choose a genre direction before I generate variants:\n"]
+        for idx, (genre, description) in enumerate(cls.SETUP_GENRE_TEMPLATES.items(), 1):
+            lines.append(f"{idx}. **{genre}** — {description}")
+        lines.append(
+            "\nReply with a number or exact genre name.\n"
+            "For custom direction, reply `custom: <your genre description>`."
+        )
+        return "\n".join(lines)
+
+    @classmethod
+    def _parse_setup_genre_choice(
+        cls, content: str
+    ) -> tuple[dict[str, str] | None, str | None]:
+        raw = str(content or "").strip()
+        if not raw:
+            return None, "Please choose a genre."
+
+        genre_keys = list(cls.SETUP_GENRE_TEMPLATES.keys())
+
+        if raw.isdigit():
+            idx = int(raw)
+            if 1 <= idx <= len(genre_keys):
+                genre = genre_keys[idx - 1]
+                return {"kind": "template", "value": genre}, None
+            return None, f"Please choose a number between 1 and {len(genre_keys)}."
+
+        lowered = raw.lower().strip()
+        if lowered.startswith("custom:") or lowered.startswith("other:"):
+            custom = raw.split(":", 1)[1].strip()
+            if len(custom) < 3:
+                return None, "Custom genre is too short. Add a bit more detail."
+            return {"kind": "custom", "value": custom[:200]}, None
+
+        normalized = lowered.replace("_", "-").replace(" ", "-")
+        normalized = re.sub(r"-{2,}", "-", normalized).strip("-")
+        if normalized in cls.SETUP_GENRE_TEMPLATES:
+            return {"kind": "template", "value": normalized}, None
+
+        return {"kind": "custom", "value": raw[:200]}, None
+
     async def _setup_handle_classify_confirm(
         self,
         campaign: Campaign,
@@ -2180,7 +3292,19 @@ class ZorkEmulator:
             else:
                 setup_data["work_description"] = ""
         else:
-            imdb_results = self._imdb_search(answer, max_results=3)
+            use_imdb_cfg = setup_data.get("use_imdb")
+            use_imdb_effective = (
+                bool(use_imdb_cfg)
+                if isinstance(use_imdb_cfg, bool)
+                else False
+            )
+            if not bool(setup_data.get("imdb_opt_in_explicit")):
+                use_imdb_effective = False
+            imdb_results = (
+                []
+                if not use_imdb_effective
+                else self._imdb_search(answer, max_results=3)
+            )
             result = {}
             if self._completion_port is not None:
                 imdb_context = ""
@@ -2212,14 +3336,19 @@ class ZorkEmulator:
             setup_data["work_description"] = result.get("work_description") or ""
             setup_data["raw_name"] = result.get("suggested_title") or answer.strip()
 
-            if not setup_data["is_known_work"] and imdb_results and not novel_intent:
+            if (
+                use_imdb_effective
+                and not setup_data["is_known_work"]
+                and imdb_results
+                and not novel_intent
+            ):
                 top = imdb_results[0]
                 setup_data["is_known_work"] = True
                 setup_data["raw_name"] = top.get("title") or setup_data["raw_name"]
                 setup_data["work_type"] = (str(top.get("type") or "").lower().replace(" ", "_")) or "other"
                 setup_data["work_description"] = str(top.get("description") or setup_data["work_description"] or "")
             confirmed = str(setup_data.get("raw_name") or "").lower()
-            if imdb_results and confirmed:
+            if use_imdb_effective and imdb_results and confirmed:
                 best = None
                 for row in imdb_results:
                     title = str(row.get("title") or "").lower()
@@ -2229,6 +3358,8 @@ class ZorkEmulator:
                 setup_data["imdb_results"] = [best] if best else [imdb_results[0]]
             else:
                 setup_data["imdb_results"] = imdb_results
+            if not use_imdb_effective:
+                setup_data["imdb_results"] = []
             if setup_data.get("imdb_results"):
                 setup_data["imdb_results"] = self._imdb_enrich_results(setup_data["imdb_results"])
                 top = setup_data["imdb_results"][0]
@@ -2236,27 +3367,111 @@ class ZorkEmulator:
                     setup_data["work_description"] = top["description"]
 
         if attachments:
-            extracted = await extract_attachment_text(attachments)
-            if isinstance(extracted, str) and extracted.startswith("ERROR:"):
-                return extracted
-            if extracted:
-                short_msg = self._attachment_setup_length_error(extracted)
-                if short_msg:
-                    setup_data["attachment_notice"] = short_msg
-                else:
-                    summary = await self._summarise_long_text(extracted)
-                    if summary:
-                        setup_data["attachment_summary"] = summary
+            attachment_texts = await extract_attachment_texts(
+                attachments,
+                config=AttachmentProcessingConfig(
+                    attachment_max_bytes=self.ATTACHMENT_MAX_BYTES,
+                    attachment_chunk_tokens=self.ATTACHMENT_CHUNK_TOKENS,
+                    attachment_model_ctx_tokens=self.ATTACHMENT_MODEL_CTX_TOKENS,
+                    attachment_prompt_overhead_tokens=self.ATTACHMENT_PROMPT_OVERHEAD_TOKENS,
+                    attachment_response_reserve_tokens=self.ATTACHMENT_RESPONSE_RESERVE_TOKENS,
+                    attachment_summary_max_tokens=self.ATTACHMENT_SUMMARY_MAX_TOKENS,
+                    attachment_max_parallel=self.ATTACHMENT_MAX_PARALLEL,
+                    attachment_guard_token=self.ATTACHMENT_GUARD_TOKEN,
+                    attachment_max_chunks=self.ATTACHMENT_MAX_CHUNKS,
+                ),
+                logger=self._logger,
+            )
+            summary_parts: list[str] = []
+            if setup_data.get("attachment_summary"):
+                summary_parts.append(str(setup_data.get("attachment_summary")).strip())
+            summary_instructions = str(
+                setup_data.get("attachment_summary_instructions") or ""
+            ).strip()
+            for attachment, extracted in attachment_texts:
+                source_label = self._extract_attachment_label(
+                    [attachment],
+                    fallback=str(setup_data.get("raw_name") or "source-material"),
+                )
+                if isinstance(extracted, str) and extracted.startswith("ERROR:"):
+                    summary_parts.append(f"{source_label}: {extracted}")
+                    continue
+                if not extracted:
+                    continue
+                try:
+                    source_chunks, _, _, _, _ = self._chunk_text_by_tokens(
+                        extracted
+                    )
+                    if source_chunks:
+                        classification_chunk = source_chunks[0]
+                        try:
+                            source_format = await self._classify_source_material_format(
+                                classification_chunk
+                            )
+                        except Exception as exc:
+                            self._logger.warning(
+                                "Setup source material classification failed; defaulting generic: %s",
+                                exc,
+                            )
+                            source_format = self.SOURCE_MATERIAL_FORMAT_GENERIC
+                        source_format = self._normalize_source_material_format(
+                            source_format
+                        )
+                        if source_format == self.SOURCE_MATERIAL_FORMAT_GENERIC:
+                            summary = await self._summarise_long_text(
+                                extracted,
+                                summary_instructions=summary_instructions or None,
+                            )
+                            if summary:
+                                summary_parts.append(f"{source_label}: {summary}")
+                        else:
+                            stored_count, source_key = self.ingest_source_material_text(
+                                str(campaign.id),
+                                document_label=source_label,
+                                text=extracted,
+                                source_format=source_format,
+                                replace_document=True,
+                            )
+                            if stored_count > 0:
+                                setup_data["source_material_document_key"] = source_key
+                except Exception:
+                    self._logger.exception(
+                        "Setup source-material indexing failed for campaign %s",
+                        campaign.id,
+                    )
 
+            summary_value = "\n\n".join(
+                part for part in summary_parts if part and part.strip()
+            ).strip()
+            if summary_value:
+                setup_data["attachment_summary"] = summary_value
+
+        if user_guidance:
+            setup_data["variant_user_guidance"] = user_guidance
+        state["setup_phase"] = "genre_pick"
+        state["setup_data"] = setup_data
+        return self._setup_genre_prompt()
+
+    async def _setup_handle_genre_pick(
+        self,
+        campaign: Campaign,
+        state: dict[str, Any],
+        setup_data: dict[str, Any],
+        message_text: str,
+    ) -> str:
+        genre_pref, error = self._parse_setup_genre_choice(message_text)
+        if error:
+            return f"{error}\n\n{self._setup_genre_prompt()}"
+
+        setup_data["genre_preference"] = genre_pref
+        user_guidance = (
+            str(setup_data.pop("variant_user_guidance", "") or "").strip() or None
+        )
         variants_msg = await self._setup_generate_storyline_variants(
             campaign,
             setup_data,
             user_guidance=user_guidance,
         )
-        attachment_notice = str(setup_data.get("attachment_notice") or "").strip()
-        if attachment_notice:
-            variants_msg = f"{attachment_notice}\n\n{variants_msg}"
-            setup_data.pop("attachment_notice", None)
         state["setup_phase"] = "storyline_pick"
         state["setup_data"] = setup_data
         return variants_msg
@@ -2297,6 +3512,60 @@ class ZorkEmulator:
             novel_prefs = {}
         on_rails = True if is_known else bool(novel_prefs.get("on_rails", False))
 
+        # Build source material index hint if docs are available.
+        source_payload = self._source_material_prompt_payload(str(campaign.id))
+        source_index_hint = ""
+        if source_payload.get("available"):
+            doc_lines = []
+            for doc in source_payload.get("docs") or []:
+                doc_lines.append(
+                    f"  - document_key='{doc.get('document_key')}' "
+                    f"label='{doc.get('document_label')}' "
+                    f"format='{doc.get('format')}' "
+                    f"snippets={doc.get('chunk_count')}"
+                )
+            source_index_hint = (
+                "\nSOURCE_MATERIAL_INDEX: "
+                f"{source_payload.get('document_count')} document(s), "
+                f"{source_payload.get('chunk_count')} total snippet(s).\n"
+                + "\n".join(doc_lines)
+                + "\nIMPORTANT: Before building the world, browse the source material to understand "
+                "characters, locations, tone, and rules. Start by listing all keys:\n"
+                '  {"tool_call": "source_browse"}\n'
+                "Then drill into specific entries with:\n"
+                '  {"tool_call": "memory_search", "category": "source", "queries": ["keyword"]}\n'
+                "Only return your final world JSON after you have reviewed the source material.\n"
+            )
+
+        name_tool_instructions = (
+            "\nYou have a name_generate tool for culturally-appropriate character names.\n"
+            "To generate names filtered by origin:\n"
+            '  {"tool_call": "name_generate", "origins": ["italian"], "gender": "f", "context": "tough bouncer"}\n'
+            "To call a tool, return ONLY the JSON tool_call object (no other keys). "
+            "You will receive the results and can call more tools or return your final response.\n"
+            "Use name_generate for ALL new original characters instead of inventing names.\n"
+        )
+        source_tool_instructions = name_tool_instructions
+        if source_payload.get("available"):
+            source_tool_instructions = (
+                "\nYou have tools to inspect ingested source material before generating your response.\n"
+                "To list all entries in a source document:\n"
+                '  {"tool_call": "source_browse", "document_key": "doc-key"}\n'
+                "To list all entries across all documents:\n"
+                '  {"tool_call": "source_browse"}\n'
+                "To filter entries by wildcard:\n"
+                '  {"tool_call": "source_browse", "wildcard": "keyword*"}\n'
+                "To semantic-search source material:\n"
+                '  {"tool_call": "memory_search", "category": "source", "queries": ["query1", "query2"]}\n'
+                "To generate culturally-appropriate character names:\n"
+                '  {"tool_call": "name_generate", "origins": ["italian"], "gender": "f", "context": "tough bouncer"}\n'
+                "To call a tool, return ONLY the JSON tool_call object (no other keys). "
+                "You will receive the results and can call more tools or return your final response.\n"
+                "ALWAYS browse source material before building the world — "
+                "the summary alone may not capture all characters, rules, or locations.\n"
+                "Use name_generate for ALL new original characters instead of inventing names.\n"
+            )
+
         world: dict[str, Any] = {}
         if self._completion_port is not None:
             imdb_results = setup_data.get("imdb_results", [])
@@ -2313,8 +3582,17 @@ class ZorkEmulator:
                     f"{attachment_summary}\n"
                     "Use this to create an accurate world with faithful characters and locations.\n"
                 )
+            genre_context = ""
+            genre_pref = setup_data.get("genre_preference")
+            if isinstance(genre_pref, dict):
+                genre_value = str(genre_pref.get("value") or "").strip()
+                if genre_value:
+                    genre_context = f"\nGenre direction: {genre_value}\n"
             finalize_system = (
                 "You are a world-builder for interactive text-adventure campaigns.\n"
+                "For non-canonical/original characters, choose distinctive specific names; avoid generic defaults "
+                "(Morgan, Chen, Mendoza, Rollins, Nakamura, Kai, River) unless source canon requires them.\n"
+                f"{source_tool_instructions}"
                 "Return ONLY valid JSON with keys: characters, story_outline, summary, "
                 "start_room, landmarks, setting, tone, default_persona, opening_narration.\n"
                 "No markdown, no code fences."
@@ -2325,6 +3603,8 @@ class ZorkEmulator:
                 f"Description: {setup_data.get('work_description', '')}\n"
                 f"{imdb_context}"
                 f"{attachment_context}"
+                f"{source_index_hint}"
+                f"{genre_context}"
                 f"Chosen storyline:\n{self._dump_json(chosen)}\n\n"
                 "Expand chapter outline into full chapters with 2-4 scenes each."
             )
@@ -2335,15 +3615,19 @@ class ZorkEmulator:
                         cur_user = (
                             f"Build the complete world for an adult text-adventure game inspired by '{raw_name}'.\n"
                             f"{imdb_context}"
+                            f"{attachment_context}"
+                            f"{source_index_hint}"
+                            f"{genre_context}"
+                            "Source-material summary (if present) is authoritative; keep names, locations, and plot faithful to it.\n"
                             f"Chosen storyline:\n{self._dump_json(chosen)}"
                         )
-                    response = await self._completion_port.complete(
+                    response = await self._setup_tool_loop(
                         finalize_system,
                         cur_user,
+                        campaign,
                         temperature=0.7,
                         max_tokens=4000,
                     )
-                    response = self._clean_response(response or "{}")
                     json_text = self._extract_json(response)
                     world = self._parse_json_lenient(json_text) if json_text else {}
                     if world and (world.get("characters") or world.get("start_room")):
@@ -2385,6 +3669,18 @@ class ZorkEmulator:
 
         if summary:
             campaign.summary = self._trim_text(str(summary), self.MAX_SUMMARY_CHARS)
+        auto_rulebook_count = 0
+        auto_rulebook_key = ""
+        try:
+            auto_rulebook_count, auto_rulebook_key = await self._generate_campaign_rulebook(
+                campaign,
+                setup_data,
+                chosen,
+                world if isinstance(world, dict) else {},
+            )
+        except Exception as exc:
+            self._logger.warning("Auto rulebook generation crashed: %s", exc)
+            self._zork_log("SETUP RULEBOOK CRASHED", str(exc))
         state.pop("setup_phase", None)
         state.pop("setup_data", None)
         if isinstance(story_outline, dict):
@@ -2467,6 +3763,11 @@ class ZorkEmulator:
         )
         if campaign.last_narration:
             result_msg += campaign.last_narration
+        self._zork_log(
+            f"CAMPAIGN SETUP FINALIZED campaign={campaign.id}",
+            f"characters={char_count} chapters={chapter_count} on_rails={on_rails} "
+            f"auto_rulebook_lines={auto_rulebook_count} auto_rulebook_key={auto_rulebook_key!r}",
+        )
         return result_msg
 
     def _extract_room_image_url(self, room_image_entry) -> Optional[str]:
@@ -4565,6 +5866,56 @@ class ZorkEmulator:
             campaign.updated_at = row.updated_at
         return True
 
+    @classmethod
+    def normalize_difficulty(cls, value: object) -> str:
+        text = " ".join(str(value or "").strip().lower().split())
+        if text in cls.DIFFICULTY_LEVELS:
+            return text
+        aliases = {
+            "default": "normal",
+            "std": "normal",
+            "story mode": "story",
+            "easy mode": "easy",
+            "medium mode": "medium",
+            "normal mode": "normal",
+            "hard mode": "hard",
+            "impossible mode": "impossible",
+        }
+        return aliases.get(text, "normal")
+
+    def get_difficulty(self, campaign: Campaign | None) -> str:
+        if campaign is None:
+            return "normal"
+        campaign_state = self.get_campaign_state(campaign)
+        return self.normalize_difficulty(campaign_state.get("difficulty", "normal"))
+
+    def set_difficulty(self, campaign: Campaign | None, difficulty: str) -> bool:
+        if campaign is None:
+            return False
+        normalized = self.normalize_difficulty(difficulty)
+        campaign_state = self.get_campaign_state(campaign)
+        campaign_state["difficulty"] = normalized
+        with self._session_factory() as session:
+            row = session.get(Campaign, campaign.id)
+            if row is None:
+                return False
+            row.state_json = self._dump_json(campaign_state)
+            row.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
+            session.commit()
+            campaign.state_json = row.state_json
+            campaign.updated_at = row.updated_at
+        return True
+
+    @classmethod
+    def _difficulty_response_note(cls, difficulty: object) -> str:
+        normalized = cls.normalize_difficulty(difficulty)
+        note = cls.DIFFICULTY_NOTES.get(normalized)
+        if not note:
+            return ""
+        return (
+            f"[SYSTEM NOTE: FOR THIS RESPONSE ONLY: difficulty={normalized}. {note}]"
+        )
+
     def cancel_pending_timer(self, campaign_id: str) -> dict[str, Any] | None:
         ctx_dict = self._pending_timers.pop(campaign_id, None)
         if ctx_dict is None:
@@ -5190,12 +6541,10 @@ class ZorkEmulator:
         return text[:48]
 
     def _build_campaign_suggestion_text(self, namespace: str) -> str:
-        existing = self.list_campaigns(namespace)
-        names = [campaign.name for campaign in existing]
-        if not names:
-            return "No campaigns exist yet."
-        sample = ", ".join(names[:8])
-        return f"Existing campaigns: {sample}"
+        if not self.PRESET_CAMPAIGNS:
+            return "No in-repo campaigns are configured."
+        sample = ", ".join(self.PRESET_CAMPAIGNS.keys())
+        return f"Available campaigns: {sample}"
 
     def _apply_character_updates(
         self,
@@ -6732,6 +8081,46 @@ class ZorkEmulator:
                 _add_name(char_name)
         return names
 
+    @classmethod
+    def _memory_lookup_enabled_for_prompt(
+        cls,
+        summary_text: object,
+        *,
+        source_material_available: bool = False,
+        action_text: object = None,
+    ) -> bool:
+        text = " ".join(str(action_text or "").strip().lower().split())
+        source_lookup_requested = (
+            bool(text)
+            and not bool(re.match(r"\s*\[ooc\b", text, re.IGNORECASE))
+            and any(
+                marker in text
+                for marker in (
+                    "remember",
+                    "recall",
+                    "what happened",
+                    "previously",
+                    "backstory",
+                    "history",
+                    "who is",
+                    "what is",
+                    "according to",
+                    "from the book",
+                    "from source",
+                    "source material",
+                    "canon",
+                    "lore",
+                    "look up",
+                )
+            )
+        )
+        summary_len = len(str(summary_text or "").strip())
+        if summary_len >= cls.MEMORY_LOOKUP_MIN_SUMMARY_CHARS:
+            return True
+        if source_material_available and source_lookup_requested:
+            return True
+        return False
+
     def build_prompt(
         self,
         campaign: Campaign,
@@ -6842,6 +8231,11 @@ class ZorkEmulator:
         )
         game_time = state.get("game_time", {})
         speed_mult = state.get("speed_multiplier", 1.0)
+        difficulty = self.normalize_difficulty(state.get("difficulty", "normal"))
+        difficulty_note = self._difficulty_response_note(difficulty)
+        response_style_note = self.RESPONSE_STYLE_NOTE
+        if difficulty_note:
+            response_style_note = f"{response_style_note}\n{difficulty_note}"
         calendar_state_before = json.dumps(
             state.get("calendar") or [],
             ensure_ascii=True,
@@ -6876,6 +8270,12 @@ class ZorkEmulator:
         currently_attentive = self._build_currently_attentive_players_for_prompt(
             campaign.id
         )
+        source_payload = self._source_material_prompt_payload(campaign.id)
+        memory_lookup_enabled = self._memory_lookup_enabled_for_prompt(
+            summary,
+            source_material_available=bool(source_payload.get("available")),
+            action_text=action,
+        )
 
         active_name = str(player_state.get("character_name") or "").strip()
         action_label = f"PLAYER_ACTION ({active_name.upper()})" if active_name else "PLAYER_ACTION"
@@ -6895,12 +8295,20 @@ class ZorkEmulator:
             f"WORLD_STATE: {self._dump_json(model_state)}\n"
             f"CURRENT_GAME_TIME: {self._dump_json(game_time)}\n"
             f"SPEED_MULTIPLIER: {speed_mult}\n"
+            f"DIFFICULTY: {difficulty}\n"
             f"ATTENTION_WINDOW_SECONDS: {self.ATTENTION_WINDOW_SECONDS}\n"
             f"CURRENTLY_ATTENTIVE_PLAYERS: {self._dump_json(currently_attentive)}\n"
             f"ACTIVE_PLAYER_LOCATION: {self._dump_json(active_location_context)}\n"
             f"CALENDAR: {self._dump_json(calendar_for_prompt)}\n"
             f"CALENDAR_REMINDERS:\n{calendar_reminders}\n"
+            f"MEMORY_LOOKUP_ENABLED: {str(memory_lookup_enabled).lower()}\n"
         )
+        if source_payload.get("available"):
+            user_prompt += (
+                f"SOURCE_MATERIAL_DOCS: {self._dump_json(source_payload.get('docs') or [])}\n"
+                f"SOURCE_MATERIAL_SNIPPET_COUNT: {source_payload.get('chunk_count')}\n"
+                f"SOURCE_MATERIAL_CHUNK_COUNT: {source_payload.get('chunk_count')}\n"
+            )
         if story_context:
             user_prompt += f"STORY_CONTEXT:\n{story_context}\n"
         user_prompt += (
@@ -6908,7 +8316,7 @@ class ZorkEmulator:
             f"PLAYER_CARD: {self._dump_json(player_card)}\n"
             f"PARTY_SNAPSHOT: {self._dump_json(party_snapshot)}\n"
             f"RECENT_TURNS:\n{recent_text}\n"
-            f"{self.RESPONSE_STYLE_NOTE}\n"
+            f"{response_style_note}\n"
             f"{action_label}: {action}\n"
         )
         system_prompt = self.SYSTEM_PROMPT
@@ -6916,7 +8324,11 @@ class ZorkEmulator:
             system_prompt = f"{system_prompt}{self.GUARDRAILS_SYSTEM_PROMPT}"
         if on_rails:
             system_prompt = f"{system_prompt}{self.ON_RAILS_SYSTEM_PROMPT}"
-        system_prompt = f"{system_prompt}{self.MEMORY_TOOL_PROMPT}"
+        if memory_lookup_enabled:
+            system_prompt = f"{system_prompt}{self.MEMORY_TOOL_PROMPT}"
+        else:
+            system_prompt = f"{system_prompt}{self.MEMORY_TOOL_DISABLED_PROMPT}"
+            system_prompt = f"{system_prompt}{self.SMS_TOOL_PROMPT}"
         if state.get("timed_events_enabled", True):
             system_prompt = f"{system_prompt}{self.TIMER_TOOL_PROMPT}"
         if story_context:
@@ -7173,6 +8585,105 @@ class ZorkEmulator:
             )
         except Exception:
             return []
+
+    def list_source_material_documents(
+        self,
+        campaign_id: str,
+        *,
+        limit: int = 20,
+    ) -> list[dict[str, object]]:
+        return SourceMaterialMemory.list_source_material_documents(
+            str(campaign_id),
+            limit=max(1, int(limit)),
+        )
+
+    def browse_source_keys(
+        self,
+        campaign_id: str,
+        *,
+        document_key: str | None = None,
+        wildcard: str = "%",
+        limit: int = 60,
+    ) -> list[str]:
+        return SourceMaterialMemory.browse_source_keys(
+            str(campaign_id),
+            document_key=document_key,
+            wildcard=str(wildcard or "%"),
+            limit=max(1, int(limit)),
+        )
+
+    def ingest_source_material_text(
+        self,
+        campaign_id: str,
+        *,
+        document_label: str,
+        text: str,
+        source_format: str | None = None,
+        replace_document: bool = True,
+    ) -> tuple[int, str]:
+        chunks, _, _, _, _ = self._chunk_text_by_tokens(str(text or ""))
+        if not chunks:
+            return 0, "source-material"
+        try:
+            normalized_format = self._normalize_source_material_format(source_format)
+        except Exception:
+            normalized_format = None
+        if not normalized_format:
+            try:
+                normalized_format = self._source_material_format_heuristic(
+                    str(chunks[0] or "")
+                )
+            except Exception:
+                normalized_format = self.SOURCE_MATERIAL_FORMAT_GENERIC
+        if normalized_format == self.SOURCE_MATERIAL_FORMAT_GENERIC:
+            key = SourceMaterialMemory._normalize_source_document_key(
+                str(document_label or "source-material")
+            )
+            return 0, key
+        source_mode = self._source_material_storage_mode(normalized_format)
+        duplicate_doc = SourceMaterialMemory.find_duplicate_source_material_document(
+            str(campaign_id),
+            chunks=chunks,
+            source_mode=source_mode,
+        )
+        if duplicate_doc:
+            existing_key = str(duplicate_doc.get("document_key") or "").strip() or "source-material"
+            return 0, existing_key
+
+        return SourceMaterialMemory.store_source_material_chunks(
+            str(campaign_id),
+            document_label=str(document_label or "source-material"),
+            chunks=chunks,
+            source_mode=source_mode,
+            replace_document=bool(replace_document),
+        )
+
+    def search_source_material(
+        self,
+        query: str,
+        campaign_id: str,
+        *,
+        document_key: str | None = None,
+        top_k: int = 5,
+        before_lines: int = 0,
+        after_lines: int = 0,
+    ) -> list[tuple[str, str, int, str, float]]:
+        try:
+            before_n = max(0, int(before_lines))
+        except Exception:
+            before_n = 0
+        try:
+            after_n = max(0, int(after_lines))
+        except Exception:
+            after_n = 0
+        return SourceMaterialMemory.search_source_material(
+            query,
+            str(campaign_id),
+            document_key=document_key,
+            top_k=max(1, int(top_k)),
+            before_lines=before_n,
+            after_lines=after_n,
+        )
 
     def list_sms_threads(
         self,

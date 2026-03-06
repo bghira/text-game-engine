@@ -1,4 +1,14 @@
 from .engine import GameEngine
+from ..backends import (
+    BackendTextCompletionPort,
+    ChatMessage,
+    CompletionRequest,
+    CompletionResult,
+    ModelBackend,
+    OllamaBackend,
+    build_backend,
+    build_text_completion_port,
+)
 from .attachments import (
     AttachmentLike,
     AttachmentProcessingConfig,
@@ -14,6 +24,7 @@ from .emulator_ports import (
     TimerEffectsPort,
 )
 from .tokens import glm_token_count
+from .source_material_memory import SourceMaterialMemory
 from .types import (
     GiveItemInstruction,
     LLMTurnOutput,
@@ -26,6 +37,14 @@ from .types import (
 
 __all__ = [
     "GameEngine",
+    "BackendTextCompletionPort",
+    "ChatMessage",
+    "CompletionRequest",
+    "CompletionResult",
+    "ModelBackend",
+    "OllamaBackend",
+    "build_backend",
+    "build_text_completion_port",
     "AttachmentLike",
     "AttachmentProcessingConfig",
     "AttachmentTextProcessor",
@@ -37,6 +56,7 @@ __all__ = [
     "MediaGenerationPort",
     "extract_attachment_text",
     "glm_token_count",
+    "SourceMaterialMemory",
     "GiveItemInstruction",
     "LLMTurnOutput",
     "ResolveTurnInput",
