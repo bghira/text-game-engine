@@ -8,7 +8,7 @@ from sqlalchemy import select
 
 from text_game_engine.core.engine import GameEngine
 from text_game_engine.core.types import GiveItemInstruction, LLMTurnOutput, ResolveTurnInput, TimerInstruction
-from text_game_engine.persistence.sqlalchemy.models import Actor, Campaign, OutboxEvent, Snapshot, Timer, Turn
+from text_game_engine.persistence.sqlalchemy.models import Actor, Campaign, OutboxEvent, Player, Snapshot, Timer, Turn
 
 
 class StubLLM:
@@ -17,6 +17,18 @@ class StubLLM:
 
     async def complete_turn(self, context):
         return self.output
+
+
+class QueueLLM:
+    def __init__(self, outputs: list[LLMTurnOutput]):
+        self.outputs = list(outputs)
+        self.contexts = []
+
+    async def complete_turn(self, context):
+        self.contexts.append(context)
+        if not self.outputs:
+            raise AssertionError("No queued LLM outputs left.")
+        return self.outputs.pop(0)
 
 
 def test_phase_c_cas_conflict_rolls_back_all_writes(
@@ -152,6 +164,280 @@ def test_timer_outbox_includes_interrupt_scope(session_factory, uow_factory, see
             assert outbox is not None
             payload = json.loads(outbox.payload_json or "{}")
             assert payload.get("interrupt_scope") == "local"
+
+    asyncio.run(run_test())
+
+
+def test_recent_turns_visibility_filters_private_and_limited(
+    session_factory,
+    uow_factory,
+    seed_campaign_and_actor,
+):
+    async def run_test():
+        with session_factory() as session:
+            session.add_all(
+                [
+                    Actor(id="actor-2", display_name="Tester Two", kind="human", metadata_json="{}"),
+                    Actor(id="actor-3", display_name="Tester Three", kind="human", metadata_json="{}"),
+                ]
+            )
+            session.commit()
+
+        llm = QueueLLM(
+            [
+                LLMTurnOutput(
+                    narration="A private exchange.",
+                    turn_visibility={"scope": "private"},
+                ),
+                LLMTurnOutput(
+                    narration="A limited aside.",
+                    turn_visibility={
+                        "scope": "limited",
+                        "player_slugs": ["player-actor-2"],
+                    },
+                ),
+                LLMTurnOutput(narration="Observer turn."),
+                LLMTurnOutput(narration="Targeted observer turn."),
+                LLMTurnOutput(narration="Excluded observer turn."),
+            ]
+        )
+        engine = GameEngine(uow_factory=uow_factory, llm=llm)
+
+        await engine.resolve_turn(
+            ResolveTurnInput(
+                campaign_id=seed_campaign_and_actor["campaign_id"],
+                actor_id=seed_campaign_and_actor["actor_id"],
+                action="whisper to myself",
+            )
+        )
+        await engine.resolve_turn(
+            ResolveTurnInput(
+                campaign_id=seed_campaign_and_actor["campaign_id"],
+                actor_id=seed_campaign_and_actor["actor_id"],
+                action="wave actor two over",
+            )
+        )
+        await engine.resolve_turn(
+            ResolveTurnInput(
+                campaign_id=seed_campaign_and_actor["campaign_id"],
+                actor_id="actor-2",
+                action="look around",
+            )
+        )
+        await engine.resolve_turn(
+            ResolveTurnInput(
+                campaign_id=seed_campaign_and_actor["campaign_id"],
+                actor_id="actor-3",
+                action="look around",
+            )
+        )
+        await engine.resolve_turn(
+            ResolveTurnInput(
+                campaign_id=seed_campaign_and_actor["campaign_id"],
+                actor_id=seed_campaign_and_actor["actor_id"],
+                action="recap quietly",
+            )
+        )
+
+        actor2_context = llm.contexts[2]
+        actor3_context = llm.contexts[3]
+        actor1_context = llm.contexts[4]
+
+        actor2_seen = [row["content"] for row in actor2_context.recent_turns]
+        actor3_seen = [row["content"] for row in actor3_context.recent_turns]
+        actor1_seen = [row["content"] for row in actor1_context.recent_turns]
+
+        assert "A private exchange." not in actor2_seen
+        assert "whisper to myself" not in actor2_seen
+        assert "A limited aside." in actor2_seen
+        assert "wave actor two over" in actor2_seen
+
+        assert "A private exchange." not in actor3_seen
+        assert "A limited aside." not in actor3_seen
+        assert "whisper to myself" not in actor3_seen
+        assert "wave actor two over" not in actor3_seen
+
+        assert "A private exchange." in actor1_seen
+        assert "A limited aside." in actor1_seen
+        assert "whisper to myself" in actor1_seen
+        assert "wave actor two over" in actor1_seen
+
+    asyncio.run(run_test())
+
+
+def test_summary_update_only_persists_for_public_turns(
+    session_factory,
+    uow_factory,
+    seed_campaign_and_actor,
+):
+    async def run_test():
+        llm = QueueLLM(
+            [
+                LLMTurnOutput(
+                    narration="A private note.",
+                    summary_update="Private summary should not persist.",
+                    turn_visibility={"scope": "private"},
+                ),
+                LLMTurnOutput(
+                    narration="A limited note.",
+                    summary_update="Limited summary should not persist.",
+                    turn_visibility={
+                        "scope": "limited",
+                        "player_slugs": ["player-actor-2"],
+                    },
+                ),
+                LLMTurnOutput(
+                    narration="A public note.",
+                    summary_update="Public summary should persist.",
+                ),
+            ]
+        )
+        engine = GameEngine(uow_factory=uow_factory, llm=llm)
+
+        await engine.resolve_turn(
+            ResolveTurnInput(
+                campaign_id=seed_campaign_and_actor["campaign_id"],
+                actor_id=seed_campaign_and_actor["actor_id"],
+                action="keep this private",
+            )
+        )
+        await engine.resolve_turn(
+            ResolveTurnInput(
+                campaign_id=seed_campaign_and_actor["campaign_id"],
+                actor_id=seed_campaign_and_actor["actor_id"],
+                action="keep this limited",
+            )
+        )
+        await engine.resolve_turn(
+            ResolveTurnInput(
+                campaign_id=seed_campaign_and_actor["campaign_id"],
+                actor_id=seed_campaign_and_actor["actor_id"],
+                action="say it out loud",
+            )
+        )
+
+        with session_factory() as session:
+            campaign = session.get(Campaign, seed_campaign_and_actor["campaign_id"])
+            assert campaign is not None
+            summary = campaign.summary or ""
+            assert "Private summary should not persist." not in summary
+            assert "Limited summary should not persist." not in summary
+            assert "Public summary should persist." in summary
+
+    asyncio.run(run_test())
+
+
+def test_sms_style_action_is_forced_private_and_redacted_from_player_turn(
+    session_factory,
+    uow_factory,
+    seed_campaign_and_actor,
+):
+    async def run_test():
+        llm = StubLLM(
+            LLMTurnOutput(
+                narration="You send the text.",
+                summary_update="A text was sent.",
+                turn_visibility={"scope": "public"},
+            )
+        )
+        engine = GameEngine(uow_factory=uow_factory, llm=llm)
+
+        result = await engine.resolve_turn(
+            ResolveTurnInput(
+                campaign_id=seed_campaign_and_actor["campaign_id"],
+                actor_id=seed_campaign_and_actor["actor_id"],
+                action='I text Saul "Meet me outside."',
+            )
+        )
+        assert result.status == "ok"
+
+        with session_factory() as session:
+            campaign = session.get(Campaign, seed_campaign_and_actor["campaign_id"])
+            assert campaign is not None
+            assert "A text was sent." not in (campaign.summary or "")
+
+            turns = session.execute(select(Turn).order_by(Turn.id.asc())).scalars().all()
+            assert len(turns) == 1
+            narrator_turn = turns[0]
+            meta = json.loads(narrator_turn.meta_json or "{}")
+            visibility = meta.get("visibility") or {}
+            assert narrator_turn.kind == "narrator"
+            assert visibility.get("scope") == "private"
+            assert visibility.get("location_key") is None
+
+    asyncio.run(run_test())
+
+
+def test_recent_turns_visibility_filters_local_by_location(
+    session_factory,
+    uow_factory,
+    seed_campaign_and_actor,
+):
+    async def run_test():
+        with session_factory() as session:
+            session.add_all(
+                [
+                    Actor(id="actor-2", display_name="Tester Two", kind="human", metadata_json="{}"),
+                    Actor(id="actor-3", display_name="Tester Three", kind="human", metadata_json="{}"),
+                    Player(
+                        campaign_id=seed_campaign_and_actor["campaign_id"],
+                        actor_id=seed_campaign_and_actor["actor_id"],
+                        state_json=json.dumps({"location": "bar"}),
+                    ),
+                    Player(
+                        campaign_id=seed_campaign_and_actor["campaign_id"],
+                        actor_id="actor-2",
+                        state_json=json.dumps({"location": "bar"}),
+                    ),
+                    Player(
+                        campaign_id=seed_campaign_and_actor["campaign_id"],
+                        actor_id="actor-3",
+                        state_json=json.dumps({"location": "street"}),
+                    ),
+                ]
+            )
+            session.commit()
+
+        llm = QueueLLM(
+            [
+                LLMTurnOutput(
+                    narration="A local aside in the bar.",
+                ),
+                LLMTurnOutput(narration="Bar observer turn."),
+                LLMTurnOutput(narration="Street observer turn."),
+            ]
+        )
+        engine = GameEngine(uow_factory=uow_factory, llm=llm)
+
+        await engine.resolve_turn(
+            ResolveTurnInput(
+                campaign_id=seed_campaign_and_actor["campaign_id"],
+                actor_id=seed_campaign_and_actor["actor_id"],
+                action="mutter at the bar",
+            )
+        )
+        await engine.resolve_turn(
+            ResolveTurnInput(
+                campaign_id=seed_campaign_and_actor["campaign_id"],
+                actor_id="actor-2",
+                action="listen nearby",
+            )
+        )
+        await engine.resolve_turn(
+            ResolveTurnInput(
+                campaign_id=seed_campaign_and_actor["campaign_id"],
+                actor_id="actor-3",
+                action="listen from outside",
+            )
+        )
+
+        actor2_seen = [row["content"] for row in llm.contexts[1].recent_turns]
+        actor3_seen = [row["content"] for row in llm.contexts[2].recent_turns]
+
+        assert "A local aside in the bar." in actor2_seen
+        assert "mutter at the bar" in actor2_seen
+        assert "A local aside in the bar." not in actor3_seen
+        assert "mutter at the bar" not in actor3_seen
 
     asyncio.run(run_test())
 

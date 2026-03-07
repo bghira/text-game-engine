@@ -375,6 +375,7 @@ class ZorkEmulator:
         "- summary_update: string (one or two sentences of lasting changes)\n"
         "- xp_awarded: integer (0-10)\n"
         "- player_state_update: object (optional, player state patches)\n"
+        '- turn_visibility: object (optional; who should get this turn in future prompt context. Keys: "scope" ("public"|"private"|"limited"|"local"), "player_slugs" (array of player slugs from PARTY_SNAPSHOT/CURRENTLY_ATTENTIVE_PLAYERS, typically in `player-<actor_id>` form), "npc_slugs" (array of WORLD_CHARACTERS slugs who overheard/noticed), and optional "reason". This changes prompt visibility only; it does NOT change shared world state.)\n'
         "- scene_image_prompt: string (optional; include whenever the visible scene changes in a meaningful way: entering a room, newly visible characters/objects, reveals, or strong visual shifts)\n"
         "- set_timer_delay: integer (optional; 30-300 seconds, see TIMED EVENTS SYSTEM below)\n"
         "- set_timer_event: string (optional; what happens when the timer expires)\n"
@@ -424,7 +425,9 @@ class ZorkEmulator:
         "- Avoid repetitive recap loops: at most one brief callback sentence to prior events, then move the scene forward.\n"
         "- Keep diction plain and direct; prioritize immediate consequences and available choices.\n"
         "- RECENT_TURNS includes turn/time tags like [TURN #N | Day D HH:MM]. Use them to track pacing and chronology.\n"
+        "- RECENT_TURNS is already filtered to what the acting player plausibly knows. Hidden/private turns from other players are omitted.\n"
         "- CURRENTLY_ATTENTIVE_PLAYERS lists players active within ATTENTION_WINDOW_SECONDS. Use it to pace time and scene focus.\n"
+        "- TURN_VISIBILITY_DEFAULT tells you whether this turn should default to public, local, or private context.\n"
         "- If WORLD_SUMMARY is empty, invent a strong starting room and seed the world.\n"
         "- Use player_state_update for player-specific location and status.\n"
         "- Use player_state_update.room_title for a short location title (e.g. 'Penthouse Suite, Escala') whenever location changes.\n"
@@ -467,6 +470,16 @@ class ZorkEmulator:
         "Use the name_generate tool to get real culturally-appropriate names when introducing new NPCs.\n"
         "- PLAYER_CARD.state.character_name is ALWAYS the correct name for this player. Ignore any old names in WORLD_SUMMARY.\n"
         "- For other visible characters, always use the 'name' field from PARTY_SNAPSHOT. Never rename or confuse them.\n"
+        "- TURN VISIBILITY RULES:\n"
+        "  * Use turn_visibility when a turn should not fully enter every other player's RECENT_TURNS context.\n"
+        "  * public: use only for campaign-wide announcements, reminders, alarms, or changes all players should know even outside the room.\n"
+        "  * private: actor-only context.\n"
+        "  * local: default for ordinary in-room action when a concrete location_key/room is present. Players in the same room should retain it in prompt context, but it should not enter global/worldwide recap.\n"
+        "  * limited: only the acting player plus the listed player_slugs should retain the turn in prompt context.\n"
+        "  * Phone/text/SMS activity is private by default to the acting player. If they text or message someone off-scene, use private or limited unless they explicitly show or read it aloud to others.\n"
+        "  * npc_slugs are for overheard/noticed NPC awareness only. They help continuity but do not expose the turn to other players by themselves.\n"
+        "  * If TURN_VISIBILITY_DEFAULT is local, keep routine room-level interaction local unless it clearly becomes public.\n"
+        "  * If TURN_VISIBILITY_DEFAULT is private and nothing in the scene clearly makes the action public, keep it private or limited.\n"
         "- Minimize mechanical text in narration. Do not narrate exits, room_summary, or state changes unless dramatically relevant.\n"
         "- Track location/exits in player_state_update, not in narration prose.\n"
         "- CRITICAL — OTHER PLAYER CHARACTERS ARE OFF-LIMITS:\n"
@@ -591,6 +604,7 @@ class ZorkEmulator:
         "sms_schedule is invisible to players at scheduling time. Do NOT narrate the delayed SMS as already received in the current response.\n"
         "Use a stable contact thread slug for both directions (e.g. always `elizabeth` for Deshawn<->Elizabeth), not per-sender thread names.\n"
         "SMS continuity rule: do NOT leak scene context into SMS content unless the SMS explicitly mentions it.\n"
+        "SMS privacy rule: do NOT leave literal player command lines like 'I text X ...' in narration or shared room context; the SMS log is the canonical record.\n"
         "NPC SMS responses/knowledge must be limited to what that thread and established continuity plausibly reveal.\n"
     )
     MEMORY_TOOL_PROMPT = (
@@ -605,6 +619,7 @@ class ZorkEmulator:
         "- Default behavior: call memory_search first.\n"
         "- If PLAYER_ACTION involves phone/text/call/off-scene contact, use sms_list/sms_read before narrating; "
         "use sms_write when sending or replying. Use sms_schedule for delayed replies.\n"
+        "- Phone/text/SMS turns should normally be private or limited, not local/public, unless the player explicitly shares the content out loud.\n"
         "- CRITICAL SMS RULE: When an NPC replies via text/phone, you MUST call sms_write to record the NPC's reply "
         "BEFORE outputting final narration. Both sides of a conversation must be in the SMS log. "
         "If you narrate an NPC texting back but don't sms_write it, the reply is lost permanently.\n"
@@ -717,31 +732,34 @@ class ZorkEmulator:
         "Set period based on hour: 5-11=morning, 12-16=afternoon, 17-20=evening, 21-4=night.\n\n"
         "You may also return a calendar_update key (object) to manage scheduled events:\n"
         '- "calendar_update": {"add": [...], "remove": [...]} where each add entry is '
-        '{"name": str, "time_remaining": int, "time_unit": "hours"|"days", "description": str, "known_by": [str, ...]} '
+        '{"name": str, "time_remaining": int, "time_unit": "hours"|"days", "description": str, "known_by": [str, ...], "target_player": str|int (optional), "target_players": [str|int, ...] (optional)} '
         "and each remove entry is a string matching an event name.\n"
         "HARNESS BEHAVIOR:\n"
         "- The harness converts add entries into absolute due dates and stores fire_day + fire_hour (the exact in-game deadline).\n"
         "- known_by is optional. If provided, reminders are only injected when at least one known character is in the active scene.\n"
         "- Keep known_by to character names from PARTY_SNAPSHOT / WORLD_CHARACTERS. Omit known_by for globally-known events.\n"
+        "- target_player / target_players are optional player-specific targets. These may be a Discord ID, a Discord mention, a player slug, or a PARTY_SNAPSHOT-style string such as '<@123> (Rigby)'.\n"
+        "- If no target_player(s) are provided, the event is treated as global.\n"
         "- Do NOT decrement counters manually by re-adding events each turn. The harness computes remaining days automatically.\n"
         "- You will receive CALENDAR_REMINDERS in the prompt for imminent/overdue events, including hour-level countdowns near deadline.\n"
         "- CALENDAR_REMINDERS are sparse urgency signals. Do NOT echo them every turn; only surface them in narration when relevant to the current action/scene, when the player asks, or when the event is immediate.\n"
+        "- When a calendar event reaches its fire point, the harness may notify the shared channel and/or affected players directly.\n"
         "CALENDAR EVENT LIFECYCLE:\n"
         "Events should progress through phases based on fire_day vs CURRENT_GAME_TIME.day:\n"
         "1. UPCOMING — event is in the future. Mention it naturally when relevant (NPCs remind the player, "
         "signs/clues reference it).\n"
         "2. IMMINENT — event is today or tomorrow. Actively warn the player: NPCs urge action, "
         "the environment reflects urgency. Narrate pressure to act. The player should feel they need to DO something.\n"
-        "3. OVERDUE — current day is past fire_day. Do NOT remove the event. "
+        "3. OVERDUE — current day is past fire_day. The harness treats it as fired/overdue and may allow administrative cleanup later. "
         "Narrate consequences escalating. "
         "NPCs express disappointment, opportunities narrow, penalties mount. "
-        "The event stays on the calendar as a visible reminder of what the player neglected.\n"
+        "If the event still matters, keep it on the calendar as a visible reminder of what the player neglected.\n"
         "4. RESOLVED — ONLY remove an event when the player has DIRECTLY DEALT WITH IT "
         "(attended, completed, deliberately abandoned) and the outcome has been narrated. "
-        "Do NOT silently prune events. Do NOT remove events just because they are overdue.\n\n"
+        "Do NOT silently prune future events just because time passed.\n\n"
         "CRITICAL — calendar_update.remove rules:\n"
-        "- ONLY remove an event when it has been RESOLVED through player action in the current narration.\n"
-        "- NEVER remove events because time passed or they feel old. Overdue events stay and get worse.\n"
+        "- ONLY remove a future event when it has been RESOLVED through player action in the current narration.\n"
+        "- Fired/overdue events may be removed later as administrative cleanup if they are no longer pending.\n"
         "- If you are unsure whether an event should be removed, do NOT remove it.\n"
         "Use calendar events for approaching deadlines, NPC appointments, world events, "
         "and anything with narrative timing pressure.\n"
@@ -919,14 +937,142 @@ class ZorkEmulator:
         turn_number = int(getattr(turn, "id", 0) or 0)
         meta = parse_json_dict(getattr(turn, "meta_json", "{}"))
         game_time = meta.get("game_time") if isinstance(meta, dict) else None
+        prefix = f"[TURN #{turn_number}]"
         if isinstance(game_time, dict):
             day = cls._coerce_non_negative_int(game_time.get("day", 1), default=1) or 1
             hour = cls._coerce_non_negative_int(game_time.get("hour", 0), default=0)
             minute = cls._coerce_non_negative_int(game_time.get("minute", 0), default=0)
             hour = min(23, max(0, hour))
             minute = min(59, max(0, minute))
-            return f"[TURN #{turn_number} | Day {day} {hour:02d}:{minute:02d}]"
-        return f"[TURN #{turn_number}]"
+            prefix = f"[TURN #{turn_number} | Day {day} {hour:02d}:{minute:02d}]"
+        visibility = meta.get("visibility") if isinstance(meta, dict) else None
+        if not isinstance(visibility, dict):
+            return prefix
+        scope = str(visibility.get("scope") or "").strip().lower()
+        if not scope:
+            return prefix
+        details: list[str] = []
+        if scope == "public":
+            details.append("SEEN BY: public")
+        elif scope == "local":
+            details.append("SEEN BY: local")
+        else:
+            names: list[str] = []
+            raw_player_slugs = visibility.get("visible_player_slugs")
+            if isinstance(raw_player_slugs, list):
+                for item in raw_player_slugs[:6]:
+                    slug = cls._player_slug_key(item)
+                    if slug:
+                        names.append(slug)
+            details.append(f"SEEN BY: {', '.join(names) if names else 'limited'}")
+        raw_npc_slugs = visibility.get("aware_npc_slugs")
+        npc_slugs: list[str] = []
+        if isinstance(raw_npc_slugs, list):
+            for item in raw_npc_slugs[:6]:
+                slug = str(item or "").strip()
+                if slug:
+                    npc_slugs.append(slug)
+        if npc_slugs:
+            details.append(f"NPCS AWARE: {', '.join(npc_slugs)}")
+        return f"{prefix[:-1]} | {' | '.join(details)}]" if details else prefix
+
+    @staticmethod
+    def _player_slug_key(value: object) -> str:
+        text = str(value or "").strip().lower()
+        if not text:
+            return ""
+        return re.sub(r"[^a-z0-9]+", "-", text).strip("-")[:64]
+
+    @classmethod
+    def _player_visibility_slug(cls, actor_id: object) -> str:
+        raw = str(actor_id or "").strip()
+        return f"player-{raw}" if raw else ""
+
+    @staticmethod
+    def _default_prompt_turn_visibility(
+        requested_default: str,
+        player_state: Dict[str, object],
+    ) -> str:
+        default_clean = str(requested_default or "").strip().lower()
+        if default_clean == "private":
+            return "private"
+        location_key = ""
+        if isinstance(player_state, dict):
+            for key in ("room_id", "location", "room_title", "room_summary"):
+                raw = str(player_state.get(key) or "").strip()
+                if raw:
+                    location_key = raw
+                    break
+        return "local" if location_key else "public"
+
+    @classmethod
+    def _campaign_player_registry(
+        cls,
+        campaign_id: str,
+        session_factory,
+    ) -> dict[str, dict[str, dict[str, object]]]:
+        by_actor_id: dict[str, dict[str, object]] = {}
+        by_slug: dict[str, dict[str, object]] = {}
+        with session_factory() as session:
+            rows = session.query(Player).filter(Player.campaign_id == campaign_id).all()
+            for row in rows:
+                state = parse_json_dict(row.state_json)
+                fallback_name = f"Adventurer-{str(row.actor_id)[-4:]}"
+                name = str(state.get("character_name") or fallback_name).strip()
+                slug = cls._player_visibility_slug(row.actor_id)
+                entry = {
+                    "actor_id": row.actor_id,
+                    "name": name,
+                    "slug": slug,
+                    "discord_mention": f"<@{row.actor_id}>",
+                }
+                by_actor_id[row.actor_id] = entry
+                by_slug[slug] = entry
+        return {"by_actor_id": by_actor_id, "by_slug": by_slug}
+
+    @staticmethod
+    def _safe_turn_meta(turn: Turn) -> dict[str, object]:
+        meta = parse_json_dict(getattr(turn, "meta_json", "{}"))
+        return meta if isinstance(meta, dict) else {}
+
+    @classmethod
+    def _turn_visible_to_viewer(
+        cls,
+        turn: Turn,
+        viewer_actor_id: str,
+        viewer_slug: str,
+        viewer_location_key: str,
+    ) -> bool:
+        if turn.actor_id == viewer_actor_id:
+            return True
+        meta = cls._safe_turn_meta(turn)
+        visibility = meta.get("visibility")
+        if not isinstance(visibility, dict):
+            return True
+        scope = str(visibility.get("scope") or "").strip().lower()
+        if scope in {"", "public"}:
+            return True
+        if scope == "local":
+            turn_location_key = str(
+                visibility.get("location_key") or meta.get("location_key") or ""
+            ).strip().lower()
+            if viewer_location_key and turn_location_key and viewer_location_key == turn_location_key:
+                return True
+        raw_actor_ids = visibility.get("visible_actor_ids")
+        actor_ids = set()
+        if isinstance(raw_actor_ids, list):
+            actor_ids = {str(item).strip() for item in raw_actor_ids if str(item).strip()}
+        if viewer_actor_id in actor_ids:
+            return True
+        raw_player_slugs = visibility.get("visible_player_slugs")
+        player_slugs = set()
+        if isinstance(raw_player_slugs, list):
+            player_slugs = {
+                cls._player_slug_key(item)
+                for item in raw_player_slugs
+                if cls._player_slug_key(item)
+            }
+        return bool(viewer_slug and viewer_slug in player_slugs)
 
     @staticmethod
     def _normalize_timer_interrupt_scope(value: object) -> str:
@@ -1358,10 +1504,12 @@ class ZorkEmulator:
             if since_seconds < 0 or since_seconds > self.ATTENTION_WINDOW_SECONDS:
                 continue
             name = str(player_state.get("character_name") or "").strip()
+            player_slug = self._player_visibility_slug(row.actor_id)
             out.append(
                 {
                     "actor_id": row.actor_id,
                     "name": name or None,
+                    "player_slug": player_slug,
                     "seconds_since_last_message": since_seconds,
                     "attention_seconds_total": self._coerce_non_negative_int(
                         stats.get(self.PLAYER_STATS_ATTENTION_SECONDS_KEY), 0
@@ -2692,6 +2840,71 @@ class ZorkEmulator:
                 cleaned.append(compact[:8000])
         return cleaned
 
+    def _rulebook_line_key(self, line: object) -> str:
+        text = str(line or "").strip()
+        if not text:
+            return ""
+        match = re.match(r"^([A-Z][A-Z0-9-]{1,80}):\s+\S", text)
+        if not match:
+            return ""
+        return str(match.group(1) or "").strip().upper()
+
+    def _canonical_seed_rulebook_lines(
+        self,
+        campaign_id: str,
+        source_payload: dict[str, Any],
+    ) -> list[str]:
+        docs = source_payload.get("docs") or []
+        out: list[str] = []
+        seen_keys: set[str] = set()
+        auto_key = SourceMaterialMemory._normalize_source_document_key(
+            self.AUTO_RULEBOOK_DOCUMENT_LABEL
+        )
+        for doc in docs:
+            if not isinstance(doc, dict):
+                continue
+            doc_key = str(doc.get("document_key") or "").strip()
+            doc_label = str(doc.get("document_label") or "").strip()
+            doc_format = str(doc.get("format") or "").strip().lower()
+            if doc_format != self.SOURCE_MATERIAL_FORMAT_RULEBOOK:
+                continue
+            if doc_label == self.AUTO_RULEBOOK_DOCUMENT_LABEL or doc_key == auto_key:
+                continue
+            units = SourceMaterialMemory.get_source_material_document_units(
+                str(campaign_id),
+                doc_key,
+            )
+            for unit in units:
+                compact = re.sub(r"\s+", " ", str(unit or "").strip()).strip()
+                key = self._rulebook_line_key(compact)
+                if not key or key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                out.append(compact[:8000])
+        return out
+
+    def _merge_generated_rulebook_lines(
+        self,
+        campaign_id: str,
+        source_payload: dict[str, Any],
+        generated_lines: list[str],
+    ) -> list[str]:
+        canonical_lines = self._canonical_seed_rulebook_lines(campaign_id, source_payload)
+        merged: list[str] = list(canonical_lines)
+        seen_keys = {
+            self._rulebook_line_key(line)
+            for line in canonical_lines
+            if self._rulebook_line_key(line)
+        }
+        for line in generated_lines:
+            compact = re.sub(r"\s+", " ", str(line or "").strip()).strip()
+            key = self._rulebook_line_key(compact)
+            if not key or key in seen_keys:
+                continue
+            seen_keys.add(key)
+            merged.append(compact[:8000])
+        return merged
+
     def _auto_rulebook_source_index_hint(self, source_payload: dict[str, Any]) -> str:
         if not source_payload.get("available"):
             return ""
@@ -2760,6 +2973,7 @@ class ZorkEmulator:
             "Convert story summaries, plot chapters, character notes, and attachment prose into reusable rules and facts.\n"
             "Do not write scripts or scene transcripts. Do not rely on adjacent lines for context.\n"
             "Use these category families when relevant: TONE, SCENE, SETTING, CHAR, PLOT, INTERACTION, GM-RULE, and venue-specific tags such as BLUE-ROOM or RED-ROOM.\n"
+            "Existing non-auto rulebook source docs are canonical. If an existing source doc already defines a KEY, do not rewrite or replace that KEY. Only add missing keys or new non-conflicting facts.\n"
             "Required coverage:\n"
             "- TONE, TONE-RULES, SCENE-OPENING, SETTING-[MAIN]\n"
             "- For each named character: CHAR-[NAME], CHAR-[NAME]-PERSONALITY, CHAR-[NAME]-DIALOGUE\n"
@@ -2779,7 +2993,7 @@ class ZorkEmulator:
             f"{source_index_hint}"
             "Use the chosen storyline, expanded world JSON, and any detailed attachment summary below.\n"
             "If the attachment summary is a story-generator prompt or setup note, translate it into concise retrievable rulebook facts instead of copying it as prose.\n"
-            "If existing source docs contain canonical facts, merge them faithfully into this synthesized rulebook.\n\n"
+            "If existing source docs contain canonical facts, merge them faithfully into this synthesized rulebook. Existing user-provided rulebook facts always win conflicts by KEY; only supplement them.\n\n"
             f"Chosen storyline:\n{self._dump_json(chosen)}\n\n"
             f"Expanded world JSON:\n{self._dump_json(world)}\n\n"
             f"Detailed attachment summary:\n{attachment_summary or '(none)'}\n"
@@ -2803,6 +3017,11 @@ class ZorkEmulator:
             return 0, ""
         self._zork_log("SETUP RULEBOOK RAW RESPONSE", response or "(empty)")
         normalized_lines = self._normalize_generated_rulebook_lines(response or "")
+        normalized_lines = self._merge_generated_rulebook_lines(
+            str(campaign.id),
+            source_payload,
+            normalized_lines,
+        )
         if not normalized_lines:
             return 0, ""
         stored_count, document_key = self.ingest_source_material_text(
@@ -4053,6 +4272,7 @@ class ZorkEmulator:
                     continue
                 fallback_name = f"Adventurer-{entry.actor_id[-4:]}" if entry.actor_id else "Adventurer"
                 display_name = str(state.get("character_name") or fallback_name).strip()
+                player_slug = self._player_visibility_slug(entry.actor_id)
                 persona = str(state.get("persona") or "").strip()
                 if persona:
                     persona = self._trim_text(persona, self.MAX_PERSONA_PROMPT_CHARS)
@@ -4064,8 +4284,10 @@ class ZorkEmulator:
                     visible_items = self._normalize_inventory_items(state.get("inventory"))[:3]
                 out.append(
                     {
+                        "actor_id": entry.actor_id,
                         "discord_mention": f"<@{entry.actor_id}>",
                         "name": display_name,
+                        "player_slug": player_slug,
                         "is_actor": entry.actor_id == actor.actor_id,
                         "level": entry.level,
                         "persona": persona,
@@ -6849,10 +7071,21 @@ class ZorkEmulator:
             "description": str(event.get("description") or "")[:200],
             "known_by": cls._calendar_known_by_from_event(event),
         }
+        target_players = cls._calendar_target_tokens_from_event(event)
+        if target_players:
+            normalized["target_players"] = target_players
         for key in ("created_day", "created_hour"):
             raw = event.get(key)
             if isinstance(raw, (int, float)) and not isinstance(raw, bool):
                 normalized[key] = int(raw)
+        for key in ("fired_notice_key", "fired_notice_day", "fired_notice_hour"):
+            raw = event.get(key)
+            if raw is None:
+                continue
+            if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+                normalized[key] = int(raw)
+            elif isinstance(raw, str):
+                normalized[key] = raw[:160]
         return normalized
 
     @classmethod
@@ -7448,10 +7681,19 @@ class ZorkEmulator:
             text,
             flags=re.IGNORECASE,
         )
-        if not m:
-            return None
-        recipient = str(m.group(1) or "").strip().strip("\"'` ")
-        message = str(m.group(2) or "").strip()
+        if m:
+            recipient = str(m.group(1) or "").strip().strip("\"'` ")
+            message = str(m.group(2) or "").strip()
+        else:
+            m = re.match(
+                r"^\s*(?:i\s+)?(?:send\s+)?(?:sms|text|message)\s+(?:to\s+)?([^\s:\n]{1,80})\s+(.+?)\s*$",
+                text,
+                flags=re.IGNORECASE,
+            )
+            if not m:
+                return None
+            recipient = str(m.group(1) or "").strip().strip("\"'` ")
+            message = str(m.group(2) or "").strip()
         if (
             len(message) >= 2
             and message[0] == message[-1]
@@ -7657,10 +7899,81 @@ class ZorkEmulator:
         to_remove = calendar_update.get("remove")
         if isinstance(to_remove, list):
             remove_set = {str(name).strip().lower() for name in to_remove if name}
+            context_text = " ".join(str(calendar_update.get("_context") or "").lower().split())
+            allowed_remove_set: set[str] = set()
+            for event in calendar:
+                name_raw = str(event.get("name", "")).strip()
+                if not name_raw:
+                    continue
+                name_key = name_raw.lower()
+                if name_key not in remove_set:
+                    continue
+                name_norm = re.sub(r"[^a-z0-9]+", " ", name_key).strip()
+                name_tokens = [token for token in name_norm.split() if len(token) > 2]
+                name_mentioned = (
+                    name_norm in context_text
+                    or any(token in context_text for token in name_tokens)
+                )
+                completion_cues = (
+                    "completed",
+                    "finished",
+                    "resolved",
+                    "result delivered",
+                    "results delivered",
+                    "outcome delivered",
+                    "concluded",
+                    "cancelled",
+                    "abandoned",
+                    "closed out",
+                    "already left",
+                    "already departed",
+                    "already en route",
+                    "cleared from your schedule",
+                    "off your schedule",
+                )
+                cleanup_cues = (
+                    "remove from calendar",
+                    "remove it from calendar",
+                    "take it off the calendar",
+                    "take it off calendar",
+                    "clear it from the calendar",
+                    "clear from your schedule",
+                    "overdue",
+                    "already",
+                    "done",
+                )
+                premature_cues = (
+                    "arrives",
+                    "arrived",
+                    "in progress",
+                    "processing",
+                    "pending",
+                    "awaiting",
+                    "sample",
+                    "blood drawn",
+                    "not back yet",
+                )
+                has_completion = any(cue in context_text for cue in completion_cues)
+                has_cleanup_intent = any(cue in context_text for cue in cleanup_cues)
+                has_premature = any(cue in context_text for cue in premature_cues)
+                fire_day = event.get("fire_day")
+                fire_hour = event.get("fire_hour")
+                event_is_past = False
+                if isinstance(fire_day, (int, float)) and isinstance(fire_hour, (int, float)):
+                    fire_day_int = int(fire_day)
+                    fire_hour_int = int(fire_hour)
+                    event_is_past = (
+                        fire_day_int < int(current_day)
+                        or (fire_day_int == int(current_day) and fire_hour_int <= int(current_hour))
+                    )
+                if event_is_past or (
+                    name_mentioned and not has_premature and (has_completion or has_cleanup_intent)
+                ):
+                    allowed_remove_set.add(name_key)
             calendar = [
                 event
                 for event in calendar
-                if str(event.get("name", "")).strip().lower() not in remove_set
+                if str(event.get("name", "")).strip().lower() not in allowed_remove_set
             ]
 
         to_add = calendar_update.get("add")
@@ -7702,6 +8015,9 @@ class ZorkEmulator:
                     "description": str(entry.get("description") or "")[:200],
                     "known_by": self._calendar_known_by_from_event(entry),
                 }
+                target_players = self._calendar_target_tokens_from_event(entry)
+                if target_players:
+                    event["target_players"] = target_players
                 calendar.append(event)
 
         if isinstance(to_add, list):
@@ -8040,6 +8356,44 @@ class ZorkEmulator:
                 break
         return out
 
+    @classmethod
+    def _calendar_target_tokens_from_event(cls, event: object) -> list[str]:
+        if not isinstance(event, dict):
+            return []
+        raw_values: list[object] = []
+        for key in (
+            "target_players",
+            "target_player",
+            "targets",
+            "target",
+            "players",
+            "player",
+            "player_id",
+            "user_id",
+            "target_user_id",
+            "target_user_ids",
+            "who",
+        ):
+            raw_value = event.get(key)
+            if isinstance(raw_value, list):
+                raw_values.extend(raw_value)
+            elif raw_value is not None:
+                raw_values.append(raw_value)
+        out: list[str] = []
+        seen: set[str] = set()
+        for item in raw_values:
+            text = str(item or "").strip()
+            if not text:
+                continue
+            key = re.sub(r"\s+", " ", text.lower())[:160]
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            out.append(text[:160])
+            if len(out) >= 12:
+                break
+        return out
+
     def _active_scene_character_names(
         self,
         player_state: dict[str, object],
@@ -8129,6 +8483,7 @@ class ZorkEmulator:
         turns: list[Turn],
         party_snapshot: list[dict[str, object]] | None = None,
         is_new_player: bool = False,
+        turn_visibility_default: str = "public",
     ) -> tuple[str, str]:
         summary = self._strip_inventory_mentions(campaign.summary or "")
         summary = self._trim_text(summary, self.MAX_SUMMARY_CHARS)
@@ -8163,21 +8518,23 @@ class ZorkEmulator:
             "state": player_state_prompt,
         }
 
+        player_registry = self._campaign_player_registry(campaign.id, self._session_factory)
         player_names: Dict[str, str] = {}
-        actor_ids = {turn.actor_id for turn in turns if turn.actor_id}
-        if actor_ids:
-            with self._session_factory() as session:
-                rows = (
-                    session.query(Player)
-                    .filter(Player.campaign_id == campaign.id)
-                    .filter(Player.actor_id.in_(actor_ids))
-                    .all()
-                )
-                for row in rows:
-                    state_row = parse_json_dict(row.state_json)
-                    name = str(state_row.get("character_name") or "").strip()
-                    if name:
-                        player_names[row.actor_id] = name
+        player_slugs: Dict[str, str] = {}
+        for raw_actor_id, info in player_registry.get("by_actor_id", {}).items():
+            actor_id = str(raw_actor_id or "").strip()
+            if not actor_id:
+                continue
+            name = str(info.get("name") or "").strip()
+            slug = str(info.get("slug") or "").strip()
+            if name:
+                player_names[actor_id] = name
+            if slug:
+                player_slugs[actor_id] = slug
+        viewer_slug = player_slugs.get(player.actor_id) or self._player_visibility_slug(
+            player.actor_id
+        )
+        viewer_location_key = self._room_key_from_player_state(player_state).lower()
 
         recent_lines: List[str] = []
         ooc_re = re.compile(r"^\s*\[OOC\b", re.IGNORECASE)
@@ -8188,6 +8545,13 @@ class ZorkEmulator:
         for turn in turns:
             content = (turn.content or "").strip()
             if not content:
+                continue
+            if not self._turn_visible_to_viewer(
+                turn,
+                player.actor_id,
+                viewer_slug,
+                viewer_location_key,
+            ):
                 continue
             turn_prefix = self._turn_context_prefix(turn)
             if turn.kind == "player":
@@ -8285,10 +8649,15 @@ class ZorkEmulator:
             "room_summary": player_state.get("room_summary"),
         }
 
+        effective_turn_visibility_default = self._default_prompt_turn_visibility(
+            turn_visibility_default,
+            player_state,
+        )
         user_prompt = (
             f"CAMPAIGN: {campaign.name}\n"
             f"PLAYER_ID: {player.actor_id}\n"
             f"IS_NEW_PLAYER: {str(is_new_player).lower()}\n"
+            f"TURN_VISIBILITY_DEFAULT: {effective_turn_visibility_default}\n"
             f"GUARDRAILS_ENABLED: {str(guardrails_enabled).lower()}\n"
             f"RAILS_CONTEXT: {self._dump_json(rails_context)}\n"
             f"WORLD_SUMMARY: {summary}\n"

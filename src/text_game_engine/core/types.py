@@ -29,6 +29,7 @@ class LLMTurnOutput:
     summary_update: Optional[str] = None
     xp_awarded: int = 0
     player_state_update: dict[str, Any] = field(default_factory=dict)
+    turn_visibility: dict[str, Any] | None = None
     scene_image_prompt: Optional[str] = None
     timer_instruction: Optional[TimerInstruction] = None
     character_updates: dict[str, Any] = field(default_factory=dict)
