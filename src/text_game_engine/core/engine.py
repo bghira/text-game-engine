@@ -180,8 +180,13 @@ class GameEngine:
         return re.sub(r"[^a-z0-9]+", "-", text).strip("-")[:64]
 
     @staticmethod
-    def _normalize_turn_visibility(actor_id: str, actor_name: str, raw_visibility: object) -> dict[str, Any]:
-        actor_slug = GameEngine._player_slug_key(actor_name) or f"player-{actor_id}"
+    def _player_visibility_slug(actor_id: str) -> str:
+        raw = str(actor_id or "").strip()
+        return f"player-{raw}" if raw else ""
+
+    @staticmethod
+    def _normalize_turn_visibility(actor_id: str, _actor_name: str, raw_visibility: object) -> dict[str, Any]:
+        actor_slug = GameEngine._player_visibility_slug(actor_id)
         default_meta = {
             "scope": "public",
             "actor_player_slug": actor_slug,
@@ -206,15 +211,10 @@ class GameEngine:
             slug = GameEngine._player_slug_key(raw_player_slugs)
             if slug:
                 visible_player_slugs.append(slug)
-        visible_actor_ids = []
-        raw_actor_ids = raw_visibility.get("actor_ids")
-        if isinstance(raw_actor_ids, list):
-            for item in raw_actor_ids:
-                raw_id = str(item or "").strip()
-                if raw_id and raw_id not in visible_actor_ids:
-                    visible_actor_ids.append(raw_id)
-        elif isinstance(raw_actor_ids, str) and raw_actor_ids.strip():
-            visible_actor_ids.append(raw_actor_ids.strip())
+        # Keep the prompt contract aligned with the documented schema:
+        # models specify player_slugs, not actor_ids. The engine still
+        # maintains visible_actor_ids internally for the acting player.
+        visible_actor_ids: list[str] = []
         if scope in {"private", "limited"}:
             if actor_slug and actor_slug not in visible_player_slugs:
                 visible_player_slugs.insert(0, actor_slug)
@@ -286,7 +286,7 @@ class GameEngine:
 
             player_state = parse_json_dict(player.state_json)
             actor_name = str(player_state.get("character_name") or "").strip()
-            actor_slug = self._player_slug_key(actor_name) or f"player-{turn_input.actor_id}"
+            actor_slug = self._player_visibility_slug(turn_input.actor_id)
             turns = uow.turns.recent(turn_input.campaign_id, limit=24)
             def _turn_meta_payload(turn_obj):
                 meta = parse_json_dict(getattr(turn_obj, "meta_json", "{}"))
@@ -500,7 +500,7 @@ class GameEngine:
             narrator_turn_meta = {
                 "game_time": post_turn_game_time,
                 "visibility": turn_visibility,
-                "actor_player_slug": self._player_slug_key(player_state.get("character_name")),
+                "actor_player_slug": self._player_visibility_slug(turn_input.actor_id),
                 "location_key": self._room_key_from_state(player_state),
             }
             if reasoning_text:
@@ -1306,6 +1306,81 @@ class GameEngine:
         )
         return fire_day
 
+    @staticmethod
+    def _calendar_name_key(value: object) -> str:
+        text = str(value or "").strip().lower()
+        if not text:
+            return ""
+        return re.sub(r"[^a-z0-9]+", "", text)
+
+    @classmethod
+    def _calendar_known_by_from_event(cls, event: Any) -> list[str]:
+        if not isinstance(event, dict):
+            return []
+        raw_known_by = event.get("known_by")
+        items: list[object]
+        if isinstance(raw_known_by, list):
+            items = raw_known_by
+        elif isinstance(raw_known_by, str):
+            if "," in raw_known_by:
+                items = [chunk.strip() for chunk in raw_known_by.split(",")]
+            else:
+                items = [raw_known_by]
+        else:
+            items = []
+        out: list[str] = []
+        seen: set[str] = set()
+        for item in items:
+            name = str(item or "").strip()
+            if not name:
+                continue
+            key = cls._calendar_name_key(name)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            out.append(name[:80])
+            if len(out) >= 24:
+                break
+        return out
+
+    @classmethod
+    def _calendar_target_tokens_from_event(cls, event: Any) -> list[str]:
+        if not isinstance(event, dict):
+            return []
+        raw_values: list[object] = []
+        for key in (
+            "target_players",
+            "target_player",
+            "targets",
+            "target",
+            "players",
+            "player",
+            "player_id",
+            "user_id",
+            "target_user_id",
+            "target_user_ids",
+            "who",
+        ):
+            raw_value = event.get(key)
+            if isinstance(raw_value, list):
+                raw_values.extend(raw_value)
+            elif raw_value is not None:
+                raw_values.append(raw_value)
+        out: list[str] = []
+        seen: set[str] = set()
+        for item in raw_values:
+            text = str(item or "").strip()
+            if not text:
+                continue
+            key = re.sub(r"\s+", " ", text.lower())[:160]
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            out.append(text[:160])
+            if len(out) >= 12:
+                break
+        return out
+
     @classmethod
     def _calendar_normalize_event(
         cls,
@@ -1347,11 +1422,23 @@ class GameEngine:
             "fire_day": fire_day,
             "fire_hour": fire_hour,
             "description": str(event.get("description") or "")[:200],
+            "known_by": cls._calendar_known_by_from_event(event),
         }
+        target_players = cls._calendar_target_tokens_from_event(event)
+        if target_players:
+            normalized["target_players"] = target_players
         for key in ("created_day", "created_hour"):
             raw = event.get(key)
             if isinstance(raw, (int, float)) and not isinstance(raw, bool):
                 normalized[key] = int(raw)
+        for key in ("fired_notice_key", "fired_notice_day", "fired_notice_hour"):
+            raw = event.get(key)
+            if raw is None:
+                continue
+            if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+                normalized[key] = int(raw)
+            elif isinstance(raw, str):
+                normalized[key] = raw[:160]
         return normalized
 
     def _apply_calendar_update(
@@ -1409,6 +1496,22 @@ class GameEngine:
                     "cancelled",
                     "abandoned",
                     "closed out",
+                    "already left",
+                    "already departed",
+                    "already en route",
+                    "cleared from your schedule",
+                    "off your schedule",
+                )
+                cleanup_cues = (
+                    "remove from calendar",
+                    "remove it from calendar",
+                    "take it off the calendar",
+                    "take it off calendar",
+                    "clear it from the calendar",
+                    "clear from your schedule",
+                    "overdue",
+                    "already",
+                    "done",
                 )
                 premature_cues = (
                     "arrives",
@@ -1422,8 +1525,21 @@ class GameEngine:
                     "not back yet",
                 )
                 has_completion = any(cue in context_text for cue in completion_cues)
+                has_cleanup_intent = any(cue in context_text for cue in cleanup_cues)
                 has_premature = any(cue in context_text for cue in premature_cues)
-                if name_mentioned and has_completion and not has_premature:
+                fire_day = event.get("fire_day")
+                fire_hour = event.get("fire_hour")
+                event_is_past = False
+                if isinstance(fire_day, (int, float)) and isinstance(fire_hour, (int, float)):
+                    fire_day_int = int(fire_day)
+                    fire_hour_int = int(fire_hour)
+                    event_is_past = (
+                        fire_day_int < day_int
+                        or (fire_day_int == day_int and fire_hour_int <= hour_int)
+                    )
+                if event_is_past or (
+                    name_mentioned and not has_premature and (has_completion or has_cleanup_intent)
+                ):
                     allowed_remove_set.add(key)
                 else:
                     blocked += 1
@@ -1476,7 +1592,11 @@ class GameEngine:
                     "created_day": current_day,
                     "created_hour": current_hour,
                     "description": str(entry.get("description") or "")[:200],
+                    "known_by": self._calendar_known_by_from_event(entry),
                 }
+                target_players = self._calendar_target_tokens_from_event(entry)
+                if target_players:
+                    event["target_players"] = target_players
                 calendar.append(event)
 
         if isinstance(to_add, list):

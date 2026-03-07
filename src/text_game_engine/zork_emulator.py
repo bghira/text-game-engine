@@ -375,7 +375,7 @@ class ZorkEmulator:
         "- summary_update: string (one or two sentences of lasting changes)\n"
         "- xp_awarded: integer (0-10)\n"
         "- player_state_update: object (optional, player state patches)\n"
-        '- turn_visibility: object (optional; who should get this turn in future prompt context. Keys: "scope" ("public"|"private"|"limited"), "player_slugs" (array of stable player slugs from PARTY_SNAPSHOT/CURRENTLY_ATTENTIVE_PLAYERS), "npc_slugs" (array of WORLD_CHARACTERS slugs who overheard/noticed), and optional "reason". This changes prompt visibility only; it does NOT change shared world state.)\n'
+        '- turn_visibility: object (optional; who should get this turn in future prompt context. Keys: "scope" ("public"|"private"|"limited"), "player_slugs" (array of player slugs from PARTY_SNAPSHOT/CURRENTLY_ATTENTIVE_PLAYERS, typically in `player-<actor_id>` form), "npc_slugs" (array of WORLD_CHARACTERS slugs who overheard/noticed), and optional "reason". This changes prompt visibility only; it does NOT change shared world state.)\n'
         "- scene_image_prompt: string (optional; include whenever the visible scene changes in a meaningful way: entering a room, newly visible characters/objects, reveals, or strong visual shifts)\n"
         "- set_timer_delay: integer (optional; 30-300 seconds, see TIMED EVENTS SYSTEM below)\n"
         "- set_timer_event: string (optional; what happens when the timer expires)\n"
@@ -727,31 +727,34 @@ class ZorkEmulator:
         "Set period based on hour: 5-11=morning, 12-16=afternoon, 17-20=evening, 21-4=night.\n\n"
         "You may also return a calendar_update key (object) to manage scheduled events:\n"
         '- "calendar_update": {"add": [...], "remove": [...]} where each add entry is '
-        '{"name": str, "time_remaining": int, "time_unit": "hours"|"days", "description": str, "known_by": [str, ...]} '
+        '{"name": str, "time_remaining": int, "time_unit": "hours"|"days", "description": str, "known_by": [str, ...], "target_player": str|int (optional), "target_players": [str|int, ...] (optional)} '
         "and each remove entry is a string matching an event name.\n"
         "HARNESS BEHAVIOR:\n"
         "- The harness converts add entries into absolute due dates and stores fire_day + fire_hour (the exact in-game deadline).\n"
         "- known_by is optional. If provided, reminders are only injected when at least one known character is in the active scene.\n"
         "- Keep known_by to character names from PARTY_SNAPSHOT / WORLD_CHARACTERS. Omit known_by for globally-known events.\n"
+        "- target_player / target_players are optional player-specific targets. These may be a Discord ID, a Discord mention, a player slug, or a PARTY_SNAPSHOT-style string such as '<@123> (Rigby)'.\n"
+        "- If no target_player(s) are provided, the event is treated as global.\n"
         "- Do NOT decrement counters manually by re-adding events each turn. The harness computes remaining days automatically.\n"
         "- You will receive CALENDAR_REMINDERS in the prompt for imminent/overdue events, including hour-level countdowns near deadline.\n"
         "- CALENDAR_REMINDERS are sparse urgency signals. Do NOT echo them every turn; only surface them in narration when relevant to the current action/scene, when the player asks, or when the event is immediate.\n"
+        "- When a calendar event reaches its fire point, the harness may notify the shared channel and/or affected players directly.\n"
         "CALENDAR EVENT LIFECYCLE:\n"
         "Events should progress through phases based on fire_day vs CURRENT_GAME_TIME.day:\n"
         "1. UPCOMING — event is in the future. Mention it naturally when relevant (NPCs remind the player, "
         "signs/clues reference it).\n"
         "2. IMMINENT — event is today or tomorrow. Actively warn the player: NPCs urge action, "
         "the environment reflects urgency. Narrate pressure to act. The player should feel they need to DO something.\n"
-        "3. OVERDUE — current day is past fire_day. Do NOT remove the event. "
+        "3. OVERDUE — current day is past fire_day. The harness treats it as fired/overdue and may allow administrative cleanup later. "
         "Narrate consequences escalating. "
         "NPCs express disappointment, opportunities narrow, penalties mount. "
-        "The event stays on the calendar as a visible reminder of what the player neglected.\n"
+        "If the event still matters, keep it on the calendar as a visible reminder of what the player neglected.\n"
         "4. RESOLVED — ONLY remove an event when the player has DIRECTLY DEALT WITH IT "
         "(attended, completed, deliberately abandoned) and the outcome has been narrated. "
-        "Do NOT silently prune events. Do NOT remove events just because they are overdue.\n\n"
+        "Do NOT silently prune future events just because time passed.\n\n"
         "CRITICAL — calendar_update.remove rules:\n"
-        "- ONLY remove an event when it has been RESOLVED through player action in the current narration.\n"
-        "- NEVER remove events because time passed or they feel old. Overdue events stay and get worse.\n"
+        "- ONLY remove a future event when it has been RESOLVED through player action in the current narration.\n"
+        "- Fired/overdue events may be removed later as administrative cleanup if they are no longer pending.\n"
         "- If you are unsure whether an event should be removed, do NOT remove it.\n"
         "Use calendar events for approaching deadlines, NPC appointments, world events, "
         "and anything with narrative timing pressure.\n"
@@ -974,7 +977,16 @@ class ZorkEmulator:
         return re.sub(r"[^a-z0-9]+", "-", text).strip("-")[:64]
 
     @classmethod
-    def _campaign_player_registry(cls, campaign_id: str, session_factory) -> dict[str, dict[object, dict[str, object]]]:
+    def _player_visibility_slug(cls, actor_id: object) -> str:
+        raw = str(actor_id or "").strip()
+        return f"player-{raw}" if raw else ""
+
+    @classmethod
+    def _campaign_player_registry(
+        cls,
+        campaign_id: str,
+        session_factory,
+    ) -> dict[str, dict[str, dict[str, object]]]:
         by_actor_id: dict[str, dict[str, object]] = {}
         by_slug: dict[str, dict[str, object]] = {}
         with session_factory() as session:
@@ -983,7 +995,7 @@ class ZorkEmulator:
                 state = parse_json_dict(row.state_json)
                 fallback_name = f"Adventurer-{str(row.actor_id)[-4:]}"
                 name = str(state.get("character_name") or fallback_name).strip()
-                slug = cls._player_slug_key(name) or f"player-{row.actor_id}"
+                slug = cls._player_visibility_slug(row.actor_id)
                 entry = {
                     "actor_id": row.actor_id,
                     "name": name,
@@ -998,85 +1010,6 @@ class ZorkEmulator:
     def _safe_turn_meta(turn: Turn) -> dict[str, object]:
         meta = parse_json_dict(getattr(turn, "meta_json", "{}"))
         return meta if isinstance(meta, dict) else {}
-
-    @classmethod
-    def _default_turn_visibility_meta(
-        cls,
-        actor: Player | None,
-    ) -> dict[str, object]:
-        actor_name = ""
-        actor_id = None
-        if actor is not None:
-            actor_id = actor.actor_id
-            actor_state = parse_json_dict(actor.state_json)
-            actor_name = str(actor_state.get("character_name") or "").strip()
-        actor_slug = cls._player_slug_key(actor_name) or (f"player-{actor_id}" if actor_id else "")
-        return {
-            "scope": "public",
-            "actor_player_slug": actor_slug or None,
-            "actor_actor_id": actor_id,
-            "visible_player_slugs": [],
-            "visible_actor_ids": [],
-            "aware_npc_slugs": [],
-            "source": "public-default",
-        }
-
-    @classmethod
-    def _normalize_turn_visibility(
-        cls,
-        campaign: Campaign,
-        actor: Player | None,
-        raw_visibility: object,
-    ) -> dict[str, object]:
-        default_meta = cls._default_turn_visibility_meta(actor)
-        if not isinstance(raw_visibility, dict):
-            return default_meta
-        scope = str(raw_visibility.get("scope") or "").strip().lower()
-        if scope not in {"public", "private", "limited"}:
-            scope = str(default_meta.get("scope") or "public")
-        actor_slug = str(default_meta.get("actor_player_slug") or "").strip()
-        visible_player_slugs: list[str] = []
-        visible_actor_ids: list[str] = []
-        raw_player_slugs = raw_visibility.get("player_slugs")
-        player_items = raw_player_slugs if isinstance(raw_player_slugs, list) else ([raw_player_slugs] if isinstance(raw_player_slugs, str) else [])
-        seen_player_slugs: set[str] = set()
-        for item in player_items:
-            slug = cls._player_slug_key(item)
-            if not slug or slug in seen_player_slugs:
-                continue
-            seen_player_slugs.add(slug)
-            visible_player_slugs.append(slug)
-        if scope in {"private", "limited"} and actor_slug:
-            if actor_slug not in seen_player_slugs:
-                visible_player_slugs.insert(0, actor_slug)
-            actor_actor_id = str(default_meta.get("actor_actor_id") or "").strip()
-            if actor_actor_id and actor_actor_id not in visible_actor_ids:
-                visible_actor_ids.insert(0, actor_actor_id)
-        aware_npc_slugs: list[str] = []
-        raw_npc_slugs = raw_visibility.get("npc_slugs")
-        npc_items = raw_npc_slugs if isinstance(raw_npc_slugs, list) else ([raw_npc_slugs] if isinstance(raw_npc_slugs, str) else [])
-        seen_npc_slugs: set[str] = set()
-        campaign_characters = parse_json_dict(getattr(campaign, "characters_json", "{}"))
-        if isinstance(campaign_characters, dict):
-            for item in npc_items:
-                slug = str(item or "").strip()
-                if not slug:
-                    continue
-                resolved_slug = cls._resolve_existing_character_slug(campaign_characters, slug)
-                if resolved_slug and resolved_slug not in seen_npc_slugs:
-                    aware_npc_slugs.append(resolved_slug)
-                    seen_npc_slugs.add(resolved_slug)
-        reason = cls._trim_text(str(raw_visibility.get("reason") or "").strip(), 240)
-        return {
-            "scope": scope,
-            "actor_player_slug": actor_slug or None,
-            "actor_actor_id": default_meta.get("actor_actor_id"),
-            "visible_player_slugs": visible_player_slugs,
-            "visible_actor_ids": visible_actor_ids,
-            "aware_npc_slugs": aware_npc_slugs,
-            "reason": reason or None,
-            "source": "model",
-        }
 
     @classmethod
     def _turn_visible_to_viewer(cls, turn: Turn, viewer_actor_id: str, viewer_slug: str) -> bool:
@@ -1535,7 +1468,7 @@ class ZorkEmulator:
             if since_seconds < 0 or since_seconds > self.ATTENTION_WINDOW_SECONDS:
                 continue
             name = str(player_state.get("character_name") or "").strip()
-            player_slug = self._player_slug_key(name) or f"player-{row.actor_id}"
+            player_slug = self._player_visibility_slug(row.actor_id)
             out.append(
                 {
                     "actor_id": row.actor_id,
@@ -2871,6 +2804,71 @@ class ZorkEmulator:
                 cleaned.append(compact[:8000])
         return cleaned
 
+    def _rulebook_line_key(self, line: object) -> str:
+        text = str(line or "").strip()
+        if not text:
+            return ""
+        match = re.match(r"^([A-Z][A-Z0-9-]{1,80}):\s+\S", text)
+        if not match:
+            return ""
+        return str(match.group(1) or "").strip().upper()
+
+    def _canonical_seed_rulebook_lines(
+        self,
+        campaign_id: str,
+        source_payload: dict[str, Any],
+    ) -> list[str]:
+        docs = source_payload.get("docs") or []
+        out: list[str] = []
+        seen_keys: set[str] = set()
+        auto_key = SourceMaterialMemory._normalize_source_document_key(
+            self.AUTO_RULEBOOK_DOCUMENT_LABEL
+        )
+        for doc in docs:
+            if not isinstance(doc, dict):
+                continue
+            doc_key = str(doc.get("document_key") or "").strip()
+            doc_label = str(doc.get("document_label") or "").strip()
+            doc_format = str(doc.get("format") or "").strip().lower()
+            if doc_format != self.SOURCE_MATERIAL_FORMAT_RULEBOOK:
+                continue
+            if doc_label == self.AUTO_RULEBOOK_DOCUMENT_LABEL or doc_key == auto_key:
+                continue
+            units = SourceMaterialMemory.get_source_material_document_units(
+                str(campaign_id),
+                doc_key,
+            )
+            for unit in units:
+                compact = re.sub(r"\s+", " ", str(unit or "").strip()).strip()
+                key = self._rulebook_line_key(compact)
+                if not key or key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                out.append(compact[:8000])
+        return out
+
+    def _merge_generated_rulebook_lines(
+        self,
+        campaign_id: str,
+        source_payload: dict[str, Any],
+        generated_lines: list[str],
+    ) -> list[str]:
+        canonical_lines = self._canonical_seed_rulebook_lines(campaign_id, source_payload)
+        merged: list[str] = list(canonical_lines)
+        seen_keys = {
+            self._rulebook_line_key(line)
+            for line in canonical_lines
+            if self._rulebook_line_key(line)
+        }
+        for line in generated_lines:
+            compact = re.sub(r"\s+", " ", str(line or "").strip()).strip()
+            key = self._rulebook_line_key(compact)
+            if not key or key in seen_keys:
+                continue
+            seen_keys.add(key)
+            merged.append(compact[:8000])
+        return merged
+
     def _auto_rulebook_source_index_hint(self, source_payload: dict[str, Any]) -> str:
         if not source_payload.get("available"):
             return ""
@@ -2939,6 +2937,7 @@ class ZorkEmulator:
             "Convert story summaries, plot chapters, character notes, and attachment prose into reusable rules and facts.\n"
             "Do not write scripts or scene transcripts. Do not rely on adjacent lines for context.\n"
             "Use these category families when relevant: TONE, SCENE, SETTING, CHAR, PLOT, INTERACTION, GM-RULE, and venue-specific tags such as BLUE-ROOM or RED-ROOM.\n"
+            "Existing non-auto rulebook source docs are canonical. If an existing source doc already defines a KEY, do not rewrite or replace that KEY. Only add missing keys or new non-conflicting facts.\n"
             "Required coverage:\n"
             "- TONE, TONE-RULES, SCENE-OPENING, SETTING-[MAIN]\n"
             "- For each named character: CHAR-[NAME], CHAR-[NAME]-PERSONALITY, CHAR-[NAME]-DIALOGUE\n"
@@ -2958,7 +2957,7 @@ class ZorkEmulator:
             f"{source_index_hint}"
             "Use the chosen storyline, expanded world JSON, and any detailed attachment summary below.\n"
             "If the attachment summary is a story-generator prompt or setup note, translate it into concise retrievable rulebook facts instead of copying it as prose.\n"
-            "If existing source docs contain canonical facts, merge them faithfully into this synthesized rulebook.\n\n"
+            "If existing source docs contain canonical facts, merge them faithfully into this synthesized rulebook. Existing user-provided rulebook facts always win conflicts by KEY; only supplement them.\n\n"
             f"Chosen storyline:\n{self._dump_json(chosen)}\n\n"
             f"Expanded world JSON:\n{self._dump_json(world)}\n\n"
             f"Detailed attachment summary:\n{attachment_summary or '(none)'}\n"
@@ -2982,6 +2981,11 @@ class ZorkEmulator:
             return 0, ""
         self._zork_log("SETUP RULEBOOK RAW RESPONSE", response or "(empty)")
         normalized_lines = self._normalize_generated_rulebook_lines(response or "")
+        normalized_lines = self._merge_generated_rulebook_lines(
+            str(campaign.id),
+            source_payload,
+            normalized_lines,
+        )
         if not normalized_lines:
             return 0, ""
         stored_count, document_key = self.ingest_source_material_text(
@@ -4232,7 +4236,7 @@ class ZorkEmulator:
                     continue
                 fallback_name = f"Adventurer-{entry.actor_id[-4:]}" if entry.actor_id else "Adventurer"
                 display_name = str(state.get("character_name") or fallback_name).strip()
-                player_slug = self._player_slug_key(display_name) or f"player-{entry.actor_id}"
+                player_slug = self._player_visibility_slug(entry.actor_id)
                 persona = str(state.get("persona") or "").strip()
                 if persona:
                     persona = self._trim_text(persona, self.MAX_PERSONA_PROMPT_CHARS)
@@ -7031,10 +7035,21 @@ class ZorkEmulator:
             "description": str(event.get("description") or "")[:200],
             "known_by": cls._calendar_known_by_from_event(event),
         }
+        target_players = cls._calendar_target_tokens_from_event(event)
+        if target_players:
+            normalized["target_players"] = target_players
         for key in ("created_day", "created_hour"):
             raw = event.get(key)
             if isinstance(raw, (int, float)) and not isinstance(raw, bool):
                 normalized[key] = int(raw)
+        for key in ("fired_notice_key", "fired_notice_day", "fired_notice_hour"):
+            raw = event.get(key)
+            if raw is None:
+                continue
+            if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+                normalized[key] = int(raw)
+            elif isinstance(raw, str):
+                normalized[key] = raw[:160]
         return normalized
 
     @classmethod
@@ -7839,10 +7854,81 @@ class ZorkEmulator:
         to_remove = calendar_update.get("remove")
         if isinstance(to_remove, list):
             remove_set = {str(name).strip().lower() for name in to_remove if name}
+            context_text = " ".join(str(calendar_update.get("_context") or "").lower().split())
+            allowed_remove_set: set[str] = set()
+            for event in calendar:
+                name_raw = str(event.get("name", "")).strip()
+                if not name_raw:
+                    continue
+                name_key = name_raw.lower()
+                if name_key not in remove_set:
+                    continue
+                name_norm = re.sub(r"[^a-z0-9]+", " ", name_key).strip()
+                name_tokens = [token for token in name_norm.split() if len(token) > 2]
+                name_mentioned = (
+                    name_norm in context_text
+                    or any(token in context_text for token in name_tokens)
+                )
+                completion_cues = (
+                    "completed",
+                    "finished",
+                    "resolved",
+                    "result delivered",
+                    "results delivered",
+                    "outcome delivered",
+                    "concluded",
+                    "cancelled",
+                    "abandoned",
+                    "closed out",
+                    "already left",
+                    "already departed",
+                    "already en route",
+                    "cleared from your schedule",
+                    "off your schedule",
+                )
+                cleanup_cues = (
+                    "remove from calendar",
+                    "remove it from calendar",
+                    "take it off the calendar",
+                    "take it off calendar",
+                    "clear it from the calendar",
+                    "clear from your schedule",
+                    "overdue",
+                    "already",
+                    "done",
+                )
+                premature_cues = (
+                    "arrives",
+                    "arrived",
+                    "in progress",
+                    "processing",
+                    "pending",
+                    "awaiting",
+                    "sample",
+                    "blood drawn",
+                    "not back yet",
+                )
+                has_completion = any(cue in context_text for cue in completion_cues)
+                has_cleanup_intent = any(cue in context_text for cue in cleanup_cues)
+                has_premature = any(cue in context_text for cue in premature_cues)
+                fire_day = event.get("fire_day")
+                fire_hour = event.get("fire_hour")
+                event_is_past = False
+                if isinstance(fire_day, (int, float)) and isinstance(fire_hour, (int, float)):
+                    fire_day_int = int(fire_day)
+                    fire_hour_int = int(fire_hour)
+                    event_is_past = (
+                        fire_day_int < int(current_day)
+                        or (fire_day_int == int(current_day) and fire_hour_int <= int(current_hour))
+                    )
+                if event_is_past or (
+                    name_mentioned and not has_premature and (has_completion or has_cleanup_intent)
+                ):
+                    allowed_remove_set.add(name_key)
             calendar = [
                 event
                 for event in calendar
-                if str(event.get("name", "")).strip().lower() not in remove_set
+                if str(event.get("name", "")).strip().lower() not in allowed_remove_set
             ]
 
         to_add = calendar_update.get("add")
@@ -7884,6 +7970,9 @@ class ZorkEmulator:
                     "description": str(entry.get("description") or "")[:200],
                     "known_by": self._calendar_known_by_from_event(entry),
                 }
+                target_players = self._calendar_target_tokens_from_event(entry)
+                if target_players:
+                    event["target_players"] = target_players
                 calendar.append(event)
 
         if isinstance(to_add, list):
@@ -8222,6 +8311,44 @@ class ZorkEmulator:
                 break
         return out
 
+    @classmethod
+    def _calendar_target_tokens_from_event(cls, event: object) -> list[str]:
+        if not isinstance(event, dict):
+            return []
+        raw_values: list[object] = []
+        for key in (
+            "target_players",
+            "target_player",
+            "targets",
+            "target",
+            "players",
+            "player",
+            "player_id",
+            "user_id",
+            "target_user_id",
+            "target_user_ids",
+            "who",
+        ):
+            raw_value = event.get(key)
+            if isinstance(raw_value, list):
+                raw_values.extend(raw_value)
+            elif raw_value is not None:
+                raw_values.append(raw_value)
+        out: list[str] = []
+        seen: set[str] = set()
+        for item in raw_values:
+            text = str(item or "").strip()
+            if not text:
+                continue
+            key = re.sub(r"\s+", " ", text.lower())[:160]
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            out.append(text[:160])
+            if len(out) >= 12:
+                break
+        return out
+
     def _active_scene_character_names(
         self,
         player_state: dict[str, object],
@@ -8359,8 +8486,8 @@ class ZorkEmulator:
                 player_names[actor_id] = name
             if slug:
                 player_slugs[actor_id] = slug
-        viewer_slug = player_slugs.get(player.actor_id) or self._player_slug_key(
-            player_state.get("character_name")
+        viewer_slug = player_slugs.get(player.actor_id) or self._player_visibility_slug(
+            player.actor_id
         )
 
         recent_lines: List[str] = []
