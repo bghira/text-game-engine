@@ -375,6 +375,7 @@ class ZorkEmulator:
         "- summary_update: string (one or two sentences of lasting changes)\n"
         "- xp_awarded: integer (0-10)\n"
         "- player_state_update: object (optional, player state patches)\n"
+        '- turn_visibility: object (optional; who should get this turn in future prompt context. Keys: "scope" ("public"|"private"|"limited"), "player_slugs" (array of stable player slugs from PARTY_SNAPSHOT/CURRENTLY_ATTENTIVE_PLAYERS), "npc_slugs" (array of WORLD_CHARACTERS slugs who overheard/noticed), and optional "reason". This changes prompt visibility only; it does NOT change shared world state.)\n'
         "- scene_image_prompt: string (optional; include whenever the visible scene changes in a meaningful way: entering a room, newly visible characters/objects, reveals, or strong visual shifts)\n"
         "- set_timer_delay: integer (optional; 30-300 seconds, see TIMED EVENTS SYSTEM below)\n"
         "- set_timer_event: string (optional; what happens when the timer expires)\n"
@@ -424,7 +425,9 @@ class ZorkEmulator:
         "- Avoid repetitive recap loops: at most one brief callback sentence to prior events, then move the scene forward.\n"
         "- Keep diction plain and direct; prioritize immediate consequences and available choices.\n"
         "- RECENT_TURNS includes turn/time tags like [TURN #N | Day D HH:MM]. Use them to track pacing and chronology.\n"
+        "- RECENT_TURNS is already filtered to what the acting player plausibly knows. Hidden/private turns from other players are omitted.\n"
         "- CURRENTLY_ATTENTIVE_PLAYERS lists players active within ATTENTION_WINDOW_SECONDS. Use it to pace time and scene focus.\n"
+        "- TURN_VISIBILITY_DEFAULT tells you whether this turn should default to shared/public context or private context.\n"
         "- If WORLD_SUMMARY is empty, invent a strong starting room and seed the world.\n"
         "- Use player_state_update for player-specific location and status.\n"
         "- Use player_state_update.room_title for a short location title (e.g. 'Penthouse Suite, Escala') whenever location changes.\n"
@@ -467,6 +470,13 @@ class ZorkEmulator:
         "Use the name_generate tool to get real culturally-appropriate names when introducing new NPCs.\n"
         "- PLAYER_CARD.state.character_name is ALWAYS the correct name for this player. Ignore any old names in WORLD_SUMMARY.\n"
         "- For other visible characters, always use the 'name' field from PARTY_SNAPSHOT. Never rename or confuse them.\n"
+        "- TURN VISIBILITY RULES:\n"
+        "  * Use turn_visibility when a turn should not fully enter every other player's RECENT_TURNS context.\n"
+        "  * public: obvious shared action/conversation; everyone nearby can know it.\n"
+        "  * private: actor-only context.\n"
+        "  * limited: only the acting player plus the listed player_slugs should retain the turn in prompt context.\n"
+        "  * npc_slugs are for overheard/noticed NPC awareness only. They help continuity but do not expose the turn to other players by themselves.\n"
+        "  * If TURN_VISIBILITY_DEFAULT is private and nothing in the scene clearly makes the action public, keep it private or limited.\n"
         "- Minimize mechanical text in narration. Do not narrate exits, room_summary, or state changes unless dramatically relevant.\n"
         "- Track location/exits in player_state_update, not in narration prose.\n"
         "- CRITICAL — OTHER PLAYER CHARACTERS ARE OFF-LIMITS:\n"
@@ -919,14 +929,181 @@ class ZorkEmulator:
         turn_number = int(getattr(turn, "id", 0) or 0)
         meta = parse_json_dict(getattr(turn, "meta_json", "{}"))
         game_time = meta.get("game_time") if isinstance(meta, dict) else None
+        prefix = f"[TURN #{turn_number}]"
         if isinstance(game_time, dict):
             day = cls._coerce_non_negative_int(game_time.get("day", 1), default=1) or 1
             hour = cls._coerce_non_negative_int(game_time.get("hour", 0), default=0)
             minute = cls._coerce_non_negative_int(game_time.get("minute", 0), default=0)
             hour = min(23, max(0, hour))
             minute = min(59, max(0, minute))
-            return f"[TURN #{turn_number} | Day {day} {hour:02d}:{minute:02d}]"
-        return f"[TURN #{turn_number}]"
+            prefix = f"[TURN #{turn_number} | Day {day} {hour:02d}:{minute:02d}]"
+        visibility = meta.get("visibility") if isinstance(meta, dict) else None
+        if not isinstance(visibility, dict):
+            return prefix
+        scope = str(visibility.get("scope") or "").strip().lower()
+        if not scope:
+            return prefix
+        details: list[str] = []
+        if scope == "public":
+            details.append("SEEN BY: public")
+        else:
+            names: list[str] = []
+            raw_player_slugs = visibility.get("visible_player_slugs")
+            if isinstance(raw_player_slugs, list):
+                for item in raw_player_slugs[:6]:
+                    slug = cls._player_slug_key(item)
+                    if slug:
+                        names.append(slug)
+            details.append(f"SEEN BY: {', '.join(names) if names else 'limited'}")
+        raw_npc_slugs = visibility.get("aware_npc_slugs")
+        npc_slugs: list[str] = []
+        if isinstance(raw_npc_slugs, list):
+            for item in raw_npc_slugs[:6]:
+                slug = str(item or "").strip()
+                if slug:
+                    npc_slugs.append(slug)
+        if npc_slugs:
+            details.append(f"NPCS AWARE: {', '.join(npc_slugs)}")
+        return f"{prefix[:-1]} | {' | '.join(details)}]" if details else prefix
+
+    @staticmethod
+    def _player_slug_key(value: object) -> str:
+        text = str(value or "").strip().lower()
+        if not text:
+            return ""
+        return re.sub(r"[^a-z0-9]+", "-", text).strip("-")[:64]
+
+    @classmethod
+    def _campaign_player_registry(cls, campaign_id: str, session_factory) -> dict[str, dict[object, dict[str, object]]]:
+        by_actor_id: dict[str, dict[str, object]] = {}
+        by_slug: dict[str, dict[str, object]] = {}
+        with session_factory() as session:
+            rows = session.query(Player).filter(Player.campaign_id == campaign_id).all()
+            for row in rows:
+                state = parse_json_dict(row.state_json)
+                fallback_name = f"Adventurer-{str(row.actor_id)[-4:]}"
+                name = str(state.get("character_name") or fallback_name).strip()
+                slug = cls._player_slug_key(name) or f"player-{row.actor_id}"
+                entry = {
+                    "actor_id": row.actor_id,
+                    "name": name,
+                    "slug": slug,
+                    "discord_mention": f"<@{row.actor_id}>",
+                }
+                by_actor_id[row.actor_id] = entry
+                by_slug[slug] = entry
+        return {"by_actor_id": by_actor_id, "by_slug": by_slug}
+
+    @staticmethod
+    def _safe_turn_meta(turn: Turn) -> dict[str, object]:
+        meta = parse_json_dict(getattr(turn, "meta_json", "{}"))
+        return meta if isinstance(meta, dict) else {}
+
+    @classmethod
+    def _default_turn_visibility_meta(
+        cls,
+        actor: Player | None,
+    ) -> dict[str, object]:
+        actor_name = ""
+        actor_id = None
+        if actor is not None:
+            actor_id = actor.actor_id
+            actor_state = parse_json_dict(actor.state_json)
+            actor_name = str(actor_state.get("character_name") or "").strip()
+        actor_slug = cls._player_slug_key(actor_name) or (f"player-{actor_id}" if actor_id else "")
+        return {
+            "scope": "public",
+            "actor_player_slug": actor_slug or None,
+            "actor_actor_id": actor_id,
+            "visible_player_slugs": [],
+            "visible_actor_ids": [],
+            "aware_npc_slugs": [],
+            "source": "public-default",
+        }
+
+    @classmethod
+    def _normalize_turn_visibility(
+        cls,
+        campaign: Campaign,
+        actor: Player | None,
+        raw_visibility: object,
+    ) -> dict[str, object]:
+        default_meta = cls._default_turn_visibility_meta(actor)
+        if not isinstance(raw_visibility, dict):
+            return default_meta
+        scope = str(raw_visibility.get("scope") or "").strip().lower()
+        if scope not in {"public", "private", "limited"}:
+            scope = str(default_meta.get("scope") or "public")
+        actor_slug = str(default_meta.get("actor_player_slug") or "").strip()
+        visible_player_slugs: list[str] = []
+        visible_actor_ids: list[str] = []
+        raw_player_slugs = raw_visibility.get("player_slugs")
+        player_items = raw_player_slugs if isinstance(raw_player_slugs, list) else ([raw_player_slugs] if isinstance(raw_player_slugs, str) else [])
+        seen_player_slugs: set[str] = set()
+        for item in player_items:
+            slug = cls._player_slug_key(item)
+            if not slug or slug in seen_player_slugs:
+                continue
+            seen_player_slugs.add(slug)
+            visible_player_slugs.append(slug)
+        if scope in {"private", "limited"} and actor_slug:
+            if actor_slug not in seen_player_slugs:
+                visible_player_slugs.insert(0, actor_slug)
+            actor_actor_id = str(default_meta.get("actor_actor_id") or "").strip()
+            if actor_actor_id and actor_actor_id not in visible_actor_ids:
+                visible_actor_ids.insert(0, actor_actor_id)
+        aware_npc_slugs: list[str] = []
+        raw_npc_slugs = raw_visibility.get("npc_slugs")
+        npc_items = raw_npc_slugs if isinstance(raw_npc_slugs, list) else ([raw_npc_slugs] if isinstance(raw_npc_slugs, str) else [])
+        seen_npc_slugs: set[str] = set()
+        campaign_characters = parse_json_dict(getattr(campaign, "characters_json", "{}"))
+        if isinstance(campaign_characters, dict):
+            for item in npc_items:
+                slug = str(item or "").strip()
+                if not slug:
+                    continue
+                resolved_slug = cls._resolve_existing_character_slug(campaign_characters, slug)
+                if resolved_slug and resolved_slug not in seen_npc_slugs:
+                    aware_npc_slugs.append(resolved_slug)
+                    seen_npc_slugs.add(resolved_slug)
+        reason = cls._trim_text(str(raw_visibility.get("reason") or "").strip(), 240)
+        return {
+            "scope": scope,
+            "actor_player_slug": actor_slug or None,
+            "actor_actor_id": default_meta.get("actor_actor_id"),
+            "visible_player_slugs": visible_player_slugs,
+            "visible_actor_ids": visible_actor_ids,
+            "aware_npc_slugs": aware_npc_slugs,
+            "reason": reason or None,
+            "source": "model",
+        }
+
+    @classmethod
+    def _turn_visible_to_viewer(cls, turn: Turn, viewer_actor_id: str, viewer_slug: str) -> bool:
+        if turn.actor_id == viewer_actor_id:
+            return True
+        meta = cls._safe_turn_meta(turn)
+        visibility = meta.get("visibility")
+        if not isinstance(visibility, dict):
+            return True
+        scope = str(visibility.get("scope") or "").strip().lower()
+        if scope in {"", "public"}:
+            return True
+        raw_actor_ids = visibility.get("visible_actor_ids")
+        actor_ids = set()
+        if isinstance(raw_actor_ids, list):
+            actor_ids = {str(item).strip() for item in raw_actor_ids if str(item).strip()}
+        if viewer_actor_id in actor_ids:
+            return True
+        raw_player_slugs = visibility.get("visible_player_slugs")
+        player_slugs = set()
+        if isinstance(raw_player_slugs, list):
+            player_slugs = {
+                cls._player_slug_key(item)
+                for item in raw_player_slugs
+                if cls._player_slug_key(item)
+            }
+        return bool(viewer_slug and viewer_slug in player_slugs)
 
     @staticmethod
     def _normalize_timer_interrupt_scope(value: object) -> str:
@@ -1358,10 +1535,12 @@ class ZorkEmulator:
             if since_seconds < 0 or since_seconds > self.ATTENTION_WINDOW_SECONDS:
                 continue
             name = str(player_state.get("character_name") or "").strip()
+            player_slug = self._player_slug_key(name) or f"player-{row.actor_id}"
             out.append(
                 {
                     "actor_id": row.actor_id,
                     "name": name or None,
+                    "player_slug": player_slug,
                     "seconds_since_last_message": since_seconds,
                     "attention_seconds_total": self._coerce_non_negative_int(
                         stats.get(self.PLAYER_STATS_ATTENTION_SECONDS_KEY), 0
@@ -4053,6 +4232,7 @@ class ZorkEmulator:
                     continue
                 fallback_name = f"Adventurer-{entry.actor_id[-4:]}" if entry.actor_id else "Adventurer"
                 display_name = str(state.get("character_name") or fallback_name).strip()
+                player_slug = self._player_slug_key(display_name) or f"player-{entry.actor_id}"
                 persona = str(state.get("persona") or "").strip()
                 if persona:
                     persona = self._trim_text(persona, self.MAX_PERSONA_PROMPT_CHARS)
@@ -4064,8 +4244,10 @@ class ZorkEmulator:
                     visible_items = self._normalize_inventory_items(state.get("inventory"))[:3]
                 out.append(
                     {
+                        "actor_id": entry.actor_id,
                         "discord_mention": f"<@{entry.actor_id}>",
                         "name": display_name,
+                        "player_slug": player_slug,
                         "is_actor": entry.actor_id == actor.actor_id,
                         "level": entry.level,
                         "persona": persona,
@@ -8129,6 +8311,7 @@ class ZorkEmulator:
         turns: list[Turn],
         party_snapshot: list[dict[str, object]] | None = None,
         is_new_player: bool = False,
+        turn_visibility_default: str = "public",
     ) -> tuple[str, str]:
         summary = self._strip_inventory_mentions(campaign.summary or "")
         summary = self._trim_text(summary, self.MAX_SUMMARY_CHARS)
@@ -8163,21 +8346,22 @@ class ZorkEmulator:
             "state": player_state_prompt,
         }
 
+        player_registry = self._campaign_player_registry(campaign.id, self._session_factory)
         player_names: Dict[str, str] = {}
-        actor_ids = {turn.actor_id for turn in turns if turn.actor_id}
-        if actor_ids:
-            with self._session_factory() as session:
-                rows = (
-                    session.query(Player)
-                    .filter(Player.campaign_id == campaign.id)
-                    .filter(Player.actor_id.in_(actor_ids))
-                    .all()
-                )
-                for row in rows:
-                    state_row = parse_json_dict(row.state_json)
-                    name = str(state_row.get("character_name") or "").strip()
-                    if name:
-                        player_names[row.actor_id] = name
+        player_slugs: Dict[str, str] = {}
+        for raw_actor_id, info in player_registry.get("by_actor_id", {}).items():
+            actor_id = str(raw_actor_id or "").strip()
+            if not actor_id:
+                continue
+            name = str(info.get("name") or "").strip()
+            slug = str(info.get("slug") or "").strip()
+            if name:
+                player_names[actor_id] = name
+            if slug:
+                player_slugs[actor_id] = slug
+        viewer_slug = player_slugs.get(player.actor_id) or self._player_slug_key(
+            player_state.get("character_name")
+        )
 
         recent_lines: List[str] = []
         ooc_re = re.compile(r"^\s*\[OOC\b", re.IGNORECASE)
@@ -8188,6 +8372,8 @@ class ZorkEmulator:
         for turn in turns:
             content = (turn.content or "").strip()
             if not content:
+                continue
+            if not self._turn_visible_to_viewer(turn, player.actor_id, viewer_slug):
                 continue
             turn_prefix = self._turn_context_prefix(turn)
             if turn.kind == "player":
@@ -8289,6 +8475,7 @@ class ZorkEmulator:
             f"CAMPAIGN: {campaign.name}\n"
             f"PLAYER_ID: {player.actor_id}\n"
             f"IS_NEW_PLAYER: {str(is_new_player).lower()}\n"
+            f"TURN_VISIBILITY_DEFAULT: {turn_visibility_default}\n"
             f"GUARDRAILS_ENABLED: {str(guardrails_enabled).lower()}\n"
             f"RAILS_CONTEXT: {self._dump_json(rails_context)}\n"
             f"WORLD_SUMMARY: {summary}\n"

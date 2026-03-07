@@ -172,6 +172,95 @@ class GameEngine:
                     out.append(hit)
             return out
 
+    @staticmethod
+    def _player_slug_key(value: object) -> str:
+        text = str(value or "").strip().lower()
+        if not text:
+            return ""
+        return re.sub(r"[^a-z0-9]+", "-", text).strip("-")[:64]
+
+    @staticmethod
+    def _normalize_turn_visibility(actor_id: str, actor_name: str, raw_visibility: object) -> dict[str, Any]:
+        actor_slug = GameEngine._player_slug_key(actor_name) or f"player-{actor_id}"
+        default_meta = {
+            "scope": "public",
+            "actor_player_slug": actor_slug,
+            "actor_actor_id": actor_id,
+            "visible_player_slugs": [],
+            "visible_actor_ids": [],
+            "aware_npc_slugs": [],
+        }
+        if not isinstance(raw_visibility, dict):
+            return default_meta
+        scope = str(raw_visibility.get("scope") or "").strip().lower()
+        if scope not in {"public", "private", "limited"}:
+            scope = "public"
+        visible_player_slugs = []
+        raw_player_slugs = raw_visibility.get("player_slugs")
+        if isinstance(raw_player_slugs, list):
+            for item in raw_player_slugs:
+                slug = GameEngine._player_slug_key(item)
+                if slug and slug not in visible_player_slugs:
+                    visible_player_slugs.append(slug)
+        elif isinstance(raw_player_slugs, str):
+            slug = GameEngine._player_slug_key(raw_player_slugs)
+            if slug:
+                visible_player_slugs.append(slug)
+        visible_actor_ids = []
+        raw_actor_ids = raw_visibility.get("actor_ids")
+        if isinstance(raw_actor_ids, list):
+            for item in raw_actor_ids:
+                raw_id = str(item or "").strip()
+                if raw_id and raw_id not in visible_actor_ids:
+                    visible_actor_ids.append(raw_id)
+        elif isinstance(raw_actor_ids, str) and raw_actor_ids.strip():
+            visible_actor_ids.append(raw_actor_ids.strip())
+        if scope in {"private", "limited"}:
+            if actor_slug and actor_slug not in visible_player_slugs:
+                visible_player_slugs.insert(0, actor_slug)
+            if actor_id and actor_id not in visible_actor_ids:
+                visible_actor_ids.insert(0, actor_id)
+        aware_npc_slugs = []
+        raw_npc_slugs = raw_visibility.get("npc_slugs")
+        if isinstance(raw_npc_slugs, list):
+            for item in raw_npc_slugs:
+                slug = str(item or "").strip()
+                if slug and slug not in aware_npc_slugs:
+                    aware_npc_slugs.append(slug)
+        elif isinstance(raw_npc_slugs, str) and raw_npc_slugs.strip():
+            aware_npc_slugs.append(raw_npc_slugs.strip())
+        reason = " ".join(str(raw_visibility.get("reason") or "").split())[:240]
+        return {
+            "scope": scope,
+            "actor_player_slug": actor_slug,
+            "actor_actor_id": actor_id,
+            "visible_player_slugs": visible_player_slugs,
+            "visible_actor_ids": visible_actor_ids,
+            "aware_npc_slugs": aware_npc_slugs,
+            "reason": reason or None,
+        }
+
+    @staticmethod
+    def _turn_visible_to_actor(turn: Any, actor_id: str, actor_slug: str) -> bool:
+        if str(getattr(turn, "actor_id", "") or "").strip() == str(actor_id or "").strip():
+            return True
+        meta = parse_json_dict(getattr(turn, "meta_json", "{}"))
+        visibility = meta.get("visibility") if isinstance(meta, dict) else None
+        if not isinstance(visibility, dict):
+            return True
+        scope = str(visibility.get("scope") or "").strip().lower()
+        if scope in {"", "public"}:
+            return True
+        raw_actor_ids = visibility.get("visible_actor_ids")
+        if isinstance(raw_actor_ids, list):
+            if str(actor_id or "").strip() in {str(item or "").strip() for item in raw_actor_ids}:
+                return True
+        raw_player_slugs = visibility.get("visible_player_slugs")
+        if isinstance(raw_player_slugs, list):
+            if actor_slug and actor_slug in {GameEngine._player_slug_key(item) for item in raw_player_slugs}:
+                return True
+        return False
+
     def _phase_a(self, turn_input: ResolveTurnInput, claim_token: str) -> TurnContext:
         now = self._clock()
         expires_at = now + timedelta(seconds=self._lease_ttl_seconds)
@@ -195,6 +284,9 @@ class GameEngine:
             if player is None:
                 player = uow.players.create(turn_input.campaign_id, turn_input.actor_id)
 
+            player_state = parse_json_dict(player.state_json)
+            actor_name = str(player_state.get("character_name") or "").strip()
+            actor_slug = self._player_slug_key(actor_name) or f"player-{turn_input.actor_id}"
             turns = uow.turns.recent(turn_input.campaign_id, limit=24)
             def _turn_meta_payload(turn_obj):
                 meta = parse_json_dict(getattr(turn_obj, "meta_json", "{}"))
@@ -224,6 +316,7 @@ class GameEngine:
                         "created_at": t.created_at.isoformat() if t.created_at else None,
                     }
                     for t in turns
+                    if self._turn_visible_to_actor(t, turn_input.actor_id, actor_slug)
                 ],
                 start_row_version=campaign.row_version,
                 now=now,
@@ -316,9 +409,19 @@ class GameEngine:
                 )
             player_state = apply_patch(player_state, raw_player_update)
             post_turn_game_time = self._extract_game_time_snapshot(campaign_state)
+            turn_visibility = self._normalize_turn_visibility(
+                turn_input.actor_id,
+                str(player_state.get("character_name") or ""),
+                getattr(llm_output, "turn_visibility", None),
+            )
+            turn_is_public = str(turn_visibility.get("scope") or "").strip().lower() == "public"
 
             summary = campaign.summary or ""
-            if isinstance(llm_output.summary_update, str) and llm_output.summary_update.strip():
+            if (
+                turn_is_public
+                and isinstance(llm_output.summary_update, str)
+                and llm_output.summary_update.strip()
+            ):
                 summary = (summary + "\n" + llm_output.summary_update.strip()).strip()
 
             narration = (llm_output.narration or "").strip()
@@ -377,7 +480,10 @@ class GameEngine:
             player.last_active_at = now
 
             if turn_input.record_player_turn:
-                player_turn_meta = {"game_time": pre_turn_game_time}
+                player_turn_meta = {
+                    "game_time": pre_turn_game_time,
+                    "visibility": turn_visibility,
+                }
                 uow.turns.add(
                     campaign_id=turn_input.campaign_id,
                     session_id=turn_input.session_id,
@@ -391,7 +497,12 @@ class GameEngine:
                 compact_reasoning = " ".join(llm_output.reasoning.strip().split())
                 if compact_reasoning:
                     reasoning_text = compact_reasoning[:1200]
-            narrator_turn_meta = {"game_time": post_turn_game_time}
+            narrator_turn_meta = {
+                "game_time": post_turn_game_time,
+                "visibility": turn_visibility,
+                "actor_player_slug": self._player_slug_key(player_state.get("character_name")),
+                "location_key": self._room_key_from_state(player_state),
+            }
             if reasoning_text:
                 narrator_turn_meta["reasoning"] = reasoning_text
             narrator_turn = uow.turns.add(
