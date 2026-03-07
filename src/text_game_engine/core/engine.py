@@ -185,21 +185,85 @@ class GameEngine:
         return f"player-{raw}" if raw else ""
 
     @staticmethod
-    def _normalize_turn_visibility(actor_id: str, _actor_name: str, raw_visibility: object) -> dict[str, Any]:
+    def _default_visibility_scope(actor_location_key: str) -> str:
+        location_key = str(actor_location_key or "").strip().lower()
+        return "local" if location_key and location_key != "unknown-room" else "public"
+
+    @staticmethod
+    def _is_private_phone_command_line(value: object) -> bool:
+        text = " ".join(str(value or "").strip().split())
+        if not text:
+            return False
+        return bool(
+            re.match(
+                r"^(?:i\s+)?(?:send\s+)?(?:sms|text|message)\b",
+                text,
+                flags=re.IGNORECASE,
+            )
+        )
+
+    @classmethod
+    def _redact_private_phone_command_lines(cls, text: str) -> tuple[str, bool]:
+        if not text:
+            return "", False
+        kept_lines: list[str] = []
+        redacted = False
+        for raw_line in str(text).splitlines():
+            if cls._is_private_phone_command_line(raw_line):
+                redacted = True
+                continue
+            kept_lines.append(raw_line)
+        return "\n".join(kept_lines).strip(), redacted
+
+    @staticmethod
+    def _force_private_visibility_for_phone_activity(
+        actor_id: str,
+        visibility: dict[str, Any],
+    ) -> dict[str, Any]:
         actor_slug = GameEngine._player_visibility_slug(actor_id)
+        reason = " ".join(str(visibility.get("reason") or "").split())[:240]
+        return {
+            "scope": "private",
+            "actor_player_slug": str(visibility.get("actor_player_slug") or actor_slug).strip() or actor_slug,
+            "actor_actor_id": str(visibility.get("actor_actor_id") or actor_id).strip() or actor_id,
+            "visible_player_slugs": [actor_slug] if actor_slug else [],
+            "visible_actor_ids": [str(actor_id).strip()] if str(actor_id).strip() else [],
+            "location_key": None,
+            "aware_npc_slugs": [],
+            "reason": reason or "Private phone/SMS activity is actor-only unless explicitly shared.",
+            "source": "auto-private-phone",
+        }
+
+    @staticmethod
+    def _normalize_turn_visibility(
+        actor_id: str,
+        _actor_name: str,
+        raw_visibility: object,
+        *,
+        actor_location_key: str,
+    ) -> dict[str, Any]:
+        actor_slug = GameEngine._player_visibility_slug(actor_id)
+        default_scope = GameEngine._default_visibility_scope(actor_location_key)
         default_meta = {
-            "scope": "public",
+            "scope": default_scope,
             "actor_player_slug": actor_slug,
             "actor_actor_id": actor_id,
             "visible_player_slugs": [],
             "visible_actor_ids": [],
+            "location_key": (
+                actor_location_key
+                if default_scope == "local"
+                and actor_location_key
+                and actor_location_key.lower() != "unknown-room"
+                else None
+            ),
             "aware_npc_slugs": [],
         }
         if not isinstance(raw_visibility, dict):
             return default_meta
         scope = str(raw_visibility.get("scope") or "").strip().lower()
-        if scope not in {"public", "private", "limited"}:
-            scope = "public"
+        if scope not in {"public", "private", "limited", "local"}:
+            scope = default_scope
         visible_player_slugs = []
         raw_player_slugs = raw_visibility.get("player_slugs")
         if isinstance(raw_player_slugs, list):
@@ -215,7 +279,7 @@ class GameEngine:
         # models specify player_slugs, not actor_ids. The engine still
         # maintains visible_actor_ids internally for the acting player.
         visible_actor_ids: list[str] = []
-        if scope in {"private", "limited"}:
+        if scope in {"private", "limited", "local"}:
             if actor_slug and actor_slug not in visible_player_slugs:
                 visible_player_slugs.insert(0, actor_slug)
             if actor_id and actor_id not in visible_actor_ids:
@@ -236,12 +300,18 @@ class GameEngine:
             "actor_actor_id": actor_id,
             "visible_player_slugs": visible_player_slugs,
             "visible_actor_ids": visible_actor_ids,
+            "location_key": str(default_meta.get("location_key") or "").strip() or None,
             "aware_npc_slugs": aware_npc_slugs,
             "reason": reason or None,
         }
 
     @staticmethod
-    def _turn_visible_to_actor(turn: Any, actor_id: str, actor_slug: str) -> bool:
+    def _turn_visible_to_actor(
+        turn: Any,
+        actor_id: str,
+        actor_slug: str,
+        viewer_location_key: str,
+    ) -> bool:
         if str(getattr(turn, "actor_id", "") or "").strip() == str(actor_id or "").strip():
             return True
         meta = parse_json_dict(getattr(turn, "meta_json", "{}"))
@@ -251,6 +321,12 @@ class GameEngine:
         scope = str(visibility.get("scope") or "").strip().lower()
         if scope in {"", "public"}:
             return True
+        if scope == "local":
+            turn_location_key = str(
+                visibility.get("location_key") or meta.get("location_key") or ""
+            ).strip().lower()
+            if viewer_location_key and turn_location_key and viewer_location_key == turn_location_key:
+                return True
         raw_actor_ids = visibility.get("visible_actor_ids")
         if isinstance(raw_actor_ids, list):
             if str(actor_id or "").strip() in {str(item or "").strip() for item in raw_actor_ids}:
@@ -287,6 +363,7 @@ class GameEngine:
             player_state = parse_json_dict(player.state_json)
             actor_name = str(player_state.get("character_name") or "").strip()
             actor_slug = self._player_visibility_slug(turn_input.actor_id)
+            viewer_location_key = self._room_key_from_state(player_state)
             turns = uow.turns.recent(turn_input.campaign_id, limit=24)
             def _turn_meta_payload(turn_obj):
                 meta = parse_json_dict(getattr(turn_obj, "meta_json", "{}"))
@@ -316,7 +393,12 @@ class GameEngine:
                         "created_at": t.created_at.isoformat() if t.created_at else None,
                     }
                     for t in turns
-                    if self._turn_visible_to_actor(t, turn_input.actor_id, actor_slug)
+                    if self._turn_visible_to_actor(
+                        t,
+                        turn_input.actor_id,
+                        actor_slug,
+                        viewer_location_key,
+                    )
                 ],
                 start_row_version=campaign.row_version,
                 now=now,
@@ -409,11 +491,25 @@ class GameEngine:
                 )
             player_state = apply_patch(player_state, raw_player_update)
             post_turn_game_time = self._extract_game_time_snapshot(campaign_state)
+            actor_location_key = self._room_key_from_state(player_state)
             turn_visibility = self._normalize_turn_visibility(
                 turn_input.actor_id,
                 str(player_state.get("character_name") or ""),
                 getattr(llm_output, "turn_visibility", None),
+                actor_location_key=actor_location_key,
             )
+            stored_player_action, private_phone_redacted = self._redact_private_phone_command_lines(
+                turn_input.action
+            )
+            if private_phone_redacted:
+                turn_visibility = self._force_private_visibility_for_phone_activity(
+                    turn_input.actor_id,
+                    turn_visibility,
+                )
+                self._increment_auto_fix_counter(
+                    campaign_state,
+                    "private_phone_redacted",
+                )
             turn_is_public = str(turn_visibility.get("scope") or "").strip().lower() == "public"
 
             summary = campaign.summary or ""
@@ -479,17 +575,18 @@ class GameEngine:
             player.updated_at = now
             player.last_active_at = now
 
-            if turn_input.record_player_turn:
+            if turn_input.record_player_turn and stored_player_action:
                 player_turn_meta = {
                     "game_time": pre_turn_game_time,
                     "visibility": turn_visibility,
+                    "location_key": self._room_key_from_state(player_state),
                 }
                 uow.turns.add(
                     campaign_id=turn_input.campaign_id,
                     session_id=turn_input.session_id,
                     actor_id=turn_input.actor_id,
                     kind="player",
-                    content=turn_input.action,
+                    content=stored_player_action,
                     meta_json=dump_json(player_turn_meta),
                 )
             reasoning_text: str | None = None

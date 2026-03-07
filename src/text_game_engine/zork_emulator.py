@@ -375,7 +375,7 @@ class ZorkEmulator:
         "- summary_update: string (one or two sentences of lasting changes)\n"
         "- xp_awarded: integer (0-10)\n"
         "- player_state_update: object (optional, player state patches)\n"
-        '- turn_visibility: object (optional; who should get this turn in future prompt context. Keys: "scope" ("public"|"private"|"limited"), "player_slugs" (array of player slugs from PARTY_SNAPSHOT/CURRENTLY_ATTENTIVE_PLAYERS, typically in `player-<actor_id>` form), "npc_slugs" (array of WORLD_CHARACTERS slugs who overheard/noticed), and optional "reason". This changes prompt visibility only; it does NOT change shared world state.)\n'
+        '- turn_visibility: object (optional; who should get this turn in future prompt context. Keys: "scope" ("public"|"private"|"limited"|"local"), "player_slugs" (array of player slugs from PARTY_SNAPSHOT/CURRENTLY_ATTENTIVE_PLAYERS, typically in `player-<actor_id>` form), "npc_slugs" (array of WORLD_CHARACTERS slugs who overheard/noticed), and optional "reason". This changes prompt visibility only; it does NOT change shared world state.)\n'
         "- scene_image_prompt: string (optional; include whenever the visible scene changes in a meaningful way: entering a room, newly visible characters/objects, reveals, or strong visual shifts)\n"
         "- set_timer_delay: integer (optional; 30-300 seconds, see TIMED EVENTS SYSTEM below)\n"
         "- set_timer_event: string (optional; what happens when the timer expires)\n"
@@ -427,7 +427,7 @@ class ZorkEmulator:
         "- RECENT_TURNS includes turn/time tags like [TURN #N | Day D HH:MM]. Use them to track pacing and chronology.\n"
         "- RECENT_TURNS is already filtered to what the acting player plausibly knows. Hidden/private turns from other players are omitted.\n"
         "- CURRENTLY_ATTENTIVE_PLAYERS lists players active within ATTENTION_WINDOW_SECONDS. Use it to pace time and scene focus.\n"
-        "- TURN_VISIBILITY_DEFAULT tells you whether this turn should default to shared/public context or private context.\n"
+        "- TURN_VISIBILITY_DEFAULT tells you whether this turn should default to public, local, or private context.\n"
         "- If WORLD_SUMMARY is empty, invent a strong starting room and seed the world.\n"
         "- Use player_state_update for player-specific location and status.\n"
         "- Use player_state_update.room_title for a short location title (e.g. 'Penthouse Suite, Escala') whenever location changes.\n"
@@ -472,10 +472,13 @@ class ZorkEmulator:
         "- For other visible characters, always use the 'name' field from PARTY_SNAPSHOT. Never rename or confuse them.\n"
         "- TURN VISIBILITY RULES:\n"
         "  * Use turn_visibility when a turn should not fully enter every other player's RECENT_TURNS context.\n"
-        "  * public: obvious shared action/conversation; everyone nearby can know it.\n"
+        "  * public: use only for campaign-wide announcements, reminders, alarms, or changes all players should know even outside the room.\n"
         "  * private: actor-only context.\n"
+        "  * local: default for ordinary in-room action when a concrete location_key/room is present. Players in the same room should retain it in prompt context, but it should not enter global/worldwide recap.\n"
         "  * limited: only the acting player plus the listed player_slugs should retain the turn in prompt context.\n"
+        "  * Phone/text/SMS activity is private by default to the acting player. If they text or message someone off-scene, use private or limited unless they explicitly show or read it aloud to others.\n"
         "  * npc_slugs are for overheard/noticed NPC awareness only. They help continuity but do not expose the turn to other players by themselves.\n"
+        "  * If TURN_VISIBILITY_DEFAULT is local, keep routine room-level interaction local unless it clearly becomes public.\n"
         "  * If TURN_VISIBILITY_DEFAULT is private and nothing in the scene clearly makes the action public, keep it private or limited.\n"
         "- Minimize mechanical text in narration. Do not narrate exits, room_summary, or state changes unless dramatically relevant.\n"
         "- Track location/exits in player_state_update, not in narration prose.\n"
@@ -601,6 +604,7 @@ class ZorkEmulator:
         "sms_schedule is invisible to players at scheduling time. Do NOT narrate the delayed SMS as already received in the current response.\n"
         "Use a stable contact thread slug for both directions (e.g. always `elizabeth` for Deshawn<->Elizabeth), not per-sender thread names.\n"
         "SMS continuity rule: do NOT leak scene context into SMS content unless the SMS explicitly mentions it.\n"
+        "SMS privacy rule: do NOT leave literal player command lines like 'I text X ...' in narration or shared room context; the SMS log is the canonical record.\n"
         "NPC SMS responses/knowledge must be limited to what that thread and established continuity plausibly reveal.\n"
     )
     MEMORY_TOOL_PROMPT = (
@@ -615,6 +619,7 @@ class ZorkEmulator:
         "- Default behavior: call memory_search first.\n"
         "- If PLAYER_ACTION involves phone/text/call/off-scene contact, use sms_list/sms_read before narrating; "
         "use sms_write when sending or replying. Use sms_schedule for delayed replies.\n"
+        "- Phone/text/SMS turns should normally be private or limited, not local/public, unless the player explicitly shares the content out loud.\n"
         "- CRITICAL SMS RULE: When an NPC replies via text/phone, you MUST call sms_write to record the NPC's reply "
         "BEFORE outputting final narration. Both sides of a conversation must be in the SMS log. "
         "If you narrate an NPC texting back but don't sms_write it, the reply is lost permanently.\n"
@@ -949,6 +954,8 @@ class ZorkEmulator:
         details: list[str] = []
         if scope == "public":
             details.append("SEEN BY: public")
+        elif scope == "local":
+            details.append("SEEN BY: local")
         else:
             names: list[str] = []
             raw_player_slugs = visibility.get("visible_player_slugs")
@@ -981,6 +988,23 @@ class ZorkEmulator:
         raw = str(actor_id or "").strip()
         return f"player-{raw}" if raw else ""
 
+    @staticmethod
+    def _default_prompt_turn_visibility(
+        requested_default: str,
+        player_state: Dict[str, object],
+    ) -> str:
+        default_clean = str(requested_default or "").strip().lower()
+        if default_clean == "private":
+            return "private"
+        location_key = ""
+        if isinstance(player_state, dict):
+            for key in ("room_id", "location", "room_title", "room_summary"):
+                raw = str(player_state.get(key) or "").strip()
+                if raw:
+                    location_key = raw
+                    break
+        return "local" if location_key else "public"
+
     @classmethod
     def _campaign_player_registry(
         cls,
@@ -1012,7 +1036,13 @@ class ZorkEmulator:
         return meta if isinstance(meta, dict) else {}
 
     @classmethod
-    def _turn_visible_to_viewer(cls, turn: Turn, viewer_actor_id: str, viewer_slug: str) -> bool:
+    def _turn_visible_to_viewer(
+        cls,
+        turn: Turn,
+        viewer_actor_id: str,
+        viewer_slug: str,
+        viewer_location_key: str,
+    ) -> bool:
         if turn.actor_id == viewer_actor_id:
             return True
         meta = cls._safe_turn_meta(turn)
@@ -1022,6 +1052,12 @@ class ZorkEmulator:
         scope = str(visibility.get("scope") or "").strip().lower()
         if scope in {"", "public"}:
             return True
+        if scope == "local":
+            turn_location_key = str(
+                visibility.get("location_key") or meta.get("location_key") or ""
+            ).strip().lower()
+            if viewer_location_key and turn_location_key and viewer_location_key == turn_location_key:
+                return True
         raw_actor_ids = visibility.get("visible_actor_ids")
         actor_ids = set()
         if isinstance(raw_actor_ids, list):
@@ -7645,10 +7681,19 @@ class ZorkEmulator:
             text,
             flags=re.IGNORECASE,
         )
-        if not m:
-            return None
-        recipient = str(m.group(1) or "").strip().strip("\"'` ")
-        message = str(m.group(2) or "").strip()
+        if m:
+            recipient = str(m.group(1) or "").strip().strip("\"'` ")
+            message = str(m.group(2) or "").strip()
+        else:
+            m = re.match(
+                r"^\s*(?:i\s+)?(?:send\s+)?(?:sms|text|message)\s+(?:to\s+)?([^\s:\n]{1,80})\s+(.+?)\s*$",
+                text,
+                flags=re.IGNORECASE,
+            )
+            if not m:
+                return None
+            recipient = str(m.group(1) or "").strip().strip("\"'` ")
+            message = str(m.group(2) or "").strip()
         if (
             len(message) >= 2
             and message[0] == message[-1]
@@ -8489,6 +8534,7 @@ class ZorkEmulator:
         viewer_slug = player_slugs.get(player.actor_id) or self._player_visibility_slug(
             player.actor_id
         )
+        viewer_location_key = self._room_key_from_player_state(player_state).lower()
 
         recent_lines: List[str] = []
         ooc_re = re.compile(r"^\s*\[OOC\b", re.IGNORECASE)
@@ -8500,7 +8546,12 @@ class ZorkEmulator:
             content = (turn.content or "").strip()
             if not content:
                 continue
-            if not self._turn_visible_to_viewer(turn, player.actor_id, viewer_slug):
+            if not self._turn_visible_to_viewer(
+                turn,
+                player.actor_id,
+                viewer_slug,
+                viewer_location_key,
+            ):
                 continue
             turn_prefix = self._turn_context_prefix(turn)
             if turn.kind == "player":
@@ -8598,11 +8649,15 @@ class ZorkEmulator:
             "room_summary": player_state.get("room_summary"),
         }
 
+        effective_turn_visibility_default = self._default_prompt_turn_visibility(
+            turn_visibility_default,
+            player_state,
+        )
         user_prompt = (
             f"CAMPAIGN: {campaign.name}\n"
             f"PLAYER_ID: {player.actor_id}\n"
             f"IS_NEW_PLAYER: {str(is_new_player).lower()}\n"
-            f"TURN_VISIBILITY_DEFAULT: {turn_visibility_default}\n"
+            f"TURN_VISIBILITY_DEFAULT: {effective_turn_visibility_default}\n"
             f"GUARDRAILS_ENABLED: {str(guardrails_enabled).lower()}\n"
             f"RAILS_CONTEXT: {self._dump_json(rails_context)}\n"
             f"WORLD_SUMMARY: {summary}\n"
