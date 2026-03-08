@@ -1226,6 +1226,44 @@ class GameEngine:
         return cls.DEFAULT_TURN_ADVANCE_MINUTES
 
     @classmethod
+    def _extract_time_skip_request(cls, action_text: object) -> dict[str, Any] | None:
+        text = " ".join(str(action_text or "").strip().split())
+        if not text:
+            return None
+        match = re.match(
+            r"^(?:time[\s-]*skip|timeskip)\b(?:\s+(.*))?$",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if not match:
+            return None
+        desc = str(match.group(1) or "").strip()
+        minutes = 60
+        total = 0
+        found = False
+        for raw_value, unit in re.findall(
+            r"(\d+(?:\.\d+)?)\s*(d(?:ays?)?|h(?:ours?|rs?)?|m(?:in(?:ute)?s?)?)\b",
+            desc,
+            flags=re.IGNORECASE,
+        ):
+            try:
+                value = float(raw_value)
+            except (TypeError, ValueError):
+                continue
+            unit_l = unit.lower()
+            if unit_l.startswith("d"):
+                total += int(round(value * 24 * 60))
+            elif unit_l.startswith("h"):
+                total += int(round(value * 60))
+            else:
+                total += int(round(value))
+            found = True
+        if found and total > 0:
+            minutes = total
+        minutes = max(1, min(7 * 24 * 60, int(minutes)))
+        return {"minutes": minutes, "description": desc}
+
+    @classmethod
     def _ensure_game_time_progress(
         cls,
         campaign_state: dict[str, Any],
@@ -1252,11 +1290,20 @@ class GameEngine:
             campaign_state["game_time"] = cls._game_time_from_total_minutes(cur_total)
             return campaign_state
 
-        base_minutes = cls._estimate_turn_time_advance_minutes(action_text, narration_text)
+        time_skip_request = cls._extract_time_skip_request(action_text)
+        if time_skip_request is not None:
+            base_minutes = cls._coerce_non_negative_int(
+                time_skip_request.get("minutes", 60), default=60
+            )
+        else:
+            base_minutes = cls._estimate_turn_time_advance_minutes(action_text, narration_text)
         speed_multiplier = cls._speed_multiplier_from_state(campaign_state)
         scaled = int(round(base_minutes * speed_multiplier))
         delta_minutes = max(cls.MIN_TURN_ADVANCE_MINUTES, scaled)
-        delta_minutes = min(cls.MAX_TURN_ADVANCE_MINUTES, delta_minutes)
+        if time_skip_request is None:
+            delta_minutes = min(cls.MAX_TURN_ADVANCE_MINUTES, delta_minutes)
+        else:
+            delta_minutes = min(7 * 24 * 60, delta_minutes)
         new_total = max(pre_total, cur_total) + delta_minutes
         campaign_state["game_time"] = cls._game_time_from_total_minutes(new_total)
         cls._increment_auto_fix_counter(campaign_state, "game_time_auto_advance")
@@ -1438,6 +1485,9 @@ class GameEngine:
             return {}
         if not isinstance(campaign_state, dict):
             return state_update
+
+        if not bool(campaign_state.get("on_rails", False)):
+            return dict(state_update)
 
         outline = campaign_state.get("story_outline")
         chapters = outline.get("chapters") if isinstance(outline, dict) else []

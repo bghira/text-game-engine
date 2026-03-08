@@ -339,34 +339,79 @@ def test_build_prompt_shape(session_factory, seed_campaign_and_actor):
     system_prompt, user_prompt = compat.build_prompt(campaign, player, "look", turns)
     assert "You are the ZorkEmulator" in system_prompt
     assert "STRUCTURE REQUIREMENT:" in system_prompt
-    assert "USE memory_search AGGRESSIVELY" in system_prompt
-    assert '{"tool_call": "memory_terms"' in system_prompt
-    assert '{"tool_call": "memory_turn"' in system_prompt
-    assert '{"tool_call": "memory_store"' in system_prompt
-    assert '{"tool_call": "sms_list"' in system_prompt
-    assert '{"tool_call": "sms_read"' in system_prompt
-    assert '{"tool_call": "sms_write"' in system_prompt
-    assert '{"tool_call": "sms_schedule"' in system_prompt
-    assert "character-keyed" in system_prompt
-    assert "set that character slug to null in character_updates" in system_prompt
-    assert "CALENDAR & GAME TIME SYSTEM:" in system_prompt
-    assert "CRITICAL — calendar_update.remove rules:" in system_prompt
-    assert "Do NOT remove events just because they are overdue." in system_prompt
-    assert "stores fire_day + fire_hour" in system_prompt
     assert "CALENDAR_REMINDERS" in user_prompt
     assert "ACTIVE_PLAYER_LOCATION:" in user_prompt
-    assert "CHARACTER ROSTER & PORTRAITS:" in system_prompt
-    assert '"set_timer_interrupt_scope": "local"|"global"' in system_prompt
-    assert "Use ACTIVE_PLAYER_LOCATION and PARTY_SNAPSHOT to decide scope" in system_prompt
     assert "CAMPAIGN:" in user_prompt
     assert "CURRENT_GAME_TIME:" in user_prompt
     assert "SPEED_MULTIPLIER:" in user_prompt
     assert "ATTENTION_WINDOW_SECONDS:" in user_prompt
     assert "CURRENTLY_ATTENTIVE_PLAYERS:" in user_prompt
+    assert "MEMORY_LOOKUP_ENABLED:" in user_prompt
+    assert "RECENT_TURNS_LOADED: true" in user_prompt
     assert "CALENDAR:" in user_prompt
-    assert "PLAYER_ACTION:" in user_prompt
-    assert "CURRENTLY_ATTENTIVE_PLAYERS lists players active within ATTENTION_WINDOW_SECONDS" in system_prompt
-    assert "if only one player is attentive and no immediate deadline is active" in system_prompt
+    assert "RECENT_TURNS:\n" in user_prompt
+    assert "PLAYER_ACTION" in user_prompt
+    assert '{"tool_call": "memory_terms"' not in system_prompt
+    assert '{"tool_call": "sms_list"' not in system_prompt
+    assert "CALENDAR & GAME TIME SYSTEM:" not in system_prompt
+    assert "CHARACTER ROSTER & PORTRAITS:" not in system_prompt
+
+
+def test_build_prompt_bootstrap_stage_shape(session_factory, seed_campaign_and_actor):
+    compat = _build_compat(session_factory)
+    campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
+    player = compat.get_or_create_player(seed_campaign_and_actor["campaign_id"], seed_campaign_and_actor["actor_id"])
+    turns = compat.get_recent_turns(seed_campaign_and_actor["campaign_id"])
+
+    system_prompt, user_prompt = compat.build_prompt(
+        campaign,
+        player,
+        "look",
+        turns,
+        prompt_stage=compat.PROMPT_STAGE_BOOTSTRAP,
+    )
+
+    assert "continuity bootstrapper" in system_prompt
+    assert '{"tool_call": "recent_turns"' in system_prompt
+    assert "Do NOT narrate yet" in system_prompt
+    assert "RECENT_TURNS_LOADED: false" in user_prompt
+    assert "WORLD_SUMMARY:" not in user_prompt
+    assert "WORLD_STATE:" not in user_prompt
+    assert "CALENDAR:" not in user_prompt
+    assert "STORY_CONTEXT:" not in user_prompt
+    assert "RECENT_TURNS:\n" not in user_prompt
+    assert "WORLD_CHARACTERS:" in user_prompt
+    assert "PLAYER_CARD:" in user_prompt
+    assert "PARTY_SNAPSHOT:" in user_prompt
+    assert "ACTIVE_PLAYER_LOCATION:" in user_prompt
+    assert "PLAYER_ACTION" in user_prompt
+
+
+def test_build_prompt_research_stage_shape(session_factory, seed_campaign_and_actor):
+    compat = _build_compat(session_factory)
+    campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
+    player = compat.get_or_create_player(seed_campaign_and_actor["campaign_id"], seed_campaign_and_actor["actor_id"])
+    turns = compat.get_recent_turns(seed_campaign_and_actor["campaign_id"])
+
+    system_prompt, user_prompt = compat.build_prompt(
+        campaign,
+        player,
+        "look",
+        turns,
+        prompt_stage=compat.PROMPT_STAGE_RESEARCH,
+    )
+
+    assert "research planner" in system_prompt
+    assert '{"tool_call": "ready_to_write"}' in system_prompt
+    assert (
+        '{"tool_call": "memory_search"' in system_prompt
+        or "EARLY-CAMPAIGN MEMORY MODE:" in system_prompt
+    )
+    assert '{"tool_call": "sms_list"' in system_prompt
+    assert "CALENDAR & GAME TIME SYSTEM:" in system_prompt
+    assert "RECENT_TURNS_LOADED: true" in user_prompt
+    assert "RECENT_TURNS:\n" in user_prompt
+    assert "WORLD_SUMMARY:" in user_prompt
 
 
 def test_attachment_setup_length_error_for_short_upload(session_factory):
@@ -670,6 +715,73 @@ def test_story_context_includes_next_three_and_coerces_progress_indices(session_
     assert "NEXT CHAPTER: Ch3" in story_context
     assert "UPCOMING CHAPTER 2: Ch4" in story_context
     assert "UPCOMING CHAPTER 3: Ch5" in story_context
+
+
+def test_story_context_uses_offrails_active_chapters(session_factory, seed_campaign_and_actor):
+    compat = _build_compat(session_factory)
+
+    campaign_state = {
+        "on_rails": False,
+        "chapters": [
+            {
+                "slug": "friday-night-after",
+                "title": "Friday Night, After",
+                "summary": "Everything is different and nothing shows.",
+                "current_scene": "boundary-test",
+                "scenes": ["boundary-test", "the-cat-knows", "closing-approaches"],
+                "status": "active",
+            },
+            {
+                "slug": "health-tax",
+                "title": "The Health Tax",
+                "summary": "Monet cuts him off because she noticed.",
+                "current_scene": "the-cutoff",
+                "scenes": ["the-cutoff", "what-follows"],
+                "status": "active",
+            },
+        ],
+    }
+
+    story_context = compat._build_story_context(campaign_state)
+    assert story_context is not None
+    assert "CURRENT CHAPTER: Friday Night, After" in story_context
+    assert "Scene 1: Boundary Test >>> CURRENT SCENE <<<" in story_context
+    assert "NEXT CHAPTER: The Health Tax" in story_context
+
+
+def test_build_prompt_places_story_context_above_world_summary_and_composes_summary(session_factory, seed_campaign_and_actor):
+    compat = _build_compat(session_factory)
+    campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
+    player = compat.get_or_create_player(seed_campaign_and_actor["campaign_id"], seed_campaign_and_actor["actor_id"])
+    turns = compat.get_recent_turns(seed_campaign_and_actor["campaign_id"])
+
+    with session_factory() as session:
+        campaign_row = session.get(Campaign, campaign.id)
+        campaign_row.summary = "lel without elaboration.\nInventory: stale pretzel\nKevin accepted the drink."
+        campaign_row.state_json = compat._dump_json(
+            {
+                "game_time": {"day": 1, "hour": 8, "minute": 0, "period": "morning", "date_label": "Day 1, Morning"},
+                "story_outline": {
+                    "chapters": [
+                        {
+                            "title": "Chapter One",
+                            "summary": "A real chapter summary.",
+                            "scenes": [{"title": "Opening"}],
+                        }
+                    ]
+                },
+                "current_chapter": 0,
+                "current_scene": 0,
+            }
+        )
+        session.commit()
+
+    campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
+    _system_prompt, user_prompt = compat.build_prompt(campaign, player, "look", turns)
+    assert "WORLD_SUMMARY: Kevin accepted the drink." in user_prompt
+    assert "lel without elaboration." not in user_prompt
+    assert "Inventory: stale pretzel" not in user_prompt
+    assert user_prompt.index("STORY_CONTEXT:") < user_prompt.index("WORLD_SUMMARY:")
 
 
 def test_generate_map_prompt_uses_authoritative_location_keys(session_factory, seed_campaign_and_actor):
