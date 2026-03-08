@@ -83,3 +83,31 @@ Point `cd` at a small or empty working directory when possible; Codex performs b
 - `opencode`
 
 These follow the same `BackendTextCompletionPort(...)` adapter pattern as Ollama and Codex.
+
+## Backend Performance Notes
+
+Best-to-worst so far for Zork-style narrative quality and instruction adherence:
+
+1. `glm-5`
+   Regularly follows the full contract best. This is currently the strongest backend for narrative quality and overall reliability.
+2. `gpt-5.4`
+   Performs well after the newer context-wrapper changes.[1] It also handles adult content, including action and romance, well.
+3. `glm-4.7`
+   Strong follow-through and good adult-content handling.
+4. `glm-4.6`
+   Similar to 4.7, but weaker overall.
+5. `claude` Sonnet 4.5-4.6
+   Improved after the XML/example adapter layer.[2] Still performs poorly for adult situations, especially action and romance.
+6. `qwen3.5:27b`
+   Testing was limited, but it performed surprisingly well and landed roughly around Sonnet 4.5 quality.
+7. `claude` Opus
+   Currently the weakest in this stack: high contrivance, surprisingly poor instruction adherence, and would need more backend-specific prompt optimization.
+
+Notes:
+- The ordering above is also the current best-to-worst ranking for narrative quality.
+- Adult-content support here refers to how well the model sustains consensual erotic, romantic, or violent/adult narrative situations inside the emulator contract, not a general policy statement.
+- Backend adapters matter a lot. Claude improved materially once XML wrappers and example wrapping were added; GPT-5.4 improved materially once stronger context wrappers were added.
+
+[1] GPT-5.4 note: newer context wrappers, stricter output-contract transport, and backend-specific prompt shaping improved reliability noticeably.
+
+[2] Claude note: XML section wrapping plus `<example>`-style tool/output examples improved structure following, but did not fully solve weak adult-scene handling.

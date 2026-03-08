@@ -5,6 +5,10 @@ import json
 from typing import Any
 
 from .base import ChatMessage, CompletionRequest, CompletionResult
+from .prompt_formatting import (
+    build_codex_structured_system_instructions,
+    build_codex_structured_user_prompt,
+)
 
 
 class CodexCLIBackend:
@@ -88,11 +92,12 @@ class CodexCLIBackend:
         for directory in self._add_dirs:
             command.extend(["--add-dir", directory])
         config_pairs = dict(self._config)
-        user_instructions = self._TEXT_COMPLETION_INSTRUCTIONS
-        if system_prompt:
-            # `user_instructions` is the closest separate instructions channel that
-            # `codex exec` exposes for the emulator's system/developer prompt.
-            user_instructions = f"{user_instructions}\n\n{system_prompt}"
+        user_instructions = build_codex_structured_system_instructions(
+            base_instructions=self._TEXT_COMPLETION_INSTRUCTIONS,
+            system_prompt=system_prompt,
+        )
+        # `user_instructions` is the closest separate instructions channel that
+        # `codex exec` exposes for the emulator's system/developer prompt.
         config_pairs["user_instructions"] = user_instructions
         provider_config = request.provider_options.get("config")
         if isinstance(provider_config, dict):
@@ -125,14 +130,7 @@ class CodexCLIBackend:
 
     @classmethod
     def _build_prompt(cls, messages: list[ChatMessage]) -> str:
-        non_system = [message for message in messages if message.role != "system"]
-        if len(non_system) == 1 and non_system[0].role == "user":
-            return non_system[0].content
-        parts: list[str] = []
-        for message in non_system:
-            role = str(message.role).upper()
-            parts.append(f"{role}:\n{message.content}")
-        return "\n\n".join(parts).strip()
+        return build_codex_structured_user_prompt(messages)
 
     @classmethod
     def _parse_exec_output(cls, stdout: str) -> dict[str, Any]:

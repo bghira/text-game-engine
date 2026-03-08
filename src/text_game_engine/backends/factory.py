@@ -7,7 +7,7 @@ from .base import ModelBackend
 from .claude_cli import ClaudeCLIBackend
 from .codex_cli import CodexCLIBackend
 from .gemini_cli import GeminiCLIBackend
-from .opencode_cli import OpenCodeBackend
+from .opencode_cli import OpenCodeCLIBackend
 from .ollama import OllamaBackend
 
 
@@ -20,7 +20,7 @@ def build_backend(provider: str, **config: Any) -> ModelBackend:
     if normalized == "claude":
         return ClaudeCLIBackend(**config)
     if normalized == "opencode":
-        return OpenCodeBackend(**config)
+        return OpenCodeCLIBackend(**config)
     if normalized in {"codex", "codex-cli", "codex_cli"}:
         return CodexCLIBackend(**config)
     raise ValueError(f"Unsupported backend provider: {provider}")

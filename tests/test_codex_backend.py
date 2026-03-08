@@ -64,14 +64,14 @@ def test_codex_backend_builds_exec_command_and_parses_jsonl_output():
         assert ["-C", "/tmp"] == command[command.index("-C") : command.index("-C") + 2]
         assert ["-m", "gpt-5-codex"] == command[command.index("-m") : command.index("-m") + 2]
         assert any(
-            item.startswith("user_instructions=") and "You are terse." in item
+            item.startswith("user_instructions=") and "<system_instructions>" in item and "You are terse." in item
             for item in command
         )
         assert any(
             item.startswith("model_reasoning_effort=") and '"low"' in item
             for item in command
         )
-        assert prompt == "Say hello."
+        assert prompt == "<user_request>\nSay hello.\n</user_request>"
 
     asyncio.run(run_test())
 
@@ -100,7 +100,10 @@ def test_codex_backend_formats_multi_message_prompt_and_flattens_provider_config
             )
         )
         command, prompt = backend.calls[0]
-        assert prompt == "USER:\nFirst.\n\nASSISTANT:\nSecond.\n\nUSER:\nThird."
+        assert "<conversation>" in prompt
+        assert "<user_message>" in prompt
+        assert "<assistant_message>" in prompt
+        assert "Third." in prompt
         assert any(
             item.startswith("nested.flag=") and item.endswith("true") for item in command
         )
@@ -140,10 +143,12 @@ def test_backend_text_completion_port_supports_codex_backend():
         assert result == "adapted"
         command, prompt = backend.calls[0]
         assert any(
-            item.startswith("user_instructions=") and "You are zork emulator." in item
+            item.startswith("user_instructions=")
+            and "<system_instructions>" in item
+            and "You are zork emulator." in item
             for item in command
         )
-        assert prompt == "Return adapted"
+        assert prompt == "<user_request>\nReturn adapted\n</user_request>"
 
     asyncio.run(run_test())
 

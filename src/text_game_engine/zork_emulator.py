@@ -1078,10 +1078,6 @@ class ZorkEmulator:
             if has_explicit_participants and not is_participant:
                 return False
             if has_explicit_participants:
-                viewer_is_only_actor = bool(actor_ids) and actor_ids == {str(viewer_actor_id or "").strip()}
-                viewer_is_only_slug = bool(player_slugs) and viewer_slug and player_slugs == {viewer_slug}
-                if viewer_is_only_actor or viewer_is_only_slug:
-                    return False
                 return is_participant
             return False
         if turn.actor_id == viewer_actor_id:
@@ -3062,6 +3058,561 @@ class ZorkEmulator:
             )
             return 0, ""
         return len(normalized_lines), document_key
+
+    def _source_material_export_text(
+        self,
+        document_key: str,
+        units: list[str],
+    ) -> str:
+        clean_units = [str(unit or "").strip() for unit in units if str(unit or "").strip()]
+        if not clean_units:
+            return ""
+        sample = "\n".join(clean_units[:6])
+        inferred_format = self._source_material_format_heuristic(sample)
+        if inferred_format == self.SOURCE_MATERIAL_FORMAT_RULEBOOK:
+            return "\n".join(clean_units).strip()
+        return "\n\n".join(clean_units).strip()
+
+    def _source_material_export_filename(
+        self,
+        document_key: str,
+        document_label: str | None = None,
+        *,
+        used_names: set[str] | None = None,
+    ) -> str:
+        label = " ".join(str(document_label or "").strip().split())
+        if label:
+            base = label[:180]
+        else:
+            key = str(document_key or "").strip().lower()
+            if not key:
+                key = "source-material"
+            base = SourceMaterialMemory._normalize_source_document_key(key) or "source-material"
+            base = base[:180]
+        filename = f"{base}.txt"
+        if used_names is None:
+            return filename
+        if filename not in used_names:
+            used_names.add(filename)
+            return filename
+        fallback_key = (
+            SourceMaterialMemory._normalize_source_document_key(str(document_key or "").strip())
+            or "source-material"
+        )[:80]
+        suffix = 2
+        while True:
+            candidate = f"{base} ({fallback_key}-{suffix}).txt"
+            if candidate not in used_names:
+                used_names.add(candidate)
+                return candidate
+            suffix += 1
+
+    def _campaign_export_transcript(self, campaign: Campaign) -> str:
+        with self._session_factory() as session:
+            turns = (
+                session.query(Turn)
+                .filter(Turn.campaign_id == str(campaign.id))
+                .order_by(Turn.id.asc())
+                .all()
+            )
+        registry = self._campaign_player_registry(str(campaign.id), self._session_factory)
+        by_actor_id = registry.get("by_actor_id", {})
+        lines: list[str] = []
+        for turn in turns:
+            content = str(turn.content or "").strip()
+            if not content:
+                continue
+            if turn.kind == "narrator":
+                content = self._strip_ephemeral_context_lines(content)
+                content = self._strip_narration_footer(content)
+            if not content:
+                continue
+            if turn.kind == "player":
+                entry = by_actor_id.get(str(turn.actor_id or "")) or {}
+                name = str(entry.get("name") or f"Player {turn.actor_id}").strip()
+                lines.append(f"[TURN {turn.id}] PLAYER {name}: {content}")
+            elif turn.kind == "narrator":
+                lines.append(f"[TURN {turn.id}] NARRATOR: {content}")
+            else:
+                lines.append(f"[TURN {turn.id}] {str(turn.kind or 'system').upper()}: {content}")
+        return "\n".join(lines).strip()
+
+    def _campaign_export_turn_events(
+        self,
+        campaign: Campaign,
+    ) -> list[dict[str, Any]]:
+        with self._session_factory() as session:
+            turns = (
+                session.query(Turn)
+                .filter(Turn.campaign_id == str(campaign.id))
+                .order_by(Turn.id.asc())
+                .all()
+            )
+        registry = self._campaign_player_registry(str(campaign.id), self._session_factory)
+        by_actor_id = registry.get("by_actor_id", {})
+        events: list[dict[str, Any]] = []
+        for turn in turns:
+            meta = parse_json_dict(turn.meta_json)
+            if not isinstance(meta, dict):
+                meta = {}
+            actor_entry = by_actor_id.get(str(turn.actor_id or "")) or {}
+            events.append(
+                {
+                    "turn_id": int(turn.id),
+                    "created_at": turn.created_at.isoformat() if turn.created_at else None,
+                    "kind": str(turn.kind or ""),
+                    "actor_id": str(turn.actor_id or "") or None,
+                    "player_name": str(actor_entry.get("name") or "").strip() or None,
+                    "player_slug": str(actor_entry.get("slug") or "").strip() or None,
+                    "session_id": str(turn.session_id or "") or None,
+                    "external_message_id": str(turn.external_message_id or "") or None,
+                    "external_user_message_id": str(turn.external_user_message_id or "") or None,
+                    "content": str(turn.content or ""),
+                    "meta": meta,
+                }
+            )
+        return events
+
+    async def _generate_campaign_export_digest(
+        self,
+        campaign: Campaign,
+        transcript: str,
+    ) -> str:
+        ordered_chunk_digest = await self._summarise_long_text(
+            transcript,
+            summary_instructions=(
+                "This is a complete campaign transcript from the first turn to the latest turn. "
+                "Preserve the entire story arc in chronological order. Do not collapse the story into a vague world-state summary. "
+                "Track what happens early, middle, and late; major and minor arcs; character relationship changes; discoveries; "
+                "state changes; travel; inventory/item changes that mattered; time jumps; player-to-player dynamics; private reveals "
+                "that later became relevant; NPC attitude shifts; recurring jokes; and unresolved threads. "
+                "When facts conflict, preserve both versions if needed but clearly favor the later explicit outcome. "
+                "Be comprehensive and concrete."
+            ),
+            allow_single_chunk_passthrough=False,
+        )
+        ordered_chunk_digest = str(ordered_chunk_digest or "").strip()
+        if not ordered_chunk_digest:
+            return ""
+        digest_system = (
+            "You convert an ordered set of campaign transcript summaries into a faithful whole-campaign digest.\n"
+            "Output ONLY plain text.\n"
+            "This digest must cover the entire story arc from first turn to last turn without flattening it into a generic setting summary.\n"
+            "Use these exact plain-text section labels:\n"
+            "FULL ARC OVERVIEW\n"
+            "CHRONOLOGICAL STORY BEATS\n"
+            "PLAYER THREADS\n"
+            "NPC ARCS\n"
+            "RELATIONSHIPS AND REVEALS\n"
+            "LOCATIONS ITEMS AND STATE CHANGES\n"
+            "OPEN THREADS AND AFTERMATH\n"
+            "CURRENT END STATE\n"
+            "CONFLICT RESOLUTION NOTES\n"
+            "Requirements:\n"
+            "- preserve chronology from opening setup to ending state\n"
+            "- name the real player characters and major NPCs repeatedly where relevant\n"
+            "- mention major chapter/scene transitions when known\n"
+            "- include all lasting arcs, even if they seemed small at the time\n"
+            "- if two facts conflict, choose the most sensible truthful version and say why in CONFLICT RESOLUTION NOTES\n"
+            "- multiplayer campaigns are ensemble stories, not single-protagonist stories\n"
+            "- do not write fiction prose; write a precise reconstruction digest"
+        )
+        digest_user = (
+            f"Campaign: {campaign.name}\n\n"
+            "ORDERED TRANSCRIPT SUMMARY:\n"
+            f"{ordered_chunk_digest}\n"
+        )
+        digest_text = await self._new_gpt(campaign=campaign).turbo_completion(
+            digest_system,
+            digest_user,
+            temperature=0.3,
+            max_tokens=12000,
+        )
+        digest_text = str(digest_text or "").strip()
+        return digest_text or ordered_chunk_digest
+
+    def _campaign_raw_export_filename(self, raw_format: str) -> str:
+        fmt = str(raw_format or "jsonl").strip().lower()
+        if fmt == "json":
+            return "campaign-raw.json"
+        if fmt == "markdown":
+            return "campaign-raw-markdown.md"
+        if fmt == "script":
+            return "campaign-raw-script.txt"
+        if fmt == "loglines":
+            return "campaign-raw-loglines.txt"
+        return "campaign-raw.jsonl"
+
+    def _render_campaign_raw_jsonl(
+        self,
+        campaign: Campaign,
+        events: list[dict[str, Any]],
+    ) -> str:
+        rows: list[dict[str, Any]] = [
+            {
+                "type": "campaign",
+                "campaign_id": str(campaign.id),
+                "campaign_name": str(campaign.name or ""),
+                "created_at": campaign.created_at.isoformat() if campaign.created_at else None,
+                "updated_at": campaign.updated_at.isoformat() if campaign.updated_at else None,
+            }
+        ]
+        rows.extend({"type": "turn", **event} for event in events)
+        return "\n".join(
+            json.dumps(row, ensure_ascii=False, sort_keys=True) for row in rows
+        ).strip()
+
+    def _render_campaign_raw_json(
+        self,
+        campaign: Campaign,
+        events: list[dict[str, Any]],
+    ) -> str:
+        payload = {
+            "campaign": {
+                "id": str(campaign.id),
+                "name": str(campaign.name or ""),
+                "created_at": campaign.created_at.isoformat() if campaign.created_at else None,
+                "updated_at": campaign.updated_at.isoformat() if campaign.updated_at else None,
+            },
+            "events": events,
+        }
+        return json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
+
+    def _render_campaign_raw_markdown(
+        self,
+        campaign: Campaign,
+        events: list[dict[str, Any]],
+    ) -> str:
+        lines = [
+            f"# Campaign Raw Export: {campaign.name}",
+            "",
+            "## Table of Contents",
+            "",
+            "- [Campaign Metadata](#campaign-metadata)",
+        ]
+        for event in events:
+            lines.append(f"- [Turn {event.get('turn_id')}](#turn-{event.get('turn_id')})")
+        lines.extend(
+            [
+                "",
+                "## Campaign Metadata",
+                "",
+                f"- Campaign ID: `{campaign.id}`",
+                f"- Created: `{campaign.created_at.isoformat() if campaign.created_at else ''}`",
+                f"- Updated: `{campaign.updated_at.isoformat() if campaign.updated_at else ''}`",
+            ]
+        )
+        for event in events:
+            lines.extend(
+                [
+                    "",
+                    f"## Turn {event.get('turn_id')}",
+                    "",
+                    f"- Kind: `{event.get('kind')}`",
+                    f"- Timestamp: `{event.get('created_at') or ''}`",
+                    f"- Actor ID: `{event.get('actor_id') or ''}`",
+                    f"- Player: `{event.get('player_name') or ''}`",
+                    f"- Player Slug: `{event.get('player_slug') or ''}`",
+                    f"- Session ID: `{event.get('session_id') or ''}`",
+                    "",
+                    "### Content",
+                    "",
+                    "```text",
+                    str(event.get("content") or ""),
+                    "```",
+                    "",
+                    "### Meta",
+                    "",
+                    "```json",
+                    json.dumps(event.get("meta") or {}, ensure_ascii=False, indent=2, sort_keys=True),
+                    "```",
+                ]
+            )
+        return "\n".join(lines).strip()
+
+    def _render_campaign_raw_script(
+        self,
+        campaign: Campaign,
+        events: list[dict[str, Any]],
+    ) -> str:
+        lines = [
+            f"CAMPAIGN\t{campaign.name}",
+            f"\tID\t{campaign.id}",
+            f"\tCREATED\t{campaign.created_at.isoformat() if campaign.created_at else ''}",
+            f"\tUPDATED\t{campaign.updated_at.isoformat() if campaign.updated_at else ''}",
+        ]
+        for event in events:
+            lines.append("")
+            lines.append(f"TURN\t{event.get('turn_id')}")
+            lines.append(f"\tKIND\t{event.get('kind')}")
+            lines.append(f"\tTIMESTAMP\t{event.get('created_at') or ''}")
+            lines.append(f"\tACTOR_ID\t{event.get('actor_id') or ''}")
+            lines.append(f"\tPLAYER\t{event.get('player_name') or ''}")
+            lines.append(f"\tPLAYER_SLUG\t{event.get('player_slug') or ''}")
+            lines.append(f"\tSESSION_ID\t{event.get('session_id') or ''}")
+            lines.append("\tCONTENT")
+            for row in str(event.get("content") or "").splitlines() or [""]:
+                lines.append(f"\t\t{row}")
+            lines.append("\tMETA")
+            meta_text = json.dumps(event.get("meta") or {}, ensure_ascii=False, indent=2, sort_keys=True)
+            for row in meta_text.splitlines():
+                lines.append(f"\t\t{row}")
+        return "\n".join(lines).strip()
+
+    def _render_campaign_raw_loglines(
+        self,
+        campaign: Campaign,
+        events: list[dict[str, Any]],
+    ) -> str:
+        lines = [
+            f"[CAMPAIGN EXPORT] campaign={campaign.id} name={campaign.name!r} turns={len(events)}"
+        ]
+        for event in events:
+            label = str(event.get("kind") or "event").upper()
+            if event.get("kind") == "player":
+                player_name = str(event.get("player_name") or "").strip()
+                if player_name:
+                    label = f"PLAYER {player_name}"
+            elif event.get("kind") == "narrator":
+                label = "NARRATOR"
+            lines.append(
+                f"[TURN #{event.get('turn_id')} | {event.get('created_at') or ''}] {label}: "
+                f"{str(event.get('content') or '').strip()}"
+            )
+        return "\n".join(lines).strip()
+
+    async def _generate_campaign_raw_export_artifacts(
+        self,
+        campaign: Campaign,
+        *,
+        raw_format: str = "jsonl",
+    ) -> dict[str, str]:
+        fmt = str(raw_format or "jsonl").strip().lower()
+        if fmt not in {"script", "markdown", "json", "jsonl", "loglines"}:
+            fmt = "jsonl"
+        events = self._campaign_export_turn_events(campaign)
+        if not events:
+            return {}
+        if fmt == "json":
+            text = self._render_campaign_raw_json(campaign, events)
+        elif fmt == "markdown":
+            text = self._render_campaign_raw_markdown(campaign, events)
+        elif fmt == "script":
+            text = self._render_campaign_raw_script(campaign, events)
+        elif fmt == "loglines":
+            text = self._render_campaign_raw_loglines(campaign, events)
+        else:
+            text = self._render_campaign_raw_jsonl(campaign, events)
+        if not str(text or "").strip():
+            return {}
+        return {self._campaign_raw_export_filename(fmt): str(text or "").strip()}
+
+    async def _generate_campaign_export_artifacts(
+        self,
+        campaign: Campaign,
+    ) -> dict[str, str]:
+        transcript = self._campaign_export_transcript(campaign)
+        if not transcript:
+            return {}
+        campaign_state = self.get_campaign_state(campaign)
+        characters = self.get_campaign_characters(campaign)
+        campaign_players = self._campaign_players_for_prompt(str(campaign.id), limit=24)
+        story_outline = campaign_state.get("story_outline") if isinstance(campaign_state, dict) else {}
+        plot_threads = campaign_state.get("plot_threads") if isinstance(campaign_state, dict) else []
+        chapter_plan = campaign_state.get("chapters") if isinstance(campaign_state, dict) else []
+        consequences = campaign_state.get("consequences") if isinstance(campaign_state, dict) else []
+        model_state = self._build_model_state(campaign_state if isinstance(campaign_state, dict) else {})
+        model_state = self._fit_state_to_budget(model_state, self.MAX_STATE_CHARS)
+        export_summary = await self._generate_campaign_export_digest(campaign, transcript)
+        if not export_summary:
+            export_summary = await self._summarise_long_text(
+                transcript,
+                summary_instructions=(
+                    "Summarise this full campaign playthrough faithfully for export. Preserve lasting facts, "
+                    "character arcs, relationship changes, major reveals, locations, items, chapter beats, "
+                    "timeline changes, unresolved threads, and the current open state. "
+                    "When facts conflict, prefer the later explicit outcome and the persisted world state."
+                ),
+                allow_single_chunk_passthrough=False,
+            )
+        export_summary = str(export_summary or "").strip()
+        export_summary_excerpt = export_summary
+        if len(export_summary_excerpt) > 32000:
+            export_summary_excerpt = export_summary_excerpt[:32000].rsplit(" ", 1)[0].strip() + "\n...[truncated excerpt for prompt budget]"
+        transcript_excerpt = transcript
+        if len(transcript_excerpt) > 20000:
+            transcript_excerpt = transcript_excerpt[:20000].rsplit(" ", 1)[0].strip() + "\n...[truncated excerpt for prompt budget]"
+        source_payload = self._source_material_prompt_payload(str(campaign.id))
+        source_index_hint = self._auto_rulebook_source_index_hint(source_payload)
+        source_tool_instructions = ""
+        if source_index_hint:
+            source_tool_instructions = (
+                "\nYou may inspect existing source material while resolving canon.\n"
+                'To list keys: {"tool_call": "source_browse"}\n'
+                'To browse one doc: {"tool_call": "source_browse", "document_key": "doc-key"}\n'
+                'To search canon: {"tool_call": "memory_search", "category": "source", "queries": ["keyword1", "keyword2"]}\n'
+                "To call a tool, return ONLY the JSON tool_call object. Otherwise return ONLY the requested final text.\n"
+            )
+        export_context = {
+            "campaign_name": campaign.name,
+            "campaign_summary": campaign.summary or "",
+            "story_outline": story_outline,
+            "chapter_plan": chapter_plan,
+            "plot_threads": plot_threads,
+            "consequences": consequences,
+            "current_state": model_state,
+            "characters": characters,
+            "campaign_players": campaign_players,
+        }
+        rulebook_system = (
+            "You convert a completed campaign playthrough into a retrievable rulebook for recreating that tale.\n"
+            "Output ONLY plain text rulebook lines. No markdown. No headers. No bullets. No numbering.\n"
+            "Every line must be fully self-contained and use exactly CATEGORY-TAG: fact text\n"
+            "Use category families such as TONE, SCENE, SETTING, CHAR, PLOT, INTERACTION, GM-RULE, and venue-specific tags.\n"
+            "Treat WORLD_CHARACTERS as NPC-only and CAMPAIGN_PLAYERS as real human player characters. "
+            "In multiplayer campaigns there is no single main character; preserve ensemble structure.\n"
+            "Conflict resolution priority:\n"
+            "1. Persisted current state / current character roster / current chapter state\n"
+            "2. Later explicit turn outcomes in the playthrough summary\n"
+            "3. Repeated consistent facts across the transcript\n"
+            "4. Existing source material for unchanged background canon\n"
+            "If a fact remains uncertain, omit it or phrase it cautiously instead of inventing certainty.\n"
+            "Preserve major arcs, resolved outcomes, and unresolved threads so the tale can be recreated faithfully.\n"
+            "Do not output a generic world summary. Output dense factual rulebook lines only.\n"
+            f"{source_tool_instructions}"
+        )
+        rulebook_user = (
+            f"Generate a campaign rulebook export for '{campaign.name}'.\n"
+            f"{source_index_hint}"
+            "Use the full playthrough summary and current campaign data below.\n"
+            "This export should describe how to faithfully recreate the tale as it was actually played, not just the initial setup.\n\n"
+            f"PLAYTHROUGH ARC DIGEST:\n{export_summary_excerpt or '(none)'}\n\n"
+            f"EARLY TRANSCRIPT EXCERPT:\n{transcript_excerpt or '(none)'}\n\n"
+            f"CAMPAIGN DATA:\n{self._dump_json(export_context)}\n"
+        )
+        self._zork_log(
+            f"CAMPAIGN EXPORT RULEBOOK campaign={campaign.id}",
+            f"--- SYSTEM ---\n{rulebook_system}\n--- USER ---\n{rulebook_user}",
+        )
+        rulebook_response = await self._setup_tool_loop(
+            rulebook_system,
+            rulebook_user,
+            campaign,
+            temperature=0.4,
+            max_tokens=self.AUTO_RULEBOOK_MAX_TOKENS,
+            final_response_instruction="Return your final rulebook text now.",
+        )
+        rulebook_lines = self._normalize_generated_rulebook_lines(rulebook_response or "")
+        if len(rulebook_lines) < 12:
+            repair_system = (
+                "You repair campaign export drafts into proper retrievable rulebook lines.\n"
+                "Output ONLY plain text rulebook lines.\n"
+                "Every line must be exactly CATEGORY-TAG: fact text\n"
+                "No prose paragraphs. No markdown. No headers.\n"
+                "Preserve chronology-derived facts, arcs, characters, plotlines, interactions, and GM rules.\n"
+                "If the draft is a summary instead of a rulebook, convert it into many factual rulebook lines."
+            )
+            repair_user = (
+                f"Repair this campaign export into a rulebook for '{campaign.name}'.\n\n"
+                f"DRAFT EXPORT:\n{str(rulebook_response or '').strip() or '(empty)'}\n\n"
+                f"PLAYTHROUGH ARC DIGEST:\n{export_summary_excerpt or '(none)'}\n\n"
+                f"CAMPAIGN DATA:\n{self._dump_json(export_context)}\n"
+            )
+            self._zork_log(
+                f"CAMPAIGN EXPORT RULEBOOK REPAIR campaign={campaign.id}",
+                f"--- SYSTEM ---\n{repair_system}\n--- USER ---\n{repair_user}",
+            )
+            repaired = await self._new_gpt(campaign=campaign).turbo_completion(
+                repair_system,
+                repair_user,
+                temperature=0.3,
+                max_tokens=self.AUTO_RULEBOOK_MAX_TOKENS,
+            )
+            repaired_lines = self._normalize_generated_rulebook_lines(repaired or "")
+            if repaired_lines:
+                rulebook_lines = repaired_lines
+        rulebook_text = "\n".join(rulebook_lines).strip()
+        story_prompt_system = (
+            "You convert a completed campaign playthrough into a reusable story generator prompt.\n"
+            "Output ONLY plain text. No markdown fences.\n"
+            "Write a prompt that could recreate the same campaign faithfully: tone, setting, cast, arcs, open threads, "
+            "facts, and the current shape of the story.\n"
+            "Use clear section labels in plain text such as TITLE, GENRE, FORMAT, PLAY MODE, SETTING, PLAYER CHARACTERS, "
+            "NPC CAST, CANON FACTS, MAJOR ARCS, RELATIONSHIPS, OPEN THREADS, OPENING/START STATE, and RECREATION RULES.\n"
+            "If this was multiplayer, state clearly that it is an ensemble campaign with multiple real player characters and no single protagonist.\n"
+            "Resolve conflicts using the same priority order as the rulebook export: persisted current state, later explicit outcomes, repeated consistent facts, then source canon.\n"
+            "Do not write prose fiction. Write a practical generator prompt for reconstructing the campaign.\n"
+            "This must reflect the whole story arc from first turn to last turn, not just the ending state."
+        )
+        story_prompt_user = (
+            f"Generate a story generator prompt export for '{campaign.name}'.\n"
+            "This should function like a canonical recreation prompt for the whole played campaign.\n\n"
+            f"PLAYTHROUGH ARC DIGEST:\n{export_summary_excerpt or '(none)'}\n\n"
+            f"EARLY TRANSCRIPT EXCERPT:\n{transcript_excerpt or '(none)'}\n\n"
+            f"CAMPAIGN DATA:\n{self._dump_json(export_context)}\n"
+        )
+        self._zork_log(
+            f"CAMPAIGN EXPORT STORY PROMPT campaign={campaign.id}",
+            f"--- SYSTEM ---\n{story_prompt_system}\n--- USER ---\n{story_prompt_user}",
+        )
+        story_prompt_text = await self._new_gpt(campaign=campaign).turbo_completion(
+            story_prompt_system,
+            story_prompt_user,
+            temperature=0.5,
+            max_tokens=6000,
+        )
+        story_prompt_text = str(story_prompt_text or "").strip()
+        out: dict[str, str] = {}
+        if rulebook_text:
+            out["campaign-rulebook.txt"] = rulebook_text
+        if story_prompt_text:
+            out["campaign-story-prompt.txt"] = story_prompt_text
+        return out
+
+    async def campaign_export(
+        self,
+        campaign_id: str,
+        *,
+        export_type: str = "full",
+        raw_format: str = "jsonl",
+    ) -> dict[str, str]:
+        with self._session_factory() as session:
+            campaign = session.get(Campaign, str(campaign_id))
+            if campaign is None:
+                raise KeyError(f"Unknown campaign: {campaign_id}")
+        export_type_clean = str(export_type or "full").strip().lower()
+        if export_type_clean not in {"full", "raw"}:
+            export_type_clean = "full"
+        if export_type_clean == "raw":
+            export_files = await self._generate_campaign_raw_export_artifacts(
+                campaign,
+                raw_format=raw_format,
+            )
+        else:
+            export_files = await self._generate_campaign_export_artifacts(campaign)
+        docs = self.list_source_material_documents(str(campaign.id), limit=200)
+        source_export_files: dict[str, str] = {}
+        used_names = set(export_files.keys())
+        for row in docs:
+            document_key = str(row.get("document_key") or "").strip()
+            document_label = str(row.get("document_label") or "").strip()
+            if not document_key:
+                continue
+            units = SourceMaterialMemory.get_source_material_document_units(
+                str(campaign.id),
+                document_key,
+            )
+            export_text = self._source_material_export_text(document_key, units)
+            if not export_text:
+                continue
+            filename = self._source_material_export_filename(
+                document_key,
+                document_label,
+                used_names=used_names,
+            )
+            source_export_files[filename] = export_text
+        export_files.update(source_export_files)
+        return export_files
 
     async def _setup_generate_storyline_variants(
         self,
@@ -7787,11 +8338,11 @@ class ZorkEmulator:
             message = str(m.group(2) or "").strip()
         else:
             # Pattern 2: Space-delimited — "text Doc hello"
-            # Allow articles to be part of the recipient name:
+            # Allow leading articles to be part of the captured recipient:
             # "sms the Doc the words" → recipient="the Doc", message="the words"
             m = re.match(
                 r"^\s*(?:i\s+)?(?:send\s+)?(?:sms|text|message)\s+(?:to\s+)?"
-                r"(?:(?:the|a|an|my)\s+)?([^\s:\n]{1,80})\s+(.+?)\s*$",
+                r"((?:the|a|an|my)\s+[^\s:\n]{1,80}|[^\s:\n]{1,80})\s+(.+?)\s*$",
                 text,
                 flags=re.IGNORECASE,
             )

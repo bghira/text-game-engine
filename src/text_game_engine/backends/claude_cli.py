@@ -5,6 +5,10 @@ import json
 from typing import Any
 
 from .base import ChatMessage, CompletionRequest, CompletionResult
+from .prompt_formatting import (
+    build_claude_structured_system_instructions,
+    build_claude_structured_user_prompt,
+)
 
 
 class ClaudeCLIBackend:
@@ -70,7 +74,18 @@ class ClaudeCLIBackend:
         if tools is not None:
             command.extend(["--tools", str(tools)])
         if system_prompt:
-            command.extend(["--system-prompt", system_prompt])
+            command.extend(
+                [
+                    "--system-prompt",
+                    build_claude_structured_system_instructions(
+                        base_instructions=(
+                            "You are being used as a text-completion backend, not as a coding agent. "
+                            "Respond directly to the prompt content only."
+                        ),
+                        system_prompt=system_prompt,
+                    ),
+                ]
+            )
         extra_args = request.provider_options.get("extra_args")
         if isinstance(extra_args, list):
             command.extend(str(item) for item in extra_args if str(item).strip())
@@ -94,13 +109,7 @@ class ClaudeCLIBackend:
 
     @staticmethod
     def _build_prompt(messages: list[ChatMessage]) -> str:
-        non_system = [message for message in messages if message.role != "system"]
-        if len(non_system) == 1 and non_system[0].role == "user":
-            return non_system[0].content
-        parts: list[str] = []
-        for message in non_system:
-            parts.append(f"{str(message.role).upper()}:\n{message.content}")
-        return "\n\n".join(parts).strip()
+        return build_claude_structured_user_prompt(messages)
 
     @staticmethod
     def _extract_last_json_object(stdout: str) -> dict[str, Any] | None:

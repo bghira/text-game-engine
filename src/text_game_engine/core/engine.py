@@ -419,10 +419,6 @@ class GameEngine:
             if has_explicit_participants and not is_participant:
                 return False
             if has_explicit_participants:
-                viewer_is_only_actor = bool(actor_ids) and actor_ids == {str(actor_id or "").strip()}
-                viewer_is_only_slug = bool(player_slugs) and actor_slug and player_slugs == {actor_slug}
-                if viewer_is_only_actor or viewer_is_only_slug:
-                    return False
                 return is_participant
             return False
         if scope in {"", "public"}:
@@ -1557,7 +1553,7 @@ class GameEngine:
 
     @staticmethod
     def _calendar_fix_relative_day(fire_day: int, description: str, current_day: int) -> int:
-        """Fix fire_day when description says 'tomorrow' but fire_day != current_day + 1."""
+        """Fix obvious relative-day mismatches for 'tomorrow' and 'today' wording."""
         if not description:
             return fire_day
         text = description.lower()

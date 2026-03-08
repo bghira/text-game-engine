@@ -8,6 +8,7 @@ from text_game_engine.backends import (
     ClaudeCLIBackend,
     CompletionRequest,
     GeminiCLIBackend,
+    OpenCodeCLIBackend,
     OpenCodeBackend,
     build_backend,
 )
@@ -39,7 +40,7 @@ class RecordingClaudeCLIBackend(ClaudeCLIBackend):
         return self.returncode, self.stdout, self.stderr
 
 
-class RecordingOpenCodeBackend(OpenCodeBackend):
+class RecordingOpenCodeBackend(OpenCodeCLIBackend):
     def __init__(self, *, stdout: str, stderr: str = "", returncode: int = 0, **kwargs):
         super().__init__(**kwargs)
         self.stdout = stdout
@@ -78,7 +79,8 @@ def test_gemini_backend_parses_json_and_wraps_system_prompt():
         assert command[:2] == ["gemini", "-o"]
         assert "json" in command
         assert "-m" in command
-        assert "SYSTEM:" in command[-1]
+        assert "<system_instructions>" in command[-1]
+        assert "<user_request>" in command[-1]
 
     asyncio.run(run_test())
 
@@ -108,6 +110,8 @@ def test_claude_backend_uses_system_prompt_flag_and_json_result():
         command = backend.calls[0]
         assert "--system-prompt" in command
         assert "--tools" in command
+        system_prompt = command[command.index("--system-prompt") + 1]
+        assert "<system_instructions>" in system_prompt
 
     asyncio.run(run_test())
 
@@ -141,7 +145,8 @@ def test_opencode_backend_parses_jsonl_events():
         }
         command = backend.calls[0]
         assert command[:3] == ["opencode", "run", "--format"]
-        assert "SYSTEM:" in command[-1]
+        assert "<system_instructions>" in command[-1]
+        assert "<user_request>" in command[-1]
 
     asyncio.run(run_test())
 
@@ -161,4 +166,5 @@ def test_backend_text_completion_port_supports_claude_backend():
 def test_build_backend_supports_gemini_claude_and_opencode():
     assert isinstance(build_backend("gemini"), GeminiCLIBackend)
     assert isinstance(build_backend("claude"), ClaudeCLIBackend)
-    assert isinstance(build_backend("opencode"), OpenCodeBackend)
+    assert isinstance(build_backend("opencode"), OpenCodeCLIBackend)
+    assert issubclass(OpenCodeCLIBackend, OpenCodeBackend)

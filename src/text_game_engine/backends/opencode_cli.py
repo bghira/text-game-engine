@@ -5,9 +5,13 @@ import json
 from typing import Any
 
 from .base import ChatMessage, CompletionRequest, CompletionResult
+from .prompt_formatting import (
+    build_structured_system_instructions,
+    build_structured_user_prompt,
+)
 
 
-class OpenCodeBackend:
+class OpenCodeCLIBackend:
     """OpenCode CLI backend using `opencode run --format json`."""
 
     _TEXT_COMPLETION_INSTRUCTIONS = (
@@ -97,21 +101,12 @@ class OpenCodeBackend:
             for message in messages
             if message.role == "system" and message.content.strip()
         )
-        non_system = [message for message in messages if message.role != "system"]
-        if len(non_system) == 1 and non_system[0].role == "user":
-            user_text = non_system[0].content.strip()
-            if system_prompt:
-                return (
-                    f"{cls._TEXT_COMPLETION_INSTRUCTIONS}\n\n"
-                    f"SYSTEM:\n{system_prompt}\n\nUSER:\n{user_text}"
-                ).strip()
-            return f"{cls._TEXT_COMPLETION_INSTRUCTIONS}\n\nUSER:\n{user_text}".strip()
-        parts = [cls._TEXT_COMPLETION_INSTRUCTIONS]
-        if system_prompt:
-            parts.extend(["SYSTEM:", system_prompt])
-        for message in non_system:
-            parts.extend([f"{str(message.role).upper()}:", message.content])
-        return "\n\n".join(part.strip() for part in parts if part.strip())
+        system_block = build_structured_system_instructions(
+            base_instructions=cls._TEXT_COMPLETION_INSTRUCTIONS,
+            system_prompt=system_prompt,
+        )
+        user_block = build_structured_user_prompt(messages)
+        return "\n\n".join(part for part in [system_block, user_block] if part.strip()).strip()
 
     @staticmethod
     def _parse_output(stdout: str) -> dict[str, Any]:
@@ -158,3 +153,7 @@ class OpenCodeBackend:
             "finish_reason": finish_reason,
             "error_message": error_message,
         }
+
+
+# Backwards-compatible alias for earlier exports.
+OpenCodeBackend = OpenCodeCLIBackend
