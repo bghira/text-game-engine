@@ -368,6 +368,88 @@ def test_sms_style_action_is_forced_private_and_redacted_from_player_turn(
     asyncio.run(run_test())
 
 
+def test_sms_style_turn_is_suppressed_from_later_recent_turns_for_same_actor(
+    session_factory,
+    uow_factory,
+    seed_campaign_and_actor,
+):
+    async def run_test():
+        llm = QueueLLM(
+            [
+                LLMTurnOutput(
+                    narration="You send the text.",
+                    turn_visibility={"scope": "private"},
+                ),
+                LLMTurnOutput(
+                    narration="You go back to the conversation.",
+                ),
+            ]
+        )
+        engine = GameEngine(uow_factory=uow_factory, llm=llm)
+
+        await engine.resolve_turn(
+            ResolveTurnInput(
+                campaign_id=seed_campaign_and_actor["campaign_id"],
+                actor_id=seed_campaign_and_actor["actor_id"],
+                action='I text Saul "Meet me outside."',
+            )
+        )
+        await engine.resolve_turn(
+            ResolveTurnInput(
+                campaign_id=seed_campaign_and_actor["campaign_id"],
+                actor_id=seed_campaign_and_actor["actor_id"],
+                action="talk about games with the guy next to me",
+            )
+        )
+
+        seen = [row["content"] for row in llm.contexts[1].recent_turns]
+        assert "You send the text." not in seen
+        assert all("text Saul" not in row for row in seen)
+
+    asyncio.run(run_test())
+
+
+def test_sms_check_action_is_suppressed_from_later_recent_turns_for_same_actor(
+    session_factory,
+    uow_factory,
+    seed_campaign_and_actor,
+):
+    async def run_test():
+        llm = QueueLLM(
+            [
+                LLMTurnOutput(
+                    narration="You check the thread.",
+                    turn_visibility={"scope": "private"},
+                ),
+                LLMTurnOutput(
+                    narration="You drift back into the conversation.",
+                ),
+            ]
+        )
+        engine = GameEngine(uow_factory=uow_factory, llm=llm)
+
+        await engine.resolve_turn(
+            ResolveTurnInput(
+                campaign_id=seed_campaign_and_actor["campaign_id"],
+                actor_id=seed_campaign_and_actor["actor_id"],
+                action="I check my SMS leaning away",
+            )
+        )
+        await engine.resolve_turn(
+            ResolveTurnInput(
+                campaign_id=seed_campaign_and_actor["campaign_id"],
+                actor_id=seed_campaign_and_actor["actor_id"],
+                action="go back to the couch and talk games",
+            )
+        )
+
+        seen = [row["content"] for row in llm.contexts[1].recent_turns]
+        assert "You check the thread." not in seen
+        assert all("check my SMS" not in row for row in seen)
+
+    asyncio.run(run_test())
+
+
 def test_recent_turns_visibility_filters_local_by_location(
     session_factory,
     uow_factory,

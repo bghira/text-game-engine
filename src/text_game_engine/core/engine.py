@@ -196,6 +196,12 @@ class GameEngine:
             return False
         return bool(
             re.match(
+                r"^(?:i\s+)?(?:(?:send|check|read|open|view|look\s+at)\s+)?"
+                r"(?:(?:my|the)\s+)?(?:phone|sms|texts?|messages?)\b",
+                text,
+                flags=re.IGNORECASE,
+            )
+            or re.match(
                 r"^(?:i\s+)?(?:send\s+)?(?:sms|text|message)\b",
                 text,
                 flags=re.IGNORECASE,
@@ -233,6 +239,81 @@ class GameEngine:
             "reason": reason or "Private phone/SMS activity is actor-only unless explicitly shared.",
             "source": "auto-private-phone",
         }
+
+    @classmethod
+    def _promote_player_npc_slugs(
+        cls,
+        visibility: dict[str, Any],
+        campaign_players: list[Any],
+    ) -> dict[str, Any]:
+        """Cross-reference aware_npc_slugs against real players.
+
+        When the LLM puts a real player's character slug in npc_slugs,
+        the turn should be visible to that player.  npc_slugs alone are
+        informational and do NOT expose the turn to other players.
+
+        This method auto-promotes any real player found in npc_slugs
+        into visible_player_slugs / visible_actor_ids so the turn
+        appears in their RECENT_TURNS context.
+        """
+        npc_slugs = visibility.get("aware_npc_slugs")
+        if not npc_slugs or not isinstance(npc_slugs, list):
+            return visibility
+        scope = str(visibility.get("scope") or "").strip().lower()
+        if scope == "public":
+            # public turns are already visible to everyone
+            return visibility
+
+        # Build a lookup: character-name-slug → (actor_id, player_visibility_slug)
+        player_by_char_slug: dict[str, tuple[str, str]] = {}
+        for p in campaign_players:
+            actor_id = str(getattr(p, "actor_id", "") or "").strip()
+            if not actor_id:
+                continue
+            state = parse_json_dict(getattr(p, "state_json", "{}"))
+            char_name = str(state.get("character_name") or "").strip()
+            if char_name:
+                char_slug = cls._player_slug_key(char_name)
+                if char_slug:
+                    player_by_char_slug[char_slug] = (
+                        actor_id,
+                        cls._player_visibility_slug(actor_id),
+                    )
+
+        if not player_by_char_slug:
+            return visibility
+
+        # Check each npc_slug against known players
+        promoted = False
+        vis_slugs = list(visibility.get("visible_player_slugs") or [])
+        vis_ids = list(visibility.get("visible_actor_ids") or [])
+        remaining_npc_slugs = []
+
+        for npc_slug in npc_slugs:
+            normalised = cls._player_slug_key(npc_slug)
+            match = player_by_char_slug.get(normalised)
+            if match is not None:
+                aid, pslug = match
+                # skip the acting player – already included
+                if aid == str(visibility.get("actor_actor_id") or "").strip():
+                    remaining_npc_slugs.append(npc_slug)
+                    continue
+                if pslug not in vis_slugs:
+                    vis_slugs.append(pslug)
+                if aid not in vis_ids:
+                    vis_ids.append(aid)
+                promoted = True
+            else:
+                remaining_npc_slugs.append(npc_slug)
+
+        if not promoted:
+            return visibility
+
+        result = dict(visibility)
+        result["visible_player_slugs"] = vis_slugs
+        result["visible_actor_ids"] = vis_ids
+        result["aware_npc_slugs"] = remaining_npc_slugs
+        return result
 
     @staticmethod
     def _normalize_turn_visibility(
@@ -312,13 +393,38 @@ class GameEngine:
         actor_slug: str,
         viewer_location_key: str,
     ) -> bool:
+        meta = parse_json_dict(getattr(turn, "meta_json", "{}"))
+        if bool(meta.get("suppress_context")):
+            return False
         if str(getattr(turn, "actor_id", "") or "").strip() == str(actor_id or "").strip():
             return True
-        meta = parse_json_dict(getattr(turn, "meta_json", "{}"))
         visibility = meta.get("visibility") if isinstance(meta, dict) else None
         if not isinstance(visibility, dict):
             return True
         scope = str(visibility.get("scope") or "").strip().lower()
+        raw_actor_ids = visibility.get("visible_actor_ids")
+        actor_ids = set()
+        if isinstance(raw_actor_ids, list):
+            actor_ids = {str(item or "").strip() for item in raw_actor_ids if str(item or "").strip()}
+        raw_player_slugs = visibility.get("visible_player_slugs")
+        player_slugs = set()
+        if isinstance(raw_player_slugs, list):
+            player_slugs = {GameEngine._player_slug_key(item) for item in raw_player_slugs if GameEngine._player_slug_key(item)}
+        has_explicit_participants = bool(actor_ids or player_slugs)
+        is_participant = bool(
+            str(actor_id or "").strip() in actor_ids
+            or (actor_slug and actor_slug in player_slugs)
+        )
+        if scope in {"private", "limited"}:
+            if has_explicit_participants and not is_participant:
+                return False
+            if has_explicit_participants:
+                viewer_is_only_actor = bool(actor_ids) and actor_ids == {str(actor_id or "").strip()}
+                viewer_is_only_slug = bool(player_slugs) and actor_slug and player_slugs == {actor_slug}
+                if viewer_is_only_actor or viewer_is_only_slug:
+                    return False
+                return is_participant
+            return False
         if scope in {"", "public"}:
             return True
         if scope == "local":
@@ -327,14 +433,10 @@ class GameEngine:
             ).strip().lower()
             if viewer_location_key and turn_location_key and viewer_location_key == turn_location_key:
                 return True
-        raw_actor_ids = visibility.get("visible_actor_ids")
-        if isinstance(raw_actor_ids, list):
-            if str(actor_id or "").strip() in {str(item or "").strip() for item in raw_actor_ids}:
-                return True
-        raw_player_slugs = visibility.get("visible_player_slugs")
-        if isinstance(raw_player_slugs, list):
-            if actor_slug and actor_slug in {GameEngine._player_slug_key(item) for item in raw_player_slugs}:
-                return True
+        if str(actor_id or "").strip() in actor_ids:
+            return True
+        if actor_slug and actor_slug in player_slugs:
+            return True
         return False
 
     def _phase_a(self, turn_input: ResolveTurnInput, claim_token: str) -> TurnContext:
@@ -498,6 +600,12 @@ class GameEngine:
                 getattr(llm_output, "turn_visibility", None),
                 actor_location_key=actor_location_key,
             )
+            # Auto-promote real players listed in npc_slugs so they
+            # actually receive the turn in their RECENT_TURNS context.
+            turn_visibility = self._promote_player_npc_slugs(
+                turn_visibility,
+                uow.players.list_by_campaign(turn_input.campaign_id),
+            )
             stored_player_action, private_phone_redacted = self._redact_private_phone_command_lines(
                 turn_input.action
             )
@@ -510,6 +618,7 @@ class GameEngine:
                     campaign_state,
                     "private_phone_redacted",
                 )
+            suppress_recent_context = bool(private_phone_redacted)
             turn_is_public = str(turn_visibility.get("scope") or "").strip().lower() == "public"
 
             summary = campaign.summary or ""
@@ -580,6 +689,7 @@ class GameEngine:
                     "game_time": pre_turn_game_time,
                     "visibility": turn_visibility,
                     "location_key": self._room_key_from_state(player_state),
+                    "suppress_context": suppress_recent_context,
                 }
                 uow.turns.add(
                     campaign_id=turn_input.campaign_id,
@@ -599,6 +709,7 @@ class GameEngine:
                 "visibility": turn_visibility,
                 "actor_player_slug": self._player_visibility_slug(turn_input.actor_id),
                 "location_key": self._room_key_from_state(player_state),
+                "suppress_context": suppress_recent_context,
             }
             if reasoning_text:
                 narrator_turn_meta["reasoning"] = reasoning_text
@@ -800,9 +911,20 @@ class GameEngine:
                     "appearance",
                     "speech_style",
                 }
+                old_location = str(merged[target_slug].get("location") or "").strip().lower()
                 for key, value in fields.items():
                     if key not in _IMMUTABLE:
                         merged[target_slug][key] = value
+                # If location changed but current_status wasn't updated,
+                # clear the stale status to avoid contradictions.
+                if (
+                    "location" in fields
+                    and "current_status" not in fields
+                    and "current_status" in merged[target_slug]
+                ):
+                    new_location = str(fields["location"] or "").strip().lower()
+                    if old_location and new_location and old_location != new_location:
+                        merged[target_slug]["current_status"] = ""
             else:
                 if on_rails:
                     continue
@@ -1404,6 +1526,52 @@ class GameEngine:
         return fire_day
 
     @staticmethod
+    def _calendar_fix_ampm(fire_hour: int, description: str) -> int:
+        """Fix fire_hour when description contains AM/PM that contradicts it.
+
+        Examples:
+        - fire_hour=7, description mentions "7pm"  → returns 19
+        - fire_hour=19, description mentions "7am" → returns 7
+        - fire_hour=12, description mentions "12pm" (noon) → returns 12
+        - fire_hour=0, description mentions "12am" (midnight) → returns 0
+        """
+        if not description:
+            return fire_hour
+        text = description.lower()
+        # Look for patterns like "7pm", "7 pm", "7:00pm", "7:30 pm"
+        for m in re.finditer(r"\b(\d{1,2})(?:\s*:\s*\d{2})?\s*(am|pm)\b", text):
+            desc_hour = int(m.group(1))
+            ampm = m.group(2)
+            if desc_hour < 1 or desc_hour > 12:
+                continue
+            # Convert described hour to 24h
+            if ampm == "pm":
+                expected_24h = desc_hour if desc_hour == 12 else desc_hour + 12
+            else:
+                expected_24h = 0 if desc_hour == 12 else desc_hour
+            # If fire_hour looks like the raw 12h value (not yet converted)
+            if fire_hour == desc_hour and fire_hour != expected_24h:
+                fire_hour = expected_24h
+                break
+        return fire_hour
+
+    @staticmethod
+    def _calendar_fix_relative_day(fire_day: int, description: str, current_day: int) -> int:
+        """Fix fire_day when description says 'tomorrow' but fire_day != current_day + 1."""
+        if not description:
+            return fire_day
+        text = description.lower()
+        if re.search(r"\btomorrow\b", text):
+            expected = current_day + 1
+            # If fire_day is current_day or more than 1 day off, fix it
+            if fire_day == current_day:
+                return expected
+        elif re.search(r"\btoday\b", text):
+            if fire_day > current_day:
+                return current_day
+        return fire_day
+
+    @staticmethod
     def _calendar_name_key(value: object) -> str:
         text = str(value or "").strip().lower()
         if not text:
@@ -1514,11 +1682,18 @@ class GameEngine:
                 time_remaining=event.get("time_remaining", 1),
                 time_unit=event.get("time_unit", "days"),
             )
+        # Cross-check fire_hour against description AM/PM mentions.
+        # If description says "7pm" but fire_hour is 7 (AM), fix it.
+        description = str(event.get("description") or "")[:200]
+        fire_hour = cls._calendar_fix_ampm(fire_hour, description)
+        # Cross-check fire_day against "tomorrow"/"today" in description.
+        fire_day = cls._calendar_fix_relative_day(fire_day, description, current_day)
+
         normalized: dict[str, Any] = {
             "name": name,
             "fire_day": fire_day,
             "fire_hour": fire_hour,
-            "description": str(event.get("description") or "")[:200],
+            "description": description,
             "known_by": cls._calendar_known_by_from_event(event),
         }
         target_players = cls._calendar_target_tokens_from_event(event)

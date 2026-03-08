@@ -57,3 +57,29 @@ completion_port = BackendTextCompletionPort(backend)
 ```
 
 Pass `completion_port` into `ZorkEmulator(...)` for setup, summarization, map generation, and other emulator-side completions.
+
+## Codex CLI
+
+If you already have the `codex` CLI installed and authenticated, you can use it as a backend too:
+
+```python
+from text_game_engine import BackendTextCompletionPort, CodexCLIBackend
+
+backend = CodexCLIBackend(
+    cd="/path/to/repo-or-workdir",
+    sandbox="read-only",
+)
+completion_port = BackendTextCompletionPort(backend)
+```
+
+The emulator system prompt is mapped onto Codex CLI's separate `user_instructions` config channel, and the task prompt is sent over stdin to `codex exec`.
+Point `cd` at a small or empty working directory when possible; Codex performs better as a completion backend when it is not sitting in a large repo tree.
+
+## Other local CLIs
+
+`text-game-engine` now also includes local CLI backends for:
+- `gemini`
+- `claude`
+- `opencode`
+
+These follow the same `BackendTextCompletionPort(...)` adapter pattern as Ollama and Codex.

@@ -308,6 +308,7 @@ class ZorkEmulator:
         "your inventory:",
         "current inventory:",
     )
+    _UNREAD_SMS_LINE_PREFIXES = ("📨 unread sms:", "unread sms:")
     RESPONSE_STYLE_NOTE = (
         "[SYSTEM NOTE: FOR THIS RESPONSE ONLY: use classic Zork style. Minimal words. "
         "Advance one concrete beat only. No recap of unchanged facts. No literary prose, "
@@ -477,6 +478,8 @@ class ZorkEmulator:
         "  * local: default for ordinary in-room action when a concrete location_key/room is present. Players in the same room should retain it in prompt context, but it should not enter global/worldwide recap.\n"
         "  * limited: only the acting player plus the listed player_slugs should retain the turn in prompt context.\n"
         "  * Phone/text/SMS activity is private by default to the acting player. If they text or message someone off-scene, use private or limited unless they explicitly show or read it aloud to others.\n"
+        "  * When a player starts a whisper, pull-aside, or private word, move that exchange into private or limited context immediately and keep it there until they clearly rejoin the room or a different conversation.\n"
+        "  * Do not dump the contents of a brand-new whisper into public/local narration before privacy is established. First establish the aside, then continue the private exchange on later turns.\n"
         "  * npc_slugs are for overheard/noticed NPC awareness only. They help continuity but do not expose the turn to other players by themselves.\n"
         "  * If TURN_VISIBILITY_DEFAULT is local, keep routine room-level interaction local unless it clearly becomes public.\n"
         "  * If TURN_VISIBILITY_DEFAULT is private and nothing in the scene clearly makes the action public, keep it private or limited.\n"
@@ -849,6 +852,7 @@ class ZorkEmulator:
         self._locks: dict[str, asyncio.Lock] = {}
         self._pending_timers: dict[str, dict[str, Any]] = {}
         self._pending_sms_tasks: dict[str, set[asyncio.Task]] = {}
+        self._turn_ephemeral_notices: dict[tuple[str, str, str | None], list[str]] = {}
 
     # ------------------------------------------------------------------
     # Compatibility helpers
@@ -1043,27 +1047,19 @@ class ZorkEmulator:
         viewer_slug: str,
         viewer_location_key: str,
     ) -> bool:
-        if turn.actor_id == viewer_actor_id:
-            return True
         meta = cls._safe_turn_meta(turn)
+        if bool(meta.get("suppress_context")):
+            return False
         visibility = meta.get("visibility")
         if not isinstance(visibility, dict):
+            if turn.actor_id == viewer_actor_id:
+                return True
             return True
         scope = str(visibility.get("scope") or "").strip().lower()
-        if scope in {"", "public"}:
-            return True
-        if scope == "local":
-            turn_location_key = str(
-                visibility.get("location_key") or meta.get("location_key") or ""
-            ).strip().lower()
-            if viewer_location_key and turn_location_key and viewer_location_key == turn_location_key:
-                return True
         raw_actor_ids = visibility.get("visible_actor_ids")
         actor_ids = set()
         if isinstance(raw_actor_ids, list):
             actor_ids = {str(item).strip() for item in raw_actor_ids if str(item).strip()}
-        if viewer_actor_id in actor_ids:
-            return True
         raw_player_slugs = visibility.get("visible_player_slugs")
         player_slugs = set()
         if isinstance(raw_player_slugs, list):
@@ -1072,6 +1068,34 @@ class ZorkEmulator:
                 for item in raw_player_slugs
                 if cls._player_slug_key(item)
             }
+        has_explicit_participants = bool(actor_ids or player_slugs)
+        is_participant = bool(
+            str(viewer_actor_id or "").strip() in actor_ids
+            or (viewer_slug and viewer_slug in player_slugs)
+            or turn.actor_id == viewer_actor_id
+        )
+        if scope in {"private", "limited"}:
+            if has_explicit_participants and not is_participant:
+                return False
+            if has_explicit_participants:
+                viewer_is_only_actor = bool(actor_ids) and actor_ids == {str(viewer_actor_id or "").strip()}
+                viewer_is_only_slug = bool(player_slugs) and viewer_slug and player_slugs == {viewer_slug}
+                if viewer_is_only_actor or viewer_is_only_slug:
+                    return False
+                return is_participant
+            return False
+        if turn.actor_id == viewer_actor_id:
+            return True
+        if scope in {"", "public"}:
+            return True
+        if scope == "local":
+            turn_location_key = str(
+                visibility.get("location_key") or meta.get("location_key") or ""
+            ).strip().lower()
+            if viewer_location_key and turn_location_key and viewer_location_key == turn_location_key:
+                return True
+        if viewer_actor_id in actor_ids:
+            return True
         return bool(viewer_slug and viewer_slug in player_slugs)
 
     @staticmethod
@@ -4965,6 +4989,7 @@ class ZorkEmulator:
             if cid is None:
                 return None
             should_end = True
+        self._set_turn_ephemeral_notices(campaign_id, actor_id, session_id, [])
         try:
             pending = self._pending_timers.get(campaign_id)
             can_interrupt = (
@@ -5115,6 +5140,15 @@ class ZorkEmulator:
                     pre_slugs=pre_character_slugs,
                     channel_id=portrait_channel_ref,
                 )
+                if self._private_setup_warning_needed(action):
+                    self._set_turn_ephemeral_notices(
+                        campaign_id,
+                        actor_id,
+                        session_id,
+                        [
+                            "Warning: if you include the real whisper/private content in the same setup message, it may leak before the aside is fully established. Use one short setup turn first, then continue once the reply keeps it private."
+                        ],
+                    )
                 return self._decorate_narration_and_persist(
                     campaign_id=campaign_id,
                     actor_id=actor_id,
@@ -6718,6 +6752,10 @@ class ZorkEmulator:
             stripped = line.strip().lower()
             if any(stripped.startswith(prefix) for prefix in self._INVENTORY_LINE_PREFIXES):
                 continue
+            if any(stripped.startswith(prefix) for prefix in self._UNREAD_SMS_LINE_PREFIXES):
+                continue
+            if stripped.startswith("\u23f0"):
+                continue
             kept_lines.append(line)
         return "\n".join(kept_lines).strip()
 
@@ -6725,6 +6763,66 @@ class ZorkEmulator:
         if not text:
             return ""
         return self._strip_inventory_from_narration(text)
+
+    def _set_turn_ephemeral_notices(
+        self,
+        campaign_id: str,
+        actor_id: str,
+        session_id: str | None,
+        notices: list[str],
+    ) -> None:
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        for item in notices or []:
+            text = " ".join(str(item or "").split()).strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            cleaned.append(text[:500])
+        key = (str(campaign_id), str(actor_id), str(session_id or "") or None)
+        if cleaned:
+            self._turn_ephemeral_notices[key] = cleaned
+        else:
+            self._turn_ephemeral_notices.pop(key, None)
+
+    def pop_turn_ephemeral_notices(
+        self,
+        campaign_id: str,
+        actor_id: str,
+        session_id: str | None = None,
+    ) -> list[str]:
+        return list(
+            self._turn_ephemeral_notices.pop(
+                (str(campaign_id), str(actor_id), str(session_id or "") or None),
+                [],
+            )
+        )
+
+    @staticmethod
+    def _is_private_engagement_setup_action(action: str) -> bool:
+        text = " ".join(str(action or "").strip().lower().split())
+        if not text:
+            return False
+        return bool(
+            re.search(
+                r"\b(?:whisper|murmur|lean in|lower my voice|lower your voice|quietly to|under my breath|private word|pull .* aside|take .* aside|step aside with)\b",
+                text,
+                re.IGNORECASE,
+            )
+        )
+
+    def _private_setup_warning_needed(self, action: str) -> bool:
+        if not self._is_private_engagement_setup_action(action):
+            return False
+        text = str(action or "").strip()
+        sentence_count = len(
+            [seg for seg in re.split(r"(?<=[.!?])\s+", text) if seg.strip()]
+        )
+        if sentence_count > 1:
+            return True
+        if text.count('"') >= 2 or text.count("'") >= 2:
+            return True
+        return len(text) > 180
 
     def _scrub_inventory_from_state(self, value):
         if isinstance(value, dict):
@@ -7668,6 +7766,8 @@ class ZorkEmulator:
             f"{unread_threads} thread(s){suffix}."
         )
 
+    _SMS_ARTICLES = frozenset({"the", "a", "an", "my"})
+
     @classmethod
     def _extract_inline_sms_intent(
         cls,
@@ -7676,6 +7776,7 @@ class ZorkEmulator:
         text = str(action or "").strip()
         if not text:
             return None
+        # Pattern 1: Colon-delimited — "text the Doc: hello"
         m = re.match(
             r"^\s*(?:i\s+)?(?:send\s+)?(?:sms|text|message)\s+(?:to\s+)?([^:\n]{1,120})\s*:\s*(.+?)\s*$",
             text,
@@ -7685,8 +7786,12 @@ class ZorkEmulator:
             recipient = str(m.group(1) or "").strip().strip("\"'` ")
             message = str(m.group(2) or "").strip()
         else:
+            # Pattern 2: Space-delimited — "text Doc hello"
+            # Allow articles to be part of the recipient name:
+            # "sms the Doc the words" → recipient="the Doc", message="the words"
             m = re.match(
-                r"^\s*(?:i\s+)?(?:send\s+)?(?:sms|text|message)\s+(?:to\s+)?([^\s:\n]{1,80})\s+(.+?)\s*$",
+                r"^\s*(?:i\s+)?(?:send\s+)?(?:sms|text|message)\s+(?:to\s+)?"
+                r"(?:(?:the|a|an|my)\s+)?([^\s:\n]{1,80})\s+(.+?)\s*$",
                 text,
                 flags=re.IGNORECASE,
             )
@@ -7694,6 +7799,9 @@ class ZorkEmulator:
                 return None
             recipient = str(m.group(1) or "").strip().strip("\"'` ")
             message = str(m.group(2) or "").strip()
+            # If recipient is still a bare article, something went wrong — bail
+            if recipient.lower() in cls._SMS_ARTICLES:
+                return None
         if (
             len(message) >= 2
             and message[0] == message[-1]
@@ -8243,8 +8351,13 @@ class ZorkEmulator:
             repaired = f"{cleaned}}}"
             try:
                 parsed = self._parse_json_lenient(repaired)
+                # Only accept the repair if it produced a structurally
+                # complete response (not a truncated partial dict).
                 if isinstance(parsed, dict) and parsed:
-                    return repaired
+                    has_narration = bool(parsed.get("narration"))
+                    has_tool_call = bool(parsed.get("tool_call"))
+                    if has_narration or has_tool_call:
+                        return repaired
             except Exception:
                 pass
         return cleaned
