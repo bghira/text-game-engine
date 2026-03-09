@@ -25,6 +25,7 @@ class GiveItemInstruction:
 class LLMTurnOutput:
     narration: str
     reasoning: Optional[str] = None
+    scene_output: dict[str, Any] | None = None
     state_update: dict[str, Any] = field(default_factory=dict)
     summary_update: Optional[str] = None
     xp_awarded: int = 0

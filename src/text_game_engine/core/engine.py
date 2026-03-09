@@ -709,6 +709,12 @@ class GameEngine:
             }
             if reasoning_text:
                 narrator_turn_meta["reasoning"] = reasoning_text
+            if isinstance(llm_output.summary_update, str) and llm_output.summary_update.strip():
+                narrator_turn_meta["summary_update"] = llm_output.summary_update.strip()
+            if isinstance(getattr(llm_output, "scene_output", None), dict):
+                narrator_turn_meta["scene_output"] = llm_output.scene_output
+                if narration:
+                    narrator_turn_meta["scene_output_rendered"] = narration
             narrator_turn = uow.turns.add(
                 campaign_id=turn_input.campaign_id,
                 session_id=turn_input.session_id,
