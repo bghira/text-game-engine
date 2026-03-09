@@ -368,6 +368,88 @@ def test_sms_style_action_is_forced_private_and_redacted_from_player_turn(
     asyncio.run(run_test())
 
 
+def test_sms_style_turn_is_suppressed_from_later_recent_turns_for_same_actor(
+    session_factory,
+    uow_factory,
+    seed_campaign_and_actor,
+):
+    async def run_test():
+        llm = QueueLLM(
+            [
+                LLMTurnOutput(
+                    narration="You send the text.",
+                    turn_visibility={"scope": "private"},
+                ),
+                LLMTurnOutput(
+                    narration="You go back to the conversation.",
+                ),
+            ]
+        )
+        engine = GameEngine(uow_factory=uow_factory, llm=llm)
+
+        await engine.resolve_turn(
+            ResolveTurnInput(
+                campaign_id=seed_campaign_and_actor["campaign_id"],
+                actor_id=seed_campaign_and_actor["actor_id"],
+                action='I text Saul "Meet me outside."',
+            )
+        )
+        await engine.resolve_turn(
+            ResolveTurnInput(
+                campaign_id=seed_campaign_and_actor["campaign_id"],
+                actor_id=seed_campaign_and_actor["actor_id"],
+                action="talk about games with the guy next to me",
+            )
+        )
+
+        seen = [row["content"] for row in llm.contexts[1].recent_turns]
+        assert "You send the text." not in seen
+        assert all("text Saul" not in row for row in seen)
+
+    asyncio.run(run_test())
+
+
+def test_sms_check_action_is_suppressed_from_later_recent_turns_for_same_actor(
+    session_factory,
+    uow_factory,
+    seed_campaign_and_actor,
+):
+    async def run_test():
+        llm = QueueLLM(
+            [
+                LLMTurnOutput(
+                    narration="You check the thread.",
+                    turn_visibility={"scope": "private"},
+                ),
+                LLMTurnOutput(
+                    narration="You drift back into the conversation.",
+                ),
+            ]
+        )
+        engine = GameEngine(uow_factory=uow_factory, llm=llm)
+
+        await engine.resolve_turn(
+            ResolveTurnInput(
+                campaign_id=seed_campaign_and_actor["campaign_id"],
+                actor_id=seed_campaign_and_actor["actor_id"],
+                action="I check my SMS leaning away",
+            )
+        )
+        await engine.resolve_turn(
+            ResolveTurnInput(
+                campaign_id=seed_campaign_and_actor["campaign_id"],
+                actor_id=seed_campaign_and_actor["actor_id"],
+                action="go back to the couch and talk games",
+            )
+        )
+
+        seen = [row["content"] for row in llm.contexts[1].recent_turns]
+        assert "You check the thread." not in seen
+        assert all("check my SMS" not in row for row in seen)
+
+    asyncio.run(run_test())
+
+
 def test_recent_turns_visibility_filters_local_by_location(
     session_factory,
     uow_factory,
@@ -597,6 +679,7 @@ def test_story_progress_state_update_coerces_string_indices_and_clamps(
             campaign = session.get(Campaign, seed_campaign_and_actor["campaign_id"])
             campaign.state_json = json.dumps(
                 {
+                    "on_rails": True,
                     "current_chapter": 0,
                     "current_scene": 0,
                     "story_outline": {
@@ -634,6 +717,80 @@ def test_story_progress_state_update_coerces_string_indices_and_clamps(
             assert state.get("current_scene") == 1
 
     asyncio.run(run_test())
+
+
+def test_story_progress_state_update_preserves_offrails_slug_progress(
+    session_factory, uow_factory, seed_campaign_and_actor
+):
+    async def run_test():
+        with session_factory() as session:
+            campaign = session.get(Campaign, seed_campaign_and_actor["campaign_id"])
+            campaign.state_json = json.dumps(
+                {
+                    "on_rails": False,
+                    "current_chapter": "old-chapter",
+                    "current_scene": "old-scene",
+                    "chapters": [
+                        {
+                            "slug": "friday-night-after",
+                            "title": "Friday Night, After",
+                            "summary": "Everything is different and nothing shows.",
+                            "current_scene": "boundary-test",
+                            "scenes": ["boundary-test", "the-cat-knows"],
+                            "status": "active",
+                        }
+                    ],
+                }
+            )
+            session.commit()
+
+        llm = StubLLM(
+            LLMTurnOutput(
+                narration="Off-rails progression.",
+                state_update={
+                    "current_chapter": "friday-night-after",
+                    "current_scene": "boundary-test",
+                },
+            )
+        )
+        engine = GameEngine(uow_factory=uow_factory, llm=llm)
+
+        result = await engine.resolve_turn(
+            ResolveTurnInput(
+                campaign_id=seed_campaign_and_actor["campaign_id"],
+                actor_id=seed_campaign_and_actor["actor_id"],
+                action="continue",
+            )
+        )
+        assert result.status == "ok"
+
+        with session_factory() as session:
+            campaign = session.get(Campaign, seed_campaign_and_actor["campaign_id"])
+            state = json.loads(campaign.state_json or "{}")
+            assert state.get("current_chapter") == "friday-night-after"
+            assert state.get("current_scene") == "boundary-test"
+
+    asyncio.run(run_test())
+
+
+def test_explicit_time_skip_description_bypasses_normal_turn_cap():
+    campaign_state = {
+        "game_time": {"day": 1, "hour": 8, "minute": 0},
+        "speed_multiplier": 1.0,
+    }
+    pre = {"day": 1, "hour": 8, "minute": 0}
+
+    out = GameEngine._ensure_game_time_progress(
+        campaign_state,
+        pre,
+        action_text="time-skip 8h of sleep",
+        narration_text="You sleep and return in the evening.",
+    )
+
+    game_time = out.get("game_time", {})
+    assert game_time.get("day") == 1
+    assert game_time.get("hour") == 16
+    assert game_time.get("minute") == 0
 
 
 def test_character_updates_null_removes_character(session_factory, uow_factory, seed_campaign_and_actor):

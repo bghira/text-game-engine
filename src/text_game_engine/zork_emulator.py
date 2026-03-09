@@ -308,6 +308,7 @@ class ZorkEmulator:
         "your inventory:",
         "current inventory:",
     )
+    _UNREAD_SMS_LINE_PREFIXES = ("📨 unread sms:", "unread sms:")
     RESPONSE_STYLE_NOTE = (
         "[SYSTEM NOTE: FOR THIS RESPONSE ONLY: use classic Zork style. Minimal words. "
         "Advance one concrete beat only. No recap of unchanged facts. No literary prose, "
@@ -319,6 +320,29 @@ class ZorkEmulator:
         "As game master, you may know when the player is lying; only let an NPC reveal or react to that "
         "if that NPC plausibly knows in this scene (direct evidence, prior established knowledge, or in-scene disclosure). "
         "Do not leak off-screen NPC communications into current NPC dialogue unless continuity clearly supports it.]"
+    )
+    PROMPT_STAGE_BOOTSTRAP = "bootstrap"
+    PROMPT_STAGE_RESEARCH = "research"
+    PROMPT_STAGE_FINAL = "final"
+    BOOTSTRAP_SYSTEM_PROMPT = (
+        "You are the ZorkEmulator continuity bootstrapper.\n"
+        "Do NOT narrate yet. Do NOT resolve the turn yet.\n"
+        "Your job in this phase is only to decide what immediate privacy-gated scene continuity is needed.\n"
+        "Use the acting player's location, PARTY_SNAPSHOT, WORLD_CHARACTERS, and PLAYER_ACTION to choose recent_turns receivers.\n"
+        "Return only a tool call in this phase.\n"
+    )
+    RESEARCH_SYSTEM_PROMPT = (
+        "You are the ZorkEmulator research planner.\n"
+        "RECENT_TURNS has already been loaded for the acting player.\n"
+        "Do NOT narrate yet unless the system explicitly says to finalize.\n"
+        "Your job in this phase is to gather any deeper continuity, canon, SMS, plot, chapter, or consequence context that materially matters for this turn.\n"
+        'When research is sufficient, return ONLY {"tool_call": "ready_to_write"}.\n'
+    )
+    READY_TO_WRITE_TOOL_PROMPT = (
+        "\nYou have a ready_to_write tool for ending the research phase.\n"
+        "When you have enough context to write the turn, return ONLY:\n"
+        '{"tool_call": "ready_to_write"}\n'
+        "Do not narrate in the same response as ready_to_write.\n"
     )
     DIFFICULTY_LEVELS = (
         "story",
@@ -477,6 +501,8 @@ class ZorkEmulator:
         "  * local: default for ordinary in-room action when a concrete location_key/room is present. Players in the same room should retain it in prompt context, but it should not enter global/worldwide recap.\n"
         "  * limited: only the acting player plus the listed player_slugs should retain the turn in prompt context.\n"
         "  * Phone/text/SMS activity is private by default to the acting player. If they text or message someone off-scene, use private or limited unless they explicitly show or read it aloud to others.\n"
+        "  * When a player starts a whisper, pull-aside, or private word, move that exchange into private or limited context immediately and keep it there until they clearly rejoin the room or a different conversation.\n"
+        "  * Do not dump the contents of a brand-new whisper into public/local narration before privacy is established. First establish the aside, then continue the private exchange on later turns.\n"
         "  * npc_slugs are for overheard/noticed NPC awareness only. They help continuity but do not expose the turn to other players by themselves.\n"
         "  * If TURN_VISIBILITY_DEFAULT is local, keep routine room-level interaction local unless it clearly becomes public.\n"
         "  * If TURN_VISIBILITY_DEFAULT is private and nothing in the scene clearly makes the action public, keep it private or limited.\n"
@@ -587,7 +613,29 @@ class ZorkEmulator:
         "- Long-term memory lookup tools are disabled for this turn because WORLD_SUMMARY is still within context budget.\n"
         "- Source-material memory search should only be enabled when the current player action explicitly asks for canon recall/details.\n"
         "- Do NOT call memory_search, memory_terms, memory_turn, or memory_store.\n"
-        "- Use WORLD_SUMMARY, WORLD_STATE, WORLD_CHARACTERS, PARTY_SNAPSHOT, and RECENT_TURNS directly.\n"
+        "- You may still call recent_turns for immediate visible continuity.\n"
+        "- Use WORLD_SUMMARY, WORLD_STATE, WORLD_CHARACTERS, PARTY_SNAPSHOT, CURRENTLY_ATTENTIVE_PLAYERS, and recent_turns when needed.\n"
+    )
+    RECENT_TURNS_TOOL_PROMPT = (
+        "\nYou have a recent_turns tool for immediate visible continuity.\n"
+        "You MUST call it before final narration/state JSON on every normal gameplay turn.\n"
+        "Return ONLY:\n"
+        '{"tool_call": "recent_turns", "player_slugs": ["other-player-slug"], "npc_slugs": ["npc-slug"]}\n'
+        "Optional limit example:\n"
+        '{"tool_call": "recent_turns", "player_slugs": ["other-player-slug"], "npc_slugs": ["npc-slug"], "limit": 12}\n'
+        "Include player_slugs and npc_slugs for the current receivers who need continuity from prior private/limited exchanges.\n"
+        "The receiver lists ADD relevant private continuity; they do NOT filter out normal public/local continuity.\n"
+        "The system will return recent visible turns filtered for the acting player, current location, active private/limited context, and the requested receivers.\n"
+        "This tool is required before guessing what just happened in the room.\n"
+    )
+    MEMORY_BOOTSTRAP_TOOL_PROMPT = (
+        "\nYou have memory/source retrieval tools for older continuity and canon.\n"
+        "Do NOT use them before recent_turns unless the system explicitly says recent_turns is already loaded.\n"
+        "After recent_turns, use memory_search when deeper or older recall materially matters.\n"
+        'memory_search syntax: {"tool_call": "memory_search", "queries": ["name", "location"]}\n'
+        'Optional source scope: {"tool_call": "memory_search", "category": "source", "queries": ["character", "location", "event"]}\n'
+        'Rulebook key browsing: {"tool_call": "source_browse", "document_key": "document-key"}\n'
+        'Exact turn retrieval after a hit: {"tool_call": "memory_turn", "turn_id": 1234}\n'
     )
     SMS_TOOL_PROMPT = (
         "\nYou also have SMS tools for in-game communications with off-scene NPCs:\n"
@@ -615,8 +663,8 @@ class ZorkEmulator:
         '{"tool_call": "memory_search", "category": "char:marcus-blackwell", "queries": ["penthouse", "deal"]}\n'
         "If results are weak or empty, you may immediately call memory_search again with refined queries.\n"
         "\nTOOL USAGE POLICY (HIGH PRIORITY):\n"
-        "- On MOST turns, call at least one tool BEFORE final narration/state JSON.\n"
-        "- Default behavior: call memory_search first.\n"
+        "- On every normal gameplay turn, call recent_turns BEFORE final narration/state JSON.\n"
+        "- After recent_turns, call memory_search for deeper recall when needed.\n"
         "- If PLAYER_ACTION involves phone/text/call/off-scene contact, use sms_list/sms_read before narrating; "
         "use sms_write when sending or replying. Use sms_schedule for delayed replies.\n"
         "- Phone/text/SMS turns should normally be private or limited, not local/public, unless the player explicitly shares the content out loud.\n"
@@ -655,6 +703,9 @@ class ZorkEmulator:
         "(adjustable via 'limit'). With a specific wildcard it returns the matching raw KEY: value lines.\n"
         "STRATEGY: for a rulebook you have not seen before, call source_browse with no wildcard first to see what keys exist, "
         "then use source_browse with a wildcard or memory_search with category 'source:<document_key>' for detail.\n"
+        "\nRECENT TURN CONTINUITY:\n"
+        "- If you need to know what just happened in the room or active whisper/private exchange, call recent_turns first.\n"
+        "- recent_turns is the authoritative immediate continuity tool; memory_search is for deeper or older recall.\n"
         "\nNAME GENERATION — name_generate tool:\n"
         "When introducing a new NPC, use name_generate to get real culturally-appropriate names instead of inventing them.\n"
         "- Generate names filtered by cultural origin:\n"
@@ -689,18 +740,14 @@ class ZorkEmulator:
         "Example: to recall Marcus and Anastasia, use:\n"
         '{"tool_call": "memory_search", "queries": ["Marcus", "Anastasia"]}\n'
         'NOT: {"tool_call": "memory_search", "queries": ["Marcus Anastasia relationship"]}\n'
-        "USE memory_search AGGRESSIVELY — it is cheap and fast. Prefer searching too often over guessing.\n"
-        "You MUST use memory_search on MOST turns. Specifically:\n"
-        "- ANY time a character, NPC, or named entity appears or is mentioned — even if they were in recent turns. "
-        "Memory may contain richer detail than the truncated recent context.\n"
-        "- ANY time the player references past events, locations, objects, or conversations.\n"
-        "- ANY time you are about to narrate a scene involving an established NPC — search their name first.\n"
-        "- ANY time you need to describe a location the player has visited before.\n"
-        "- At the START of most turns, search for the current location and any NPCs present to refresh your context.\n"
-        "- When the player asks questions, investigates, or examines something — search for related terms.\n"
-        "- When you are unsure about ANY detail from earlier in the campaign.\n"
-        "The cost of an unnecessary search is zero. The cost of hallucinating a detail is broken continuity.\n"
-        "When in doubt, SEARCH. Do not guess, improvise, or rely solely on RECENT_TURNS.\n"
+        "USE memory_search AGGRESSIVELY when deeper or older continuity matters.\n"
+        "You SHOULD use memory_search often, especially:\n"
+        "- when a character, NPC, or named entity appears and older context may matter\n"
+        "- when the player references past events, locations, objects, or conversations\n"
+        "- when describing a revisited location or established NPC\n"
+        "- when the player investigates, asks questions, or you are unsure about earlier campaign facts\n"
+        "Do not call memory_search reflexively after every recent_turns. Use it when it will materially improve continuity.\n"
+        "When in doubt between guessing and searching, search.\n"
         "IMPORTANT: Memories are stored as narrator event text (e.g. what happened in a scene). "
         "Queries are matched by semantic similarity against these narration snippets. "
         "Use short, concrete keyword queries with names and places — e.g. "
@@ -849,6 +896,7 @@ class ZorkEmulator:
         self._locks: dict[str, asyncio.Lock] = {}
         self._pending_timers: dict[str, dict[str, Any]] = {}
         self._pending_sms_tasks: dict[str, set[asyncio.Task]] = {}
+        self._turn_ephemeral_notices: dict[tuple[str, str, str | None], list[str]] = {}
 
     # ------------------------------------------------------------------
     # Compatibility helpers
@@ -1043,27 +1091,19 @@ class ZorkEmulator:
         viewer_slug: str,
         viewer_location_key: str,
     ) -> bool:
-        if turn.actor_id == viewer_actor_id:
-            return True
         meta = cls._safe_turn_meta(turn)
+        if bool(meta.get("suppress_context")):
+            return False
         visibility = meta.get("visibility")
         if not isinstance(visibility, dict):
+            if turn.actor_id == viewer_actor_id:
+                return True
             return True
         scope = str(visibility.get("scope") or "").strip().lower()
-        if scope in {"", "public"}:
-            return True
-        if scope == "local":
-            turn_location_key = str(
-                visibility.get("location_key") or meta.get("location_key") or ""
-            ).strip().lower()
-            if viewer_location_key and turn_location_key and viewer_location_key == turn_location_key:
-                return True
         raw_actor_ids = visibility.get("visible_actor_ids")
         actor_ids = set()
         if isinstance(raw_actor_ids, list):
             actor_ids = {str(item).strip() for item in raw_actor_ids if str(item).strip()}
-        if viewer_actor_id in actor_ids:
-            return True
         raw_player_slugs = visibility.get("visible_player_slugs")
         player_slugs = set()
         if isinstance(raw_player_slugs, list):
@@ -1072,6 +1112,30 @@ class ZorkEmulator:
                 for item in raw_player_slugs
                 if cls._player_slug_key(item)
             }
+        has_explicit_participants = bool(actor_ids or player_slugs)
+        is_participant = bool(
+            str(viewer_actor_id or "").strip() in actor_ids
+            or (viewer_slug and viewer_slug in player_slugs)
+            or turn.actor_id == viewer_actor_id
+        )
+        if scope in {"private", "limited"}:
+            if has_explicit_participants and not is_participant:
+                return False
+            if has_explicit_participants:
+                return is_participant
+            return False
+        if turn.actor_id == viewer_actor_id:
+            return True
+        if scope in {"", "public"}:
+            return True
+        if scope == "local":
+            turn_location_key = str(
+                visibility.get("location_key") or meta.get("location_key") or ""
+            ).strip().lower()
+            if viewer_location_key and turn_location_key and viewer_location_key == turn_location_key:
+                return True
+        if viewer_actor_id in actor_ids:
+            return True
         return bool(viewer_slug and viewer_slug in player_slugs)
 
     @staticmethod
@@ -2152,21 +2216,47 @@ class ZorkEmulator:
         )
         total_chunk_count = 0
         compact_docs = []
+        source_keys = []
         for row in docs:
             try:
                 chunk_count = int(row.get("chunk_count") or 0)
             except (TypeError, ValueError):
                 chunk_count = 0
             total_chunk_count += chunk_count
+            document_key = str(row.get("document_key") or "")
             source_format = cls._source_material_format_heuristic(
                 str(row.get("sample_chunk") or "")
             )
             compact_docs.append(
                 {
-                    "document_key": str(row.get("document_key") or ""),
+                    "document_key": document_key,
                     "document_label": str(row.get("document_label") or ""),
                     "chunk_count": chunk_count,
                     "format": source_format,
+                }
+            )
+            document_keys: list[str] = []
+            if document_key and source_format == "rulebook":
+                units = SourceMaterialMemory.get_source_material_document_units(
+                    str(campaign_id),
+                    document_key,
+                )
+                seen_keys: set[str] = set()
+                for unit in units:
+                    text = str(unit or "").strip()
+                    if not text or ":" not in text:
+                        continue
+                    key = text.split(":", 1)[0].strip()
+                    if not key or key in seen_keys:
+                        continue
+                    seen_keys.add(key)
+                    document_keys.append(key)
+            source_keys.append(
+                {
+                    "document_key": document_key,
+                    "document_label": str(row.get("document_label") or ""),
+                    "format": source_format,
+                    "keys": document_keys,
                 }
             )
         return {
@@ -2174,6 +2264,7 @@ class ZorkEmulator:
             "document_count": len(compact_docs),
             "chunk_count": total_chunk_count,
             "docs": compact_docs,
+            "keys": source_keys,
         }
 
     async def _summarise_long_text(
@@ -3038,6 +3129,561 @@ class ZorkEmulator:
             )
             return 0, ""
         return len(normalized_lines), document_key
+
+    def _source_material_export_text(
+        self,
+        document_key: str,
+        units: list[str],
+    ) -> str:
+        clean_units = [str(unit or "").strip() for unit in units if str(unit or "").strip()]
+        if not clean_units:
+            return ""
+        sample = "\n".join(clean_units[:6])
+        inferred_format = self._source_material_format_heuristic(sample)
+        if inferred_format == self.SOURCE_MATERIAL_FORMAT_RULEBOOK:
+            return "\n".join(clean_units).strip()
+        return "\n\n".join(clean_units).strip()
+
+    def _source_material_export_filename(
+        self,
+        document_key: str,
+        document_label: str | None = None,
+        *,
+        used_names: set[str] | None = None,
+    ) -> str:
+        label = " ".join(str(document_label or "").strip().split())
+        if label:
+            base = label[:180]
+        else:
+            key = str(document_key or "").strip().lower()
+            if not key:
+                key = "source-material"
+            base = SourceMaterialMemory._normalize_source_document_key(key) or "source-material"
+            base = base[:180]
+        filename = f"{base}.txt"
+        if used_names is None:
+            return filename
+        if filename not in used_names:
+            used_names.add(filename)
+            return filename
+        fallback_key = (
+            SourceMaterialMemory._normalize_source_document_key(str(document_key or "").strip())
+            or "source-material"
+        )[:80]
+        suffix = 2
+        while True:
+            candidate = f"{base} ({fallback_key}-{suffix}).txt"
+            if candidate not in used_names:
+                used_names.add(candidate)
+                return candidate
+            suffix += 1
+
+    def _campaign_export_transcript(self, campaign: Campaign) -> str:
+        with self._session_factory() as session:
+            turns = (
+                session.query(Turn)
+                .filter(Turn.campaign_id == str(campaign.id))
+                .order_by(Turn.id.asc())
+                .all()
+            )
+        registry = self._campaign_player_registry(str(campaign.id), self._session_factory)
+        by_actor_id = registry.get("by_actor_id", {})
+        lines: list[str] = []
+        for turn in turns:
+            content = str(turn.content or "").strip()
+            if not content:
+                continue
+            if turn.kind == "narrator":
+                content = self._strip_ephemeral_context_lines(content)
+                content = self._strip_narration_footer(content)
+            if not content:
+                continue
+            if turn.kind == "player":
+                entry = by_actor_id.get(str(turn.actor_id or "")) or {}
+                name = str(entry.get("name") or f"Player {turn.actor_id}").strip()
+                lines.append(f"[TURN {turn.id}] PLAYER {name}: {content}")
+            elif turn.kind == "narrator":
+                lines.append(f"[TURN {turn.id}] NARRATOR: {content}")
+            else:
+                lines.append(f"[TURN {turn.id}] {str(turn.kind or 'system').upper()}: {content}")
+        return "\n".join(lines).strip()
+
+    def _campaign_export_turn_events(
+        self,
+        campaign: Campaign,
+    ) -> list[dict[str, Any]]:
+        with self._session_factory() as session:
+            turns = (
+                session.query(Turn)
+                .filter(Turn.campaign_id == str(campaign.id))
+                .order_by(Turn.id.asc())
+                .all()
+            )
+        registry = self._campaign_player_registry(str(campaign.id), self._session_factory)
+        by_actor_id = registry.get("by_actor_id", {})
+        events: list[dict[str, Any]] = []
+        for turn in turns:
+            meta = parse_json_dict(turn.meta_json)
+            if not isinstance(meta, dict):
+                meta = {}
+            actor_entry = by_actor_id.get(str(turn.actor_id or "")) or {}
+            events.append(
+                {
+                    "turn_id": int(turn.id),
+                    "created_at": turn.created_at.isoformat() if turn.created_at else None,
+                    "kind": str(turn.kind or ""),
+                    "actor_id": str(turn.actor_id or "") or None,
+                    "player_name": str(actor_entry.get("name") or "").strip() or None,
+                    "player_slug": str(actor_entry.get("slug") or "").strip() or None,
+                    "session_id": str(turn.session_id or "") or None,
+                    "external_message_id": str(turn.external_message_id or "") or None,
+                    "external_user_message_id": str(turn.external_user_message_id or "") or None,
+                    "content": str(turn.content or ""),
+                    "meta": meta,
+                }
+            )
+        return events
+
+    async def _generate_campaign_export_digest(
+        self,
+        campaign: Campaign,
+        transcript: str,
+    ) -> str:
+        ordered_chunk_digest = await self._summarise_long_text(
+            transcript,
+            summary_instructions=(
+                "This is a complete campaign transcript from the first turn to the latest turn. "
+                "Preserve the entire story arc in chronological order. Do not collapse the story into a vague world-state summary. "
+                "Track what happens early, middle, and late; major and minor arcs; character relationship changes; discoveries; "
+                "state changes; travel; inventory/item changes that mattered; time jumps; player-to-player dynamics; private reveals "
+                "that later became relevant; NPC attitude shifts; recurring jokes; and unresolved threads. "
+                "When facts conflict, preserve both versions if needed but clearly favor the later explicit outcome. "
+                "Be comprehensive and concrete."
+            ),
+            allow_single_chunk_passthrough=False,
+        )
+        ordered_chunk_digest = str(ordered_chunk_digest or "").strip()
+        if not ordered_chunk_digest:
+            return ""
+        digest_system = (
+            "You convert an ordered set of campaign transcript summaries into a faithful whole-campaign digest.\n"
+            "Output ONLY plain text.\n"
+            "This digest must cover the entire story arc from first turn to last turn without flattening it into a generic setting summary.\n"
+            "Use these exact plain-text section labels:\n"
+            "FULL ARC OVERVIEW\n"
+            "CHRONOLOGICAL STORY BEATS\n"
+            "PLAYER THREADS\n"
+            "NPC ARCS\n"
+            "RELATIONSHIPS AND REVEALS\n"
+            "LOCATIONS ITEMS AND STATE CHANGES\n"
+            "OPEN THREADS AND AFTERMATH\n"
+            "CURRENT END STATE\n"
+            "CONFLICT RESOLUTION NOTES\n"
+            "Requirements:\n"
+            "- preserve chronology from opening setup to ending state\n"
+            "- name the real player characters and major NPCs repeatedly where relevant\n"
+            "- mention major chapter/scene transitions when known\n"
+            "- include all lasting arcs, even if they seemed small at the time\n"
+            "- if two facts conflict, choose the most sensible truthful version and say why in CONFLICT RESOLUTION NOTES\n"
+            "- multiplayer campaigns are ensemble stories, not single-protagonist stories\n"
+            "- do not write fiction prose; write a precise reconstruction digest"
+        )
+        digest_user = (
+            f"Campaign: {campaign.name}\n\n"
+            "ORDERED TRANSCRIPT SUMMARY:\n"
+            f"{ordered_chunk_digest}\n"
+        )
+        digest_text = await self._new_gpt(campaign=campaign).turbo_completion(
+            digest_system,
+            digest_user,
+            temperature=0.3,
+            max_tokens=12000,
+        )
+        digest_text = str(digest_text or "").strip()
+        return digest_text or ordered_chunk_digest
+
+    def _campaign_raw_export_filename(self, raw_format: str) -> str:
+        fmt = str(raw_format or "jsonl").strip().lower()
+        if fmt == "json":
+            return "campaign-raw.json"
+        if fmt == "markdown":
+            return "campaign-raw-markdown.md"
+        if fmt == "script":
+            return "campaign-raw-script.txt"
+        if fmt == "loglines":
+            return "campaign-raw-loglines.txt"
+        return "campaign-raw.jsonl"
+
+    def _render_campaign_raw_jsonl(
+        self,
+        campaign: Campaign,
+        events: list[dict[str, Any]],
+    ) -> str:
+        rows: list[dict[str, Any]] = [
+            {
+                "type": "campaign",
+                "campaign_id": str(campaign.id),
+                "campaign_name": str(campaign.name or ""),
+                "created_at": campaign.created_at.isoformat() if campaign.created_at else None,
+                "updated_at": campaign.updated_at.isoformat() if campaign.updated_at else None,
+            }
+        ]
+        rows.extend({"type": "turn", **event} for event in events)
+        return "\n".join(
+            json.dumps(row, ensure_ascii=False, sort_keys=True) for row in rows
+        ).strip()
+
+    def _render_campaign_raw_json(
+        self,
+        campaign: Campaign,
+        events: list[dict[str, Any]],
+    ) -> str:
+        payload = {
+            "campaign": {
+                "id": str(campaign.id),
+                "name": str(campaign.name or ""),
+                "created_at": campaign.created_at.isoformat() if campaign.created_at else None,
+                "updated_at": campaign.updated_at.isoformat() if campaign.updated_at else None,
+            },
+            "events": events,
+        }
+        return json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
+
+    def _render_campaign_raw_markdown(
+        self,
+        campaign: Campaign,
+        events: list[dict[str, Any]],
+    ) -> str:
+        lines = [
+            f"# Campaign Raw Export: {campaign.name}",
+            "",
+            "## Table of Contents",
+            "",
+            "- [Campaign Metadata](#campaign-metadata)",
+        ]
+        for event in events:
+            lines.append(f"- [Turn {event.get('turn_id')}](#turn-{event.get('turn_id')})")
+        lines.extend(
+            [
+                "",
+                "## Campaign Metadata",
+                "",
+                f"- Campaign ID: `{campaign.id}`",
+                f"- Created: `{campaign.created_at.isoformat() if campaign.created_at else ''}`",
+                f"- Updated: `{campaign.updated_at.isoformat() if campaign.updated_at else ''}`",
+            ]
+        )
+        for event in events:
+            lines.extend(
+                [
+                    "",
+                    f"## Turn {event.get('turn_id')}",
+                    "",
+                    f"- Kind: `{event.get('kind')}`",
+                    f"- Timestamp: `{event.get('created_at') or ''}`",
+                    f"- Actor ID: `{event.get('actor_id') or ''}`",
+                    f"- Player: `{event.get('player_name') or ''}`",
+                    f"- Player Slug: `{event.get('player_slug') or ''}`",
+                    f"- Session ID: `{event.get('session_id') or ''}`",
+                    "",
+                    "### Content",
+                    "",
+                    "```text",
+                    str(event.get("content") or ""),
+                    "```",
+                    "",
+                    "### Meta",
+                    "",
+                    "```json",
+                    json.dumps(event.get("meta") or {}, ensure_ascii=False, indent=2, sort_keys=True),
+                    "```",
+                ]
+            )
+        return "\n".join(lines).strip()
+
+    def _render_campaign_raw_script(
+        self,
+        campaign: Campaign,
+        events: list[dict[str, Any]],
+    ) -> str:
+        lines = [
+            f"CAMPAIGN\t{campaign.name}",
+            f"\tID\t{campaign.id}",
+            f"\tCREATED\t{campaign.created_at.isoformat() if campaign.created_at else ''}",
+            f"\tUPDATED\t{campaign.updated_at.isoformat() if campaign.updated_at else ''}",
+        ]
+        for event in events:
+            lines.append("")
+            lines.append(f"TURN\t{event.get('turn_id')}")
+            lines.append(f"\tKIND\t{event.get('kind')}")
+            lines.append(f"\tTIMESTAMP\t{event.get('created_at') or ''}")
+            lines.append(f"\tACTOR_ID\t{event.get('actor_id') or ''}")
+            lines.append(f"\tPLAYER\t{event.get('player_name') or ''}")
+            lines.append(f"\tPLAYER_SLUG\t{event.get('player_slug') or ''}")
+            lines.append(f"\tSESSION_ID\t{event.get('session_id') or ''}")
+            lines.append("\tCONTENT")
+            for row in str(event.get("content") or "").splitlines() or [""]:
+                lines.append(f"\t\t{row}")
+            lines.append("\tMETA")
+            meta_text = json.dumps(event.get("meta") or {}, ensure_ascii=False, indent=2, sort_keys=True)
+            for row in meta_text.splitlines():
+                lines.append(f"\t\t{row}")
+        return "\n".join(lines).strip()
+
+    def _render_campaign_raw_loglines(
+        self,
+        campaign: Campaign,
+        events: list[dict[str, Any]],
+    ) -> str:
+        lines = [
+            f"[CAMPAIGN EXPORT] campaign={campaign.id} name={campaign.name!r} turns={len(events)}"
+        ]
+        for event in events:
+            label = str(event.get("kind") or "event").upper()
+            if event.get("kind") == "player":
+                player_name = str(event.get("player_name") or "").strip()
+                if player_name:
+                    label = f"PLAYER {player_name}"
+            elif event.get("kind") == "narrator":
+                label = "NARRATOR"
+            lines.append(
+                f"[TURN #{event.get('turn_id')} | {event.get('created_at') or ''}] {label}: "
+                f"{str(event.get('content') or '').strip()}"
+            )
+        return "\n".join(lines).strip()
+
+    async def _generate_campaign_raw_export_artifacts(
+        self,
+        campaign: Campaign,
+        *,
+        raw_format: str = "jsonl",
+    ) -> dict[str, str]:
+        fmt = str(raw_format or "jsonl").strip().lower()
+        if fmt not in {"script", "markdown", "json", "jsonl", "loglines"}:
+            fmt = "jsonl"
+        events = self._campaign_export_turn_events(campaign)
+        if not events:
+            return {}
+        if fmt == "json":
+            text = self._render_campaign_raw_json(campaign, events)
+        elif fmt == "markdown":
+            text = self._render_campaign_raw_markdown(campaign, events)
+        elif fmt == "script":
+            text = self._render_campaign_raw_script(campaign, events)
+        elif fmt == "loglines":
+            text = self._render_campaign_raw_loglines(campaign, events)
+        else:
+            text = self._render_campaign_raw_jsonl(campaign, events)
+        if not str(text or "").strip():
+            return {}
+        return {self._campaign_raw_export_filename(fmt): str(text or "").strip()}
+
+    async def _generate_campaign_export_artifacts(
+        self,
+        campaign: Campaign,
+    ) -> dict[str, str]:
+        transcript = self._campaign_export_transcript(campaign)
+        if not transcript:
+            return {}
+        campaign_state = self.get_campaign_state(campaign)
+        characters = self.get_campaign_characters(campaign)
+        campaign_players = self._campaign_players_for_prompt(str(campaign.id), limit=24)
+        story_outline = campaign_state.get("story_outline") if isinstance(campaign_state, dict) else {}
+        plot_threads = campaign_state.get("plot_threads") if isinstance(campaign_state, dict) else []
+        chapter_plan = campaign_state.get("chapters") if isinstance(campaign_state, dict) else []
+        consequences = campaign_state.get("consequences") if isinstance(campaign_state, dict) else []
+        model_state = self._build_model_state(campaign_state if isinstance(campaign_state, dict) else {})
+        model_state = self._fit_state_to_budget(model_state, self.MAX_STATE_CHARS)
+        export_summary = await self._generate_campaign_export_digest(campaign, transcript)
+        if not export_summary:
+            export_summary = await self._summarise_long_text(
+                transcript,
+                summary_instructions=(
+                    "Summarise this full campaign playthrough faithfully for export. Preserve lasting facts, "
+                    "character arcs, relationship changes, major reveals, locations, items, chapter beats, "
+                    "timeline changes, unresolved threads, and the current open state. "
+                    "When facts conflict, prefer the later explicit outcome and the persisted world state."
+                ),
+                allow_single_chunk_passthrough=False,
+            )
+        export_summary = str(export_summary or "").strip()
+        export_summary_excerpt = export_summary
+        if len(export_summary_excerpt) > 32000:
+            export_summary_excerpt = export_summary_excerpt[:32000].rsplit(" ", 1)[0].strip() + "\n...[truncated excerpt for prompt budget]"
+        transcript_excerpt = transcript
+        if len(transcript_excerpt) > 20000:
+            transcript_excerpt = transcript_excerpt[:20000].rsplit(" ", 1)[0].strip() + "\n...[truncated excerpt for prompt budget]"
+        source_payload = self._source_material_prompt_payload(str(campaign.id))
+        source_index_hint = self._auto_rulebook_source_index_hint(source_payload)
+        source_tool_instructions = ""
+        if source_index_hint:
+            source_tool_instructions = (
+                "\nYou may inspect existing source material while resolving canon.\n"
+                'To list keys: {"tool_call": "source_browse"}\n'
+                'To browse one doc: {"tool_call": "source_browse", "document_key": "doc-key"}\n'
+                'To search canon: {"tool_call": "memory_search", "category": "source", "queries": ["keyword1", "keyword2"]}\n'
+                "To call a tool, return ONLY the JSON tool_call object. Otherwise return ONLY the requested final text.\n"
+            )
+        export_context = {
+            "campaign_name": campaign.name,
+            "campaign_summary": campaign.summary or "",
+            "story_outline": story_outline,
+            "chapter_plan": chapter_plan,
+            "plot_threads": plot_threads,
+            "consequences": consequences,
+            "current_state": model_state,
+            "characters": characters,
+            "campaign_players": campaign_players,
+        }
+        rulebook_system = (
+            "You convert a completed campaign playthrough into a retrievable rulebook for recreating that tale.\n"
+            "Output ONLY plain text rulebook lines. No markdown. No headers. No bullets. No numbering.\n"
+            "Every line must be fully self-contained and use exactly CATEGORY-TAG: fact text\n"
+            "Use category families such as TONE, SCENE, SETTING, CHAR, PLOT, INTERACTION, GM-RULE, and venue-specific tags.\n"
+            "Treat WORLD_CHARACTERS as NPC-only and CAMPAIGN_PLAYERS as real human player characters. "
+            "In multiplayer campaigns there is no single main character; preserve ensemble structure.\n"
+            "Conflict resolution priority:\n"
+            "1. Persisted current state / current character roster / current chapter state\n"
+            "2. Later explicit turn outcomes in the playthrough summary\n"
+            "3. Repeated consistent facts across the transcript\n"
+            "4. Existing source material for unchanged background canon\n"
+            "If a fact remains uncertain, omit it or phrase it cautiously instead of inventing certainty.\n"
+            "Preserve major arcs, resolved outcomes, and unresolved threads so the tale can be recreated faithfully.\n"
+            "Do not output a generic world summary. Output dense factual rulebook lines only.\n"
+            f"{source_tool_instructions}"
+        )
+        rulebook_user = (
+            f"Generate a campaign rulebook export for '{campaign.name}'.\n"
+            f"{source_index_hint}"
+            "Use the full playthrough summary and current campaign data below.\n"
+            "This export should describe how to faithfully recreate the tale as it was actually played, not just the initial setup.\n\n"
+            f"PLAYTHROUGH ARC DIGEST:\n{export_summary_excerpt or '(none)'}\n\n"
+            f"EARLY TRANSCRIPT EXCERPT:\n{transcript_excerpt or '(none)'}\n\n"
+            f"CAMPAIGN DATA:\n{self._dump_json(export_context)}\n"
+        )
+        self._zork_log(
+            f"CAMPAIGN EXPORT RULEBOOK campaign={campaign.id}",
+            f"--- SYSTEM ---\n{rulebook_system}\n--- USER ---\n{rulebook_user}",
+        )
+        rulebook_response = await self._setup_tool_loop(
+            rulebook_system,
+            rulebook_user,
+            campaign,
+            temperature=0.4,
+            max_tokens=self.AUTO_RULEBOOK_MAX_TOKENS,
+            final_response_instruction="Return your final rulebook text now.",
+        )
+        rulebook_lines = self._normalize_generated_rulebook_lines(rulebook_response or "")
+        if len(rulebook_lines) < 12:
+            repair_system = (
+                "You repair campaign export drafts into proper retrievable rulebook lines.\n"
+                "Output ONLY plain text rulebook lines.\n"
+                "Every line must be exactly CATEGORY-TAG: fact text\n"
+                "No prose paragraphs. No markdown. No headers.\n"
+                "Preserve chronology-derived facts, arcs, characters, plotlines, interactions, and GM rules.\n"
+                "If the draft is a summary instead of a rulebook, convert it into many factual rulebook lines."
+            )
+            repair_user = (
+                f"Repair this campaign export into a rulebook for '{campaign.name}'.\n\n"
+                f"DRAFT EXPORT:\n{str(rulebook_response or '').strip() or '(empty)'}\n\n"
+                f"PLAYTHROUGH ARC DIGEST:\n{export_summary_excerpt or '(none)'}\n\n"
+                f"CAMPAIGN DATA:\n{self._dump_json(export_context)}\n"
+            )
+            self._zork_log(
+                f"CAMPAIGN EXPORT RULEBOOK REPAIR campaign={campaign.id}",
+                f"--- SYSTEM ---\n{repair_system}\n--- USER ---\n{repair_user}",
+            )
+            repaired = await self._new_gpt(campaign=campaign).turbo_completion(
+                repair_system,
+                repair_user,
+                temperature=0.3,
+                max_tokens=self.AUTO_RULEBOOK_MAX_TOKENS,
+            )
+            repaired_lines = self._normalize_generated_rulebook_lines(repaired or "")
+            if repaired_lines:
+                rulebook_lines = repaired_lines
+        rulebook_text = "\n".join(rulebook_lines).strip()
+        story_prompt_system = (
+            "You convert a completed campaign playthrough into a reusable story generator prompt.\n"
+            "Output ONLY plain text. No markdown fences.\n"
+            "Write a prompt that could recreate the same campaign faithfully: tone, setting, cast, arcs, open threads, "
+            "facts, and the current shape of the story.\n"
+            "Use clear section labels in plain text such as TITLE, GENRE, FORMAT, PLAY MODE, SETTING, PLAYER CHARACTERS, "
+            "NPC CAST, CANON FACTS, MAJOR ARCS, RELATIONSHIPS, OPEN THREADS, OPENING/START STATE, and RECREATION RULES.\n"
+            "If this was multiplayer, state clearly that it is an ensemble campaign with multiple real player characters and no single protagonist.\n"
+            "Resolve conflicts using the same priority order as the rulebook export: persisted current state, later explicit outcomes, repeated consistent facts, then source canon.\n"
+            "Do not write prose fiction. Write a practical generator prompt for reconstructing the campaign.\n"
+            "This must reflect the whole story arc from first turn to last turn, not just the ending state."
+        )
+        story_prompt_user = (
+            f"Generate a story generator prompt export for '{campaign.name}'.\n"
+            "This should function like a canonical recreation prompt for the whole played campaign.\n\n"
+            f"PLAYTHROUGH ARC DIGEST:\n{export_summary_excerpt or '(none)'}\n\n"
+            f"EARLY TRANSCRIPT EXCERPT:\n{transcript_excerpt or '(none)'}\n\n"
+            f"CAMPAIGN DATA:\n{self._dump_json(export_context)}\n"
+        )
+        self._zork_log(
+            f"CAMPAIGN EXPORT STORY PROMPT campaign={campaign.id}",
+            f"--- SYSTEM ---\n{story_prompt_system}\n--- USER ---\n{story_prompt_user}",
+        )
+        story_prompt_text = await self._new_gpt(campaign=campaign).turbo_completion(
+            story_prompt_system,
+            story_prompt_user,
+            temperature=0.5,
+            max_tokens=6000,
+        )
+        story_prompt_text = str(story_prompt_text or "").strip()
+        out: dict[str, str] = {}
+        if rulebook_text:
+            out["campaign-rulebook.txt"] = rulebook_text
+        if story_prompt_text:
+            out["campaign-story-prompt.txt"] = story_prompt_text
+        return out
+
+    async def campaign_export(
+        self,
+        campaign_id: str,
+        *,
+        export_type: str = "full",
+        raw_format: str = "jsonl",
+    ) -> dict[str, str]:
+        with self._session_factory() as session:
+            campaign = session.get(Campaign, str(campaign_id))
+            if campaign is None:
+                raise KeyError(f"Unknown campaign: {campaign_id}")
+        export_type_clean = str(export_type or "full").strip().lower()
+        if export_type_clean not in {"full", "raw"}:
+            export_type_clean = "full"
+        if export_type_clean == "raw":
+            export_files = await self._generate_campaign_raw_export_artifacts(
+                campaign,
+                raw_format=raw_format,
+            )
+        else:
+            export_files = await self._generate_campaign_export_artifacts(campaign)
+        docs = self.list_source_material_documents(str(campaign.id), limit=200)
+        source_export_files: dict[str, str] = {}
+        used_names = set(export_files.keys())
+        for row in docs:
+            document_key = str(row.get("document_key") or "").strip()
+            document_label = str(row.get("document_label") or "").strip()
+            if not document_key:
+                continue
+            units = SourceMaterialMemory.get_source_material_document_units(
+                str(campaign.id),
+                document_key,
+            )
+            export_text = self._source_material_export_text(document_key, units)
+            if not export_text:
+                continue
+            filename = self._source_material_export_filename(
+                document_key,
+                document_label,
+                used_names=used_names,
+            )
+            source_export_files[filename] = export_text
+        export_files.update(source_export_files)
+        return export_files
 
     async def _setup_generate_storyline_variants(
         self,
@@ -4965,6 +5611,7 @@ class ZorkEmulator:
             if cid is None:
                 return None
             should_end = True
+        self._set_turn_ephemeral_notices(campaign_id, actor_id, session_id, [])
         try:
             pending = self._pending_timers.get(campaign_id)
             can_interrupt = (
@@ -5115,6 +5762,15 @@ class ZorkEmulator:
                     pre_slugs=pre_character_slugs,
                     channel_id=portrait_channel_ref,
                 )
+                if self._private_setup_warning_needed(action):
+                    self._set_turn_ephemeral_notices(
+                        campaign_id,
+                        actor_id,
+                        session_id,
+                        [
+                            "Warning: if you include the real whisper/private content in the same setup message, it may leak before the aside is fully established. Use one short setup turn first, then continue once the reply keeps it private."
+                        ],
+                    )
                 return self._decorate_narration_and_persist(
                     campaign_id=campaign_id,
                     actor_id=actor_id,
@@ -6138,6 +6794,75 @@ class ZorkEmulator:
             f"[SYSTEM NOTE: FOR THIS RESPONSE ONLY: difficulty={normalized}. {note}]"
         )
 
+    @classmethod
+    def _merge_system_notes(cls, *notes: object) -> str:
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        for note in notes:
+            text = str(note or "").strip()
+            if not text:
+                continue
+            if text in seen:
+                continue
+            seen.add(text)
+            if text.startswith("[SYSTEM NOTE:") and text.endswith("]"):
+                text = text[len("[SYSTEM NOTE:") : -1].strip()
+            cleaned.append(text)
+        if not cleaned:
+            return ""
+        return f"[SYSTEM NOTE: FOR THIS RESPONSE ONLY: {' '.join(cleaned)}]"
+
+    @classmethod
+    def _turn_response_style_note(cls, difficulty: object) -> str:
+        return cls._merge_system_notes(
+            cls.RESPONSE_STYLE_NOTE,
+            cls._difficulty_response_note(difficulty),
+            (
+                'Return final JSON only. Include reasoning first. '
+                'state_update is required and must include "game_time", "current_chapter", and "current_scene" explicitly.'
+            ),
+        )
+
+    @classmethod
+    def _turn_stage_note(cls, difficulty: object, prompt_stage: str) -> str:
+        stage = str(prompt_stage or cls.PROMPT_STAGE_FINAL).strip().lower()
+        if stage == cls.PROMPT_STAGE_BOOTSTRAP:
+            return cls._merge_system_notes(
+                cls._difficulty_response_note(difficulty),
+                "Do not narrate yet. First decide the immediate continuity receivers and call recent_turns.",
+            )
+        if stage == cls.PROMPT_STAGE_RESEARCH:
+            return cls._merge_system_notes(
+                cls._difficulty_response_note(difficulty),
+                "RECENT_TURNS is loaded. Do not call recent_turns again this turn.",
+                "Use memory/source/SMS/planning tools only when they materially improve continuity.",
+                'When research is sufficient, return ONLY {"tool_call": "ready_to_write"}. Do not narrate yet.',
+            )
+        return cls._turn_response_style_note(difficulty)
+
+    @classmethod
+    def _build_turn_prompt_tail(
+        cls,
+        player_state: dict[str, object],
+        action: str,
+        response_style_note: str,
+        *,
+        turn_attachment_context: str | None = None,
+        extra_lines: list[str] | None = None,
+    ) -> str:
+        active_name = str(player_state.get("character_name") or "").strip()
+        action_label = f"PLAYER_ACTION ({active_name.upper()})" if active_name else "PLAYER_ACTION"
+        parts = [f"{action_label}: {action}"]
+        if turn_attachment_context:
+            parts.append(f"TURN_ATTACHMENT_CONTEXT:\n{turn_attachment_context}")
+        for line in extra_lines or []:
+            text = str(line or "").strip()
+            if text:
+                parts.append(text)
+        if response_style_note:
+            parts.append(response_style_note)
+        return "\n".join(parts)
+
     def cancel_pending_timer(self, campaign_id: str) -> dict[str, Any] | None:
         ctx_dict = self._pending_timers.pop(campaign_id, None)
         if ctx_dict is None:
@@ -6361,6 +7086,36 @@ class ZorkEmulator:
         merged = (existing + "\n" + "\n".join(new_lines)).strip()
         return self._trim_text(merged, self.MAX_SUMMARY_CHARS)
 
+    def _compose_world_summary(
+        self,
+        campaign: Campaign,
+        campaign_state: Dict[str, object],
+        max_chars: int = 1600,
+    ) -> str:
+        summary = self._strip_inventory_mentions(campaign.summary or "")
+        lines: list[str] = []
+        seen: set[str] = set()
+        for raw_line in str(summary or "").splitlines():
+            line = " ".join(str(raw_line or "").strip().split())
+            if not line:
+                continue
+            line_l = line.lower()
+            if line_l in {"none", "n/a", "na", "lel without elaboration."}:
+                continue
+            if any(token in line_l for token in ("inventory:", "📨 unread sms:", "calendar_update")):
+                continue
+            if line_l in seen:
+                continue
+            seen.add(line_l)
+            lines.append(line)
+        text = "\n".join(lines).strip()
+        if text:
+            return self._trim_text(text, max_chars)
+        story_context = self._build_story_context(campaign_state)
+        if story_context:
+            return self._trim_text(story_context.splitlines()[0], max_chars)
+        return ""
+
     def _fit_state_to_budget(self, state: Dict[str, object], max_chars: int) -> Dict[str, object]:
         text = self._dump_json(state)
         if len(text) <= max_chars:
@@ -6423,6 +7178,60 @@ class ZorkEmulator:
         return self._prune_stale_state(model_state)
 
     def _build_story_context(self, campaign_state: Dict[str, object]) -> Optional[str]:
+        if not bool(campaign_state.get("on_rails", False)):
+            chapters = campaign_state.get("chapters")
+            if isinstance(chapters, list) and chapters:
+                active_rows = [
+                    row
+                    for row in chapters
+                    if isinstance(row, dict)
+                    and str(row.get("status") or "active").strip().lower() == "active"
+                ]
+                rows = active_rows[:4] if active_rows else [row for row in chapters if isinstance(row, dict)][:4]
+                if rows:
+                    def _chapter_scene_label(value: object) -> str:
+                        text = str(value or "").strip()
+                        if not text:
+                            return "Untitled"
+                        text = text.replace("_", "-")
+                        parts = [part for part in text.split("-") if part]
+                        if not parts:
+                            return "Untitled"
+                        return " ".join(part.capitalize() for part in parts)[:120]
+
+                    current = rows[0]
+                    lines: List[str] = []
+                    lines.append(f"CURRENT CHAPTER: {current.get('title', 'Untitled')}")
+                    lines.append(f"  Summary: {current.get('summary', '')}")
+                    scenes = current.get("scenes") or []
+                    current_scene_slug = str(current.get("current_scene") or "").strip()
+                    if isinstance(scenes, list):
+                        for i, scene in enumerate(scenes):
+                            scene_slug = str(scene or "").strip()
+                            marker = " >>> CURRENT SCENE <<<" if scene_slug and scene_slug == current_scene_slug else ""
+                            lines.append(f"  Scene {i + 1}: {_chapter_scene_label(scene_slug)}{marker}")
+                    if len(rows) > 1:
+                        lines.append("")
+                        for idx, row in enumerate(rows[1:4], start=1):
+                            label = "NEXT CHAPTER" if idx == 1 else f"UPCOMING CHAPTER {idx}"
+                            lines.append(f"{label}: {row.get('title', 'Untitled')}")
+                            summary = str(row.get("summary") or "").strip()
+                            if summary:
+                                lines.append(f"  Preview: {summary[:320]}")
+                            row_scenes = row.get("scenes") or []
+                            if isinstance(row_scenes, list) and row_scenes:
+                                preview_titles = [
+                                    _chapter_scene_label(scene)
+                                    for scene in row_scenes[:3]
+                                    if str(scene or "").strip()
+                                ]
+                                if preview_titles:
+                                    lines.append(f"  Early scenes: {', '.join(preview_titles)}")
+                            lines.append("")
+                    while lines and not lines[-1]:
+                        lines.pop()
+                    return "\n".join(lines) if lines else None
+
         outline = campaign_state.get("story_outline")
         if not isinstance(outline, dict):
             return None
@@ -6718,6 +7527,10 @@ class ZorkEmulator:
             stripped = line.strip().lower()
             if any(stripped.startswith(prefix) for prefix in self._INVENTORY_LINE_PREFIXES):
                 continue
+            if any(stripped.startswith(prefix) for prefix in self._UNREAD_SMS_LINE_PREFIXES):
+                continue
+            if stripped.startswith("\u23f0"):
+                continue
             kept_lines.append(line)
         return "\n".join(kept_lines).strip()
 
@@ -6725,6 +7538,66 @@ class ZorkEmulator:
         if not text:
             return ""
         return self._strip_inventory_from_narration(text)
+
+    def _set_turn_ephemeral_notices(
+        self,
+        campaign_id: str,
+        actor_id: str,
+        session_id: str | None,
+        notices: list[str],
+    ) -> None:
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        for item in notices or []:
+            text = " ".join(str(item or "").split()).strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            cleaned.append(text[:500])
+        key = (str(campaign_id), str(actor_id), str(session_id or "") or None)
+        if cleaned:
+            self._turn_ephemeral_notices[key] = cleaned
+        else:
+            self._turn_ephemeral_notices.pop(key, None)
+
+    def pop_turn_ephemeral_notices(
+        self,
+        campaign_id: str,
+        actor_id: str,
+        session_id: str | None = None,
+    ) -> list[str]:
+        return list(
+            self._turn_ephemeral_notices.pop(
+                (str(campaign_id), str(actor_id), str(session_id or "") or None),
+                [],
+            )
+        )
+
+    @staticmethod
+    def _is_private_engagement_setup_action(action: str) -> bool:
+        text = " ".join(str(action or "").strip().lower().split())
+        if not text:
+            return False
+        return bool(
+            re.search(
+                r"\b(?:whisper|murmur|lean in|lower my voice|lower your voice|quietly to|under my breath|private word|pull .* aside|take .* aside|step aside with)\b",
+                text,
+                re.IGNORECASE,
+            )
+        )
+
+    def _private_setup_warning_needed(self, action: str) -> bool:
+        if not self._is_private_engagement_setup_action(action):
+            return False
+        text = str(action or "").strip()
+        sentence_count = len(
+            [seg for seg in re.split(r"(?<=[.!?])\s+", text) if seg.strip()]
+        )
+        if sentence_count > 1:
+            return True
+        if text.count('"') >= 2 or text.count("'") >= 2:
+            return True
+        return len(text) > 180
 
     def _scrub_inventory_from_state(self, value):
         if isinstance(value, dict):
@@ -7668,6 +8541,8 @@ class ZorkEmulator:
             f"{unread_threads} thread(s){suffix}."
         )
 
+    _SMS_ARTICLES = frozenset({"the", "a", "an", "my"})
+
     @classmethod
     def _extract_inline_sms_intent(
         cls,
@@ -7676,6 +8551,7 @@ class ZorkEmulator:
         text = str(action or "").strip()
         if not text:
             return None
+        # Pattern 1: Colon-delimited — "text the Doc: hello"
         m = re.match(
             r"^\s*(?:i\s+)?(?:send\s+)?(?:sms|text|message)\s+(?:to\s+)?([^:\n]{1,120})\s*:\s*(.+?)\s*$",
             text,
@@ -7685,8 +8561,12 @@ class ZorkEmulator:
             recipient = str(m.group(1) or "").strip().strip("\"'` ")
             message = str(m.group(2) or "").strip()
         else:
+            # Pattern 2: Space-delimited — "text Doc hello"
+            # Allow leading articles to be part of the captured recipient:
+            # "sms the Doc the words" → recipient="the Doc", message="the words"
             m = re.match(
-                r"^\s*(?:i\s+)?(?:send\s+)?(?:sms|text|message)\s+(?:to\s+)?([^\s:\n]{1,80})\s+(.+?)\s*$",
+                r"^\s*(?:i\s+)?(?:send\s+)?(?:sms|text|message)\s+(?:to\s+)?"
+                r"((?:the|a|an|my)\s+[^\s:\n]{1,80}|[^\s:\n]{1,80})\s+(.+?)\s*$",
                 text,
                 flags=re.IGNORECASE,
             )
@@ -7694,6 +8574,9 @@ class ZorkEmulator:
                 return None
             recipient = str(m.group(1) or "").strip().strip("\"'` ")
             message = str(m.group(2) or "").strip()
+            # If recipient is still a bare article, something went wrong — bail
+            if recipient.lower() in cls._SMS_ARTICLES:
+                return None
         if (
             len(message) >= 2
             and message[0] == message[-1]
@@ -8243,8 +9126,13 @@ class ZorkEmulator:
             repaired = f"{cleaned}}}"
             try:
                 parsed = self._parse_json_lenient(repaired)
+                # Only accept the repair if it produced a structurally
+                # complete response (not a truncated partial dict).
                 if isinstance(parsed, dict) and parsed:
-                    return repaired
+                    has_narration = bool(parsed.get("narration"))
+                    has_tool_call = bool(parsed.get("tool_call"))
+                    if has_narration or has_tool_call:
+                        return repaired
             except Exception:
                 pass
         return cleaned
@@ -8484,11 +9372,22 @@ class ZorkEmulator:
         party_snapshot: list[dict[str, object]] | None = None,
         is_new_player: bool = False,
         turn_visibility_default: str = "public",
+        turn_attachment_context: str | None = None,
+        tail_extra_lines: list[str] | None = None,
+        bootstrap_only: bool = False,
+        prompt_stage: str = PROMPT_STAGE_FINAL,
     ) -> tuple[str, str]:
-        summary = self._strip_inventory_mentions(campaign.summary or "")
-        summary = self._trim_text(summary, self.MAX_SUMMARY_CHARS)
+        stage = str(prompt_stage or self.PROMPT_STAGE_FINAL).strip().lower()
+        if stage not in {
+            self.PROMPT_STAGE_BOOTSTRAP,
+            self.PROMPT_STAGE_RESEARCH,
+            self.PROMPT_STAGE_FINAL,
+        }:
+            stage = self.PROMPT_STAGE_FINAL
+        bootstrap_only = bootstrap_only or stage == self.PROMPT_STAGE_BOOTSTRAP
         state = self.get_campaign_state(campaign)
         state = self._scrub_inventory_from_state(state)
+        summary = self._compose_world_summary(campaign, state, max_chars=self.MAX_SUMMARY_CHARS)
         if "game_time" not in state:
             state["game_time"] = {
                 "day": 1,
@@ -8596,10 +9495,7 @@ class ZorkEmulator:
         game_time = state.get("game_time", {})
         speed_mult = state.get("speed_multiplier", 1.0)
         difficulty = self.normalize_difficulty(state.get("difficulty", "normal"))
-        difficulty_note = self._difficulty_response_note(difficulty)
-        response_style_note = self.RESPONSE_STYLE_NOTE
-        if difficulty_note:
-            response_style_note = f"{response_style_note}\n{difficulty_note}"
+        response_style_note = self._turn_stage_note(difficulty, stage)
         calendar_state_before = json.dumps(
             state.get("calendar") or [],
             ensure_ascii=True,
@@ -8641,8 +9537,6 @@ class ZorkEmulator:
             action_text=action,
         )
 
-        active_name = str(player_state.get("character_name") or "").strip()
-        action_label = f"PLAYER_ACTION ({active_name.upper()})" if active_name else "PLAYER_ACTION"
         active_location_context = {
             "room_title": player_state.get("room_title"),
             "location": player_state.get("location"),
@@ -8660,50 +9554,80 @@ class ZorkEmulator:
             f"TURN_VISIBILITY_DEFAULT: {effective_turn_visibility_default}\n"
             f"GUARDRAILS_ENABLED: {str(guardrails_enabled).lower()}\n"
             f"RAILS_CONTEXT: {self._dump_json(rails_context)}\n"
-            f"WORLD_SUMMARY: {summary}\n"
-            f"WORLD_STATE: {self._dump_json(model_state)}\n"
+        )
+        if source_payload.get("available"):
+            user_prompt += (
+                f"SOURCE_MATERIAL_DOCS: {self._dump_json(source_payload.get('docs') or [])}\n"
+                f"SOURCE_MATERIAL_KEYS: {self._dump_json(source_payload.get('keys') or [])}\n"
+                f"SOURCE_MATERIAL_SNIPPET_COUNT: {source_payload.get('chunk_count')}\n"
+                f"SOURCE_MATERIAL_CHUNK_COUNT: {source_payload.get('chunk_count')}\n"
+            )
+        user_prompt += (
             f"CURRENT_GAME_TIME: {self._dump_json(game_time)}\n"
             f"SPEED_MULTIPLIER: {speed_mult}\n"
             f"DIFFICULTY: {difficulty}\n"
             f"ATTENTION_WINDOW_SECONDS: {self.ATTENTION_WINDOW_SECONDS}\n"
             f"CURRENTLY_ATTENTIVE_PLAYERS: {self._dump_json(currently_attentive)}\n"
             f"ACTIVE_PLAYER_LOCATION: {self._dump_json(active_location_context)}\n"
-            f"CALENDAR: {self._dump_json(calendar_for_prompt)}\n"
-            f"CALENDAR_REMINDERS:\n{calendar_reminders}\n"
             f"MEMORY_LOOKUP_ENABLED: {str(memory_lookup_enabled).lower()}\n"
+            f"RECENT_TURNS_LOADED: {str(not bootstrap_only).lower()}\n"
         )
-        if source_payload.get("available"):
-            user_prompt += (
-                f"SOURCE_MATERIAL_DOCS: {self._dump_json(source_payload.get('docs') or [])}\n"
-                f"SOURCE_MATERIAL_SNIPPET_COUNT: {source_payload.get('chunk_count')}\n"
-                f"SOURCE_MATERIAL_CHUNK_COUNT: {source_payload.get('chunk_count')}\n"
-            )
-        if story_context:
-            user_prompt += f"STORY_CONTEXT:\n{story_context}\n"
         user_prompt += (
             f"WORLD_CHARACTERS: {self._dump_json(characters_for_prompt)}\n"
             f"PLAYER_CARD: {self._dump_json(player_card)}\n"
             f"PARTY_SNAPSHOT: {self._dump_json(party_snapshot)}\n"
-            f"RECENT_TURNS:\n{recent_text}\n"
-            f"{response_style_note}\n"
-            f"{action_label}: {action}\n"
         )
-        system_prompt = self.SYSTEM_PROMPT
-        if guardrails_enabled:
-            system_prompt = f"{system_prompt}{self.GUARDRAILS_SYSTEM_PROMPT}"
-        if on_rails:
-            system_prompt = f"{system_prompt}{self.ON_RAILS_SYSTEM_PROMPT}"
-        if memory_lookup_enabled:
-            system_prompt = f"{system_prompt}{self.MEMORY_TOOL_PROMPT}"
-        else:
-            system_prompt = f"{system_prompt}{self.MEMORY_TOOL_DISABLED_PROMPT}"
+        if not bootstrap_only:
+            if story_context:
+                user_prompt += f"STORY_CONTEXT:\n{story_context}\n"
+            user_prompt += (
+                f"WORLD_SUMMARY: {summary}\n"
+                f"WORLD_STATE: {self._dump_json(model_state)}\n"
+                f"CALENDAR: {self._dump_json(calendar_for_prompt)}\n"
+                f"CALENDAR_REMINDERS:\n{calendar_reminders}\n"
+                f"RECENT_TURNS:\n{recent_text}\n"
+            )
+        turn_prompt_tail = self._build_turn_prompt_tail(
+            player_state,
+            action,
+            response_style_note,
+            turn_attachment_context=turn_attachment_context,
+            extra_lines=tail_extra_lines,
+        )
+        if turn_prompt_tail:
+            user_prompt += f"{turn_prompt_tail}\n"
+
+        if stage == self.PROMPT_STAGE_BOOTSTRAP:
+            system_prompt = self.BOOTSTRAP_SYSTEM_PROMPT
+            system_prompt = f"{system_prompt}{self.RECENT_TURNS_TOOL_PROMPT}"
+            if memory_lookup_enabled:
+                system_prompt = f"{system_prompt}{self.MEMORY_BOOTSTRAP_TOOL_PROMPT}"
+            else:
+                system_prompt = f"{system_prompt}{self.MEMORY_TOOL_DISABLED_PROMPT}"
+        elif stage == self.PROMPT_STAGE_RESEARCH:
+            system_prompt = self.RESEARCH_SYSTEM_PROMPT
+            if guardrails_enabled:
+                system_prompt = f"{system_prompt}{self.GUARDRAILS_SYSTEM_PROMPT}"
+            if on_rails:
+                system_prompt = f"{system_prompt}{self.ON_RAILS_SYSTEM_PROMPT}"
+            if memory_lookup_enabled:
+                system_prompt = f"{system_prompt}{self.MEMORY_TOOL_PROMPT}"
+            else:
+                system_prompt = f"{system_prompt}{self.MEMORY_TOOL_DISABLED_PROMPT}"
             system_prompt = f"{system_prompt}{self.SMS_TOOL_PROMPT}"
-        if state.get("timed_events_enabled", True):
-            system_prompt = f"{system_prompt}{self.TIMER_TOOL_PROMPT}"
-        if story_context:
-            system_prompt = f"{system_prompt}{self.STORY_OUTLINE_TOOL_PROMPT}"
-        system_prompt = f"{system_prompt}{self.CALENDAR_TOOL_PROMPT}"
-        system_prompt = f"{system_prompt}{self.ROSTER_PROMPT}"
+            if state.get("timed_events_enabled", True):
+                system_prompt = f"{system_prompt}{self.TIMER_TOOL_PROMPT}"
+            if story_context:
+                system_prompt = f"{system_prompt}{self.STORY_OUTLINE_TOOL_PROMPT}"
+            system_prompt = f"{system_prompt}{self.CALENDAR_TOOL_PROMPT}"
+            system_prompt = f"{system_prompt}{self.ROSTER_PROMPT}"
+            system_prompt = f"{system_prompt}{self.READY_TO_WRITE_TOOL_PROMPT}"
+        else:
+            system_prompt = self.SYSTEM_PROMPT
+            if guardrails_enabled:
+                system_prompt = f"{system_prompt}{self.GUARDRAILS_SYSTEM_PROMPT}"
+            if on_rails:
+                system_prompt = f"{system_prompt}{self.ON_RAILS_SYSTEM_PROMPT}"
         return system_prompt, user_prompt
 
     async def generate_map(self, campaign_or_ctx, actor_id: str | None = None, command_prefix: str = "!") -> str:
@@ -8852,7 +9776,7 @@ class ZorkEmulator:
             f"PLAYER_ROOM_TITLE: {room_title or 'Unknown'}\n"
             f"PLAYER_ROOM_SUMMARY: {room_summary or ''}\n"
             f"PLAYER_EXITS: {exits or []}\n"
-            f"WORLD_SUMMARY: {self._trim_text(campaign.summary or '', 1200)}\n"
+            f"WORLD_SUMMARY: {self._compose_world_summary(campaign, campaign_state, max_chars=1200)}\n"
             f"WORLD_STATE: {self._dump_json(model_state)}\n"
             f"LANDMARKS: {landmarks_text}\n"
             f"WORLD_CHARACTER_LOCATIONS: {chars_text}\n"
