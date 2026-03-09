@@ -8,10 +8,13 @@ from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable
 
+from .dice import format_dice_result, resolve_dice_check
 from .errors import StaleClaimError, TurnBusyError
+from .minigames import MinigameEngine, MinigameState
 from .normalize import apply_patch, dump_json, normalize_give_item, parse_json_dict
 from .ports import ActorResolverPort, LLMPort
-from .types import ResolveTurnInput, ResolveTurnResult, RewindResult, TurnContext
+from .puzzles import PuzzleEngine, PuzzleState
+from .types import DiceCheckRequest, DiceCheckResult, ResolveTurnInput, ResolveTurnResult, RewindResult, TurnContext
 
 
 class GameEngine:
@@ -73,6 +76,10 @@ class GameEngine:
             context: TurnContext | None = None
             try:
                 context = self._phase_a(turn_input, claim_token)
+
+                # Pre-LLM: validate active puzzle / minigame input
+                self._pre_llm_puzzle_minigame(context, turn_input)
+
                 llm_output = await self._llm.complete_turn(context)
 
                 if before_phase_c is not None:
@@ -573,6 +580,33 @@ class GameEngine:
                 action_text=turn_input.action,
                 narration_text=llm_output.narration or "",
             )
+
+            # --- Dice / Puzzle / Minigame Phase C processing ---
+            player_attributes = parse_json_dict(player.attributes_json) if player.attributes_json else {}
+            llm_output, dice_result = self._resolve_dice_check(llm_output, player_attributes, campaign_state)
+            self._process_puzzle_trigger(llm_output, campaign_state)
+            self._process_minigame_challenge(llm_output, campaign_state)
+
+            # Clean up completed puzzles
+            _ap = campaign_state.get("_active_puzzle")
+            if isinstance(_ap, dict) and (_ap.get("solved") or _ap.get("failed")):
+                campaign_state.pop("_active_puzzle", None)
+                campaign_state.pop("_puzzle_result", None)
+
+            # Clean up completed minigames
+            _am = campaign_state.get("_active_minigame")
+            if isinstance(_am, dict):
+                _mg = MinigameState.from_dict(_am)
+                if MinigameEngine.is_finished(_mg):
+                    campaign_state["_last_minigame_result"] = {
+                        "game_type": _mg.game_type,
+                        "status": _mg.status,
+                        "opponent_slug": _mg.opponent_slug,
+                        "stakes": _mg.stakes,
+                    }
+                    campaign_state.pop("_active_minigame", None)
+                    campaign_state.pop("_minigame_result", None)
+
             _on_rails = bool(campaign_state.get("on_rails"))
             campaign_characters = self._apply_character_updates(
                 campaign_characters,
@@ -822,7 +856,169 @@ class GameEngine:
                 scene_image_prompt=(llm_output.scene_image_prompt or None),
                 timer_instruction=timer_instruction,
                 give_item=give_item_payload,
+                dice_result=dice_result,
+                active_puzzle=campaign_state.get("_active_puzzle"),
+                active_minigame=campaign_state.get("_active_minigame"),
             )
+
+    # ------------------------------------------------------------------
+    # Dice / Puzzle / Minigame helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _pre_llm_puzzle_minigame(context: TurnContext, turn_input: ResolveTurnInput) -> None:
+        """Validate player input against active puzzle / minigame BEFORE the LLM call.
+
+        Results are injected into ``context.campaign_state`` so the LLM sees them
+        in the prompt and can narrate accordingly.
+        """
+        active_puzzle = context.campaign_state.get("_active_puzzle")
+        if active_puzzle:
+            puzzle_state = PuzzleState.from_dict(active_puzzle)
+            action = turn_input.action.strip().lower()
+            # Handle special keywords
+            if action in ("give up", "abandon puzzle"):
+                puzzle_state.failed = True
+                context.campaign_state["_puzzle_result"] = {
+                    "correct": False,
+                    "feedback": "Puzzle abandoned.",
+                    "solved": False,
+                    "failed": True,
+                }
+                context.campaign_state["_active_puzzle"] = puzzle_state.to_dict()
+            elif action in ("hint", "puzzle hint"):
+                hint = PuzzleEngine.get_hint(puzzle_state)
+                context.campaign_state["_puzzle_result"] = {
+                    "hint": hint or "No more hints available.",
+                }
+                context.campaign_state["_active_puzzle"] = puzzle_state.to_dict()
+            elif PuzzleEngine.is_puzzle_attempt(puzzle_state, turn_input.action):
+                correct, feedback = PuzzleEngine.validate_answer(puzzle_state, turn_input.action)
+                context.campaign_state["_puzzle_result"] = {
+                    "correct": correct,
+                    "feedback": feedback,
+                    "solved": puzzle_state.solved,
+                    "failed": puzzle_state.failed,
+                }
+                context.campaign_state["_active_puzzle"] = puzzle_state.to_dict()
+
+        active_minigame = context.campaign_state.get("_active_minigame")
+        if active_minigame:
+            game_state = MinigameState.from_dict(active_minigame)
+            action = turn_input.action.strip().lower()
+            if action in ("quit game", "forfeit", "quit", "resign"):
+                game_state.status = "npc_won"
+                context.campaign_state["_minigame_result"] = {
+                    "valid": True,
+                    "message": "You forfeit the game.",
+                    "finished": True,
+                    "board": MinigameEngine.render_board(game_state),
+                }
+                context.campaign_state["_active_minigame"] = game_state.to_dict()
+            elif MinigameEngine.is_game_move(game_state, turn_input.action):
+                valid, msg = MinigameEngine.player_move(game_state, turn_input.action)
+                context.campaign_state["_minigame_result"] = {
+                    "valid": valid,
+                    "message": msg,
+                    "finished": MinigameEngine.is_finished(game_state),
+                    "board": MinigameEngine.render_board(game_state),
+                }
+                context.campaign_state["_active_minigame"] = game_state.to_dict()
+
+    @staticmethod
+    def _resolve_dice_check(llm_output, player_attributes: dict[str, int], campaign_state: dict[str, Any]):
+        """Process a dice_check from LLM output. Returns (llm_output, DiceCheckResult | None)."""
+        dice_check = getattr(llm_output, "dice_check", None)
+        if dice_check is None:
+            return llm_output, None
+
+        # Build DiceCheckRequest from raw data if needed
+        if isinstance(dice_check, dict):
+            from .types import DiceCheckOutcome
+            on_success_raw = dice_check.get("on_success", {})
+            on_failure_raw = dice_check.get("on_failure", {})
+            dice_check = DiceCheckRequest(
+                attribute=str(dice_check.get("attribute", "")),
+                dc=int(dice_check.get("dc", 10)),
+                context=str(dice_check.get("context", "")),
+                on_success=DiceCheckOutcome(
+                    narration=str(on_success_raw.get("narration", "")),
+                    state_update=dict(on_success_raw.get("state_update") or {}),
+                    player_state_update=dict(on_success_raw.get("player_state_update") or {}),
+                    xp_awarded=int(on_success_raw.get("xp_awarded", 0)),
+                ),
+                on_failure=DiceCheckOutcome(
+                    narration=str(on_failure_raw.get("narration", "")),
+                    state_update=dict(on_failure_raw.get("state_update") or {}),
+                    player_state_update=dict(on_failure_raw.get("player_state_update") or {}),
+                    xp_awarded=int(on_failure_raw.get("xp_awarded", 0)),
+                ),
+            )
+
+        result, outcome = resolve_dice_check(dice_check, player_attributes)
+
+        # Prepend dice result line + append outcome narration
+        dice_line = format_dice_result(result)
+        narration = llm_output.narration or ""
+        parts = [dice_line, narration]
+        if outcome.narration:
+            parts.append(outcome.narration)
+        llm_output.narration = "\n".join(p for p in parts if p)
+
+        # Merge outcome state updates (outcome overrides base on conflict)
+        if not isinstance(llm_output.state_update, dict):
+            llm_output.state_update = {}
+        for k, v in outcome.state_update.items():
+            llm_output.state_update[k] = v
+
+        if not isinstance(llm_output.player_state_update, dict):
+            llm_output.player_state_update = {}
+        for k, v in outcome.player_state_update.items():
+            llm_output.player_state_update[k] = v
+
+        llm_output.xp_awarded = int(llm_output.xp_awarded or 0) + outcome.xp_awarded
+
+        # Store for continuity
+        campaign_state["_last_dice_check"] = asdict(result)
+
+        return llm_output, result
+
+    @staticmethod
+    def _process_puzzle_trigger(llm_output, campaign_state: dict[str, Any]) -> None:
+        """If LLM output includes a puzzle_trigger, generate and store the puzzle."""
+        trigger = getattr(llm_output, "puzzle_trigger", None)
+        if trigger is None:
+            return
+        if isinstance(trigger, dict):
+            from .types import PuzzleTrigger
+            trigger = PuzzleTrigger(
+                puzzle_type=str(trigger.get("puzzle_type", "riddle")),
+                context=str(trigger.get("context", "")),
+                difficulty=str(trigger.get("difficulty", "medium")),
+            )
+        puzzle = PuzzleEngine.generate(trigger)
+        campaign_state["_active_puzzle"] = puzzle.to_dict()
+        llm_output.narration = (llm_output.narration or "") + "\n\n" + puzzle.question
+
+    @staticmethod
+    def _process_minigame_challenge(llm_output, campaign_state: dict[str, Any]) -> None:
+        """If LLM output includes a minigame_challenge, create the game."""
+        challenge = getattr(llm_output, "minigame_challenge", None)
+        if challenge is None:
+            return
+        if isinstance(challenge, dict):
+            from .types import MinigameChallenge
+            challenge = MinigameChallenge(
+                game_type=str(challenge.get("game_type", "")),
+                opponent_slug=str(challenge.get("opponent_slug", "")),
+                stakes=str(challenge.get("stakes", "")),
+            )
+        try:
+            game = MinigameEngine.new_game(challenge)
+        except ValueError:
+            return
+        campaign_state["_active_minigame"] = game.to_dict()
+        llm_output.narration = (llm_output.narration or "") + "\n\n" + MinigameEngine.render_board(game)
 
     def _release_claim_best_effort(self, campaign_id: str, actor_id: str, claim_token: str) -> None:
         try:
