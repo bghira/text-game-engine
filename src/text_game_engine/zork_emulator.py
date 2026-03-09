@@ -263,6 +263,9 @@ class ZorkEmulator:
     MEMORY_SEARCH_USAGE_MAX_TERMS = 300
     MEMORY_SEARCH_ROSTER_HINT_THRESHOLD = 3
     TURN_TIME_INDEX_KEY = "_turn_time_index"
+    LITERARY_STYLES_STATE_KEY = "literary_styles"
+    MAX_LITERARY_STYLES_PROMPT_CHARS = 3000
+    MAX_LITERARY_STYLE_PROFILE_CHARS = 400
     MODEL_STATE_EXCLUDE_KEYS = ROOM_STATE_KEYS | {
         "last_narration",
         "room_scene_images",
@@ -285,6 +288,7 @@ class ZorkEmulator:
         SMS_READ_STATE_KEY,
         SMS_MESSAGE_SEQ_KEY,
         TURN_TIME_INDEX_KEY,
+        LITERARY_STYLES_STATE_KEY,
     }
     PLAYER_STATE_EXCLUDE_KEYS = {"inventory", "room_description", PLAYER_STATS_KEY}
     _STALE_VALUE_PATTERNS = _COMPLETED_VALUES | {
@@ -310,13 +314,21 @@ class ZorkEmulator:
     )
     _UNREAD_SMS_LINE_PREFIXES = ("📨 unread sms:", "unread sms:")
     RESPONSE_STYLE_NOTE = (
-        "[SYSTEM NOTE: FOR THIS RESPONSE ONLY: use classic Zork style. Minimal words. "
-        "Advance one concrete beat only. No recap of unchanged facts. No literary prose, "
-        "no novelistic inner monologue, no comic-book melodrama. Keep NPC output actionable "
+        "[SYSTEM NOTE: FOR THIS RESPONSE ONLY: use the current style direction. Narrate in 1 to 6 beats as needed. "
+        "No recap of unchanged facts. No flowery language unless a character canonically speaks that way. "
+        "No novelistic inner monologue or comic-book melodrama. Keep NPC output actionable "
         "(intent, decision, question, or action), not repetitive reaction text. "
+        "Vary pacing and meter between turns: sometimes clipped, sometimes patient, sometimes blunt, sometimes practical. "
+        "Do not default emotional beats to the same therapeutic language or cadence every time. "
+        "Avoid contrived emotional-summary language or therapist-speak "
+        "unless that exact voice is canonically right for the speaking character. "
         "ANTI-ECHO: do NOT restate, paraphrase, or mirror the player's just-written wording. "
         "Do not quote the player's lines back to them unless one exact contested phrase is materially necessary. "
-        "Default: NPC first line must add new information, a decision, a demand, a consequence, or a direct question. "
+        "Default: NPC first line should add new information, a decision, a demand, or a consequence. "
+        "A direct question is valid, but it should not be the default when the NPC already has enough to react to. "
+        "When deciding whether the player answered sincerely or evasively, bias toward sincere. "
+        "Wordplay, humor, indirection, metaphor, or stylish phrasing still count as an answer when they convey a real feeling, motive, memory, or admission. "
+        "Only treat the player as evasive if they actually changed the subject, dodged the substance, or refused to answer. "
         "As game master, you may know when the player is lying; only let an NPC reveal or react to that "
         "if that NPC plausibly knows in this scene (direct evidence, prior established knowledge, or in-scene disclosure). "
         "Do not leak off-screen NPC communications into current NPC dialogue unless continuity clearly supports it.]"
@@ -371,8 +383,8 @@ class ZorkEmulator:
         ),
     }
     SYSTEM_PROMPT = (
-        "You are the ZorkEmulator, a classic text-adventure GM with light RPG rules. "
-        "You describe outcomes in second person, terse and concrete. You track rooms, "
+        "You are the ZorkEmulator, a text-adventure GM with light RPG rules. "
+        "You describe outcomes in second person. You track rooms, "
         "objects, exits, and consequences. Each player is a distinct character and "
         "may be in a different location or timeline than other players. You never break character. "
         "This is an adult-oriented game. You may include mature themes, explicit content, violence, "
@@ -420,7 +432,8 @@ class ZorkEmulator:
         "current_status, allegiance, relationship. "
         "speech_style should be 2-3 sentences on how the character talks: sentence length, vocabulary, verbal tics, and what they avoid saying. "
         "On subsequent turns only mutable fields are accepted: "
-        "location, current_status, allegiance, relationship, relationships, deceased_reason, and any other dynamic key. "
+        "location, current_status, allegiance, relationship, relationships, literary_style, deceased_reason, and any other dynamic key. "
+        "literary_style should be a string referencing a key from LITERARY_STYLES (if available). "
         "Immutable fields (name, personality, background, appearance, speech_style) are locked at creation and silently ignored on updates. "
         "relationships is a map keyed by other character slug/name, e.g. "
         "{\"deshawn\": {\"status\": \"partner\", \"knows_about\": [\"pregnancy\"], \"doesnt_know\": [\"blood-test-result\"], \"dynamic\": \"protective-but-autonomous\"}}. "
@@ -441,9 +454,15 @@ class ZorkEmulator:
         "- Keep reasoning concise (roughly 1-4 short sentences, <=1200 chars).\n"
         "- Do NOT repeat the narration outside the JSON object.\n"
         "- Keep narration under 1800 characters.\n"
-        "- Write in classic Zork style: concise, concrete, and gameplay-forward.\n"
-        "- Keep narration minimal by default (roughly 1-4 sentences, usually 30-120 words).\n"
-        "- No literary flourish: avoid poetic language, novel-style interior monologue, melodrama, or comic-book framing.\n"
+        "- Write in the current style direction.\n"
+        "- Narrate in 1 to 6 beats as needed for the turn.\n"
+        "- Avoid flowery language unless a specific character canonically speaks that way. Avoid novel-style interior monologue, melodrama, or comic-book framing.\n"
+        "- Vary pacing and sentence rhythm from turn to turn while staying true to the speaking character.\n"
+        "- When LITERARY_STYLES is present, it contains named style profiles extracted from real literary works. Each profile describes prose craft: rhythm, register, texture, and avoidances.\n"
+        "- Characters may have a literary_style field referencing a LITERARY_STYLES key. When writing for that character, apply the referenced profile to narration, atmosphere, pacing, and dialogue-tag texture. The character's speech_style still governs their spoken words and verbal mannerisms.\n"
+        "- In multi-character scenes with different literary_style keys, use the dominant scene character's style for overall narration and shift subtly when writing beats for characters with different styles. Do not abruptly switch voices.\n"
+        "- Do not let every emotional beat collapse into the same stock therapeutic or pseudo-profound language.\n"
+        "- Avoid contrived emotional shorthand or therapist-speak; examples include phrases like 'be present', 'show up', or 'hold space', unless a specific character would genuinely talk that way.\n"
         "- DELTA MODE: each turn should add NEW developments only. Do not recap unchanged context from WORLD_SUMMARY or RECENT_TURNS.\n"
         "- Do not re-state the player's action in paraphrase unless needed for immediate clarity.\n"
         "- Avoid repetitive recap loops: at most one brief callback sentence to prior events, then move the scene forward.\n"
@@ -543,6 +562,21 @@ class ZorkEmulator:
         "- Do NOT escalate environmental hardship (property damage, theft risk, safety collapse, social pressure) just to coerce acceptance of an optional deal.\n"
         "- Do NOT assert debts, obligations, or contracts unless they were explicitly accepted earlier and grounded in WORLD_STATE/RECENT_TURNS.\n"
         "- NPCs may disagree with the player, but must pursue their own goals through plausible actions, not narrative coercion to force a 'yes'.\n"
+        "- SINCERITY RESPECT: when a player gives a sincere, vulnerable, or emotionally honest answer to an NPC question, "
+        "the NPC's next line MUST engage with what was actually said — agree, disagree, be moved, be uncomfortable, push back on the substance — "
+        "but must NOT dismiss it as a non-answer, dodge, or deflection and re-ask the same question.\n"
+        "- CLASSIFICATION BIAS: when deciding whether the player's answer is sincere or evasive, bias toward sincere. "
+        "Humor, wordplay, indirection, metaphor, sideways phrasing, or emotional shorthand still count as an answer if they contain real personal content. "
+        "A playful answer is not a dodge just because it is clever. Treat it as evasive only if it truly avoids the substance of the question.\n"
+        "- An NPC may want a different answer, but 'that's not what I asked' is only valid when the player genuinely evaded the question "
+        "(changed subject, gave a non-sequitur that ignored the question entirely, answered a question that wasn't asked). "
+        "If the player answered honestly in their own words, that IS the answer, even if it wasn't the phrasing the NPC hoped for.\n"
+        "- ANTI-PATTERN — PASSWORD GATING: do NOT loop an NPC question until the player delivers a specific scripted line or sentiment. "
+        "If the GM has a reveal or vulnerability beat planned for an NPC, the NPC should be able to reach it through multiple player paths, "
+        "not only through one magic-word answer. Gate on sincerity, not on phrasing.\n"
+        "- PRESENCE / DEFLECTION RULE: the player is allowed to deflect, joke, pivot to practical talk, change register, or wander away from an emotional beat without being morally penalized for 'not being present.' "
+        "Do not frame ordinary avoidance, awkwardness, or scene drift as a failure of character.\n"
+        "- An unresolved confrontation may remain unresolved. Unless the NPC has an immediate concrete reason to stop the player right now, let the moment cool, break, or trail off instead of forcing another emotional pass in the same scene.\n"
         "- ANTI-PATTERN: Do not default NPCs to romantic or sexual availability.\n"
         "- Physical contact (tracing fingers, lingering looks, soft touches, leaning close) must be motivated by established relationship history and current emotional state.\n"
         "- Most human interactions are not foreplay. NPCs should behave like people with their own priorities unless the scene has organically built to intimacy through player and NPC choices.\n"
@@ -2038,6 +2072,76 @@ class ZorkEmulator:
         if resolved_format:
             return resolved_format
         return self._source_material_format_heuristic(sample)
+
+    async def _analyze_literary_style(
+        self,
+        text: str,
+        label: str,
+    ) -> Dict[str, dict]:
+        """Extract prose-craft profiles from literary text."""
+        sample = str(text or "").strip()[:8000]
+        if not sample or self._completion_port is None:
+            return {}
+
+        system_prompt = (
+            "You are a prose-craft analyst. Given a sample of literary text, extract the craft, not the plot. "
+            "Describe sentence rhythm and length patterns, vocabulary register, what the prose avoids, phrasing habits, "
+            "emotional register, punctuation choices, and distinctive texture.\n"
+            "Do NOT summarise events or characters.\n"
+            'Return ONLY JSON: {"profiles": [{"key_suffix": null, "profile": "..."}]}.\n'
+            "key_suffix is null for a single unified profile. If the sample contains distinct registers, "
+            'you MAY split them with key_suffix values like "ARGUMENT" or "TENDER". '
+            f"Each profile must be <= {self.MAX_LITERARY_STYLE_PROFILE_CHARS} characters."
+        )
+        user_prompt = (
+            f'Analyse the prose craft of this sample labelled "{label}".\n'
+            f"Sample:\n{sample}\n"
+            "Return only the JSON object."
+        )
+        parsed: Dict[str, Any] = {}
+        cleaned = ""
+        try:
+            response = await self._completion_port.complete(
+                system_prompt,
+                user_prompt,
+                temperature=0.3,
+                max_tokens=1200,
+            )
+            cleaned = self._clean_response(response or "")
+            json_text = self._extract_json(cleaned)
+            if json_text:
+                parsed = self._parse_json_lenient(json_text)
+        except Exception as exc:
+            self._logger.warning("Literary style analysis failed (LLM parse): %s", exc)
+
+        profiles_raw = parsed.get("profiles") if isinstance(parsed, dict) else None
+        if not isinstance(profiles_raw, list):
+            profiles_raw = []
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        result: Dict[str, dict] = {}
+        for entry in profiles_raw:
+            if not isinstance(entry, dict):
+                continue
+            profile_text = str(entry.get("profile") or "").strip()
+            if not profile_text:
+                continue
+            profile_text = profile_text[: self.MAX_LITERARY_STYLE_PROFILE_CHARS]
+            suffix = str(entry.get("key_suffix") or "").strip()
+            key = f"{label}-{suffix.upper()}" if suffix else label
+            result[key] = {
+                "profile": profile_text,
+                "source_label": label,
+                "created_at": now_iso,
+            }
+
+        if not result and cleaned:
+            result[label] = {
+                "profile": cleaned[: self.MAX_LITERARY_STYLE_PROFILE_CHARS],
+                "source_label": label,
+                "created_at": now_iso,
+            }
+        return result
 
     @classmethod
     def _estimate_attachment_chunk_count(cls, text: str) -> int:
@@ -7090,27 +7194,63 @@ class ZorkEmulator:
         self,
         campaign: Campaign,
         campaign_state: Dict[str, object],
+        *,
+        turns: list[Turn] | None = None,
+        viewer_actor_id: str | None = None,
+        viewer_slug: str = "",
+        viewer_location_key: str = "",
         max_chars: int = 1600,
     ) -> str:
         summary = self._strip_inventory_mentions(campaign.summary or "")
-        lines: list[str] = []
         seen: set[str] = set()
-        for raw_line in str(summary or "").splitlines():
-            line = " ".join(str(raw_line or "").strip().split())
+        persisted_lines: list[str] = []
+        recent_lines: list[str] = []
+
+        def _append_if_relevant(target: list[str], raw_text: object) -> None:
+            line = " ".join(str(raw_text or "").strip().split())
             if not line:
-                continue
+                return
             line_l = line.lower()
             if line_l in {"none", "n/a", "na", "lel without elaboration."}:
-                continue
+                return
             if any(token in line_l for token in ("inventory:", "📨 unread sms:", "calendar_update")):
-                continue
+                return
             if line_l in seen:
-                continue
+                return
             seen.add(line_l)
-            lines.append(line)
+            target.append(line)
+
+        for raw_line in str(summary or "").splitlines():
+            _append_if_relevant(persisted_lines, raw_line)
+
+        if isinstance(turns, list) and viewer_actor_id and turns:
+            for turn in turns[-24:]:
+                if not isinstance(turn, Turn) or turn.kind != "narrator":
+                    continue
+                if not self._turn_visible_to_viewer(
+                    turn,
+                    viewer_actor_id,
+                    viewer_slug,
+                    viewer_location_key,
+                ):
+                    continue
+                meta = self._safe_turn_meta(turn)
+                if bool(meta.get("suppress_context")):
+                    continue
+                summary_candidate = meta.get("summary_update")
+                if not str(summary_candidate or "").strip():
+                    summary_candidate = (
+                        meta.get("scene_output_rendered")
+                        or turn.content
+                        or ""
+                    )
+                _append_if_relevant(recent_lines, summary_candidate)
+
+        lines = recent_lines + persisted_lines
         text = "\n".join(lines).strip()
         if text:
             return self._trim_text(text, max_chars)
+
         story_context = self._build_story_context(campaign_state)
         if story_context:
             return self._trim_text(story_context.splitlines()[0], max_chars)
@@ -8757,6 +8897,96 @@ class ZorkEmulator:
         self._register_pending_sms_task(str(campaign_id), task)
         return True, "scheduled", delay
 
+    @classmethod
+    def _normalize_calendar_update(cls, raw: object) -> Dict[str, object] | None:
+        if not isinstance(raw, dict) or not raw:
+            return None
+        has_add = "add" in raw
+        has_remove = "remove" in raw
+        if not has_add and not has_remove and raw.get("name"):
+            raw = {"add": [dict(raw)]}
+            has_add = True
+        result: Dict[str, object] = {}
+        if has_add:
+            add_val = raw.get("add")
+            if isinstance(add_val, dict):
+                add_val = [add_val]
+            if isinstance(add_val, list):
+                normalized_add: list[dict[str, object]] = []
+                for entry in add_val:
+                    if not isinstance(entry, dict):
+                        continue
+                    row = dict(entry)
+                    if "time_remaining" not in row:
+                        if "hours_remaining" in row:
+                            row["time_remaining"] = row.pop("hours_remaining")
+                            row.setdefault("time_unit", "hours")
+                        elif "days_remaining" in row:
+                            row["time_remaining"] = row.pop("days_remaining")
+                            row.setdefault("time_unit", "days")
+                    for echo_key in (
+                        "status",
+                        "_status",
+                        "_hours_until",
+                        "_days_until",
+                        "hours_remaining",
+                        "days_remaining",
+                        "created_day",
+                        "created_hour",
+                    ):
+                        row.pop(echo_key, None)
+                    normalized_add.append(row)
+                result["add"] = normalized_add
+        if has_remove:
+            remove_val = raw.get("remove")
+            if isinstance(remove_val, str):
+                remove_val = [remove_val]
+            if isinstance(remove_val, list):
+                result["remove"] = remove_val
+        return result if result else None
+
+    @classmethod
+    def _extract_calendar_update_from_state_update(
+        cls,
+        state_update: object,
+        calendar_update: object,
+    ) -> tuple[object, object]:
+        if not isinstance(state_update, dict):
+            return state_update, calendar_update
+        merged_calendar = (
+            dict(calendar_update) if isinstance(calendar_update, dict) else {}
+        )
+        merged_add = list(merged_calendar.get("add") or [])
+        changed = False
+        cleaned_state_update = dict(state_update)
+
+        def _consume_events(raw_entry: object) -> None:
+            nonlocal changed
+            if isinstance(raw_entry, dict) and isinstance(raw_entry.get("events"), list):
+                for item in raw_entry.get("events") or []:
+                    if isinstance(item, dict):
+                        merged_add.append(dict(item))
+                        changed = True
+            elif isinstance(raw_entry, list):
+                for item in raw_entry:
+                    if isinstance(item, dict):
+                        merged_add.append(dict(item))
+                        changed = True
+
+        for legacy_key in ("calendar", "cal", "events"):
+            raw_entry = cleaned_state_update.get(legacy_key)
+            if raw_entry is None:
+                continue
+            before_count = len(merged_add)
+            _consume_events(raw_entry)
+            if len(merged_add) != before_count:
+                cleaned_state_update.pop(legacy_key, None)
+
+        if not changed:
+            return state_update, calendar_update
+        merged_calendar["add"] = merged_add
+        return cleaned_state_update, merged_calendar
+
     def _apply_calendar_update(
         self,
         campaign_state: Dict[str, object],
@@ -8764,6 +8994,9 @@ class ZorkEmulator:
     ) -> Dict[str, object]:
         """Process calendar add/remove ops and persist absolute fire_day entries."""
         if not isinstance(calendar_update, dict):
+            return campaign_state
+        calendar_update = self._normalize_calendar_update(calendar_update)
+        if calendar_update is None:
             return campaign_state
         calendar_raw = list(campaign_state.get("calendar") or [])
         game_time = campaign_state.get("game_time") or {}
@@ -8864,11 +9097,40 @@ class ZorkEmulator:
             for entry in to_add:
                 if not isinstance(entry, dict):
                     continue
-                name = str(entry.get("name") or "").strip()
+                name = str(
+                    entry.get("name")
+                    or entry.get("title")
+                    or entry.get("event_key")
+                    or ""
+                ).strip()
                 if not name:
                     continue
                 fire_day = entry.get("fire_day")
                 fire_hour = entry.get("fire_hour")
+                if not isinstance(fire_day, (int, float)) or isinstance(fire_day, bool):
+                    day_alias = entry.get("day")
+                    if isinstance(day_alias, (int, float)) and not isinstance(day_alias, bool):
+                        fire_day = int(day_alias)
+                if not isinstance(fire_hour, (int, float)) or isinstance(fire_hour, bool):
+                    time_alias = str(entry.get("time") or "").strip()
+                    if time_alias:
+                        match = re.search(
+                            r"(?:day\s*(?P<day>\d+)[,\s-]*)?(?P<hour>\d{1,2}):(?P<minute>\d{2})\s*(?P<ampm>[ap]m)?",
+                            time_alias,
+                            re.IGNORECASE,
+                        )
+                        if match:
+                            if not isinstance(fire_day, (int, float)) or isinstance(fire_day, bool):
+                                day_group = match.group("day")
+                                if day_group:
+                                    fire_day = int(day_group)
+                            parsed_hour = int(match.group("hour"))
+                            ampm = str(match.group("ampm") or "").strip().lower()
+                            if ampm == "pm" and parsed_hour < 12:
+                                parsed_hour += 12
+                            elif ampm == "am" and parsed_hour == 12:
+                                parsed_hour = 0
+                            fire_hour = parsed_hour
                 if (
                     isinstance(fire_day, (int, float))
                     and not isinstance(fire_day, bool)
@@ -8895,10 +9157,27 @@ class ZorkEmulator:
                     "fire_hour": resolved_fire_hour,
                     "created_day": current_day,
                     "created_hour": current_hour,
-                    "description": str(entry.get("description") or "")[:200],
+                    "description": str(
+                        entry.get("description")
+                        or entry.get("notes")
+                        or entry.get("details")
+                        or ""
+                    )[:200],
                     "known_by": self._calendar_known_by_from_event(entry),
                 }
+                location_text = str(entry.get("location") or "").strip()
+                if location_text and not str(event.get("description") or "").strip():
+                    event["description"] = f"Location: {location_text}"[:200]
+                elif location_text:
+                    event["description"] = (
+                        f"{str(event.get('description') or '').strip()} Location: {location_text}"
+                    )[:200]
                 target_players = self._calendar_target_tokens_from_event(entry)
+                visibility = str(entry.get("visibility") or "").strip().lower()
+                if not target_players and visibility == "private":
+                    actor_id = str(entry.get("actor_id") or "").strip()
+                    if actor_id:
+                        target_players = [actor_id]
                 if target_players:
                     event["target_players"] = target_players
                 calendar.append(event)
@@ -8973,6 +9252,7 @@ class ZorkEmulator:
                     "_slug": slug,
                     "name": char.get("name", slug),
                     "speech_style": char.get("speech_style"),
+                    "literary_style": char.get("literary_style"),
                     "location": char.get("location"),
                     "current_status": char.get("current_status"),
                     "allegiance": char.get("allegiance"),
@@ -8998,6 +9278,44 @@ class ZorkEmulator:
                 return characters_list
             characters_list = characters_list[:-1]
         return []
+
+    def _literary_styles_for_prompt(
+        self,
+        campaign_state: dict[str, Any],
+        characters_for_prompt: list[dict[str, object]],
+    ) -> Optional[str]:
+        styles = campaign_state.get(self.LITERARY_STYLES_STATE_KEY)
+        if not isinstance(styles, dict) or not styles:
+            return None
+
+        active_refs: set[str] = set()
+        for char in characters_for_prompt or []:
+            if not isinstance(char, dict):
+                continue
+            ref = str(char.get("literary_style") or "").strip()
+            if ref:
+                active_refs.add(ref)
+
+        def _sort_key(key: str) -> tuple[int, str]:
+            return (0 if key in active_refs else 1, key)
+
+        lines: list[str] = []
+        budget = self.MAX_LITERARY_STYLES_PROMPT_CHARS
+        for key in sorted(styles.keys(), key=_sort_key):
+            entry = styles.get(key)
+            if not isinstance(entry, dict):
+                continue
+            profile = str(entry.get("profile") or "").strip()
+            if not profile:
+                continue
+            line = f"  {key}: {profile}"
+            if len(line) > budget:
+                break
+            lines.append(line)
+            budget -= len(line) + 1
+            if budget <= 0:
+                break
+        return "\n".join(lines) if lines else None
 
     def _zork_log(self, section: str, body: str = "") -> None:
         try:
@@ -9387,7 +9705,6 @@ class ZorkEmulator:
         bootstrap_only = bootstrap_only or stage == self.PROMPT_STAGE_BOOTSTRAP
         state = self.get_campaign_state(campaign)
         state = self._scrub_inventory_from_state(state)
-        summary = self._compose_world_summary(campaign, state, max_chars=self.MAX_SUMMARY_CHARS)
         if "game_time" not in state:
             state["game_time"] = {
                 "day": 1,
@@ -9434,6 +9751,15 @@ class ZorkEmulator:
             player.actor_id
         )
         viewer_location_key = self._room_key_from_player_state(player_state).lower()
+        summary = self._compose_world_summary(
+            campaign,
+            state,
+            turns=turns,
+            viewer_actor_id=player.actor_id,
+            viewer_slug=viewer_slug,
+            viewer_location_key=viewer_location_key,
+            max_chars=self.MAX_SUMMARY_CHARS,
+        )
 
         recent_lines: List[str] = []
         ooc_re = re.compile(r"^\s*\[OOC\b", re.IGNORECASE)
@@ -9531,6 +9857,10 @@ class ZorkEmulator:
             campaign.id
         )
         source_payload = self._source_material_prompt_payload(campaign.id)
+        literary_styles_text = self._literary_styles_for_prompt(
+            state,
+            characters_for_prompt,
+        )
         memory_lookup_enabled = self._memory_lookup_enabled_for_prompt(
             summary,
             source_material_available=bool(source_payload.get("available")),
@@ -9577,6 +9907,8 @@ class ZorkEmulator:
             f"PLAYER_CARD: {self._dump_json(player_card)}\n"
             f"PARTY_SNAPSHOT: {self._dump_json(party_snapshot)}\n"
         )
+        if literary_styles_text:
+            user_prompt += f"LITERARY_STYLES:\n{literary_styles_text}\n"
         if not bootstrap_only:
             if story_context:
                 user_prompt += f"STORY_CONTEXT:\n{story_context}\n"

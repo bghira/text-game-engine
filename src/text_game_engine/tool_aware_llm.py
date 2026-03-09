@@ -134,6 +134,25 @@ class ToolAwareZorkLLM:
             return default
 
     @staticmethod
+    def _memory_tool_text_value(text: object, max_chars: int = 4000) -> str:
+        normalized = str(text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+        if len(normalized) > max_chars:
+            normalized = normalized[: max_chars - 3].rstrip() + "..."
+        return normalized
+
+    @staticmethod
+    def _memory_tool_jsonl(records: list[dict[str, Any]]) -> str:
+        return "\n".join(
+            json.dumps(
+                row,
+                ensure_ascii=True,
+                separators=(",", ":"),
+            )
+            for row in records
+            if isinstance(row, dict)
+        )
+
+    @staticmethod
     def _tool_call_signature(payload: dict[str, Any]) -> str:
         if not isinstance(payload, dict):
             return ""
@@ -425,7 +444,12 @@ class ToolAwareZorkLLM:
             return None
         return payload if isinstance(payload, dict) else None
 
-    def _payload_to_output(self, payload: dict[str, Any]) -> LLMTurnOutput:
+    def _payload_to_output(
+        self,
+        payload: dict[str, Any],
+        *,
+        actor_id: str | None = None,
+    ) -> LLMTurnOutput:
         emulator = self._emulator
         if emulator is None:
             return LLMTurnOutput(narration="")
@@ -433,6 +457,17 @@ class ToolAwareZorkLLM:
         narration = payload.get("narration")
         if not isinstance(narration, str):
             narration = ""
+
+        scene_output = payload.get("scene_output")
+        if not isinstance(scene_output, dict):
+            scene_output = None
+        if not narration and scene_output is not None:
+            try:
+                rendered = emulator._scene_output_rendered_text(scene_output)  # noqa: SLF001
+            except Exception:
+                rendered = ""
+            if isinstance(rendered, str) and rendered.strip():
+                narration = rendered.strip()
 
         state_update = payload.get("state_update")
         if not isinstance(state_update, dict):
@@ -449,6 +484,29 @@ class ToolAwareZorkLLM:
         state_update, player_state_update = emulator._split_room_state(  # noqa: SLF001
             state_update, player_state_update
         )
+
+        try:
+            state_update, extracted_calendar_update = emulator._extract_calendar_update_from_state_update(  # noqa: SLF001
+                state_update,
+                payload.get("calendar_update"),
+            )
+        except Exception:
+            extracted_calendar_update = payload.get("calendar_update")
+        if isinstance(extracted_calendar_update, dict):
+            add_rows = extracted_calendar_update.get("add")
+            if isinstance(add_rows, list):
+                for row in add_rows:
+                    if not isinstance(row, dict):
+                        continue
+                    visibility = str(row.get("visibility") or "").strip().lower()
+                    target_players = row.get("target_players")
+                    target_player = row.get("target_player")
+                    has_targets = bool(target_player) or (
+                        isinstance(target_players, list) and bool(target_players)
+                    )
+                    if visibility == "private" and not has_targets and actor_id:
+                        row["target_players"] = [str(actor_id)]
+            state_update["calendar_update"] = extracted_calendar_update
 
         summary_update = payload.get("summary_update")
         if not isinstance(summary_update, str) or not summary_update.strip():
@@ -530,6 +588,7 @@ class ToolAwareZorkLLM:
         return LLMTurnOutput(
             narration=narration,
             reasoning=reasoning,
+            scene_output=scene_output,
             state_update=state_update,
             summary_update=summary_update,
             xp_awarded=xp_awarded,
@@ -783,37 +842,36 @@ class ToolAwareZorkLLM:
             source_hits_unique.append(row)
         source_hits_unique = source_hits_unique[:12]
 
-        lines = ["MEMORY_RECALL (results from memory_search):"]
+        records: list[dict[str, Any]] = []
         for query in queries[:4]:
-            lines.append(f"Results for '{query}':")
-        lines.append("Narrator turn matches:")
-        if ordered_narrator:
+            query_hits = 0
             for hit in ordered_narrator:
-                snippet = str(hit.get("content") or "").strip().replace("\n", " ")
-                if len(snippet) > 280:
-                    snippet = snippet[:279].rstrip() + "..."
-                lines.append(
-                    "- [narrator turn "
-                    f"{hit['turn_id']}, relevance {float(hit['score']):.2f}"
-                    f"{', actor ' + str(hit.get('actor_player_slug')) if hit.get('actor_player_slug') else ''}"
-                    f"{', visibility ' + str(hit.get('visibility_scope')) if str(hit.get('visibility_scope') or 'public') != 'public' else ''}"
-                    f"{', location ' + str(hit.get('location_key')) if hit.get('location_key') else ''}"
-                    f"]: {snippet}"
+                query_hits += 1
+                records.append(
+                    {
+                        "kind": "memory_hit",
+                        "query": query,
+                        "memory_type": "turn",
+                        "turn_id": int(hit.get("turn_id", 0) or 0),
+                        "relevance": round(float(hit.get("score", 0.0) or 0.0), 4),
+                        "actor_player_slug": str(hit.get("actor_player_slug") or "").strip(),
+                        "visibility_scope": str(hit.get("visibility_scope") or "public").strip(),
+                        "location_key": str(hit.get("location_key") or "").strip(),
+                        "text": self._memory_tool_text_value(hit.get("content") or "", max_chars=280),
+                    }
                 )
-        else:
-            lines.append("- (no narrator turn matches)")
-
-        if curated_hits:
-            lines.append("Curated memory matches:")
             for term, memory, score in curated_hits[:5]:
-                snippet = str(memory or "").strip().replace("\n", " ")
-                if len(snippet) > 220:
-                    snippet = snippet[:219].rstrip() + "..."
-                lines.append(
-                    f"- [term {term}, relevance {float(score):.2f}]: {snippet}"
+                query_hits += 1
+                records.append(
+                    {
+                        "kind": "memory_hit",
+                        "query": query,
+                        "memory_type": "manual",
+                        "term": str(term or "").strip(),
+                        "relevance": round(float(score or 0.0), 4),
+                        "text": self._memory_tool_text_value(memory or "", max_chars=220),
+                    }
                 )
-        if source_hits_unique:
-            lines.append("Source material matches:")
             for (
                 source_doc_key,
                 source_doc_label,
@@ -823,29 +881,28 @@ class ToolAwareZorkLLM:
             ) in source_hits_unique:
                 if float(source_score) < 0.40:
                     continue
-                source_format = source_doc_formats.get(source_doc_key, "generic")
-                source_text_lines = [
-                    line.strip()
-                    for line in str(source_chunk_text or "").splitlines()
-                    if line.strip()
-                ]
-                source_text = (
-                    "\n    ".join(source_text_lines)
-                    if source_text_lines
-                    else str(source_chunk_text or "").strip()
+                query_hits += 1
+                records.append(
+                    {
+                        "kind": "memory_hit",
+                        "query": query,
+                        "memory_type": "source",
+                        "document_key": str(source_doc_key or ""),
+                        "document_label": str(source_doc_label or ""),
+                        "chunk_index": int(source_chunk_index or 0),
+                        "relevance": round(float(source_score or 0.0), 4),
+                        "text": self._memory_tool_text_value(source_chunk_text or "", max_chars=4000),
+                    }
                 )
-                if len(source_text) > 4000:
-                    source_text = (
-                        source_text[:4000].rsplit(" ", 1)[0].strip() + "..."
-                    )
-                lines.append(
-                    "- [source "
-                    f"{source_doc_label} ({source_doc_key}) snippet {int(source_chunk_index)}, "
-                    f"format {source_format}, relevance {float(source_score):.2f}]:\n    {source_text}"
-                )
-        elif has_source_material and source_scope:
-            scope_label = f"source:{source_scope_key}" if source_scope_key else "source"
-            lines.append(f"Source material matches: (none in scope '{scope_label}')")
+            records.insert(
+                len(records) - query_hits,
+                {
+                    "kind": "memory_query_result",
+                    "query": query,
+                    "category": category or "",
+                    "hit_count": query_hits,
+                },
+            )
         if has_source_material:
             total_snippets = 0
             for row in source_docs:
@@ -853,102 +910,40 @@ class ToolAwareZorkLLM:
                     total_snippets += int(row.get("chunk_count") or 0)
                 except Exception:
                     continue
-            lines.append(
-                f"SOURCE_MATERIAL_INDEX: {len(source_docs)} document(s), {total_snippets} total snippet(s)."
+            records.append(
+                {
+                    "kind": "source_index_meta",
+                    "document_count": len(source_docs),
+                    "snippet_count": total_snippets,
+                }
             )
             for row in source_docs[:5]:
-                row_format = str(row.get("format") or "").strip().lower()
-                if not row_format:
-                    row_format = source_doc_formats.get(
-                        str(row.get("document_key") or ""), "generic"
-                    )
-                lines.append(
-                    "- "
-                    f"key='{row.get('document_key')}' "
-                    f"label='{row.get('document_label')}' "
-                    f"format='{row_format}' "
-                    f"snippets={row.get('chunk_count')}"
+                row_format = str(row.get("format") or "").strip().lower() or source_doc_formats.get(
+                    str(row.get("document_key") or ""), "generic"
                 )
-
-        lines.extend(
-            [
-                "MEMORY_RECALL_NEXT_ACTIONS:",
-                "- To retrieve FULL text for a specific hit turn number:",
-                '  {"tool_call": "memory_turn", "turn_id": 1234}',
-                "- To discover curated memory categories/terms before narrowing search:",
-                '  {"tool_call": "memory_terms", "wildcard": "char:*"}',
-                "- To search inside one curated category after term discovery:",
-                '  {"tool_call": "memory_search", "category": "char:character-slug", "queries": ["keyword1", "keyword2"]}',
-                "- To search narrator memories for interactions involving a player slug:",
-                '  {"tool_call": "memory_search", "category": "interaction:player-slug", "queries": ["argument", "deal", "kiss"]}',
-                "- To search for turns noticed by a specific NPC slug:",
-                '  {"tool_call": "memory_search", "category": "awareness:npc-slug", "queries": ["overheard", "promise", "secret"]}',
-                "- To restrict narrator-memory recall by visibility scope:",
-                '  {"tool_call": "memory_search", "category": "visibility:private", "queries": ["secret meeting"]}',
-                '  {"tool_call": "memory_search", "category": "visibility:local", "queries": ["bar argument"]}',
-                "- To inspect off-scene SMS communications:",
-                '  {"tool_call": "sms_list", "wildcard": "*"}',
-                '  {"tool_call": "sms_read", "thread": "contact-slug", "limit": 20}',
-                "- To schedule a delayed incoming SMS (hidden until delivery):",
-                '  {"tool_call": "sms_schedule", "thread": "contact-slug", "from": "NPC", "to": "Player", "message": "...", "delay_seconds": 120}',
-            ]
-        )
-        if has_source_material:
-            source_formats = sorted(set(source_doc_formats.values()) or {"generic"})
-            source_formats_set = set(source_formats)
-            has_rulebook = "rulebook" in source_formats_set
-            has_only_generic = source_formats_set == {"generic"}
-            format_descriptions = {
-                "story": "scripted scenes / prose",
-                "rulebook": "line facts (`KEY: value`)",
-                "generic": "notes/dumps (usually not indexed)",
-            }
-            lines.extend(
-                [
-                    "SOURCE_MATERIAL_FORMAT_GUIDE:",
-                    f"- Active formats: {', '.join(source_formats)}",
-                ]
+                records.append(
+                    {
+                        "kind": "source_index_entry",
+                        "document_key": str(row.get("document_key") or ""),
+                        "document_label": str(row.get("document_label") or ""),
+                        "format": row_format,
+                        "snippet_count": row.get("chunk_count"),
+                    }
+                )
+        for hint in roster_hints[:6]:
+            if not isinstance(hint, dict):
+                continue
+            records.append(
+                {
+                    "kind": "memory_roster_hint",
+                    "term": str(hint.get("term") or hint.get("slug") or "").strip(),
+                    "slug": str(hint.get("slug") or "").strip(),
+                    "count": int(hint.get("count") or 0),
+                }
             )
-            for fmt in source_formats:
-                lines.append(f"- {fmt}: {format_descriptions.get(fmt, fmt)}")
-            lines.extend(
-                [
-                    "To inspect source text:",
-                    '  {"tool_call": "memory_search", "category": "source", "queries": ["keyword"]}',
-                    '  {"tool_call": "memory_search", "category": "source:<document-key>", "queries": ["keyword"]}',
-                ]
-            )
-            if has_only_generic:
-                lines.append(
-                    "- Generic docs are usually summarized in setup prompts; use source search only for "
-                    "exact wording when needed."
-                )
-            if has_rulebook:
-                lines.extend(
-                    [
-                        "- Rulebook docs expose keyed snippets. First pass (no filter) to discover keys:",
-                        '  {"tool_call": "source_browse"}',
-                        '  {"tool_call": "source_browse", "document_key": "document-key"}',
-                        "Then narrow with wildcard keys:",
-                        '  {"tool_call": "source_browse", "wildcard": "keyword*"}',
-                    ]
-                )
-        if roster_hints:
-            lines.append("MEMORY_RECALL_ROSTER_RECOMMENDATIONS:")
-            for hint in roster_hints[:6]:
-                term = str(hint.get("term") or hint.get("slug") or "").strip() or "unknown-term"
-                slug = str(hint.get("slug") or "").strip() or "character-slug"
-                try:
-                    count = int(hint.get("count") or 0)
-                except Exception:
-                    count = 0
-                lines.append(
-                    "- You have looked for "
-                    f"'{term}' {count} times and it is not present in WORLD_CHARACTERS. "
-                    "If this is stable/non-stale information and you can confirm it, "
-                    f"store it with character_updates using slug '{slug}'."
-                )
-        return "\n".join(lines)
+        if not records:
+            return "MEMORY_RECALL: No relevant memories found."
+        return "MEMORY_RECALL:\n" + self._memory_tool_jsonl(records)
 
     def _tool_memory_terms(self, campaign_id: str, payload: dict[str, Any]) -> str:
         wildcard_raw = payload.get("wildcard")
@@ -972,27 +967,40 @@ class ToolAwareZorkLLM:
             )
             terms = [term for term in distinct if term and fnmatch(term, wildcard)]
 
-        lines = ["MEMORY_TERMS:"]
+        rows: list[dict[str, Any]] = []
         if terms:
             for row in terms[:40]:
                 if isinstance(row, dict):
-                    category = str(row.get("category") or "").strip()
-                    term = str(row.get("term") or "").strip()
-                    label = f"{category} :: {term}" if category else term
-                    lines.append(f"- {label}")
+                    rows.append(
+                        {
+                            "kind": "memory_term",
+                            "category": str(row.get("category") or "").strip(),
+                            "term": str(row.get("term") or "").strip(),
+                            "count": row.get("count"),
+                            "last_at": row.get("last_at"),
+                        }
+                    )
                 else:
-                    lines.append(f"- {row}")
+                    rows.append(
+                        {
+                            "kind": "memory_term",
+                            "category": "",
+                            "term": str(row),
+                            "count": None,
+                            "last_at": None,
+                        }
+                    )
         else:
-            lines.append("- (none)")
-
-        lines.extend(
-            [
-                "NEXT_ACTIONS:",
-                '- {"tool_call": "memory_search", "category": "char:character-slug", "queries": ["keyword"]}',
-                '- {"tool_call": "memory_store", "category": "char:character-slug", "term": "keyword", "memory": "fact"}',
-            ]
-        )
-        return "\n".join(lines)
+            rows.append(
+                {
+                    "kind": "memory_term",
+                    "category": "",
+                    "term": "",
+                    "count": 0,
+                    "last_at": None,
+                }
+            )
+        return "MEMORY_TERMS_RESULT:\n" + self._memory_tool_jsonl(rows)
 
     def _tool_source_browse(self, campaign_id: str, payload: dict[str, Any]) -> str:
         doc_key_raw = payload.get("document_key") or payload.get("document")
@@ -1077,6 +1085,190 @@ class ToolAwareZorkLLM:
             "or fewer filters."
         )
 
+    def _tool_recent_turns(
+        self,
+        campaign_id: str,
+        payload: dict[str, Any],
+        *,
+        actor_id: str | None = None,
+    ) -> str:
+        if self._emulator is None or not actor_id:
+            return "RECENT_TURNS: unavailable"
+        try:
+            limit = max(1, min(40, int(payload.get("limit") or 24)))
+        except Exception:
+            limit = 24
+        raw_player_slugs = payload.get("player_slugs")
+        requested_player_slugs = {
+            self._emulator._player_slug_key(item)  # noqa: SLF001
+            for item in (raw_player_slugs if isinstance(raw_player_slugs, list) else [])
+            if self._emulator._player_slug_key(item)  # noqa: SLF001
+        }
+        raw_npc_slugs = payload.get("npc_slugs")
+        requested_npc_slugs = {
+            str(item or "").strip()
+            for item in (raw_npc_slugs if isinstance(raw_npc_slugs, list) else [])
+            if str(item or "").strip()
+        }
+
+        with self._session_factory() as session:
+            actor_row = (
+                session.query(Player)
+                .filter(Player.campaign_id == campaign_id)
+                .filter(Player.actor_id == actor_id)
+                .first()
+            )
+            turns = (
+                session.query(Turn)
+                .filter(Turn.campaign_id == campaign_id)
+                .order_by(Turn.id.desc())
+                .limit(max(limit * 4, 40))
+                .all()
+            )
+        turns.reverse()
+        actor_state = self._parse_json(actor_row.state_json, {}) if actor_row is not None else {}
+        viewer_slug = self._emulator._player_visibility_slug(actor_id)  # noqa: SLF001
+        viewer_location_key = self._emulator._room_key_from_player_state(actor_state).lower()  # noqa: SLF001
+
+        def _turn_relevant_to_receivers(turn: Turn) -> bool:
+            meta = self._emulator._safe_turn_meta(turn)  # noqa: SLF001
+            visibility = meta.get("visibility")
+            if not isinstance(visibility, dict):
+                return False
+            scope = str(visibility.get("scope") or "").strip().lower()
+            if scope not in {"private", "limited"}:
+                return False
+            visible_player_slugs = {
+                self._emulator._player_slug_key(item)  # noqa: SLF001
+                for item in list(visibility.get("visible_player_slugs") or [])
+                if self._emulator._player_slug_key(item)  # noqa: SLF001
+            }
+            aware_npc_slugs = {
+                str(item or "").strip()
+                for item in list(visibility.get("aware_npc_slugs") or [])
+                if str(item or "").strip()
+            }
+            player_match = True
+            npc_match = True
+            if requested_player_slugs:
+                player_match = bool(visible_player_slugs.intersection(requested_player_slugs))
+            if requested_npc_slugs:
+                npc_match = bool(aware_npc_slugs.intersection(requested_npc_slugs))
+            return player_match and npc_match
+
+        rows: list[dict[str, Any]] = []
+        location_history: list[str] = []
+        visible_count = 0
+        for turn in turns:
+            visible = self._emulator._turn_visible_to_viewer(  # noqa: SLF001
+                turn,
+                actor_id,
+                viewer_slug,
+                viewer_location_key,
+            )
+            if (
+                not visible
+                and turn.actor_id == actor_id
+                and (requested_player_slugs or requested_npc_slugs)
+                and _turn_relevant_to_receivers(turn)
+            ):
+                visible = True
+            if not visible:
+                continue
+            visible_count += 1
+            meta = self._emulator._safe_turn_meta(turn)  # noqa: SLF001
+            visibility = meta.get("visibility") if isinstance(meta, dict) else {}
+            location_key = str(
+                (visibility or {}).get("location_key") or meta.get("location_key") or ""
+            ).strip()
+            if location_key:
+                location_history.append(location_key)
+            turn_row: dict[str, Any] = {
+                "kind": "turn",
+                "turn_id": int(turn.id),
+                "turn_kind": str(turn.kind or ""),
+                "location_key": location_key,
+                "context_key": str(
+                    (visibility or {}).get("context_key") or meta.get("context_key") or ""
+                ).strip()
+                or None,
+                "visibility": str((visibility or {}).get("scope") or "public").strip().lower(),
+            }
+            game_time = meta.get("game_time")
+            if isinstance(game_time, dict):
+                turn_row["day"] = int(game_time.get("day", 1) or 1)
+                turn_row["hour"] = int(game_time.get("hour", 0) or 0)
+                turn_row["minute"] = int(game_time.get("minute", 0) or 0)
+            rows.append(turn_row)
+
+            scene_output = meta.get("scene_output")
+            beats = scene_output.get("beats") if isinstance(scene_output, dict) else None
+            if isinstance(beats, list) and beats:
+                for index, beat in enumerate(beats):
+                    if not isinstance(beat, dict):
+                        continue
+                    rows.append(
+                        {
+                            "kind": "beat",
+                            "turn_id": int(turn.id),
+                            "index": index,
+                            "reasoning": str(beat.get("reasoning") or "").strip(),
+                            "type": str(beat.get("type") or "narration").strip(),
+                            "speaker": str(beat.get("speaker") or "narrator").strip(),
+                            "actors": list(beat.get("actors") or []),
+                            "listeners": list(beat.get("listeners") or []),
+                            "visibility": str(beat.get("visibility") or "local").strip(),
+                            "aware_actor_ids": list((beat.get("aware_actor_ids") or [])),
+                            "aware_npc_slugs": list((beat.get("aware_npc_slugs") or [])),
+                            "location_key": beat.get("location_key"),
+                            "context_key": beat.get("context_key"),
+                            "text": self._memory_tool_text_value(beat.get("text") or "", max_chars=2000),
+                        }
+                    )
+            else:
+                rows.append(
+                    {
+                        "kind": "beat",
+                        "turn_id": int(turn.id),
+                        "index": 0,
+                        "reasoning": "Compatibility fallback from stored turn text.",
+                        "type": "player_action" if str(turn.kind or "") == "player" else "narration",
+                        "speaker": str(turn.actor_id or "narrator"),
+                        "actors": [str(turn.actor_id or "").strip()] if str(turn.kind or "") == "player" else [],
+                        "listeners": [],
+                        "visibility": str((visibility or {}).get("scope") or "public").strip().lower(),
+                        "aware_actor_ids": list((visibility or {}).get("visible_actor_ids") or []),
+                        "aware_npc_slugs": list((visibility or {}).get("aware_npc_slugs") or []),
+                        "location_key": location_key or None,
+                        "context_key": str(
+                            (visibility or {}).get("context_key") or meta.get("context_key") or ""
+                        ).strip()
+                        or None,
+                        "text": self._memory_tool_text_value(turn.content or "", max_chars=2000),
+                    }
+                )
+            if visible_count >= limit:
+                break
+
+        current_location = viewer_location_key or "unknown"
+        last_other = "none"
+        for key in reversed(location_history):
+            if key and key.lower() != current_location.lower():
+                last_other = key
+                break
+        header_lines = [
+            "RECENT_TURNS_LOADED: true",
+            "RECENT_TURNS_NOTE: Immediate visible continuity for the acting player.",
+            "Local continuity is room-scoped; older local turns from other rooms may be missing.",
+            f"RECENT_TURNS_LOCATIONS: current={current_location} last_other={last_other}",
+            f"RECENT_TURNS_RECEIVERS: players={sorted(requested_player_slugs)} npcs={sorted(requested_npc_slugs)}",
+            "RECENT_TURNS:",
+        ]
+        if not rows:
+            header_lines.append("None")
+            return "\n".join(header_lines)
+        return "\n".join(header_lines) + "\n" + self._memory_tool_jsonl(rows)
+
     def _tool_memory_turn(
         self,
         campaign_id: str,
@@ -1088,7 +1280,18 @@ class ToolAwareZorkLLM:
         try:
             turn_id = int(turn_id_raw)
         except Exception:
-            return "MEMORY_TURN: invalid turn_id"
+            return (
+                "MEMORY_TURN_RESULT:\n"
+                + self._memory_tool_jsonl(
+                    [
+                        {
+                            "kind": "memory_turn_result",
+                            "status": "invalid_turn_id",
+                            "turn_id": str(turn_id_raw or ""),
+                        }
+                    ]
+                )
+            )
 
         with self._session_factory() as session:
             turn = (
@@ -1106,7 +1309,18 @@ class ToolAwareZorkLLM:
                     .first()
                 )
         if turn is None:
-            return f"MEMORY_TURN: no turn found for turn_id={turn_id}"
+            return (
+                "MEMORY_TURN_RESULT:\n"
+                + self._memory_tool_jsonl(
+                    [
+                        {
+                            "kind": "memory_turn_result",
+                            "status": "not_found",
+                            "turn_id": turn_id,
+                        }
+                    ]
+                )
+            )
         if actor_id and self._emulator is not None:
             actor_state = (
                 self._parse_json(actor_row.state_json, {})
@@ -1120,19 +1334,36 @@ class ToolAwareZorkLLM:
             if not self._emulator._turn_visible_to_viewer(  # noqa: SLF001
                 turn, actor_id, actor_slug or "", actor_location_key.lower()
             ):
-                return "MEMORY_TURN: that turn exists, but it is not visible to this player."
+                return (
+                    "MEMORY_TURN_RESULT:\n"
+                    + self._memory_tool_jsonl(
+                        [
+                            {
+                                "kind": "memory_turn_result",
+                                "status": "not_visible",
+                                "turn_id": turn_id,
+                            }
+                        ]
+                    )
+                )
 
-        content = str(turn.content or "")
-        if len(content) > 12000:
-            content = content[:11999].rstrip() + "..."
         return (
-            "MEMORY_TURN_FULLTEXT:\n"
-            f"turn_id={int(turn.id)}\n"
-            f"kind={turn.kind}\n"
-            f"actor_id={turn.actor_id}\n"
-            f"created_at={turn.created_at.isoformat() if turn.created_at else None}\n"
-            "content:\n"
-            f"{content}\n"
+            "MEMORY_TURN_RESULT:\n"
+            + self._memory_tool_jsonl(
+                [
+                    {
+                        "kind": "memory_turn_result",
+                        "status": "ok",
+                        "turn_id": int(turn.id),
+                        "turn_kind": str(turn.kind or ""),
+                        "actor_id": str(turn.actor_id or ""),
+                        "created_at": turn.created_at.isoformat() if turn.created_at else None,
+                        "full_text": self._memory_tool_text_value(
+                            turn.content or "", max_chars=12000
+                        ),
+                    }
+                ]
+            )
         )
 
     def _tool_memory_store(self, campaign_id: str, payload: dict[str, Any]) -> str:
@@ -1670,7 +1901,7 @@ class ToolAwareZorkLLM:
         if name == "ready_to_write":
             return "READY_TO_WRITE_ACK"
         if name == "recent_turns":
-            return "RECENT_TURNS_TOOL_NOT_IMPLEMENTED"
+            return self._tool_recent_turns(campaign_id, payload, actor_id=actor_id)
         return f"TOOL_ERROR: unsupported tool_call '{name}'"
 
     async def _resolve_payload(
@@ -1925,10 +2156,9 @@ class ToolAwareZorkLLM:
             )
             if payload is None:
                 return await self._fallback.complete_turn(context)
-            return self._payload_to_output(payload)
+            return self._payload_to_output(payload, actor_id=context.actor_id)
         except Exception:
             return await self._fallback.complete_turn(context)
 
 
 ZorkToolAwareLLM = ToolAwareZorkLLM
-
