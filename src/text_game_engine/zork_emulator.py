@@ -289,6 +289,12 @@ class ZorkEmulator:
         SMS_MESSAGE_SEQ_KEY,
         TURN_TIME_INDEX_KEY,
         LITERARY_STYLES_STATE_KEY,
+        "_active_puzzle",
+        "_puzzle_result",
+        "_active_minigame",
+        "_minigame_result",
+        "_last_dice_check",
+        "_last_minigame_result",
     }
     PLAYER_STATE_EXCLUDE_KEYS = {"inventory", "room_description", PLAYER_STATS_KEY}
     _STALE_VALUE_PATTERNS = _COMPLETED_VALUES | {
@@ -588,6 +594,27 @@ class ZorkEmulator:
         "  * Pacing is a gift. Know when to linger on a moment and when to cut to the next beat. Not every action needs a full scene.\n"
         "  * The best turns leave the player wanting to type their next move immediately.\n"
         "- Tone lock: match narration to WORLD_STATE.tone. Player humor is allowed, but ambient world/NPC behavior should remain tonally consistent unless the story explicitly shifts tone.\n"
+        "- PUZZLE SYSTEM: When PUZZLE_CONFIG is present, the campaign has puzzle mechanics enabled.\n"
+        "  You may include dice_check in your JSON to request a skill check against player attributes.\n"
+        "  dice_check requires: attribute (string matching a PLAYER_CARD attribute), dc (integer difficulty class),\n"
+        "  context (what is being attempted), on_success (object with narration, state_update, player_state_update, xp_awarded),\n"
+        "  and on_failure (same shape). The harness rolls d20 + attribute modifier and selects the outcome.\n"
+        "  DC guidance: trivial 5, easy 8, moderate 12, hard 15, very hard 18, near-impossible 20+.\n"
+        "  Only request dice_check when the outcome is genuinely uncertain and the player has a relevant attribute.\n"
+        "- You may include puzzle_trigger to start a harness-managed puzzle: {puzzle_type, context, difficulty}.\n"
+        "  Types: \"riddle\", \"math\", \"sequence\", \"cipher\". The harness generates and validates — do not solve it yourself.\n"
+        "- You may include minigame_challenge to start a mini-game: {game_type, opponent_slug, stakes}.\n"
+        "  Types: \"tic_tac_toe\", \"nim\", \"dice_duel\", \"coin_flip\". The harness manages game state.\n"
+        "- When ACTIVE_PUZZLE or ACTIVE_MINIGAME is present, a mechanical challenge is in progress.\n"
+        "  Narrate around it — do NOT spoil puzzle answers or override minigame outcomes.\n"
+        "  When PUZZLE_RESULT or MINIGAME_RESULT is present, narrate the outcome.\n"
+        "- When LAST_DICE_CHECK is present, the previous turn had a skill check.\n"
+        "  Use the result for continuity — do not contradict it.\n"
+        "- dice_check: object (optional; request a skill check. Keys: attribute, dc, context, on_success, on_failure.\n"
+        "  on_success/on_failure each have: narration (string), state_update (object), player_state_update (object), xp_awarded (int).\n"
+        "  The harness rolls and selects one outcome.)\n"
+        "- puzzle_trigger: object (optional; start a harness-managed puzzle. Keys: puzzle_type, context, difficulty.)\n"
+        "- minigame_challenge: object (optional; start a mini-game. Keys: game_type, opponent_slug, stakes.)\n"
     )
     GUARDRAILS_SYSTEM_PROMPT = (
         "\nSTRICT RAILS MODE IS ENABLED.\n"
@@ -2363,12 +2390,16 @@ class ZorkEmulator:
                     "keys": document_keys,
                 }
             )
+        digests = SourceMaterialMemory.get_all_source_material_digests(
+            str(campaign_id),
+        )
         return {
             "available": bool(compact_docs),
             "document_count": len(compact_docs),
             "chunk_count": total_chunk_count,
             "docs": compact_docs,
             "keys": source_keys,
+            "digests": digests,
         }
 
     async def _summarise_long_text(
@@ -2632,7 +2663,7 @@ class ZorkEmulator:
                             )
                             source_format = self.SOURCE_MATERIAL_FORMAT_GENERIC
                         source_format = self._normalize_source_material_format(source_format)
-                        stored_count, source_key = self.ingest_source_material_text(
+                        stored_count, source_key = await self.ingest_source_material_with_digest(
                             str(campaign.id),
                             document_label=str(raw_name or "source-material"),
                             text=attachment_text,
@@ -3167,7 +3198,8 @@ class ZorkEmulator:
             "Each line should usually be 50-200 words.\n"
             "Convert story summaries, plot chapters, character notes, and attachment prose into reusable rules and facts.\n"
             "Do not write scripts or scene transcripts. Do not rely on adjacent lines for context.\n"
-            "Use these category families when relevant: TONE, SCENE, SETTING, CHAR, PLOT, INTERACTION, GM-RULE, and venue-specific tags such as BLUE-ROOM or RED-ROOM.\n"
+            "Use these category families when relevant: TONE, SCENE, SETTING, CHAR, PLOT, INTERACTION, GM-RULE, MECHANIC, and location-specific tags.\n"
+            "For location-specific tags, use descriptive names that identify the narrative function of the place (e.g. FRAME-NARRATIVE-ATTIC, IVORY-TOWER, SWAMPS-OF-SADNESS) rather than generic labels like BLUE-ROOM or RED-ROOM. The tag should be unambiguous even if encountered outside this campaign's context.\n"
             "Existing non-auto rulebook source docs are canonical. If an existing source doc already defines a KEY, do not rewrite or replace that KEY. Only add missing keys or new non-conflicting facts.\n"
             "Required coverage:\n"
             "- TONE, TONE-RULES, SCENE-OPENING, SETTING-[MAIN]\n"
@@ -3178,6 +3210,21 @@ class ZorkEmulator:
             "If the setting involves intimacy, vulnerability, or explicit consent norms, include TONE-CONSENT and GM-RULE-CONSENT-ENFORCEMENT.\n"
             "If the setting has money, rooms, rentals, or prices, include GM-RULE-MONEY.\n"
             "Dialogue lines must show distinct voice. Running jokes, recurring habits, venue rules, and notable recurring objects should become separate retrievable facts when important.\n"
+            "\n"
+            "MECHANIC EXTRACTION — trackable resource systems:\n"
+            "If the source material contains a system where actions have cumulative costs, track it explicitly. Examples: wishes that cost memories, corruption that grows with power use, sanity that erodes, fuel that depletes, trust that accumulates or decays. For each such system, emit:\n"
+            "- MECHANIC-[NAME]: describe the resource, its starting state, what depletes or restores it, and the consequence of exhaustion.\n"
+            "- MECHANIC-[NAME]-COST-TABLE: list each action and its specific cost. Be concrete — 'wish for courage costs memory of mother's voice' is useful, 'wishes cost memories' is not.\n"
+            "The harness can track these as player_state fields (e.g. player.memories_remaining, player.corruption_level). Name the fields in the MECHANIC entry so the GM knows what to update.\n"
+            "\n"
+            "NPC ESCALATION BEHAVIORS:\n"
+            "For each major NPC, CHAR-[NAME]-PERSONALITY must include not just who they are but what they do when the player stalls, refuses, or doesn't engage. Every NPC who needs something from the player must have an escalation path — what concrete action do they take if the moment passes without player response? Passive NPCs who 'wait' or 'invite' must have an UNLOCKED state: what they do when waiting is no longer an option. If the source material shows this (e.g. a character who forces a story loop, sends an emissary, leaves, attacks, or withdraws an offer), capture that escalation explicitly.\n"
+            "\n"
+            "CONVERSATION-TERMINAL NPCs:\n"
+            "Some NPCs do not engage in extended dialogue. If a character's defining trait is apathy, nihilism, hostility, or inscrutability, say so explicitly in their CHAR entry and add: 'This NPC answers once — poorly, reluctantly, or cryptically — and that is all the player gets. Do not let the player re-ask or interrogate. The NPC does not care enough to test the player or withhold strategically. They gave their answer; it was bad; move on.'\n"
+            "\n"
+            "CONFRONTATION SINCERITY:\n"
+            "For NPCs who challenge the player philosophically or morally (villains, tempters, nihilists, gatekeepers), add a CHAR-[NAME]-CONFRONTATION note. The GM must engage with the sincerity of the player's defiance even when the words are plain. 'You're wrong' spoken with conviction is a valid response. The NPC should not dismiss simple sincerity as naive or re-ask until the player delivers a philosophically sophisticated rebuttal. The NPC reacts to the stance, not the eloquence.\n"
             "Avoid generic AI-default names for any new characters. Ban list: Morgan, Kai, River, Sage, Quinn, Riley, Jordan, Avery, Harper, Rowan, Blake, Skyler, Ash, Nova, Zara, Milo, Ezra, Luna; surnames: Chen, Mendoza, Nakamura, Patel, Rollins, Kim, Santos, Okafor, Volkov, Johansson, Delacroix, Venn, Sands, Kade, Park.\n"
             "Preserve player agency, kindness, and genre tone. Unless the genre explicitly demands otherwise, do not invent trauma hooks or coercive plot pressure.\n"
             f"{source_tool_instructions}"
@@ -4133,14 +4180,35 @@ class ZorkEmulator:
         prefs = setup_data.get("novel_preferences", {})
         if not isinstance(prefs, dict):
             prefs = {}
-        if answer in ("on-rails", "onrails", "on rails", "rails", "strict"):
-            prefs["on_rails"] = True
+
+        if "on_rails" not in prefs:
+            # Step 1: parse on-rails answer, ask puzzle question
+            if answer in ("on-rails", "onrails", "on rails", "rails", "strict"):
+                prefs["on_rails"] = True
+            else:
+                prefs["on_rails"] = False
+            setup_data["novel_preferences"] = prefs
+            state["setup_data"] = setup_data
+            return (
+                "2. **Puzzle encounters?** Should the campaign include mechanical challenges "
+                "(dice rolls, riddles, mini-games)?\n"
+                "Options: **none** / **light** (environmental puzzles only) / "
+                "**moderate** (+ skill checks & riddles) / **full** (+ mini-games)\n"
+            )
         else:
-            prefs["on_rails"] = False
-        setup_data["novel_preferences"] = prefs
-        state["setup_phase"] = "finalize"
-        state["setup_data"] = setup_data
-        return await self._setup_finalize(campaign, state, setup_data, user_id=actor_id)
+            # Step 2: parse puzzle mode, finalize
+            puzzle_mode = "none"
+            if answer in ("light", "environmental"):
+                puzzle_mode = "light"
+            elif answer in ("moderate", "mod", "skill", "skill checks", "riddles"):
+                puzzle_mode = "moderate"
+            elif answer in ("full", "all", "yes", "heavy", "mini-games", "minigames"):
+                puzzle_mode = "full"
+            prefs["puzzle_mode"] = puzzle_mode
+            setup_data["novel_preferences"] = prefs
+            state["setup_phase"] = "finalize"
+            state["setup_data"] = setup_data
+            return await self._setup_finalize(campaign, state, setup_data, user_id=actor_id)
 
     @staticmethod
     def _is_explicit_setup_no(message_text: str) -> tuple[bool, str]:
@@ -4394,7 +4462,7 @@ class ZorkEmulator:
                             if summary:
                                 summary_parts.append(f"{source_label}: {summary}")
                         else:
-                            stored_count, source_key = self.ingest_source_material_text(
+                            stored_count, source_key = await self.ingest_source_material_with_digest(
                                 str(campaign.id),
                                 document_label=source_label,
                                 text=extracted,
@@ -4667,6 +4735,7 @@ class ZorkEmulator:
         if default_persona:
             state["default_persona"] = self._trim_text(str(default_persona), self.MAX_PERSONA_PROMPT_CHARS)
         state["on_rails"] = on_rails
+        state["puzzle_mode"] = novel_prefs.get("puzzle_mode", "none")
 
         if opening:
             room_title = start_room.get("room_title", "") if isinstance(start_room, dict) else ""
@@ -9317,6 +9386,60 @@ class ZorkEmulator:
                 break
         return "\n".join(lines) if lines else None
 
+    @staticmethod
+    def _puzzle_system_for_prompt(campaign_state: dict[str, Any]) -> str | None:
+        """Build prompt sections for active puzzles, minigames, and dice checks."""
+        parts: list[str] = []
+
+        puzzle_mode = campaign_state.get("puzzle_mode")
+        if puzzle_mode and puzzle_mode != "none":
+            parts.append(f"PUZZLE_CONFIG:\n  mode: {puzzle_mode}")
+
+        active_puzzle = campaign_state.get("_active_puzzle")
+        if isinstance(active_puzzle, dict):
+            from .core.puzzles import PuzzleState, PuzzleEngine
+            ps = PuzzleState.from_dict(active_puzzle)
+            parts.append(PuzzleEngine.render_prompt_section(ps))
+
+        puzzle_result = campaign_state.get("_puzzle_result")
+        if isinstance(puzzle_result, dict):
+            lines = ["PUZZLE_RESULT:"]
+            for k, v in puzzle_result.items():
+                lines.append(f"  {k}: {v}")
+            parts.append("\n".join(lines))
+
+        active_minigame = campaign_state.get("_active_minigame")
+        if isinstance(active_minigame, dict):
+            from .core.minigames import MinigameState, MinigameEngine
+            ms = MinigameState.from_dict(active_minigame)
+            parts.append(MinigameEngine.render_prompt_section(ms))
+
+        minigame_result = campaign_state.get("_minigame_result")
+        if isinstance(minigame_result, dict):
+            lines = ["MINIGAME_RESULT:"]
+            for k, v in minigame_result.items():
+                lines.append(f"  {k}: {v}")
+            parts.append("\n".join(lines))
+
+        last_dice = campaign_state.get("_last_dice_check")
+        if isinstance(last_dice, dict):
+            attr = last_dice.get("attribute", "skill")
+            roll_val = last_dice.get("roll", 0)
+            mod = last_dice.get("modifier", 0)
+            total = last_dice.get("total", 0)
+            dc = last_dice.get("dc", 0)
+            success = last_dice.get("success", False)
+            context = last_dice.get("context", "")
+            parts.append(
+                f"LAST_DICE_CHECK:\n"
+                f"  attribute: {attr}\n"
+                f"  roll: {roll_val} + {mod} = {total} vs DC {dc}\n"
+                f"  result: {'success' if success else 'failure'}\n"
+                f"  context: \"{context}\""
+            )
+
+        return "\n\n".join(parts) if parts else None
+
     def _zork_log(self, section: str, body: str = "") -> None:
         try:
             ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -9892,6 +10015,12 @@ class ZorkEmulator:
                 f"SOURCE_MATERIAL_SNIPPET_COUNT: {source_payload.get('chunk_count')}\n"
                 f"SOURCE_MATERIAL_CHUNK_COUNT: {source_payload.get('chunk_count')}\n"
             )
+            source_digests = source_payload.get("digests") or {}
+            if source_digests:
+                for digest_key, digest_text in source_digests.items():
+                    user_prompt += (
+                        f"SOURCE_MATERIAL_DIGEST [{digest_key}]:\n{digest_text}\n"
+                    )
         user_prompt += (
             f"CURRENT_GAME_TIME: {self._dump_json(game_time)}\n"
             f"SPEED_MULTIPLIER: {speed_mult}\n"
@@ -9909,6 +10038,9 @@ class ZorkEmulator:
         )
         if literary_styles_text:
             user_prompt += f"LITERARY_STYLES:\n{literary_styles_text}\n"
+        _puzzle_text = self._puzzle_system_for_prompt(state)
+        if _puzzle_text:
+            user_prompt += f"{_puzzle_text}\n"
         if not bootstrap_only:
             if story_context:
                 user_prompt += f"STORY_CONTEXT:\n{story_context}\n"
@@ -10222,6 +10354,43 @@ class ZorkEmulator:
             limit=max(1, int(limit)),
         )
 
+    def list_campaign_rules(self, campaign_id: str) -> list[dict[str, str]]:
+        return SourceMaterialMemory.list_rulebook_entries(
+            str(campaign_id),
+            SourceMaterialMemory._normalize_source_document_key(
+                self.AUTO_RULEBOOK_DOCUMENT_LABEL
+            ),
+        )
+
+    def get_campaign_rule(
+        self,
+        campaign_id: str,
+        rule_key: str,
+    ) -> dict[str, str] | None:
+        return SourceMaterialMemory.get_rulebook_entry(
+            str(campaign_id),
+            SourceMaterialMemory._normalize_source_document_key(
+                self.AUTO_RULEBOOK_DOCUMENT_LABEL
+            ),
+            rule_key,
+        )
+
+    def put_campaign_rule(
+        self,
+        campaign_id: str,
+        *,
+        rule_key: str,
+        rule_text: str,
+        upsert: bool = False,
+    ) -> dict[str, object]:
+        return SourceMaterialMemory.put_rulebook_entry(
+            str(campaign_id),
+            document_label=self.AUTO_RULEBOOK_DOCUMENT_LABEL,
+            rule_key=rule_key,
+            rule_text=rule_text,
+            replace_existing=bool(upsert),
+        )
+
     def browse_source_keys(
         self,
         campaign_id: str,
@@ -10282,6 +10451,79 @@ class ZorkEmulator:
             source_mode=source_mode,
             replace_document=bool(replace_document),
         )
+
+    async def ingest_source_material_with_digest(
+        self,
+        campaign_id: str,
+        *,
+        document_label: str,
+        text: str,
+        source_format: str | None = None,
+        replace_document: bool = True,
+        ctx_message=None,
+        channel=None,
+    ) -> tuple[int, str]:
+        """Ingest source material and generate a recursive summary digest.
+
+        Calls :meth:`ingest_source_material_text` for chunk storage, then
+        runs ``_summarise_long_text`` to produce a narrative digest that is
+        stored alongside the chunks for prompt injection.
+        """
+        stored_count, document_key = self.ingest_source_material_text(
+            campaign_id,
+            document_label=document_label,
+            text=text,
+            source_format=source_format,
+            replace_document=replace_document,
+        )
+        if stored_count <= 0:
+            return stored_count, document_key
+
+        try:
+            normalized_format = self._normalize_source_material_format(source_format)
+        except Exception:
+            normalized_format = None
+        if not normalized_format:
+            try:
+                chunks, _, _, _, _ = self._chunk_text_by_tokens(str(text or ""))
+                normalized_format = self._source_material_format_heuristic(
+                    str((chunks[0] if chunks else text[:4000]) or "")
+                )
+            except Exception:
+                normalized_format = self.SOURCE_MATERIAL_FORMAT_GENERIC
+
+        if normalized_format in (
+            self.SOURCE_MATERIAL_FORMAT_STORY,
+            self.SOURCE_MATERIAL_FORMAT_RULEBOOK,
+        ):
+            try:
+                digest = await self._summarise_long_text(
+                    text,
+                    ctx_message=ctx_message,
+                    channel=channel,
+                    summary_instructions=(
+                        "This is source material for a text-adventure campaign. "
+                        "Produce a comprehensive narrative digest preserving all characters, "
+                        "locations, plot arcs, factions, key events, world rules, and "
+                        "relationships. Maintain chronological order where applicable. "
+                        "Be detailed and concrete — this digest will be used to ground "
+                        "the campaign world."
+                    ),
+                )
+                if digest and digest.strip():
+                    SourceMaterialMemory.store_source_material_digest(
+                        str(campaign_id),
+                        document_key,
+                        digest.strip(),
+                    )
+            except Exception:
+                self._logger.exception(
+                    "Source material digest generation failed for campaign %s key %s",
+                    campaign_id,
+                    document_key,
+                )
+
+        return stored_count, document_key
 
     def search_source_material(
         self,

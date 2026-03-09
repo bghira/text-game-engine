@@ -31,6 +31,16 @@ CREATE TABLE IF NOT EXISTS source_material_chunks (
 );
 CREATE INDEX IF NOT EXISTS idx_tge_sm_campaign ON source_material_chunks(campaign_id);
 CREATE INDEX IF NOT EXISTS idx_tge_sm_campaign_doc ON source_material_chunks(campaign_id, document_key);
+
+CREATE TABLE IF NOT EXISTS source_material_digests (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    campaign_id     TEXT    NOT NULL,
+    document_key    TEXT    NOT NULL,
+    digest_text     TEXT    NOT NULL,
+    created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_tge_smd_campaign_doc
+    ON source_material_digests(campaign_id, document_key);
 """
 
 
@@ -297,6 +307,122 @@ class SourceMaterialMemory:
             return []
 
     @classmethod
+    def _normalize_rulebook_fact_key(cls, value: str) -> str:
+        return " ".join(str(value or "").strip().split())
+
+    @classmethod
+    def list_rulebook_entries(
+        cls,
+        campaign_id: str,
+        document_key: str,
+    ) -> List[Dict[str, str]]:
+        try:
+            units = cls.get_source_material_document_units(campaign_id, document_key)
+            entries: List[Dict[str, str]] = []
+            for unit in units:
+                text = str(unit or "").strip()
+                if not cls._is_rulebook_fact_line(text):
+                    continue
+                key, value = text.split(":", 1)
+                key_clean = cls._normalize_rulebook_fact_key(key)
+                value_clean = " ".join(value.strip().split())
+                if not key_clean or not value_clean:
+                    continue
+                entries.append({"key": key_clean, "value": value_clean})
+            return entries
+        except Exception:
+            logger.exception(
+                "Source material: list_rulebook_entries failed for campaign %s key %s",
+                campaign_id,
+                document_key,
+            )
+            return []
+
+    @classmethod
+    def get_rulebook_entry(
+        cls,
+        campaign_id: str,
+        document_key: str,
+        rule_key: str,
+    ) -> Dict[str, str] | None:
+        normalized_key = cls._normalize_rulebook_fact_key(rule_key).lower()
+        if not normalized_key:
+            return None
+        for entry in cls.list_rulebook_entries(campaign_id, document_key):
+            if cls._normalize_rulebook_fact_key(entry.get("key") or "").lower() == normalized_key:
+                return entry
+        return None
+
+    @classmethod
+    def put_rulebook_entry(
+        cls,
+        campaign_id: str,
+        *,
+        document_label: str,
+        rule_key: str,
+        rule_text: str,
+        replace_existing: bool = False,
+    ) -> Dict[str, object]:
+        label = " ".join(str(document_label or "").strip().split())[:120] or "campaign-rulebook"
+        document_key = cls._normalize_source_document_key(label)
+        key_clean = cls._normalize_rulebook_fact_key(rule_key)
+        value_clean = " ".join(str(rule_text or "").strip().split())
+        if not key_clean or not value_clean:
+            return {
+                "ok": False,
+                "document_key": document_key,
+                "document_label": label,
+                "reason": "invalid",
+            }
+
+        entries = cls.list_rulebook_entries(campaign_id, document_key)
+        match_index = -1
+        old_value = None
+        normalized_lookup = key_clean.lower()
+        for idx, entry in enumerate(entries):
+            entry_key = cls._normalize_rulebook_fact_key(entry.get("key") or "")
+            if entry_key.lower() == normalized_lookup:
+                match_index = idx
+                key_clean = entry_key or key_clean
+                old_value = str(entry.get("value") or "").strip()
+                break
+
+        if match_index >= 0 and not replace_existing:
+            return {
+                "ok": False,
+                "document_key": document_key,
+                "document_label": label,
+                "reason": "exists",
+                "key": key_clean,
+                "old_value": old_value or "",
+                "new_value": value_clean,
+            }
+
+        if match_index >= 0:
+            entries[match_index] = {"key": key_clean, "value": value_clean}
+        else:
+            entries.append({"key": key_clean, "value": value_clean})
+
+        lines = [f"{entry['key']}: {entry['value']}" for entry in entries if entry.get("key") and entry.get("value")]
+        stored_count, stored_key = cls.store_source_material_chunks(
+            campaign_id,
+            document_label=label,
+            chunks=["\n".join(lines)],
+            source_mode="rulebook",
+            replace_document=True,
+        )
+        return {
+            "ok": stored_count > 0,
+            "document_key": stored_key,
+            "document_label": label,
+            "key": key_clean,
+            "old_value": old_value or "",
+            "new_value": value_clean,
+            "created": match_index < 0,
+            "replaced": match_index >= 0,
+        }
+
+    @classmethod
     def _source_units_signature(cls, units: List[str]) -> str:
         normalized = "\n".join(
             " ".join(str(unit or "").strip().lower().split())
@@ -364,6 +490,13 @@ class SourceMaterialMemory:
                 """,
                 (str(campaign_id), key),
             )
+            conn.execute(
+                """
+                DELETE FROM source_material_digests
+                WHERE campaign_id = ? AND document_key = ?
+                """,
+                (str(campaign_id), key),
+            )
             conn.commit()
             return int(getattr(cur, "rowcount", 0) or 0)
         except Exception:
@@ -381,6 +514,13 @@ class SourceMaterialMemory:
             cur = conn.execute(
                 """
                 DELETE FROM source_material_chunks
+                WHERE campaign_id = ?
+                """,
+                (str(campaign_id),),
+            )
+            conn.execute(
+                """
+                DELETE FROM source_material_digests
                 WHERE campaign_id = ?
                 """,
                 (str(campaign_id),),
@@ -456,6 +596,124 @@ class SourceMaterialMemory:
                 campaign_id,
             )
             return 0, "source-material"
+
+    @classmethod
+    def store_source_material_digest(
+        cls,
+        campaign_id: str,
+        document_key: str,
+        digest_text: str,
+    ) -> bool:
+        try:
+            key = cls._normalize_source_document_key(document_key)
+            text = str(digest_text or "").strip()
+            if not key or not text:
+                return False
+            conn = cls._get_conn()
+            conn.execute(
+                """
+                INSERT INTO source_material_digests (campaign_id, document_key, digest_text)
+                VALUES (?, ?, ?)
+                ON CONFLICT(campaign_id, document_key)
+                DO UPDATE SET digest_text = excluded.digest_text,
+                              created_at = CURRENT_TIMESTAMP
+                """,
+                (str(campaign_id), key, text),
+            )
+            conn.commit()
+            return True
+        except Exception:
+            logger.exception(
+                "Source material: store digest failed for campaign %s key %s",
+                campaign_id,
+                document_key,
+            )
+            return False
+
+    @classmethod
+    def get_source_material_digest(
+        cls,
+        campaign_id: str,
+        document_key: str,
+    ) -> Optional[str]:
+        try:
+            key = cls._normalize_source_document_key(document_key)
+            if not key:
+                return None
+            conn = cls._get_conn()
+            row = conn.execute(
+                """
+                SELECT digest_text
+                FROM source_material_digests
+                WHERE campaign_id = ? AND document_key = ?
+                """,
+                (str(campaign_id), key),
+            ).fetchone()
+            if row and str(row[0] or "").strip():
+                return str(row[0]).strip()
+            return None
+        except Exception:
+            logger.exception(
+                "Source material: get digest failed for campaign %s key %s",
+                campaign_id,
+                document_key,
+            )
+            return None
+
+    @classmethod
+    def get_all_source_material_digests(
+        cls,
+        campaign_id: str,
+    ) -> Dict[str, str]:
+        try:
+            conn = cls._get_conn()
+            rows = conn.execute(
+                """
+                SELECT document_key, digest_text
+                FROM source_material_digests
+                WHERE campaign_id = ?
+                """,
+                (str(campaign_id),),
+            ).fetchall()
+            return {
+                str(row[0]): str(row[1]).strip()
+                for row in rows
+                if str(row[0] or "").strip() and str(row[1] or "").strip()
+            }
+        except Exception:
+            logger.exception(
+                "Source material: get all digests failed for campaign %s",
+                campaign_id,
+            )
+            return {}
+
+    @classmethod
+    def delete_source_material_digest(
+        cls,
+        campaign_id: str,
+        document_key: str,
+    ) -> bool:
+        try:
+            key = cls._normalize_source_document_key(document_key)
+            if not key:
+                return False
+            conn = cls._get_conn()
+            conn.execute(
+                """
+                DELETE FROM source_material_digests
+                WHERE campaign_id = ? AND document_key = ?
+                """,
+                (str(campaign_id), key),
+            )
+            conn.commit()
+            return True
+        except Exception:
+            logger.exception(
+                "Source material: delete digest failed for campaign %s key %s",
+                campaign_id,
+                document_key,
+            )
+            return False
 
     @classmethod
     def search_source_material(

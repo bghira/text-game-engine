@@ -22,6 +22,49 @@ class GiveItemInstruction:
 
 
 @dataclass
+class DiceCheckOutcome:
+    narration: str
+    state_update: dict[str, Any] = field(default_factory=dict)
+    player_state_update: dict[str, Any] = field(default_factory=dict)
+    xp_awarded: int = 0
+
+
+@dataclass
+class DiceCheckRequest:
+    attribute: str
+    dc: int
+    context: str
+    on_success: DiceCheckOutcome
+    on_failure: DiceCheckOutcome
+
+
+@dataclass
+class DiceCheckResult:
+    attribute: str
+    attribute_value: int
+    dc: int
+    roll: int
+    modifier: int
+    total: int
+    success: bool
+    context: str
+
+
+@dataclass
+class PuzzleTrigger:
+    puzzle_type: str
+    context: str
+    difficulty: str = "medium"
+
+
+@dataclass
+class MinigameChallenge:
+    game_type: str
+    opponent_slug: str
+    stakes: str = ""
+
+
+@dataclass
 class LLMTurnOutput:
     narration: str
     reasoning: Optional[str] = None
@@ -35,6 +78,9 @@ class LLMTurnOutput:
     timer_instruction: Optional[TimerInstruction] = None
     character_updates: dict[str, Any] = field(default_factory=dict)
     give_item: Optional[GiveItemInstruction] = None
+    dice_check: Optional[DiceCheckRequest] = None
+    puzzle_trigger: Optional[PuzzleTrigger] = None
+    minigame_challenge: Optional[MinigameChallenge] = None
 
 
 @dataclass
@@ -72,6 +118,9 @@ class ResolveTurnResult:
     timer_instruction: Optional[TimerInstruction] = None
     give_item: Optional[dict[str, Any]] = None
     conflict_reason: Optional[str] = None
+    dice_result: Optional[DiceCheckResult] = None
+    active_puzzle: Optional[dict[str, Any]] = None
+    active_minigame: Optional[dict[str, Any]] = None
 
 
 @dataclass
