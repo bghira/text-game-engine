@@ -2264,8 +2264,11 @@ class ZorkEmulator:
                 for entry in raw_fragments:
                     if not isinstance(entry, dict):
                         continue
-                    register = str(entry.get("register") or "GENERAL").strip().upper()
-                    obs = str(entry.get("observation") or "").strip()
+                    register = " ".join(str(entry.get("register") or "GENERAL").split()).upper()[:30]
+                    register = "".join(c for c in register if c.isalnum() or c in ("-", "_", " "))
+                    if not register:
+                        register = "GENERAL"
+                    obs = " ".join(str(entry.get("observation") or "").split())
                     if obs:
                         obs = obs[: self._WRITING_FRAGMENT_MAX_CHARS]
                         out.append(f"[{register}] {obs}")
@@ -2793,7 +2796,7 @@ class ZorkEmulator:
                             source_format=source_format,
                             replace_document=True,
                         )
-                        if stored_count > 0:
+                        if stored_count > 0 or source_key:
                             setup_data["source_material_document_key"] = source_key
                         if literary_profiles:
                             styles = state.get(self.LITERARY_STYLES_STATE_KEY)
@@ -4598,7 +4601,7 @@ class ZorkEmulator:
                                 source_format=source_format,
                                 replace_document=True,
                             )
-                            if stored_count > 0:
+                            if stored_count > 0 or source_key:
                                 setup_data["source_material_document_key"] = source_key
                             if literary_profiles:
                                 styles = state.get(self.LITERARY_STYLES_STATE_KEY)
@@ -10732,7 +10735,23 @@ class ZorkEmulator:
                 document_key,
             )
 
-        # Step 2: Extract writing fragments and store as chunks.
+        # Step 2: Clear stale chunks up front when replacing, then extract
+        # writing fragments and store as new chunks.
+        if replace_document:
+            try:
+                conn = SourceMaterialMemory._get_conn()
+                conn.execute(
+                    "DELETE FROM source_material_chunks WHERE campaign_id = ? AND document_key = ?",
+                    (str(campaign_id), document_key),
+                )
+                conn.commit()
+            except Exception:
+                self._logger.exception(
+                    "Failed to clear stale chunks for campaign %s key %s",
+                    campaign_id,
+                    document_key,
+                )
+
         fragments: List[str] = []
         try:
             fragments = await self._extract_writing_fragments(
@@ -10753,7 +10772,7 @@ class ZorkEmulator:
                 document_label=str(document_label or "source-material"),
                 chunks=fragments,
                 source_mode="generic",
-                replace_document=bool(replace_document),
+                replace_document=False,  # Already cleared above.
             )
 
         # Step 3: Extract literary style profiles.
@@ -10761,7 +10780,7 @@ class ZorkEmulator:
         try:
             literary_profiles = await self._analyze_literary_style(
                 text,
-                str(document_label or "source-material").strip().lower().replace(" ", "-").replace("_", "-")[:60],
+                document_key,
             )
         except Exception:
             self._logger.exception(
@@ -10770,7 +10789,7 @@ class ZorkEmulator:
                 document_key,
             )
 
-        return max(stored_count, 1), document_key, literary_profiles
+        return stored_count, document_key, literary_profiles
 
     def search_source_material(
         self,
