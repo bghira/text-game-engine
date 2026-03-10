@@ -2170,6 +2170,132 @@ class ZorkEmulator:
             }
         return result
 
+    # -- Writing fragment extraction (literary analysis → searchable chunks) --
+
+    _WRITING_FRAGMENT_SAMPLE_SIZE = 3000  # chars per passage sample
+    _WRITING_FRAGMENT_MAX_SAMPLES = 12
+    _WRITING_FRAGMENT_MIN_SAMPLES = 4
+    _WRITING_FRAGMENT_MAX_CHARS = 800  # max chars per craft fragment
+
+    async def _extract_writing_fragments(
+        self,
+        text: str,
+        label: str,
+    ) -> List[str]:
+        """Extract prose-craft observation fragments from a literary text.
+
+        Samples multiple passages spread throughout the text, sends each
+        to the LLM for craft analysis, and returns a list of short
+        craft-observation strings suitable for embedding and similarity
+        search during gameplay.
+        """
+        full_text = str(text or "").strip()
+        if not full_text or self._completion_port is None:
+            return []
+
+        # Build passage samples spread evenly through the text.
+        sample_size = self._WRITING_FRAGMENT_SAMPLE_SIZE
+        text_len = len(full_text)
+        n_samples = max(
+            self._WRITING_FRAGMENT_MIN_SAMPLES,
+            min(self._WRITING_FRAGMENT_MAX_SAMPLES, text_len // sample_size),
+        )
+        if text_len <= sample_size * 2:
+            passages = [full_text]
+        else:
+            step = max(1, (text_len - sample_size) // (n_samples - 1))
+            passages = []
+            for i in range(n_samples):
+                start = min(i * step, text_len - sample_size)
+                end = start + sample_size
+                passage = full_text[start:end]
+                # Trim to nearest paragraph/sentence boundary.
+                first_newline = passage.find("\n", 40)
+                if first_newline > 0:
+                    passage = passage[first_newline + 1:]
+                last_period = passage.rfind(".", 0, -40)
+                if last_period > 0:
+                    passage = passage[: last_period + 1]
+                passage = passage.strip()
+                if passage:
+                    passages.append(passage)
+
+        if not passages:
+            return []
+
+        system_prompt = (
+            "You are a prose-craft analyst for a text-adventure game engine. "
+            "Given a passage from a literary work, extract CRAFT observations — NOT plot, NOT content.\n"
+            "For each distinct technique you observe, produce a short fragment describing it.\n"
+            "Focus on: sentence rhythm, clause stacking, vocabulary register, "
+            "punctuation choices, metaphor patterns, dialogue-tag texture, "
+            "pacing techniques, tense usage, emotional register, and what the prose avoids.\n"
+            "Tag each fragment with the REGISTER it applies to (e.g. DESCRIPTION, DIALOGUE, "
+            "ACTION, INTROSPECTION, TRANSITION, ATMOSPHERE).\n"
+            'Return ONLY JSON: {"fragments": [{"register": "...", "observation": "..."}]}\n'
+            f"Each observation must be <= {self._WRITING_FRAGMENT_MAX_CHARS} characters. "
+            "Produce 3-6 fragments per passage."
+        )
+
+        async def _analyze_passage(passage: str) -> List[str]:
+            user_prompt = (
+                f'Analyse the prose craft in this passage from "{label}".\n'
+                f"Passage:\n{passage}\n"
+                "Return only the JSON object."
+            )
+            try:
+                response = await self._completion_port.complete(
+                    system_prompt,
+                    user_prompt,
+                    temperature=0.3,
+                    max_tokens=1500,
+                )
+                cleaned = self._clean_response(response or "")
+                json_text = self._extract_json(cleaned)
+                if not json_text:
+                    return []
+                parsed = self._parse_json_lenient(json_text)
+                if not isinstance(parsed, dict):
+                    return []
+                raw_fragments = parsed.get("fragments")
+                if not isinstance(raw_fragments, list):
+                    return []
+                out: List[str] = []
+                for entry in raw_fragments:
+                    if not isinstance(entry, dict):
+                        continue
+                    register = " ".join(str(entry.get("register") or "GENERAL").split()).upper()[:30]
+                    register = "".join(c for c in register if c.isalnum() or c in ("-", "_", " "))
+                    if not register:
+                        register = "GENERAL"
+                    obs = " ".join(str(entry.get("observation") or "").split())
+                    if obs:
+                        obs = obs[: self._WRITING_FRAGMENT_MAX_CHARS]
+                        out.append(f"[{register}] {obs}")
+                return out
+            except Exception as exc:
+                self._logger.warning("Writing fragment extraction failed for a passage: %s", exc)
+                return []
+
+        # Run in parallel batches of 4.
+        all_fragments: List[str] = []
+        batch_size = 4
+        for batch_start in range(0, len(passages), batch_size):
+            batch = passages[batch_start: batch_start + batch_size]
+            results = await asyncio.gather(*[_analyze_passage(p) for p in batch])
+            for result in results:
+                all_fragments.extend(result)
+
+        # Deduplicate very similar fragments (exact match after lowering).
+        seen: set[str] = set()
+        deduped: List[str] = []
+        for frag in all_fragments:
+            key = frag.lower().strip()
+            if key not in seen:
+                seen.add(key)
+                deduped.append(frag)
+        return deduped
+
     @classmethod
     def _estimate_attachment_chunk_count(cls, text: str) -> int:
         chunks, _, _, _, _ = cls._chunk_text_by_tokens(text)
@@ -2663,15 +2789,21 @@ class ZorkEmulator:
                             )
                             source_format = self.SOURCE_MATERIAL_FORMAT_GENERIC
                         source_format = self._normalize_source_material_format(source_format)
-                        stored_count, source_key = await self.ingest_source_material_with_digest(
+                        stored_count, source_key, literary_profiles = await self.ingest_source_material_with_digest(
                             str(campaign.id),
                             document_label=str(raw_name or "source-material"),
                             text=attachment_text,
                             source_format=source_format,
                             replace_document=True,
                         )
-                        if stored_count > 0:
+                        if stored_count > 0 or source_key:
                             setup_data["source_material_document_key"] = source_key
+                        if literary_profiles:
+                            styles = state.get(self.LITERARY_STYLES_STATE_KEY)
+                            if not isinstance(styles, dict):
+                                styles = {}
+                            styles.update(literary_profiles)
+                            state[self.LITERARY_STYLES_STATE_KEY] = styles
                 except Exception:
                     self._logger.exception(
                         "Start setup source-material indexing failed for campaign %s",
@@ -4462,15 +4594,21 @@ class ZorkEmulator:
                             if summary:
                                 summary_parts.append(f"{source_label}: {summary}")
                         else:
-                            stored_count, source_key = await self.ingest_source_material_with_digest(
+                            stored_count, source_key, literary_profiles = await self.ingest_source_material_with_digest(
                                 str(campaign.id),
                                 document_label=source_label,
                                 text=extracted,
                                 source_format=source_format,
                                 replace_document=True,
                             )
-                            if stored_count > 0:
+                            if stored_count > 0 or source_key:
                                 setup_data["source_material_document_key"] = source_key
+                            if literary_profiles:
+                                styles = state.get(self.LITERARY_STYLES_STATE_KEY)
+                                if not isinstance(styles, dict):
+                                    styles = {}
+                                styles.update(literary_profiles)
+                                state[self.LITERARY_STYLES_STATE_KEY] = styles
                 except Exception:
                     self._logger.exception(
                         "Setup source-material indexing failed for campaign %s",
@@ -10462,13 +10600,51 @@ class ZorkEmulator:
         replace_document: bool = True,
         ctx_message=None,
         channel=None,
-    ) -> tuple[int, str]:
-        """Ingest source material and generate a recursive summary digest.
+    ) -> tuple[int, str, Dict[str, dict]]:
+        """Ingest source material, generate digest, and extract writing style.
 
-        Calls :meth:`ingest_source_material_text` for chunk storage, then
-        runs ``_summarise_long_text`` to produce a narrative digest that is
-        stored alongside the chunks for prompt injection.
+        For **story** format: skips raw paragraph chunk storage entirely.
+        Instead, generates a narrative digest, extracts prose-craft writing
+        fragments via LLM analysis, stores those fragments as searchable
+        chunks, and extracts literary style profiles.  The caller should
+        merge the returned profiles into ``campaign_state["literary_styles"]``.
+
+        For **rulebook** format: stores chunks normally via
+        :meth:`ingest_source_material_text` and generates a digest.
+
+        Returns ``(stored_count, document_key, literary_profiles)`` where
+        ``literary_profiles`` is a dict suitable for merging into
+        ``campaign_state["literary_styles"]`` (empty for non-story formats).
         """
+        try:
+            normalized_format = self._normalize_source_material_format(source_format)
+        except Exception:
+            normalized_format = None
+        if not normalized_format:
+            try:
+                chunks_probe, _, _, _, _ = self._chunk_text_by_tokens(str(text or ""))
+                normalized_format = self._source_material_format_heuristic(
+                    str((chunks_probe[0] if chunks_probe else text[:4000]) or "")
+                )
+            except Exception:
+                normalized_format = self.SOURCE_MATERIAL_FORMAT_GENERIC
+
+        # ------------------------------------------------------------------
+        # Story format: literary analysis pipeline (no raw chunk storage)
+        # ------------------------------------------------------------------
+        if normalized_format == self.SOURCE_MATERIAL_FORMAT_STORY:
+            return await self._ingest_story_literary(
+                campaign_id,
+                document_label=document_label,
+                text=text,
+                replace_document=replace_document,
+                ctx_message=ctx_message,
+                channel=channel,
+            )
+
+        # ------------------------------------------------------------------
+        # Rulebook / other: existing flow (raw chunks + digest)
+        # ------------------------------------------------------------------
         stored_count, document_key = self.ingest_source_material_text(
             campaign_id,
             document_label=document_label,
@@ -10477,25 +10653,9 @@ class ZorkEmulator:
             replace_document=replace_document,
         )
         if stored_count <= 0:
-            return stored_count, document_key
+            return stored_count, document_key, {}
 
-        try:
-            normalized_format = self._normalize_source_material_format(source_format)
-        except Exception:
-            normalized_format = None
-        if not normalized_format:
-            try:
-                chunks, _, _, _, _ = self._chunk_text_by_tokens(str(text or ""))
-                normalized_format = self._source_material_format_heuristic(
-                    str((chunks[0] if chunks else text[:4000]) or "")
-                )
-            except Exception:
-                normalized_format = self.SOURCE_MATERIAL_FORMAT_GENERIC
-
-        if normalized_format in (
-            self.SOURCE_MATERIAL_FORMAT_STORY,
-            self.SOURCE_MATERIAL_FORMAT_RULEBOOK,
-        ):
+        if normalized_format == self.SOURCE_MATERIAL_FORMAT_RULEBOOK:
             try:
                 digest = await self._summarise_long_text(
                     text,
@@ -10523,7 +10683,113 @@ class ZorkEmulator:
                     document_key,
                 )
 
-        return stored_count, document_key
+        return stored_count, document_key, {}
+
+    async def _ingest_story_literary(
+        self,
+        campaign_id: str,
+        *,
+        document_label: str,
+        text: str,
+        replace_document: bool = True,
+        ctx_message=None,
+        channel=None,
+    ) -> tuple[int, str, Dict[str, dict]]:
+        """Story-format ingestion: digest + writing fragments + literary profiles.
+
+        Instead of storing raw story paragraphs, this method:
+        1. Generates a narrative digest (content/plot retrieval).
+        2. Extracts prose-craft writing fragments via LLM and stores
+           them as the searchable chunks (style retrieval).
+        3. Extracts overall literary style profiles for prompt injection.
+        """
+        document_key = SourceMaterialMemory._normalize_source_document_key(
+            str(document_label or "source-material")
+        )
+
+        # Step 1: Generate narrative digest.
+        try:
+            digest = await self._summarise_long_text(
+                text,
+                ctx_message=ctx_message,
+                channel=channel,
+                summary_instructions=(
+                    "This is source material for a text-adventure campaign. "
+                    "Produce a comprehensive narrative digest preserving all characters, "
+                    "locations, plot arcs, factions, key events, world rules, and "
+                    "relationships. Maintain chronological order where applicable. "
+                    "Be detailed and concrete — this digest will be used to ground "
+                    "the campaign world."
+                ),
+            )
+            if digest and digest.strip():
+                SourceMaterialMemory.store_source_material_digest(
+                    str(campaign_id),
+                    document_key,
+                    digest.strip(),
+                )
+        except Exception:
+            self._logger.exception(
+                "Story digest generation failed for campaign %s key %s",
+                campaign_id,
+                document_key,
+            )
+
+        # Step 2: Clear stale chunks up front when replacing, then extract
+        # writing fragments and store as new chunks.
+        if replace_document:
+            try:
+                conn = SourceMaterialMemory._get_conn()
+                conn.execute(
+                    "DELETE FROM source_material_chunks WHERE campaign_id = ? AND document_key = ?",
+                    (str(campaign_id), document_key),
+                )
+                conn.commit()
+            except Exception:
+                self._logger.exception(
+                    "Failed to clear stale chunks for campaign %s key %s",
+                    campaign_id,
+                    document_key,
+                )
+
+        fragments: List[str] = []
+        try:
+            fragments = await self._extract_writing_fragments(
+                text,
+                str(document_label or "source-material"),
+            )
+        except Exception:
+            self._logger.exception(
+                "Writing fragment extraction failed for campaign %s key %s",
+                campaign_id,
+                document_key,
+            )
+
+        stored_count = 0
+        if fragments:
+            stored_count, document_key = SourceMaterialMemory.store_source_material_chunks(
+                str(campaign_id),
+                document_label=str(document_label or "source-material"),
+                chunks=fragments,
+                source_mode="generic",
+                replace_document=False,  # Already cleared above.
+            )
+
+        # Step 3: Extract literary style profiles.
+        literary_profiles: Dict[str, dict] = {}
+        try:
+            literary_profiles = await self._analyze_literary_style(
+                text,
+                document_key,
+            )
+        except Exception:
+            self._logger.exception(
+                "Literary style extraction failed for campaign %s key %s",
+                campaign_id,
+                document_key,
+            )
+
+        return stored_count, document_key, literary_profiles
 
     def search_source_material(
         self,
