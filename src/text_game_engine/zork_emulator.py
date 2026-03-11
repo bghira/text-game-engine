@@ -82,13 +82,7 @@ class ZorkEmulator:
     XP_BASE = 100
     XP_PER_LEVEL = 50
     ATTENTION_WINDOW_SECONDS = 600
-    IMMUTABLE_CHARACTER_FIELDS = {
-        "name",
-        "personality",
-        "background",
-        "appearance",
-        "speech_style",
-    }
+    IMMUTABLE_CHARACTER_FIELDS: set = set()  # slug is the dict key, not a field
     ATTACHMENT_MAX_BYTES = 500_000
     ATTACHMENT_CHUNK_TOKENS = 50_000
     ATTACHMENT_MODEL_CTX_TOKENS = 200_000
@@ -145,7 +139,88 @@ class ZorkEmulator:
         SOURCE_MATERIAL_FORMAT_GENERIC: "generic",
     }
     AUTO_RULEBOOK_DOCUMENT_LABEL = "campaign-rulebook"
+    COMMUNICATION_RULEBOOK_DOCUMENT_LABEL = "gm-communication-rules"
     AUTO_RULEBOOK_MAX_TOKENS = 16_000
+    DEFAULT_GM_COMMUNICATION_RULES: dict[str, str] = {
+        "GM-RULE-COMMUNICATION-SOFTENING": (
+            "When the player wraps real emotional content in humor, metaphor, or understatement, "
+            "this is softening — emotional load management, not avoidance. The feeling is present; "
+            "the packaging is gentle. The GM recognizes the underlying feeling. NPCs may critique "
+            "the packaging (e.g., 'I hate when you joke about this'), but they must still react "
+            "to the substance rather than treating the response as a non-answer. "
+            'Example: "I guess I\'m just here for the bad decisions" → substance: '
+            '"I\'m hurting and I came here because I didn\'t know where else to go."'
+        ),
+        "GM-RULE-COMMUNICATION-REFRAMING": (
+            "When the player places something painful inside a different context — a joke, a reference, "
+            "a physical metaphor — this is reframing. The GM recognizes this as a collaborative act, "
+            "giving the NPC a way to engage safely. The NPC reacts to the reframed concept based on "
+            "their personality (e.g., playing along, or being confused by the metaphor), rather than "
+            "acting like a broken parser demanding a literal answer. "
+            'Example: "Figure out your knot" → substance: '
+            '"I love you and I need you to find your own way forward."'
+        ),
+        "GM-RULE-COMMUNICATION-TESTING": (
+            "When the player gives a partial or indirect answer, they may be testing whether the NPC "
+            "is safe to be honest with. The GM recognizes this as calibration, not evasion. The NPC "
+            "reacts based on their nature—with warmth, impatience, or suspicion. The NPC is allowed "
+            "to fail the player's 'test', but they do so as a character, not by rejecting the prompt "
+            "with 'that's not what I asked.' "
+            'Example: "Yeah, something like that, I don\'t know" → substance: '
+            '"I\'m checking whether you\'ll receive a half-answer with patience."'
+        ),
+        "GM-RULE-COMMUNICATION-PROCESSING": (
+            "When the player's words come out disorganized, circular, or contradictory, they may be "
+            "processing aloud — working toward clarity in real time. The GM recognizes this as processing, "
+            "not evasion. A patient NPC might give space; an impatient or low-intelligence NPC might "
+            "interrupt or show frustration, but they do so as a character reacting to a rambling person, "
+            "not as an AI failing to understand the input."
+        ),
+        "GM-RULE-COMMUNICATION-INDIRECTION": (
+            "The player may communicate through patterns shaped by their background — literal language "
+            "that sounds blunt, indirect language that sounds evasive, humor that sounds dismissive, "
+            "silence that sounds cold. The GM recognizes these as valid communication modes. When a "
+            "mismatch occurs, the NPC reacts according to their nature (confused, offended, asking for "
+            "clarification), but the GM does not label the player as uncooperative."
+        ),
+        "GM-RULE-COMMUNICATION-PLAYFUL": (
+            "When the player participates in a social dance — flirtation, banter, verbal sparring — "
+            "indirection IS the content. The GM recognizes this as a social dance, not a refusal to "
+            "answer. The NPC may dance back, or abruptly shut it down if they are humorless, but they "
+            "do so because of who they are, not because the GM requires a straight, literal answer."
+        ),
+        "GM-RULE-COMMUNICATION-ACTION": (
+            "When the player does something physical instead of answering verbally — pouring a drink, "
+            "looking out the window, walking to the door — they are communicating through action. "
+            "The GM recognizes the action for its emotional content and does not treat verbal silence "
+            "as a refusal to engage. The NPC reacts to the meaning of the physical action. "
+            'Example: "I lie down and go to sleep" after a difficult conversation → substance: '
+            '"I\'m overwhelmed and need to stop processing right now."'
+        ),
+        "GM-RULE-SUBSTANCE-EXTRACTION": (
+            "Before deciding how an NPC responds, the GM's reasoning must perform SUBSTANCE EXTRACTION: "
+            "identify what the player actually communicated, separate from how they communicated it. "
+            "Format in reasoning: 'Player said [X]. Communication mode: [mode]. Substance: [what they "
+            "actually mean/feel/need].' The NPC then responds to that SUBSTANCE strictly through the "
+            "filter of their own intelligence, perception, and personality. (e.g., a low-INT goblin might "
+            "misinterpret the extracted substance completely, but the GM knows what the player meant)."
+        ),
+        "GM-RULE-NPC-RESPONSE-TO-INDIRECTION": (
+            "NPCs must not treat indirect communication as a failure to prompt. They CAN be confused, moved, "
+            "annoyed, uncomfortable, or delighted by it. An NPC can critique the player's delivery ('Stop "
+            "joking about dying'), provided they don't get stuck in a loop demanding a 'real' answer. The "
+            "constraint is on the GM's CATEGORIZATION in reasoning, not on the NPC's PERSONALITY in dialogue."
+        ),
+        "GM-RULE-EVASION-DEFINITION": (
+            "Categorize player communication as evasion when the player intentionally redirects to avoid "
+            "consequences, hide information, or escape accountability. Intentionality is the key factor. "
+            "If a player mentions their friends to dodge a murder accusation, that is evasion, even if "
+            "it is tangentially connected emotionally. If they are reaching for connection through the "
+            "only words they can find, it is not evasion. The GM must assess if the player is deliberately "
+            "dodging before labeling a response as evasive."
+        ),
+    }
+    COMMUNICATION_RULE_KEYS = tuple(DEFAULT_GM_COMMUNICATION_RULES.keys())
     DEFAULT_SCENE_IMAGE_MODEL = "black-forest-labs/FLUX.2-klein-4b"
     DEFAULT_AVATAR_IMAGE_MODEL = "black-forest-labs/FLUX.2-klein-4b"
     SCENE_IMAGE_PRESERVE_PREFIX = (
@@ -339,6 +414,16 @@ class ZorkEmulator:
         "if that NPC plausibly knows in this scene (direct evidence, prior established knowledge, or in-scene disclosure). "
         "Do not leak off-screen NPC communications into current NPC dialogue unless continuity clearly supports it.]"
     )
+    WRITING_CRAFT_PROMPT = (
+        "WRITING_CRAFT:\n"
+        "- Anticipate what the player needs to know right now. Answer their implicit questions before they ask.\n"
+        "- Ground every sentence in the concrete: sensory detail, specific objects, named places. Abstract summary is not narration.\n"
+        "- Simple, not simplistic. Accessible prose that trusts the reader's intelligence. Never over-explain.\n"
+        "- Every paragraph earns its place. Cut anything that doesn't move the scene, reveal character, or build atmosphere.\n"
+        "- Prefer the precise word over the approximate one. One vivid verb beats three limp adjectives.\n"
+        "- Structure matters: vary sentence length and rhythm. A short sentence after a long one lands harder.\n"
+        "- Style is the differentiator. Don't just describe what happens — make how you describe it unmistakable.\n"
+    )
     PROMPT_STAGE_BOOTSTRAP = "bootstrap"
     PROMPT_STAGE_RESEARCH = "research"
     PROMPT_STAGE_FINAL = "final"
@@ -361,6 +446,12 @@ class ZorkEmulator:
         "When you have enough context to write the turn, return ONLY:\n"
         '{"tool_call": "ready_to_write"}\n'
         "Do not narrate in the same response as ready_to_write.\n"
+        "If the player's communication mode/substance matters before narration, you may first request only the relevant communication rules:\n"
+        '{"tool_call": "communication_rules", "keys": ["GM-RULE-COMMUNICATION-SOFTENING", "GM-RULE-SUBSTANCE-EXTRACTION"]}\n'
+        "Available communication rule keys: "
+        + ", ".join(COMMUNICATION_RULE_KEYS)
+        + ".\n"
+        "Request only the subset that matters for this turn, then return ready_to_write.\n"
     )
     DIFFICULTY_LEVELS = (
         "story",
@@ -417,7 +508,8 @@ class ZorkEmulator:
         "- summary_update: string (one or two sentences of lasting changes)\n"
         "- xp_awarded: integer (0-10)\n"
         "- player_state_update: object (optional, player state patches)\n"
-        '- turn_visibility: object (optional; who should get this turn in future prompt context. Keys: "scope" ("public"|"private"|"limited"|"local"), "player_slugs" (array of player slugs from PARTY_SNAPSHOT/CURRENTLY_ATTENTIVE_PLAYERS, typically in `player-<actor_id>` form), "npc_slugs" (array of WORLD_CHARACTERS slugs who overheard/noticed), and optional "reason". This changes prompt visibility only; it does NOT change shared world state.)\n'
+        '- co_located_player_slugs: array (optional; exact PARTY_SNAPSHOT player_slugs for OTHER CAMPAIGN_PLAYERS who remain physically with the acting player after this turn. Use only for room/location sync; it does NOT authorize new dialogue, actions, or decisions for them.)\n'
+        '- turn_visibility: object (optional; who should get this turn in future prompt context. Keys: "scope" ("public"|"private"|"limited"|"local"), "player_slugs" (array of player slugs from PARTY_SNAPSHOT, typically in `player-<actor_id>` form), "npc_slugs" (array of WORLD_CHARACTERS slugs who overheard/noticed), and optional "reason". This changes prompt visibility only; it does NOT change shared world state.)\n'
         "- scene_image_prompt: string (optional; include whenever the visible scene changes in a meaningful way: entering a room, newly visible characters/objects, reveals, or strong visual shifts)\n"
         "- set_timer_delay: integer (optional; 30-300 seconds, see TIMED EVENTS SYSTEM below)\n"
         "- set_timer_event: string (optional; what happens when the timer expires)\n"
@@ -444,6 +536,10 @@ class ZorkEmulator:
         "relationships is a map keyed by other character slug/name, e.g. "
         "{\"deshawn\": {\"status\": \"partner\", \"knows_about\": [\"pregnancy\"], \"doesnt_know\": [\"blood-test-result\"], \"dynamic\": \"protective-but-autonomous\"}}. "
         "Use it to track disclosures, secrets, and dynamic shifts.\n"
+        "Examples:\n"
+        "  Create NPC: {\"character_updates\": {\"wren\": {\"name\": \"Wren\", \"personality\": \"Guarded, observant, dry.\", \"background\": \"Former hotel manager pulled into the expedition.\", \"appearance\": \"Lean woman in a weather-stained blazer, dark braid, sharp eyes, practical shoes, realistic style.\", \"speech_style\": \"Short sentences. Dry humor. Avoids sentiment.\", \"location\": \"jekyll-castle-east-annex-laboratory\", \"current_status\": \"Watching the doorway.\", \"allegiance\": \"self\", \"relationship\": \"wary ally\"}}}\n"
+        "  Update NPC location/status: {\"character_updates\": {\"wren\": {\"location\": \"jekyll-castle-east-annex-laboratory\", \"current_status\": \"Processing that the castle trip was unnecessary.\"}}}\n"
+        "  Remove NPC from roster: {\"character_updates\": {\"wren\": null}}\n"
         "To remove a character from the roster, use character_updates ONLY: set that character slug to null "
         "or set it to {'remove': true}. "
         "NEVER use state_update.<character_slug>=null for roster removal. "
@@ -475,13 +571,16 @@ class ZorkEmulator:
         "- Keep diction plain and direct; prioritize immediate consequences and available choices.\n"
         "- RECENT_TURNS includes turn/time tags like [TURN #N | Day D HH:MM]. Use them to track pacing and chronology.\n"
         "- RECENT_TURNS is already filtered to what the acting player plausibly knows. Hidden/private turns from other players are omitted.\n"
-        "- CURRENTLY_ATTENTIVE_PLAYERS lists players active within ATTENTION_WINDOW_SECONDS. Use it to pace time and scene focus.\n"
         "- TURN_VISIBILITY_DEFAULT tells you whether this turn should default to public, local, or private context.\n"
+        "- When SOURCE_MATERIAL_DOCS is present, treat it as canon. On normal turns, source lookup should be part of your research plan before asserting key plot facts, but only query the relevant subset for this turn.\n"
+        "- Use source payload to bias queries: rulebook docs are key-snippet indexes (browse with source_browse first), story docs are narrative scenes, generic docs are mixed/loose notes.\n"
         "- If WORLD_SUMMARY is empty, invent a strong starting room and seed the world.\n"
         "- Use player_state_update for player-specific location and status.\n"
         "- Use player_state_update.room_title for a short location title (e.g. 'Penthouse Suite, Escala') whenever location changes.\n"
         "- Use player_state_update.room_description for a full room description only when location changes.\n"
         "- Use player_state_update.room_summary for a short one-line room summary for future context.\n"
+        "- MULTI-PLAYER LOCATION SYNC: if another real player character from PARTY_SNAPSHOT is still physically with the acting player after this turn, include their exact PARTY_SNAPSHOT slug in co_located_player_slugs. The harness will mirror the acting player's room fields to them without inventing new behavior.\n"
+        'Example: {"player_state_update":{"location":"side-room-b","room_title":"Side Room B","room_summary":"Private side room off Fellowship Hall.","room_description":"A narrow side room with a low lamp and one upholstered bench.","exits":["Fellowship Hall"]},"co_located_player_slugs":["player-249794335095128065"]}\n'
         "- CRITICAL — ROOM STATE COHERENCE: whenever the player's physical location changes (movement, teleport, time-skip, "
         "reuniting with party, being picked up, waking in a new place, etc.) you MUST update ALL of: "
         "location, room_title, room_summary, room_description, and exits in player_state_update. "
@@ -526,8 +625,8 @@ class ZorkEmulator:
         "  * local: default for ordinary in-room action when a concrete location_key/room is present. Players in the same room should retain it in prompt context, but it should not enter global/worldwide recap.\n"
         "  * limited: only the acting player plus the listed player_slugs should retain the turn in prompt context.\n"
         "  * Phone/text/SMS activity is private by default to the acting player. If they text or message someone off-scene, use private or limited unless they explicitly show or read it aloud to others.\n"
-        "  * When a player starts a whisper, pull-aside, or private word, move that exchange into private or limited context immediately and keep it there until they clearly rejoin the room or a different conversation.\n"
-        "  * Do not dump the contents of a brand-new whisper into public/local narration before privacy is established. First establish the aside, then continue the private exchange on later turns.\n"
+        "  * Intimacy or sexual activity is NOT automatically private. If it happens openly in the same room, it is usually local unless the player takes it off-scene or the scene is already inside an established private thread.\n"
+        "  * Private context is managed by the harness via explicit player commands or UI actions. Do NOT auto-detect whispers or asides from narration — only honour TURN_VISIBILITY_DEFAULT and ACTIVE_PRIVATE_CONTEXT as provided.\n"
         "  * npc_slugs are for overheard/noticed NPC awareness only. They help continuity but do not expose the turn to other players by themselves.\n"
         "  * If TURN_VISIBILITY_DEFAULT is local, keep routine room-level interaction local unless it clearly becomes public.\n"
         "  * If TURN_VISIBILITY_DEFAULT is private and nothing in the scene clearly makes the action public, keep it private or limited.\n"
@@ -557,6 +656,7 @@ class ZorkEmulator:
         "- REASONING CHECKS (must be reflected in reasoning):\n"
         "  * Calendar removals: only remove events that THIS turn's action/narration directly resolved.\n"
         "  * Movement consistency: if any NPC/entity moves in narration, include matching location updates in character_updates/state_update.\n"
+        "    Example NPC move: {\"character_updates\": {\"dr-helena-marsh\": {\"location\": \"dr-jekyll-castle-room-14\", \"current_status\": \"At the threshold, watching.\"}}}\n"
         "- Causality first: do not introduce new pursuers, attacks, disasters, media attention, or environmental threats without concrete setup in prior turns/state.\n"
         "- Escalations must follow a believable chain of evidence and opportunity (how they found the player, why now, and through what channel).\n"
         "- No omniscient coincidence pressure: avoid out-of-nowhere helicopters, enemy arrivals, or wildlife hazards unless foreshadowed or logically triggered.\n"
@@ -675,7 +775,7 @@ class ZorkEmulator:
         "- Source-material memory search should only be enabled when the current player action explicitly asks for canon recall/details.\n"
         "- Do NOT call memory_search, memory_terms, memory_turn, or memory_store.\n"
         "- You may still call recent_turns for immediate visible continuity.\n"
-        "- Use WORLD_SUMMARY, WORLD_STATE, WORLD_CHARACTERS, PARTY_SNAPSHOT, CURRENTLY_ATTENTIVE_PLAYERS, and recent_turns when needed.\n"
+        "- Use WORLD_SUMMARY, WORLD_STATE, WORLD_CHARACTERS, PARTY_SNAPSHOT, and recent_turns when needed.\n"
     )
     RECENT_TURNS_TOOL_PROMPT = (
         "\nYou have a recent_turns tool for immediate visible continuity.\n"
@@ -747,7 +847,7 @@ class ZorkEmulator:
         "When category is provided in memory_search, curated memories in that category are vector searched.\n"
         "When SOURCE_MATERIAL_DOCS is present, source canon is indexed in vector memory.\n"
         "Each source doc has one format: story, rulebook, or generic.\n"
-        "Use memory_search with category 'source' for canon facts before narration.\n"
+        "Use memory_search with category 'source' for canon facts before narration. On normal turns, include only the relevant subset of source canon for this turn rather than trying to fetch every document:\n"
         '{"tool_call": "memory_search", "category": "source", "queries": ["character name", "location", "event"]}\n'
         "You can scope one source document with category 'source:<document_key>' when SOURCE_MATERIAL_DOCS provides keys.\n"
         "Format notes: rulebook = line facts in KEY: value form; story = prose/scripted scenes; generic = mixed notes.\n"
@@ -765,7 +865,7 @@ class ZorkEmulator:
         "STRATEGY: for a rulebook you have not seen before, call source_browse with no wildcard first to see what keys exist, "
         "then use source_browse with a wildcard or memory_search with category 'source:<document_key>' for detail.\n"
         "\nRECENT TURN CONTINUITY:\n"
-        "- If you need to know what just happened in the room or active whisper/private exchange, call recent_turns first.\n"
+        "- If you need to know what just happened in the room or active private context, call recent_turns first.\n"
         "- recent_turns is the authoritative immediate continuity tool; memory_search is for deeper or older recall.\n"
         "\nNAME GENERATION — name_generate tool:\n"
         "When introducing a new NPC, use name_generate to get real culturally-appropriate names instead of inventing them.\n"
@@ -829,9 +929,8 @@ class ZorkEmulator:
         "Every turn, you MUST advance game_time in state_update by a plausible amount "
         "(minutes for quick actions, hours for travel, etc.). "
         "Scale the advance by SPEED_MULTIPLIER — at 2x, time passes roughly twice as fast per turn.\n"
-        "Use CURRENTLY_ATTENTIVE_PLAYERS for pacing: if only one player is attentive and no immediate deadline is active, "
-        "prefer larger jumps (15-90 minutes or to the next meaningful beat) instead of repeated 5-10 minute increments.\n"
-        "If multiple players are currently attentive in the same campaign, keep finer-grained time only when needed to preserve shared-scene coherence.\n"
+        "Pace game_time by scene needs: prefer larger jumps (15-90 minutes or to the next meaningful beat) when no immediate deadline is active, "
+        "and keep finer-grained time only when needed to preserve shared-scene coherence.\n"
         "Update these fields in state_update:\n"
         '- "game_time": {"day": int, "hour": int (0-23), "minute": int (0-59), '
         '"period": "morning"|"afternoon"|"evening"|"night", '
@@ -1139,6 +1238,17 @@ class ZorkEmulator:
                 by_slug[slug] = entry
         return {"by_actor_id": by_actor_id, "by_slug": by_slug}
 
+    def get_pc_names(self, campaign_id: str) -> list[str]:
+        """Return display names of all player characters in a campaign."""
+        registry = self._campaign_player_registry(
+            campaign_id, self._session_factory
+        )
+        return [
+            str(e.get("name") or "")
+            for e in registry.get("by_actor_id", {}).values()
+            if str(e.get("name") or "").strip()
+        ]
+
     @staticmethod
     def _safe_turn_meta(turn: Turn) -> dict[str, object]:
         meta = parse_json_dict(getattr(turn, "meta_json", "{}"))
@@ -1190,10 +1300,14 @@ class ZorkEmulator:
         if scope in {"", "public"}:
             return True
         if scope == "local":
-            turn_location_key = str(
-                visibility.get("location_key") or meta.get("location_key") or ""
-            ).strip().lower()
-            if viewer_location_key and turn_location_key and viewer_location_key == turn_location_key:
+            turn_location_keys = {
+                k for k in (
+                    cls._normalize_location_key(visibility.get("location_key")),
+                    cls._normalize_location_key(meta.get("location_key")),
+                ) if k
+            }
+            viewer_loc_norm = cls._normalize_location_key(viewer_location_key)
+            if viewer_loc_norm and turn_location_keys and viewer_loc_norm in turn_location_keys:
                 return True
         if viewer_actor_id in actor_ids:
             return True
@@ -1601,49 +1715,6 @@ class ZorkEmulator:
         attention_seconds = self._coerce_non_negative_int(stats.get(self.PLAYER_STATS_ATTENTION_SECONDS_KEY), 0)
         stats["attention_hours"] = round(attention_seconds / 3600.0, 2)
         return stats
-
-    def _build_currently_attentive_players_for_prompt(
-        self,
-        campaign_id: str,
-        limit: int | None = None,
-    ) -> list[dict[str, object]]:
-        now_dt = self._now()
-        max_rows = limit if isinstance(limit, int) and limit > 0 else self.MAX_PARTY_CONTEXT_PLAYERS
-        with self._session_factory() as session:
-            rows = (
-                session.query(Player)
-                .filter(Player.campaign_id == campaign_id)
-                .order_by(Player.last_active_at.desc())
-                .all()
-            )
-        out: list[dict[str, object]] = []
-        for row in rows:
-            player_state = self.get_player_state(row)
-            stats = self._get_player_stats_from_state(player_state)
-            last_message_at = self._parse_utc_timestamp(
-                stats.get(self.PLAYER_STATS_LAST_MESSAGE_AT_KEY)
-            )
-            if last_message_at is None:
-                continue
-            since_seconds = int((now_dt - last_message_at).total_seconds())
-            if since_seconds < 0 or since_seconds > self.ATTENTION_WINDOW_SECONDS:
-                continue
-            name = str(player_state.get("character_name") or "").strip()
-            player_slug = self._player_visibility_slug(row.actor_id)
-            out.append(
-                {
-                    "actor_id": row.actor_id,
-                    "name": name or None,
-                    "player_slug": player_slug,
-                    "seconds_since_last_message": since_seconds,
-                    "attention_seconds_total": self._coerce_non_negative_int(
-                        stats.get(self.PLAYER_STATS_ATTENTION_SECONDS_KEY), 0
-                    ),
-                }
-            )
-            if len(out) >= max_rows:
-                break
-        return out
 
     def _normalize_campaign_name(self, name: str) -> str:
         return normalize_campaign_name(name)
@@ -2516,9 +2587,27 @@ class ZorkEmulator:
                     "keys": document_keys,
                 }
             )
-        digests = SourceMaterialMemory.get_all_source_material_digests(
-            str(campaign_id),
-        )
+        communication_key = cls.communication_rulebook_document_key()
+        rulebook_document_keys = {
+            str(doc.get("document_key") or "").strip()
+            for doc in compact_docs
+            if str(doc.get("format") or "").strip().lower()
+            == cls.SOURCE_MATERIAL_FORMAT_RULEBOOK
+        }
+        digests = {
+            str(doc_key): digest_text
+            for doc_key, digest_text in (
+                SourceMaterialMemory.get_all_source_material_digests(
+                    str(campaign_id),
+                )
+                or {}
+            ).items()
+            if (
+                SourceMaterialMemory._normalize_source_document_key(str(doc_key or ""))
+                != communication_key
+                and str(doc_key or "").strip() not in rulebook_document_keys
+            )
+        }
         return {
             "available": bool(compact_docs),
             "document_count": len(compact_docs),
@@ -3041,7 +3130,7 @@ class ZorkEmulator:
                     limit = max(1, min(255, int(payload.get("limit") or 255)))
                 except (TypeError, ValueError):
                     pass
-                lines = SourceMaterialMemory.browse_source_keys(
+                lines = self.browse_source_keys(
                     str(campaign.id),
                     document_key=doc_key or None,
                     wildcard=wildcard,
@@ -3091,7 +3180,7 @@ class ZorkEmulator:
                     pass
                 hits: list[str] = []
                 for q in queries:
-                    results = SourceMaterialMemory.search_source_material(
+                    results = self.search_source_material(
                         q,
                         str(campaign.id),
                         document_key=doc_key_scope,
@@ -3207,6 +3296,19 @@ class ZorkEmulator:
             return ""
         return str(match.group(1) or "").strip().upper()
 
+    @classmethod
+    def communication_rulebook_document_key(cls) -> str:
+        return SourceMaterialMemory._normalize_source_document_key(
+            cls.COMMUNICATION_RULEBOOK_DOCUMENT_LABEL
+        )
+
+    @classmethod
+    def _communication_rulebook_lines(cls) -> list[str]:
+        return [
+            f"{rule_key}: {rule_text}"
+            for rule_key, rule_text in cls.DEFAULT_GM_COMMUNICATION_RULES.items()
+        ]
+
     def _canonical_seed_rulebook_lines(
         self,
         campaign_id: str,
@@ -3218,6 +3320,7 @@ class ZorkEmulator:
         auto_key = SourceMaterialMemory._normalize_source_document_key(
             self.AUTO_RULEBOOK_DOCUMENT_LABEL
         )
+        communication_key = self.communication_rulebook_document_key()
         for doc in docs:
             if not isinstance(doc, dict):
                 continue
@@ -3226,7 +3329,12 @@ class ZorkEmulator:
             doc_format = str(doc.get("format") or "").strip().lower()
             if doc_format != self.SOURCE_MATERIAL_FORMAT_RULEBOOK:
                 continue
-            if doc_label == self.AUTO_RULEBOOK_DOCUMENT_LABEL or doc_key == auto_key:
+            if (
+                doc_label == self.AUTO_RULEBOOK_DOCUMENT_LABEL
+                or doc_key == auto_key
+                or doc_label == self.COMMUNICATION_RULEBOOK_DOCUMENT_LABEL
+                or doc_key == communication_key
+            ):
                 continue
             units = SourceMaterialMemory.get_source_material_document_units(
                 str(campaign_id),
@@ -5160,10 +5268,23 @@ class ZorkEmulator:
         text = str(value).strip().lower()
         return re.sub(r"\s+", " ", text)
 
+    @staticmethod
+    def _normalize_location_key(value: object) -> str:
+        """Collapse a location key to a canonical alphanumeric form.
+
+        Both human-readable names (``"Nothing's Edge Approach"``) and
+        slug-style keys (``"nothing-edge-approach"``) normalise to the
+        same string (``"nothingsedgeapproach"``), so they compare equal
+        regardless of which format was used at storage time.
+        """
+        if value is None:
+            return ""
+        return re.sub(r"[^a-z0-9]", "", str(value).strip().lower())
+
     def _room_key_from_player_state(self, player_state: Dict[str, object]) -> str:
         if not isinstance(player_state, dict):
             return "unknown-room"
-        for key in ("room_id", "location", "room_title", "room_summary"):
+        for key in ("location_key", "room_id", "location", "room_title", "room_summary"):
             raw = player_state.get(key)
             normalized = self._normalize_match_text(raw)
             if normalized:
@@ -7453,7 +7574,12 @@ class ZorkEmulator:
                     )
                 _append_if_relevant(recent_lines, summary_candidate)
 
-        lines = recent_lines + persisted_lines
+        # The persisted campaign.summary blob predates visibility-aware
+        # composition and may contain global/stale lines from scenes the current
+        # viewer should not see. Once we have usable recent narrator history for
+        # this viewer, prefer that scoped history and treat the persisted blob as
+        # fallback only.
+        lines = recent_lines if recent_lines else persisted_lines
         text = "\n".join(lines).strip()
         if text:
             return self._trim_text(text, max_chars)
@@ -10114,9 +10240,6 @@ class ZorkEmulator:
             or calendar_state_after != calendar_state_before
         ):
             campaign.state_json = self._dump_json(state)
-        currently_attentive = self._build_currently_attentive_players_for_prompt(
-            campaign.id
-        )
         source_payload = self._source_material_prompt_payload(campaign.id)
         literary_styles_text = self._literary_styles_for_prompt(
             state,
@@ -10163,8 +10286,6 @@ class ZorkEmulator:
             f"CURRENT_GAME_TIME: {self._dump_json(game_time)}\n"
             f"SPEED_MULTIPLIER: {speed_mult}\n"
             f"DIFFICULTY: {difficulty}\n"
-            f"ATTENTION_WINDOW_SECONDS: {self.ATTENTION_WINDOW_SECONDS}\n"
-            f"CURRENTLY_ATTENTIVE_PLAYERS: {self._dump_json(currently_attentive)}\n"
             f"ACTIVE_PLAYER_LOCATION: {self._dump_json(active_location_context)}\n"
             f"MEMORY_LOOKUP_ENABLED: {str(memory_lookup_enabled).lower()}\n"
             f"RECENT_TURNS_LOADED: {str(not bootstrap_only).lower()}\n"
@@ -10601,7 +10722,7 @@ class ZorkEmulator:
         ctx_message=None,
         channel=None,
     ) -> tuple[int, str, Dict[str, dict]]:
-        """Ingest source material, generate digest, and extract writing style.
+        """Ingest source material and extract writing style.
 
         For **story** format: skips raw paragraph chunk storage entirely.
         Instead, generates a narrative digest, extracts prose-craft writing
@@ -10610,7 +10731,9 @@ class ZorkEmulator:
         merge the returned profiles into ``campaign_state["literary_styles"]``.
 
         For **rulebook** format: stores chunks normally via
-        :meth:`ingest_source_material_text` and generates a digest.
+        :meth:`ingest_source_material_text` and explicitly removes any
+        narrative digest, since rulebooks are retrieved via keys/facts
+        rather than digest summaries.
 
         Returns ``(stored_count, document_key, literary_profiles)`` where
         ``literary_profiles`` is a dict suitable for merging into
@@ -10656,32 +10779,10 @@ class ZorkEmulator:
             return stored_count, document_key, {}
 
         if normalized_format == self.SOURCE_MATERIAL_FORMAT_RULEBOOK:
-            try:
-                digest = await self._summarise_long_text(
-                    text,
-                    ctx_message=ctx_message,
-                    channel=channel,
-                    summary_instructions=(
-                        "This is source material for a text-adventure campaign. "
-                        "Produce a comprehensive narrative digest preserving all characters, "
-                        "locations, plot arcs, factions, key events, world rules, and "
-                        "relationships. Maintain chronological order where applicable. "
-                        "Be detailed and concrete — this digest will be used to ground "
-                        "the campaign world."
-                    ),
-                )
-                if digest and digest.strip():
-                    SourceMaterialMemory.store_source_material_digest(
-                        str(campaign_id),
-                        document_key,
-                        digest.strip(),
-                    )
-            except Exception:
-                self._logger.exception(
-                    "Source material digest generation failed for campaign %s key %s",
-                    campaign_id,
-                    document_key,
-                )
+            SourceMaterialMemory.delete_source_material_digest(
+                str(campaign_id),
+                document_key,
+            )
 
         return stored_count, document_key, {}
 

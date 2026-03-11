@@ -9,6 +9,7 @@ from .codex_cli import CodexCLIBackend
 from .gemini_cli import GeminiCLIBackend
 from .opencode_cli import OpenCodeCLIBackend
 from .ollama import OllamaBackend
+from .zai import ZAIBackend
 
 
 def build_backend(provider: str, **config: Any) -> ModelBackend:
@@ -23,6 +24,8 @@ def build_backend(provider: str, **config: Any) -> ModelBackend:
         return OpenCodeCLIBackend(**config)
     if normalized in {"codex", "codex-cli", "codex_cli"}:
         return CodexCLIBackend(**config)
+    if normalized == "zai":
+        return ZAIBackend(**config)
     raise ValueError(f"Unsupported backend provider: {provider}")
 
 

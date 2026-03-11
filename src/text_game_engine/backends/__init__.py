@@ -6,6 +6,7 @@ from .factory import build_backend, build_text_completion_port
 from .gemini_cli import GeminiCLIBackend
 from .opencode_cli import OpenCodeBackend, OpenCodeCLIBackend
 from .ollama import OllamaBackend
+from .zai import ZAIBackend
 
 __all__ = [
     "BackendTextCompletionPort",
@@ -19,6 +20,7 @@ __all__ = [
     "OpenCodeBackend",
     "OpenCodeCLIBackend",
     "OllamaBackend",
+    "ZAIBackend",
     "build_backend",
     "build_text_completion_port",
 ]

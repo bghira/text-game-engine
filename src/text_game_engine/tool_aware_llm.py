@@ -477,6 +477,23 @@ class ToolAwareZorkLLM:
         if not isinstance(player_state_update, dict):
             player_state_update = {}
 
+        co_located_player_slugs = payload.get("co_located_player_slugs")
+        if isinstance(co_located_player_slugs, list):
+            normalized_co_located_player_slugs: list[str] = []
+            seen_co_located_player_slugs: set[str] = set()
+            actor_visibility_slug = (
+                emulator._player_visibility_slug(actor_id) if actor_id else ""
+            )  # noqa: SLF001
+            for item in co_located_player_slugs:
+                slug = str(item or "").strip().lower()
+                if not slug or slug == actor_visibility_slug or slug in seen_co_located_player_slugs:
+                    continue
+                seen_co_located_player_slugs.add(slug)
+                normalized_co_located_player_slugs.append(slug)
+            co_located_player_slugs = normalized_co_located_player_slugs
+        else:
+            co_located_player_slugs = []
+
         turn_visibility = payload.get("turn_visibility")
         if not isinstance(turn_visibility, dict):
             turn_visibility = None
@@ -484,6 +501,9 @@ class ToolAwareZorkLLM:
         state_update, player_state_update = emulator._split_room_state(  # noqa: SLF001
             state_update, player_state_update
         )
+        game_time_update = state_update.get("game_time")
+        if isinstance(game_time_update, dict) and game_time_update:
+            player_state_update.setdefault("game_time", game_time_update)
 
         try:
             state_update, extracted_calendar_update = emulator._extract_calendar_update_from_state_update(  # noqa: SLF001
@@ -593,6 +613,7 @@ class ToolAwareZorkLLM:
             summary_update=summary_update,
             xp_awarded=xp_awarded,
             player_state_update=player_state_update,
+            co_located_player_slugs=co_located_player_slugs,
             turn_visibility=turn_visibility,
             scene_image_prompt=scene_image_prompt,
             timer_instruction=timer_instruction,
@@ -1040,6 +1061,30 @@ class ToolAwareZorkLLM:
             f"SOURCE_BROWSE_RESULT "
             f"(document_key={document_key or '*'!r}, "
             f"{wildcard_meta}): no entries found"
+        )
+
+    def _tool_communication_rules(self, payload: dict[str, Any]) -> str:
+        if self._emulator is None:
+            return "COMMUNICATION_RULES_RESULT: unavailable"
+        raw_keys = payload.get("keys") or []
+        if isinstance(raw_keys, str):
+            raw_keys = [raw_keys]
+        requested_keys = [
+            str(key or "").strip().upper()
+            for key in raw_keys
+            if str(key or "").strip()
+        ][:8]
+        requested_set = set(requested_keys)
+        lines = [
+            f"{rule_key}: {rule_text}"
+            for rule_key, rule_text in self._emulator.DEFAULT_GM_COMMUNICATION_RULES.items()  # noqa: SLF001
+            if rule_key in requested_set
+        ]
+        if lines:
+            return "COMMUNICATION_RULES_RESULT:\n" + "\n".join(lines)
+        return (
+            "COMMUNICATION_RULES_RESULT: no matching keys found. Available keys: "
+            + ", ".join(self._emulator.COMMUNICATION_RULE_KEYS)  # noqa: SLF001
         )
 
     def _tool_name_generate(self, campaign_id: str, payload: dict[str, Any]) -> str:
@@ -1876,6 +1921,8 @@ class ToolAwareZorkLLM:
             return self._tool_memory_terms(campaign_id, payload)
         if name == "source_browse":
             return self._tool_source_browse(campaign_id, payload)
+        if name == "communication_rules":
+            return self._tool_communication_rules(payload)
         if name == "name_generate":
             return self._tool_name_generate(campaign_id, payload)
         if name == "memory_turn":
@@ -1911,6 +1958,8 @@ class ToolAwareZorkLLM:
         action_text: str,
         system_prompt: str,
         user_prompt: str,
+        final_system_prompt: str,
+        final_user_prompt: str,
     ) -> dict[str, Any] | None:
         first = await self._completion.complete(
             system_prompt,
@@ -2037,6 +2086,36 @@ class ToolAwareZorkLLM:
 
         if emulator._is_tool_call(payload) and str(payload.get("tool_call") or "").strip().lower() != "ready_to_write":  # noqa: E501, SLF001
             return None
+
+        # Dedicated ready_to_write finalization: the payload is the tool call
+        # itself (no narration), so issue the actual writing call with craft guidance.
+        if emulator._is_tool_call(payload) and str(payload.get("tool_call") or "").strip().lower() == "ready_to_write":  # noqa: E501, SLF001
+            _pc_names = emulator.get_pc_names(campaign_id)
+            _pc_reminder = ""
+            if _pc_names:
+                _pc_reminder = (
+                    "\nPLAYER_CHARACTERS (real humans — do NOT write their dialogue, actions, decisions, "
+                    f"emotional reactions, facial expressions, or movement): {', '.join(_pc_names)}\n"
+                )
+            finalize_prompt = (
+                f"{final_user_prompt}\n"
+                f"{tool_history}\n\n"
+                "RESEARCH_COMPLETE: Context gathering is complete.\n"
+                "Do NOT call any more tools now. Return final narration/state JSON directly.\n"
+                "REQUIRED fields: reasoning, scene_output, narration, state_update (with game_time), summary_update.\n"
+                + _pc_reminder
+                + emulator.WRITING_CRAFT_PROMPT
+            )
+            finalized = await self._completion.complete(
+                final_system_prompt,
+                finalize_prompt,
+                temperature=self._temperature,
+                max_tokens=self._max_tokens,
+            )
+            finalized_payload = self._parse_model_payload(finalized)
+            if finalized_payload is not None and not emulator._is_tool_call(finalized_payload):  # noqa: SLF001
+                payload = finalized_payload
+
         if self._is_emptyish_payload(payload):
             self._bump_auto_fix_counter(campaign_id, "empty_response_repair_retry")
             repair_prompt = (
@@ -2146,6 +2225,15 @@ class ToolAwareZorkLLM:
                 context.action,
                 turns,
                 turn_visibility_default=turn_visibility_default,
+                prompt_stage=emulator.PROMPT_STAGE_RESEARCH,
+            )
+            final_system_prompt, final_user_prompt = emulator.build_prompt(
+                campaign,
+                player,
+                context.action,
+                turns,
+                turn_visibility_default=turn_visibility_default,
+                prompt_stage=emulator.PROMPT_STAGE_FINAL,
             )
             payload = await self._resolve_payload(
                 context.campaign_id,
@@ -2153,6 +2241,8 @@ class ToolAwareZorkLLM:
                 context.action,
                 system_prompt,
                 user_prompt,
+                final_system_prompt,
+                final_user_prompt,
             )
             if payload is None:
                 return await self._fallback.complete_turn(context)
