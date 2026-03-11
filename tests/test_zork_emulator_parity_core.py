@@ -344,8 +344,6 @@ def test_build_prompt_shape(session_factory, seed_campaign_and_actor):
     assert "CAMPAIGN:" in user_prompt
     assert "CURRENT_GAME_TIME:" in user_prompt
     assert "SPEED_MULTIPLIER:" in user_prompt
-    assert "ATTENTION_WINDOW_SECONDS:" in user_prompt
-    assert "CURRENTLY_ATTENTIVE_PLAYERS:" in user_prompt
     assert "MEMORY_LOOKUP_ENABLED:" in user_prompt
     assert "RECENT_TURNS_LOADED: true" in user_prompt
     assert "CALENDAR:" in user_prompt
@@ -447,22 +445,6 @@ def test_recent_turns_include_turn_number_and_in_game_time(session_factory, seed
 
     assert "[TURN #" in user_prompt
     assert "Day 2 14:30" in user_prompt
-
-
-def test_currently_attentive_players_prompt_field(session_factory, seed_campaign_and_actor):
-    compat = _build_compat(session_factory)
-    campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
-    player = compat.get_or_create_player(seed_campaign_and_actor["campaign_id"], seed_campaign_and_actor["actor_id"])
-    other = compat.get_or_create_player(seed_campaign_and_actor["campaign_id"], "actor-2")
-    now = datetime(2026, 2, 21, 12, 0, 0)
-    compat.record_player_message(player, observed_at=now)
-    compat.record_player_message(other, observed_at=now - timedelta(seconds=compat.ATTENTION_WINDOW_SECONDS + 5))
-    turns = compat.get_recent_turns(seed_campaign_and_actor["campaign_id"])
-
-    _system_prompt, user_prompt = compat.build_prompt(campaign, player, "look", turns)
-    assert "CURRENTLY_ATTENTIVE_PLAYERS:" in user_prompt
-    assert seed_campaign_and_actor["actor_id"] in user_prompt
-    assert "actor-2" not in user_prompt
 
 
 def test_sms_thread_roundtrip(session_factory, seed_campaign_and_actor):

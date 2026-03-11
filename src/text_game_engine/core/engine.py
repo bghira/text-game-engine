@@ -191,6 +191,53 @@ class GameEngine:
         raw = str(actor_id or "").strip()
         return f"player-{raw}" if raw else ""
 
+    @classmethod
+    def _sync_marked_co_located_players(
+        cls,
+        uow: Any,
+        campaign_id: str,
+        source_actor_id: str,
+        source_state: dict[str, Any],
+        player_slugs: list[str],
+    ) -> int:
+        if not isinstance(source_state, dict) or not isinstance(player_slugs, list):
+            return 0
+        slug_set = {
+            str(item or "").strip().lower()
+            for item in player_slugs
+            if str(item or "").strip()
+        }
+        if not slug_set:
+            return 0
+        has_room_context = any(
+            source_state.get(key)
+            for key in ("room_id", "location", "room_title", "room_summary", "room_description")
+        )
+        if not has_room_context:
+            return 0
+        changed = 0
+        for target in uow.players.list_by_campaign(campaign_id):
+            if str(getattr(target, "actor_id", "")) == str(source_actor_id):
+                continue
+            target_state = parse_json_dict(target.state_json)
+            actor_slug = cls._player_visibility_slug(str(getattr(target, "actor_id", "") or ""))
+            name_slug = cls._player_slug_key(target_state.get("character_name"))
+            if actor_slug not in slug_set and name_slug not in slug_set:
+                continue
+            before = dict(target_state)
+            for key in ("room_id", "location", "room_title", "room_summary", "room_description", "exits"):
+                src_val = source_state.get(key)
+                if src_val is None:
+                    target_state.pop(key, None)
+                else:
+                    target_state[key] = src_val
+            if target_state == before:
+                continue
+            target.state_json = dump_json(target_state)
+            target.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
+            changed += 1
+        return changed
+
     @staticmethod
     def _default_visibility_scope(actor_location_key: str) -> str:
         location_key = str(actor_location_key or "").strip().lower()
@@ -613,7 +660,15 @@ class GameEngine:
                 merged_character_updates,
                 on_rails=_on_rails,
             )
+            campaign_characters, _ = self._sync_npc_locations_from_state_to_roster(
+                campaign_characters,
+                campaign_state_update,
+            )
             raw_player_update = llm_output.player_state_update or {}
+            if isinstance(raw_player_update, dict):
+                game_time_now = campaign_state.get("game_time")
+                if isinstance(game_time_now, dict) and game_time_now:
+                    raw_player_update.setdefault("game_time", game_time_now)
             if self._player_state_sanitizer is not None and isinstance(raw_player_update, dict):
                 raw_player_update = self._player_state_sanitizer(
                     player_state,
@@ -676,6 +731,13 @@ class GameEngine:
                 player_state=player_state,
                 narration_text=narration,
             )
+            co_located_player_sync = self._sync_marked_co_located_players(
+                uow,
+                turn_input.campaign_id,
+                turn_input.actor_id,
+                player_state,
+                list(getattr(llm_output, "co_located_player_slugs", []) or []),
+            )
             if active_char_sync:
                 self._increment_auto_fix_counter(
                     campaign_state,
@@ -687,6 +749,12 @@ class GameEngine:
                     campaign_state,
                     "location_auto_sync_world_characters",
                     amount=world_char_sync,
+                )
+            if co_located_player_sync:
+                self._increment_auto_fix_counter(
+                    campaign_state,
+                    "location_auto_sync_co_located_players",
+                    amount=co_located_player_sync,
                 )
 
             # give_item compatibility path - unresolved targets are non-fatal.
@@ -1102,13 +1170,7 @@ class GameEngine:
                 continue
             if target_slug and target_slug in merged:
                 # Existing character — only accept mutable fields.
-                _IMMUTABLE = {
-                    "name",
-                    "personality",
-                    "background",
-                    "appearance",
-                    "speech_style",
-                }
+                _IMMUTABLE: set[str] = set()
                 old_location = str(merged[target_slug].get("location") or "").strip().lower()
                 for key, value in fields.items():
                     if key not in _IMMUTABLE:
@@ -1129,6 +1191,37 @@ class GameEngine:
                 # New character — store everything.
                 merged[slug] = dict(fields)
         return merged
+
+    @classmethod
+    def _sync_npc_locations_from_state_to_roster(
+        cls,
+        existing: dict[str, Any],
+        state_update: dict[str, Any],
+    ) -> tuple[dict[str, Any], int]:
+        merged = dict(existing) if isinstance(existing, dict) else {}
+        if not isinstance(state_update, dict) or not merged:
+            return merged, 0
+        overlay_mutable = {"location", "current_status", "allegiance"}
+        changed = 0
+        for slug, overlay in state_update.items():
+            if not isinstance(overlay, dict):
+                continue
+            target_slug = cls._resolve_existing_character_slug(merged, slug)
+            if not target_slug or target_slug not in merged:
+                continue
+            entry = merged[target_slug]
+            if not isinstance(entry, dict):
+                continue
+            for field in overlay_mutable:
+                if field not in overlay:
+                    continue
+                new_val = overlay[field]
+                if new_val is None:
+                    continue
+                if entry.get(field) != new_val:
+                    entry[field] = new_val
+                    changed += 1
+        return merged, changed
 
     @classmethod
     def _resolve_existing_character_slug(
