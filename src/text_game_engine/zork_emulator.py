@@ -1238,6 +1238,17 @@ class ZorkEmulator:
                 by_slug[slug] = entry
         return {"by_actor_id": by_actor_id, "by_slug": by_slug}
 
+    def get_pc_names(self, campaign_id: str) -> list[str]:
+        """Return display names of all player characters in a campaign."""
+        registry = self._campaign_player_registry(
+            campaign_id, self._session_factory
+        )
+        return [
+            str(e.get("name") or "")
+            for e in registry.get("by_actor_id", {}).values()
+            if str(e.get("name") or "").strip()
+        ]
+
     @staticmethod
     def _safe_turn_meta(turn: Turn) -> dict[str, object]:
         meta = parse_json_dict(getattr(turn, "meta_json", "{}"))
@@ -3297,131 +3308,6 @@ class ZorkEmulator:
             f"{rule_key}: {rule_text}"
             for rule_key, rule_text in cls.DEFAULT_GM_COMMUNICATION_RULES.items()
         ]
-
-    @staticmethod
-    def _source_wildcard_matches(text: str, wildcard: str) -> bool:
-        pattern = str(wildcard or "%").strip()
-        if not pattern or pattern in {"*", "%", "%%"}:
-            return True
-        regex = re.escape(pattern.replace("*", "%")).replace("%", ".*")
-        return bool(re.match(rf"(?is)^{regex}$", str(text or "").strip()))
-
-    @classmethod
-    def _browse_builtin_source_keys(
-        cls,
-        *,
-        document_key: str | None = None,
-        wildcard: str = "%",
-        limit: int = 255,
-    ) -> list[str]:
-        built_in_key = cls.communication_rulebook_document_key()
-        requested_key = (
-            SourceMaterialMemory._normalize_source_document_key(str(document_key or ""))
-            if document_key
-            else ""
-        )
-        if requested_key and requested_key != built_in_key:
-            return []
-        pattern = str(wildcard or "%").strip()
-        broad_browse = pattern in {"", "*", "%", "%%"}
-        out: list[str] = []
-        seen: set[str] = set()
-        for line in cls._communication_rulebook_lines():
-            key_text = line.split(":", 1)[0].strip() if ":" in line else line
-            target_text = key_text if broad_browse else line
-            if not cls._source_wildcard_matches(target_text, pattern):
-                continue
-            if broad_browse:
-                entry = key_text if requested_key else f"{built_in_key}: {key_text}"
-            else:
-                entry = line
-            normalized = " ".join(str(entry or "").lower().split())
-            if not normalized or normalized in seen:
-                continue
-            seen.add(normalized)
-            out.append(entry)
-            if len(out) >= max(1, int(limit)):
-                break
-        return out
-
-    @classmethod
-    def _search_builtin_source_material(
-        cls,
-        query: str,
-        *,
-        document_key: str | None = None,
-        top_k: int = 5,
-        before_lines: int = 0,
-        after_lines: int = 0,
-    ) -> list[tuple[str, str, int, str, float]]:
-        built_in_key = cls.communication_rulebook_document_key()
-        requested_key = (
-            SourceMaterialMemory._normalize_source_document_key(str(document_key or ""))
-            if document_key
-            else ""
-        )
-        if requested_key and requested_key != built_in_key:
-            return []
-        query_text = " ".join(str(query or "").lower().split())
-        if not query_text:
-            return []
-        query_terms = [term for term in re.split(r"[^a-z0-9]+", query_text) if term]
-        lines = cls._communication_rulebook_lines()
-        scored: list[tuple[int, float]] = []
-        for idx, line in enumerate(lines, start=1):
-            hay = line.lower()
-            key_text = line.split(":", 1)[0].strip().lower() if ":" in line else ""
-            score = 0.0
-            if query_text in hay:
-                score = 1.0
-                if query_text in key_text:
-                    score += 0.2
-            elif query_terms:
-                overlap = sum(1 for term in query_terms if term in hay)
-                if overlap:
-                    score = overlap / max(1, len(query_terms))
-                    key_overlap = sum(1 for term in query_terms if term in key_text)
-                    if key_overlap:
-                        score += key_overlap / max(1, len(query_terms) * 2)
-            if score > 0.0:
-                scored.append((idx, score))
-        scored.sort(key=lambda item: (item[1], -item[0]), reverse=True)
-        before_n = max(0, int(before_lines or 0))
-        after_n = max(0, int(after_lines or 0))
-        out: list[tuple[str, str, int, str, float]] = []
-        for center_idx, score in scored[: max(1, int(top_k))]:
-            start_idx = max(1, center_idx - before_n)
-            end_idx = min(len(lines), center_idx + after_n)
-            window = [lines[i - 1] for i in range(start_idx, end_idx + 1)]
-            out.append(
-                (
-                    built_in_key,
-                    cls.COMMUNICATION_RULEBOOK_DOCUMENT_LABEL,
-                    center_idx,
-                    "\n".join(window),
-                    float(score),
-                )
-            )
-        return out
-
-    @classmethod
-    def _list_source_material_documents_with_builtins(
-        cls,
-        campaign_id: str,
-        *,
-        limit: int = 20,
-    ) -> list[dict[str, object]]:
-        docs = SourceMaterialMemory.list_source_material_documents(
-            str(campaign_id),
-            limit=max(1, int(limit)),
-        )
-        built_in_doc = {
-            "document_key": cls.communication_rulebook_document_key(),
-            "document_label": cls.COMMUNICATION_RULEBOOK_DOCUMENT_LABEL,
-            "chunk_count": len(cls.DEFAULT_GM_COMMUNICATION_RULES),
-            "sample_chunk": "\n".join(cls._communication_rulebook_lines()[:6]),
-        }
-        return [built_in_doc, *docs][: max(1, int(limit))]
 
     def _canonical_seed_rulebook_lines(
         self,
@@ -10836,7 +10722,7 @@ class ZorkEmulator:
         ctx_message=None,
         channel=None,
     ) -> tuple[int, str, Dict[str, dict]]:
-        """Ingest source material, generate digest, and extract writing style.
+        """Ingest source material and extract writing style.
 
         For **story** format: skips raw paragraph chunk storage entirely.
         Instead, generates a narrative digest, extracts prose-craft writing
@@ -10845,7 +10731,9 @@ class ZorkEmulator:
         merge the returned profiles into ``campaign_state["literary_styles"]``.
 
         For **rulebook** format: stores chunks normally via
-        :meth:`ingest_source_material_text` and generates a digest.
+        :meth:`ingest_source_material_text` and explicitly removes any
+        narrative digest, since rulebooks are retrieved via keys/facts
+        rather than digest summaries.
 
         Returns ``(stored_count, document_key, literary_profiles)`` where
         ``literary_profiles`` is a dict suitable for merging into

@@ -524,6 +524,98 @@ def test_recent_turns_visibility_filters_local_by_location(
     asyncio.run(run_test())
 
 
+def test_co_located_player_sync_mirrors_room_fields_and_bumps_counter(
+    session_factory,
+    uow_factory,
+    seed_campaign_and_actor,
+):
+    async def run_test():
+        with session_factory() as session:
+            session.add(
+                Actor(id="actor-2", display_name="Tester Two", kind="human", metadata_json="{}")
+            )
+            session.add_all(
+                [
+                    Player(
+                        campaign_id=seed_campaign_and_actor["campaign_id"],
+                        actor_id=seed_campaign_and_actor["actor_id"],
+                        state_json=json.dumps(
+                            {
+                                "character_name": "Lead Player",
+                                "location": "old-room",
+                                "room_title": "Old Room",
+                                "room_summary": "Old summary",
+                                "room_description": "Old desc",
+                                "exits": ["north"],
+                            }
+                        ),
+                    ),
+                    Player(
+                        campaign_id=seed_campaign_and_actor["campaign_id"],
+                        actor_id="actor-2",
+                        state_json=json.dumps(
+                            {
+                                "character_name": "Other Player",
+                                "location": "far-room",
+                                "room_title": "Far Room",
+                                "room_summary": "Far summary",
+                                "room_description": "Far desc",
+                                "exits": ["south"],
+                            }
+                        ),
+                    ),
+                ]
+            )
+            session.commit()
+
+        llm = StubLLM(
+            LLMTurnOutput(
+                narration="You both move into the side room.",
+                player_state_update={
+                    "location": "side-room-b",
+                    "room_title": "Side Room B",
+                    "room_summary": "Private side room off Fellowship Hall.",
+                    "room_description": "A narrow side room with a low lamp and one upholstered bench.",
+                    "exits": ["Fellowship Hall"],
+                },
+                co_located_player_slugs=["player-actor-2"],
+            )
+        )
+        engine = GameEngine(uow_factory=uow_factory, llm=llm)
+
+        result = await engine.resolve_turn(
+            ResolveTurnInput(
+                campaign_id=seed_campaign_and_actor["campaign_id"],
+                actor_id=seed_campaign_and_actor["actor_id"],
+                action="head into side room b together",
+            )
+        )
+        assert result.status == "ok"
+
+        with session_factory() as session:
+            synced = (
+                session.query(Player)
+                .filter(Player.campaign_id == seed_campaign_and_actor["campaign_id"])
+                .filter(Player.actor_id == "actor-2")
+                .first()
+            )
+            assert synced is not None
+            synced_state = json.loads(synced.state_json or "{}")
+            assert synced_state.get("location") == "side-room-b"
+            assert synced_state.get("room_title") == "Side Room B"
+            assert synced_state.get("room_summary") == "Private side room off Fellowship Hall."
+            assert synced_state.get("room_description") == "A narrow side room with a low lamp and one upholstered bench."
+            assert synced_state.get("exits") == ["Fellowship Hall"]
+
+            campaign = session.get(Campaign, seed_campaign_and_actor["campaign_id"])
+            assert campaign is not None
+            campaign_state = json.loads(campaign.state_json or "{}")
+            counters = campaign_state.get(GameEngine.AUTO_FIX_COUNTERS_KEY) or {}
+            assert counters.get("location_auto_sync_co_located_players") == 1
+
+    asyncio.run(run_test())
+
+
 def test_memory_visibility_filter_after_rewind(session_factory, uow_factory, seed_campaign_and_actor):
     async def run_test():
         llm = StubLLM(LLMTurnOutput(narration="Turn narration"))

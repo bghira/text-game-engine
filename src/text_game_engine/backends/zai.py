@@ -87,7 +87,13 @@ class ZAIBackend:
         max_tokens: int,
         thinking_enabled: bool,
     ) -> Any:
-        from openai import OpenAI
+        try:
+            from openai import OpenAI
+        except ImportError as exc:  # pragma: no cover - dependency guard
+            raise RuntimeError(
+                "ZAI backend requires the optional 'openai' package. "
+                "Install text-game-engine with the dependency needed for the 'zai' provider."
+            ) from exc
 
         client = OpenAI(
             api_key=self._api_key,
@@ -119,6 +125,8 @@ class ZAIBackend:
         brace_depth = 0
         in_json = False
         found_tool_call = False
+        in_string = False
+        escape_next = False
 
         try:
             for chunk in stream:
@@ -131,11 +139,24 @@ class ZAIBackend:
                 chunks.append(text)
 
                 for ch in text:
+                    if escape_next:
+                        escape_next = False
+                        continue
+                    if ch == "\\" and in_string:
+                        escape_next = True
+                        continue
+                    if ch == '"':
+                        in_string = not in_string
+                        continue
+                    if in_string:
+                        continue
                     if ch == "{":
                         if not in_json:
                             in_json = True
                         brace_depth += 1
                     elif ch == "}":
+                        if not in_json or brace_depth <= 0:
+                            continue
                         brace_depth -= 1
                         if in_json and brace_depth == 0:
                             so_far = "".join(chunks)

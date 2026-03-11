@@ -10,6 +10,7 @@ from text_game_engine.core.types import GiveItemInstruction, LLMTurnOutput, Time
 from text_game_engine.core.engine import GameEngine
 from text_game_engine.persistence.sqlalchemy.uow import SQLAlchemyUnitOfWork
 from text_game_engine.persistence.sqlalchemy.models import Campaign, Player, Snapshot, Turn
+from text_game_engine.tool_aware_llm import ToolAwareZorkLLM
 from text_game_engine.zork_emulator import ZorkEmulator
 
 
@@ -118,6 +119,19 @@ class GuardRetryCompletionPort:
 class FailingCondenseCompletionPort:
     async def complete(self, system_prompt, prompt, *, temperature=0.8, max_tokens=2048):
         raise RuntimeError("condense failed")
+
+
+class ReadyToWriteCompletionPort:
+    def __init__(self):
+        self.calls = []
+
+    async def complete(self, system_prompt, prompt, *, temperature=0.8, max_tokens=2048):
+        self.calls.append({"system_prompt": system_prompt, "prompt": prompt})
+        if len(self.calls) == 1:
+            return '{"tool_call":"ready_to_write"}'
+        return (
+            '{"reasoning":"finalized","narration":"Final scene.","state_update":{"game_time":{"day":1,"hour":9,"minute":0,"period":"morning","date_label":"Day 1, Morning"}},"summary_update":"done"}'
+        )
 
 
 class StubTimerEffects:
@@ -410,6 +424,62 @@ def test_build_prompt_research_stage_shape(session_factory, seed_campaign_and_ac
     assert "RECENT_TURNS_LOADED: true" in user_prompt
     assert "RECENT_TURNS:\n" in user_prompt
     assert "WORLD_SUMMARY:" in user_prompt
+
+
+def test_ready_to_write_finalization_uses_final_stage_system_prompt(
+    session_factory,
+    seed_campaign_and_actor,
+):
+    async def run_test():
+        completion = ReadyToWriteCompletionPort()
+        engine = GameEngine(
+            uow_factory=lambda: SQLAlchemyUnitOfWork(session_factory),
+            llm=StubLLM(LLMTurnOutput(narration="unused")),
+        )
+        compat = ZorkEmulator(engine, session_factory, completion_port=completion)
+        tool_llm = ToolAwareZorkLLM(
+            session_factory=session_factory,
+            completion_port=completion,
+            temperature=0.8,
+            max_tokens=2048,
+        )
+        tool_llm.bind_emulator(compat)
+
+        campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
+        player = compat.get_or_create_player(seed_campaign_and_actor["campaign_id"], seed_campaign_and_actor["actor_id"])
+        turns = compat.get_recent_turns(seed_campaign_and_actor["campaign_id"])
+        research_system_prompt, research_user_prompt = compat.build_prompt(
+            campaign,
+            player,
+            "look",
+            turns,
+            prompt_stage=compat.PROMPT_STAGE_RESEARCH,
+        )
+        final_system_prompt, final_user_prompt = compat.build_prompt(
+            campaign,
+            player,
+            "look",
+            turns,
+            prompt_stage=compat.PROMPT_STAGE_FINAL,
+        )
+
+        payload = await tool_llm._resolve_payload(  # noqa: SLF001
+            seed_campaign_and_actor["campaign_id"],
+            seed_campaign_and_actor["actor_id"],
+            "look",
+            research_system_prompt,
+            research_user_prompt,
+            final_system_prompt,
+            final_user_prompt,
+        )
+
+        assert payload is not None
+        assert payload.get("narration") == "Final scene."
+        assert len(completion.calls) == 2
+        assert '{"tool_call": "ready_to_write"}' in completion.calls[0]["system_prompt"]
+        assert '{"tool_call": "ready_to_write"}' not in completion.calls[1]["system_prompt"]
+
+    asyncio.run(run_test())
 
 
 def test_attachment_setup_length_error_for_short_upload(session_factory):

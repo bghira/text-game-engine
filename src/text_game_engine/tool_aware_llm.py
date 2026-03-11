@@ -1958,6 +1958,8 @@ class ToolAwareZorkLLM:
         action_text: str,
         system_prompt: str,
         user_prompt: str,
+        final_system_prompt: str,
+        final_user_prompt: str,
     ) -> dict[str, Any] | None:
         first = await self._completion.complete(
             system_prompt,
@@ -2088,16 +2090,24 @@ class ToolAwareZorkLLM:
         # Dedicated ready_to_write finalization: the payload is the tool call
         # itself (no narration), so issue the actual writing call with craft guidance.
         if emulator._is_tool_call(payload) and str(payload.get("tool_call") or "").strip().lower() == "ready_to_write":  # noqa: E501, SLF001
+            _pc_names = emulator.get_pc_names(campaign_id)
+            _pc_reminder = ""
+            if _pc_names:
+                _pc_reminder = (
+                    "\nPLAYER_CHARACTERS (real humans — do NOT write their dialogue, actions, decisions, "
+                    f"emotional reactions, facial expressions, or movement): {', '.join(_pc_names)}\n"
+                )
             finalize_prompt = (
-                f"{user_prompt}\n"
+                f"{final_user_prompt}\n"
                 f"{tool_history}\n\n"
                 "RESEARCH_COMPLETE: Context gathering is complete.\n"
                 "Do NOT call any more tools now. Return final narration/state JSON directly.\n"
                 "REQUIRED fields: reasoning, scene_output, narration, state_update (with game_time), summary_update.\n"
+                + _pc_reminder
                 + emulator.WRITING_CRAFT_PROMPT
             )
             finalized = await self._completion.complete(
-                system_prompt,
+                final_system_prompt,
                 finalize_prompt,
                 temperature=self._temperature,
                 max_tokens=self._max_tokens,
@@ -2215,6 +2225,15 @@ class ToolAwareZorkLLM:
                 context.action,
                 turns,
                 turn_visibility_default=turn_visibility_default,
+                prompt_stage=emulator.PROMPT_STAGE_RESEARCH,
+            )
+            final_system_prompt, final_user_prompt = emulator.build_prompt(
+                campaign,
+                player,
+                context.action,
+                turns,
+                turn_visibility_default=turn_visibility_default,
+                prompt_stage=emulator.PROMPT_STAGE_FINAL,
             )
             payload = await self._resolve_payload(
                 context.campaign_id,
@@ -2222,6 +2241,8 @@ class ToolAwareZorkLLM:
                 context.action,
                 system_prompt,
                 user_prompt,
+                final_system_prompt,
+                final_user_prompt,
             )
             if payload is None:
                 return await self._fallback.complete_turn(context)
