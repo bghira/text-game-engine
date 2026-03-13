@@ -10,10 +10,15 @@ from typing import Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
-_MODEL = None
+_model_minilm = None
+_model_snowflake = None
 _MODEL_LOCK = threading.Lock()
 _MAX_INPUT_CHARS = 512
 _SOURCE_SNIPPET_MAX_CHARS = 1200
+
+EMBED_SOURCE_MINILM = "minilm"
+EMBED_SOURCE_SNOWFLAKE = "snowflake"
+EMBED_SOURCE_DEFAULT = EMBED_SOURCE_SNOWFLAKE
 
 _DB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "data")
 _DB_PATH = os.path.join(_DB_DIR, "tge_source_embeddings.db")
@@ -27,6 +32,7 @@ CREATE TABLE IF NOT EXISTS source_material_chunks (
     chunk_index     INTEGER NOT NULL,
     chunk_text      TEXT    NOT NULL,
     embedding       BLOB    NOT NULL,
+    embed_source    TEXT NOT NULL DEFAULT 'minilm',
     created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_tge_sm_campaign ON source_material_chunks(campaign_id);
@@ -44,23 +50,41 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_tge_smd_campaign_doc
 """
 
 
-def _get_model():
-    global _MODEL
-    if _MODEL is not None:
-        return _MODEL
-    with _MODEL_LOCK:
-        if _MODEL is not None:
-            return _MODEL
-        from sentence_transformers import SentenceTransformer
-
-        _MODEL = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
-        return _MODEL
+_VALID_EMBED_SOURCES = {EMBED_SOURCE_MINILM, EMBED_SOURCE_SNOWFLAKE}
 
 
-def _embed(text: str) -> bytes:
+def _get_model(source: str = EMBED_SOURCE_DEFAULT):
+    global _model_minilm, _model_snowflake
+    source = (source or "").strip().lower()
+    if source not in _VALID_EMBED_SOURCES:
+        logger.warning("Unknown embed source %r, falling back to %s", source, EMBED_SOURCE_DEFAULT)
+        source = EMBED_SOURCE_DEFAULT
+    if source == EMBED_SOURCE_MINILM:
+        if _model_minilm is not None:
+            return _model_minilm
+        with _MODEL_LOCK:
+            if _model_minilm is not None:
+                return _model_minilm
+            from sentence_transformers import SentenceTransformer
+
+            _model_minilm = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+            return _model_minilm
+    else:
+        if _model_snowflake is not None:
+            return _model_snowflake
+        with _MODEL_LOCK:
+            if _model_snowflake is not None:
+                return _model_snowflake
+            from sentence_transformers import SentenceTransformer
+
+            _model_snowflake = SentenceTransformer("Snowflake/snowflake-arctic-embed-s")
+            return _model_snowflake
+
+
+def _embed(text: str, source: str = EMBED_SOURCE_DEFAULT) -> bytes:
     import numpy as np
 
-    model = _get_model()
+    model = _get_model(source)
     vector = model.encode((text or "")[:_MAX_INPUT_CHARS], normalize_embeddings=True)
     return np.asarray(vector, dtype=np.float32).tobytes()
 
@@ -69,6 +93,20 @@ def _bytes_to_vector(blob: bytes):
     import numpy as np
 
     return np.frombuffer(blob, dtype=np.float32)
+
+
+_ALLOWED_EMBED_TABLES = {"source_material_chunks"}
+
+
+def _campaign_embed_sources(conn, table: str, campaign_id) -> set:
+    """Return the set of distinct embed_source values for a campaign in *table*."""
+    if table not in _ALLOWED_EMBED_TABLES:
+        raise ValueError(f"Invalid table name for embed source query: {table!r}")
+    rows = conn.execute(
+        f"SELECT DISTINCT embed_source FROM {table} WHERE campaign_id = ?",
+        (str(campaign_id),),
+    ).fetchall()
+    return {str(r[0] or EMBED_SOURCE_MINILM) for r in rows}
 
 
 class SourceMaterialMemory:
@@ -83,8 +121,20 @@ class SourceMaterialMemory:
         conn = sqlite3.connect(_DB_PATH, check_same_thread=False)
         conn.execute("PRAGMA journal_mode=WAL")
         conn.executescript(_SCHEMA_SQL)
+        cls._ensure_schema(conn)
         cls._conn_local.conn = conn
         return conn
+
+    @classmethod
+    def _ensure_schema(cls, conn: sqlite3.Connection) -> None:
+        cols = conn.execute("PRAGMA table_info(source_material_chunks)").fetchall()
+        existing = {str(r[1] or "").strip() for r in cols}
+        if "embed_source" not in existing:
+            conn.execute(
+                "ALTER TABLE source_material_chunks "
+                "ADD COLUMN embed_source TEXT NOT NULL DEFAULT 'minilm'"
+            )
+            conn.commit()
 
     @staticmethod
     def _normalize_source_document_key(value: str) -> str:
@@ -543,6 +593,7 @@ class SourceMaterialMemory:
         chunks: List[str],
         source_mode: str = "line",
         replace_document: bool = True,
+        embed_source: str = EMBED_SOURCE_DEFAULT,
     ) -> Tuple[int, str]:
         try:
             label = " ".join(str(document_label or "").strip().split())[:120]
@@ -576,8 +627,8 @@ class SourceMaterialMemory:
                 conn.execute(
                     """
                     INSERT INTO source_material_chunks
-                    (campaign_id, document_key, document_label, chunk_index, chunk_text, embedding)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                    (campaign_id, document_key, document_label, chunk_index, chunk_text, embedding, embed_source)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         str(campaign_id),
@@ -585,7 +636,8 @@ class SourceMaterialMemory:
                         label,
                         idx,
                         chunk_text,
-                        _embed(chunk_text),
+                        _embed(chunk_text, source=embed_source),
+                        embed_source,
                     ),
                 )
             conn.commit()
@@ -729,59 +781,87 @@ class SourceMaterialMemory:
         try:
             import numpy as np
 
-            query_vec = _bytes_to_vector(_embed(query or ""))
             conn = cls._get_conn()
+            sources = _campaign_embed_sources(conn, "source_material_chunks", campaign_id)
+            if not sources:
+                return []
             before_n = max(0, min(50, int(before_lines)))
             after_n = max(0, min(50, int(after_lines)))
             key = str(document_key or "").strip()
+
+            # Build by_doc index from all rows (for window expansion).
             if key:
-                rows = conn.execute(
+                all_rows = conn.execute(
                     """
-                    SELECT document_key, document_label, chunk_index, chunk_text, embedding
+                    SELECT document_key, chunk_index, chunk_text
                     FROM source_material_chunks
                     WHERE campaign_id = ? AND document_key = ?
                     """,
                     (str(campaign_id), key),
                 ).fetchall()
             else:
-                rows = conn.execute(
+                all_rows = conn.execute(
                     """
-                    SELECT document_key, document_label, chunk_index, chunk_text, embedding
+                    SELECT document_key, chunk_index, chunk_text
                     FROM source_material_chunks
                     WHERE campaign_id = ?
                     """,
                     (str(campaign_id),),
                 ).fetchall()
-            if not rows:
-                return []
-
             by_doc: Dict[str, Dict[int, str]] = {}
+            for r_key, r_idx, r_text in all_rows:
+                doc_k = str(r_key or "")
+                ci = int(r_idx or 0)
+                ct = str(r_text or "")
+                if ci > 0 and ct:
+                    by_doc.setdefault(doc_k, {})[ci] = ct
+
             scored: List[Tuple[str, str, int, str, float]] = []
-            for row_key, row_label, row_chunk_idx, row_chunk_text, row_blob in rows:
-                doc_key = str(row_key or "")
-                chunk_idx = int(row_chunk_idx or 0)
-                chunk_text = str(row_chunk_text or "")
-                if chunk_idx > 0 and chunk_text:
-                    by_doc.setdefault(doc_key, {})[chunk_idx] = chunk_text
-                vec = _bytes_to_vector(row_blob)
-                score = float(np.dot(query_vec, vec))
-                scored.append(
-                    (
-                        doc_key,
-                        str(row_label or ""),
-                        chunk_idx,
-                        chunk_text,
-                        score,
+            for source in sources:
+                query_vec = _bytes_to_vector(_embed(query or "", source=source))
+                if key:
+                    rows = conn.execute(
+                        """
+                        SELECT document_key, document_label, chunk_index, chunk_text, embedding
+                        FROM source_material_chunks
+                        WHERE campaign_id = ? AND document_key = ? AND embed_source = ?
+                        """,
+                        (str(campaign_id), key, source),
+                    ).fetchall()
+                else:
+                    rows = conn.execute(
+                        """
+                        SELECT document_key, document_label, chunk_index, chunk_text, embedding
+                        FROM source_material_chunks
+                        WHERE campaign_id = ? AND embed_source = ?
+                        """,
+                        (str(campaign_id), source),
+                    ).fetchall()
+
+                for row_key, row_label, row_chunk_idx, row_chunk_text, row_blob in rows:
+                    doc_key_str = str(row_key or "")
+                    chunk_idx = int(row_chunk_idx or 0)
+                    chunk_text = str(row_chunk_text or "")
+                    vec = _bytes_to_vector(row_blob)
+                    score = float(np.dot(query_vec, vec))
+                    scored.append(
+                        (
+                            doc_key_str,
+                            str(row_label or ""),
+                            chunk_idx,
+                            chunk_text,
+                            score,
+                        )
                     )
-                )
+
             scored.sort(key=lambda t: t[4], reverse=True)
             selected = scored[: max(1, int(top_k))]
             expanded: List[Tuple[str, str, int, str, float]] = []
             mark_center = bool(before_n or after_n)
-            for doc_key, doc_label, center_idx, center_text, score in selected:
-                doc_chunks = by_doc.get(doc_key, {})
+            for doc_key_s, doc_label, center_idx, center_text, score in selected:
+                doc_chunks = by_doc.get(doc_key_s, {})
                 if center_idx <= 0:
-                    expanded.append((doc_key, doc_label, center_idx, center_text, score))
+                    expanded.append((doc_key_s, doc_label, center_idx, center_text, score))
                     continue
                 start_idx = max(1, center_idx - before_n)
                 end_idx = center_idx + after_n
@@ -798,7 +878,7 @@ class SourceMaterialMemory:
                     window_parts = [center_text]
                 expanded.append(
                     (
-                        doc_key,
+                        doc_key_s,
                         doc_label,
                         center_idx,
                         "\n".join(window_parts),

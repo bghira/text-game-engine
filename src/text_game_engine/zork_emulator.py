@@ -397,6 +397,8 @@ class ZorkEmulator:
     RESPONSE_STYLE_NOTE = (
         "[SYSTEM NOTE: FOR THIS RESPONSE ONLY: use the current style direction. Narrate in 1 to 6 beats as needed. "
         "No recap of unchanged facts. No flowery language unless a character canonically speaks that way. "
+        "Do not restage the room with a closing tableau or camera sweep over unchanged props, plates, parked cars, shadows, music, or weather. "
+        "If those details did not materially change this turn, leave them implicit. "
         "No novelistic inner monologue or comic-book melodrama. Keep NPC output actionable "
         "(intent, decision, question, or action), not repetitive reaction text. "
         "Vary pacing and meter between turns: sometimes clipped, sometimes patient, sometimes blunt, sometimes practical. "
@@ -416,11 +418,16 @@ class ZorkEmulator:
     )
     WRITING_CRAFT_PROMPT = (
         "WRITING_CRAFT:\n"
+        "- The player reads your output as the next entry in a continuous scroll — they can see everything you wrote before. Never re-establish setting, re-introduce characters, or recap facts the player already read unless something changed.\n"
         "- Anticipate what the player needs to know right now. Answer their implicit questions before they ask.\n"
         "- Ground every sentence in the concrete: sensory detail, specific objects, named places. Abstract summary is not narration.\n"
+        "- Do not inventory static scene furniture or recap unchanged atmosphere after the main beat lands. If the table, room, music, weather, shadows, or parked cars did not change, do not give them a farewell paragraph.\n"
         "- Simple, not simplistic. Accessible prose that trusts the reader's intelligence. Never over-explain.\n"
-        "- Every paragraph earns its place. Cut anything that doesn't move the scene, reveal character, or build atmosphere.\n"
+        "- Every paragraph earns its place. Cut anything that doesn't move the scene or reveal character.\n"
+        "- Atmosphere is seasoning, not the meal. One or two concrete sensory details per scene beat are enough; don't let mood-painting crowd out action, dialogue, or discovery.\n"
+        "- Not every character or object present in a scene needs to be re-stated or involved on every beat. Mention only those whose actions or reactions are meaningful right now.\n"
         "- Prefer the precise word over the approximate one. One vivid verb beats three limp adjectives.\n"
+        "- Never narrate 'a beat' (e.g. 'a beat of silence', 'there is a beat before...'). Show the pause through action, description, or pacing instead.\n"
         "- Structure matters: vary sentence length and rhythm. A short sentence after a long one lands harder.\n"
         "- Style is the differentiator. Don't just describe what happens — make how you describe it unmistakable.\n"
     )
@@ -568,6 +575,8 @@ class ZorkEmulator:
         "- DELTA MODE: each turn should add NEW developments only. Do not recap unchanged context from WORLD_SUMMARY or RECENT_TURNS.\n"
         "- Do not re-state the player's action in paraphrase unless needed for immediate clarity.\n"
         "- Avoid repetitive recap loops: at most one brief callback sentence to prior events, then move the scene forward.\n"
+        "- Do not end the turn with a static room-summary coda. If props, plates, music, shadows, weather, parked cars, or seating geometry did not materially change, do not summarize them again.\n"
+        "- Do not end the turn with a poetic wrap-up line, thematic echo, or atmospheric summary sentence. No 'The [place] holds its [emotion]', no 'whatever comes after X', no rhetorical questions framing the next beat. End on the last concrete action or line of dialogue, then stop.\n"
         "- Keep diction plain and direct; prioritize immediate consequences and available choices.\n"
         "- RECENT_TURNS includes turn/time tags like [TURN #N | Day D HH:MM]. Use them to track pacing and chronology.\n"
         "- RECENT_TURNS is already filtered to what the acting player plausibly knows. Hidden/private turns from other players are omitted.\n"
@@ -3465,7 +3474,7 @@ class ZorkEmulator:
             "\n"
             "CONFRONTATION SINCERITY:\n"
             "For NPCs who challenge the player philosophically or morally (villains, tempters, nihilists, gatekeepers), add a CHAR-[NAME]-CONFRONTATION note. The GM must engage with the sincerity of the player's defiance even when the words are plain. 'You're wrong' spoken with conviction is a valid response. The NPC should not dismiss simple sincerity as naive or re-ask until the player delivers a philosophically sophisticated rebuttal. The NPC reacts to the stance, not the eloquence.\n"
-            "Avoid generic AI-default names for any new characters. Ban list: Morgan, Kai, River, Sage, Quinn, Riley, Jordan, Avery, Harper, Rowan, Blake, Skyler, Ash, Nova, Zara, Milo, Ezra, Luna; surnames: Chen, Mendoza, Nakamura, Patel, Rollins, Kim, Santos, Okafor, Volkov, Johansson, Delacroix, Venn, Sands, Kade, Park.\n"
+            "Avoid generic AI-default names for any new characters. Ban list: Morgan, Kai, River, Sage, Quinn, Riley, Jordan, Avery, Harper, Rowan, Blake, Skyler, Ash, Nova, Zara, Milo, Ezra, Luna, Marcus; surnames: Chen, Mendoza, Nakamura, Patel, Rollins, Kim, Santos, Okafor, Volkov, Johansson, Delacroix, Venn, Sands, Kade, Park.\n"
             "Preserve player agency, kindness, and genre tone. Unless the genre explicitly demands otherwise, do not invent trauma hooks or coercive plot pressure.\n"
             f"{source_tool_instructions}"
         )
@@ -4939,6 +4948,9 @@ class ZorkEmulator:
 
         characters = world.get("characters", {})
         if isinstance(characters, dict) and characters:
+            for _char in characters.values():
+                if isinstance(_char, dict):
+                    _char["_enriched"] = True
             campaign.characters_json = self._dump_json(characters)
 
         story_outline = world.get("story_outline", {})
@@ -5887,6 +5899,232 @@ class ZorkEmulator:
             session.commit()
         return True
 
+    # ── Async Mid-Game NPC Enrichment ─────────────────────────────────────
+
+    ENRICHMENT_FIELDS = {
+        "personality", "background", "appearance", "speech_style",
+        "goals", "skills", "hobbies", "cultural_touchstones",
+        "childhood_memories", "relationships_history",
+        "escalation_behavior", "confrontation_style",
+    }
+
+    def _build_character_enrichment_prompt(
+        self,
+        campaign_name: str,
+        setting: str,
+        tone: str,
+        summary: str,
+        existing_character_names: list,
+        character_seed: dict,
+    ) -> tuple[str, str]:
+        """Return (system_prompt, user_prompt) for character enrichment."""
+        system_prompt = (
+            "You are a character-depth engine for an interactive text-adventure game.\n"
+            "Given a seed character profile, expand it into a rich, deep character.\n"
+            "Return ONLY valid JSON with two keys:\n\n"
+            '"profile" — object with these string fields:\n'
+            "  - personality (expanded: coping mechanisms, conflict handling, discomfort, deflection)\n"
+            "  - background (expanded: childhood, pivotal moments, how they changed since youth)\n"
+            "  - appearance (seed plus consistent physical details, gestures, wear patterns)\n"
+            "  - speech_style (expanded: verbal tics, phrases, angry vs calm vs lying, sentence structure)\n"
+            "  - goals (immediate and deep life goals)\n"
+            "  - skills (practical and social)\n"
+            "  - hobbies (free time activities)\n"
+            "  - cultural_touchstones (books read, stories referenced, cultural knowledge)\n"
+            "  - childhood_memories (2-3 specific memories that shaped them)\n"
+            "  - relationships_history (previous relationships good AND bad, or none; trust patterns)\n"
+            "  - escalation_behavior (what they do when player stalls/refuses/doesn't engage)\n"
+            "  - confrontation_style (how they handle direct philosophical/moral challenges)\n\n"
+            '"rulebook_lines" — array of exactly 4 strings in CATEGORY-TAG: fact text format:\n'
+            "  - CHAR-[NAME]: general character summary (50-200 words)\n"
+            "  - CHAR-[NAME]-PERSONALITY: personality and behavioral patterns (50-200 words)\n"
+            "  - CHAR-[NAME]-DIALOGUE: speech patterns and dialogue guidance (50-200 words)\n"
+            "  - INTERACTION-NEWCOMER-[NAME]: how to introduce and play this character when meeting the player (50-200 words)\n\n"
+            "Rules:\n"
+            "- Build on the seed character data — NEVER contradict it\n"
+            "- Match the campaign tone\n"
+            "- Do not invent trauma or abuse unless the seed implies it\n"
+            "- Rulebook lines must be plain text (no markdown, no JSON)\n"
+            "- Each rulebook line must be 50-200 words\n"
+            "- No markdown, no code fences in the response\n"
+        )
+        trimmed_summary = (summary or "")[:500]
+        banned_names = ", ".join(existing_character_names) if existing_character_names else "none"
+        user_prompt = (
+            f"Campaign: {campaign_name}\n"
+            f"Setting: {setting}\n"
+            f"Tone: {tone}\n"
+            f"Summary: {trimmed_summary}\n"
+            f"Existing characters (do not duplicate names): {banned_names}\n\n"
+            f"Seed character to enrich:\n{json.dumps(character_seed, indent=2)}\n"
+        )
+        return system_prompt, user_prompt
+
+    async def _enqueue_character_enrichment(
+        self,
+        campaign_id: str,
+        character_slug: str,
+        character_seed_dict: dict,
+    ) -> bool:
+        """Async enrichment: expand a shallow NPC seed into a deep character profile."""
+        try:
+            self._logger.info(
+                "CHARACTER ENRICHMENT START slug=%s campaign=%s",
+                character_slug, campaign_id,
+            )
+            # Extract campaign context
+            with self._session_factory() as session:
+                campaign = session.get(Campaign, str(campaign_id))
+                if campaign is None:
+                    return False
+                campaign_state = parse_json_dict(campaign.state_json)
+                setting = str(campaign_state.get("setting") or "").strip()
+                tone = str(campaign_state.get("tone") or "").strip()
+                summary = str(campaign.summary or "").strip()
+                campaign_name = str(campaign.name or "")
+                characters = parse_json_dict(campaign.characters_json)
+                existing_names = [
+                    str(c.get("name", s)).strip()
+                    for s, c in characters.items()
+                    if isinstance(c, dict)
+                ]
+
+            system_prompt, user_prompt = self._build_character_enrichment_prompt(
+                campaign_name=campaign_name,
+                setting=setting,
+                tone=tone,
+                summary=summary,
+                existing_character_names=existing_names,
+                character_seed=character_seed_dict,
+            )
+
+            if self._completion_port is None:
+                self._logger.warning("No completion port for character enrichment")
+                return False
+            response = await self._completion_port.complete(
+                system_prompt, user_prompt,
+                temperature=0.7, max_tokens=3000,
+            )
+            if not response:
+                self._logger.warning(
+                    "Character enrichment returned empty for %s", character_slug,
+                )
+                return False
+
+            json_text = self._extract_json(response)
+            enrichment = self._parse_json_lenient(json_text) if json_text else None
+            if not isinstance(enrichment, dict):
+                self._logger.warning(
+                    "Character enrichment parse failed for %s", character_slug,
+                )
+                return False
+
+            profile = enrichment.get("profile")
+            rulebook_lines = enrichment.get("rulebook_lines")
+            if not isinstance(profile, dict):
+                self._logger.warning(
+                    "Character enrichment missing profile for %s", character_slug,
+                )
+                return False
+            if not isinstance(rulebook_lines, list):
+                rulebook_lines = []
+
+            # Validate rulebook lines
+            valid_lines = []
+            for line in rulebook_lines:
+                if isinstance(line, str) and re.match(r"^[A-Z][A-Z0-9-]{1,80}:\s+\S", line):
+                    valid_lines.append(line)
+
+            self._apply_character_enrichment(
+                campaign_id=campaign_id,
+                character_slug=character_slug,
+                profile=profile,
+                rulebook_lines=valid_lines,
+            )
+            self._logger.info(
+                "CHARACTER ENRICHMENT COMPLETE slug=%s campaign=%s profile_keys=%s rulebook_lines=%d",
+                character_slug, campaign_id, list(profile.keys()), len(valid_lines),
+            )
+            return True
+        except Exception as e:
+            self._logger.warning(
+                "Character enrichment failed for %s: %s", character_slug, e,
+            )
+            return False
+
+    def _apply_character_enrichment(
+        self,
+        campaign_id: str,
+        character_slug: str,
+        profile: dict,
+        rulebook_lines: list,
+    ) -> bool:
+        """Write enriched profile back to characters_json and store rulebook entries."""
+        with self._session_factory() as session:
+            campaign = session.get(Campaign, str(campaign_id))
+            if campaign is None:
+                return False
+            characters = parse_json_dict(campaign.characters_json)
+            if character_slug not in characters:
+                return False
+            char = characters[character_slug]
+            if not isinstance(char, dict):
+                return False
+
+            # Merge ONLY enrichment fields — never touch mutable narrator fields
+            for field in self.ENRICHMENT_FIELDS:
+                if field in profile:
+                    val = profile[field]
+                    if not isinstance(val, str):
+                        val = str(val) if val is not None else ""
+                    char[field] = val
+            char["_enriched"] = True
+
+            campaign.characters_json = self._dump_json(characters)
+            campaign.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
+            session.commit()
+
+        # Store rulebook entries
+        for line in rulebook_lines:
+            colon_idx = line.index(":")
+            rule_key = line[:colon_idx].strip()
+            rule_text = line[colon_idx + 1:].strip()
+            try:
+                self.put_campaign_rule(
+                    str(campaign_id),
+                    rule_key=rule_key,
+                    rule_text=rule_text,
+                    upsert=True,
+                )
+            except Exception as e:
+                self._logger.warning("Failed to store rulebook entry %s: %s", rule_key, e)
+        return True
+
+    async def _enqueue_new_character_enrichments(
+        self,
+        *,
+        campaign_id: str,
+        pre_slugs: set[str],
+    ) -> None:
+        """Enqueue enrichment for all new unenriched characters (mirrors _enqueue_new_character_portraits)."""
+        with self._session_factory() as session:
+            campaign = session.get(Campaign, str(campaign_id))
+            if campaign is None:
+                return
+            characters = parse_json_dict(campaign.characters_json)
+        if not isinstance(characters, dict):
+            return
+        for slug, value in characters.items():
+            if slug in pre_slugs or not isinstance(value, dict):
+                continue
+            if value.get("_enriched"):
+                continue
+            await self._enqueue_character_enrichment(
+                campaign_id=campaign_id,
+                character_slug=slug,
+                character_seed_dict=dict(value),
+            )
+
     def set_attribute(self, player: Player, name: str, value: int) -> tuple[bool, str]:
         if value < 0 or value > self.MAX_ATTRIBUTE_VALUE:
             return False, f"Value must be between 0 and {self.MAX_ATTRIBUTE_VALUE}."
@@ -6194,6 +6432,10 @@ class ZorkEmulator:
                     pre_slugs=pre_character_slugs,
                     channel_id=portrait_channel_ref,
                 )
+                asyncio.create_task(self._enqueue_new_character_enrichments(
+                    campaign_id=campaign_id,
+                    pre_slugs=pre_character_slugs,
+                ))
                 if self._private_setup_warning_needed(action):
                     self._set_turn_ephemeral_notices(
                         campaign_id,
@@ -7468,6 +7710,10 @@ class ZorkEmulator:
             pre_slugs=pre_character_slugs,
             channel_id=channel_id,
         )
+        asyncio.create_task(self._enqueue_new_character_enrichments(
+            campaign_id=campaign_id,
+            pre_slugs=pre_character_slugs,
+        ))
         narration = self._strip_narration_footer(result.narration or "")
         if (
             " ".join(str(narration or "").lower().split())
@@ -10499,7 +10745,7 @@ class ZorkEmulator:
             f"PLAYER_ROOM_TITLE: {room_title or 'Unknown'}\n"
             f"PLAYER_ROOM_SUMMARY: {room_summary or ''}\n"
             f"PLAYER_EXITS: {exits or []}\n"
-            f"WORLD_SUMMARY: {self._compose_world_summary(campaign, campaign_state, max_chars=1200)}\n"
+            f"WORLD_SUMMARY: {self._compose_world_summary(campaign, campaign_state, max_chars=6000)}\n"
             f"WORLD_STATE: {self._dump_json(model_state)}\n"
             f"LANDMARKS: {landmarks_text}\n"
             f"WORLD_CHARACTER_LOCATIONS: {chars_text}\n"
