@@ -5949,7 +5949,6 @@ class ZorkEmulator:
             "- No markdown, no code fences in the response\n"
         )
         trimmed_summary = (summary or "")[:500]
-        char_name = character_seed.get("name", "Unknown")
         banned_names = ", ".join(existing_character_names) if existing_character_names else "none"
         user_prompt = (
             f"Campaign: {campaign_name}\n"
@@ -6031,7 +6030,6 @@ class ZorkEmulator:
                 rulebook_lines = []
 
             # Validate rulebook lines
-            import re
             valid_lines = []
             for line in rulebook_lines:
                 if isinstance(line, str) and re.match(r"^[A-Z][A-Z0-9-]{1,80}:\s+\S", line):
@@ -6076,7 +6074,10 @@ class ZorkEmulator:
             # Merge ONLY enrichment fields — never touch mutable narrator fields
             for field in self.ENRICHMENT_FIELDS:
                 if field in profile:
-                    char[field] = profile[field]
+                    val = profile[field]
+                    if not isinstance(val, str):
+                        val = str(val) if val is not None else ""
+                    char[field] = val
             char["_enriched"] = True
 
             campaign.characters_json = self._dump_json(characters)
@@ -6431,10 +6432,10 @@ class ZorkEmulator:
                     pre_slugs=pre_character_slugs,
                     channel_id=portrait_channel_ref,
                 )
-                await self._enqueue_new_character_enrichments(
+                asyncio.create_task(self._enqueue_new_character_enrichments(
                     campaign_id=campaign_id,
                     pre_slugs=pre_character_slugs,
-                )
+                ))
                 if self._private_setup_warning_needed(action):
                     self._set_turn_ephemeral_notices(
                         campaign_id,
@@ -7709,10 +7710,10 @@ class ZorkEmulator:
             pre_slugs=pre_character_slugs,
             channel_id=channel_id,
         )
-        await self._enqueue_new_character_enrichments(
+        asyncio.create_task(self._enqueue_new_character_enrichments(
             campaign_id=campaign_id,
             pre_slugs=pre_character_slugs,
-        )
+        ))
         narration = self._strip_narration_footer(result.narration or "")
         if (
             " ".join(str(narration or "").lower().split())
@@ -10744,7 +10745,7 @@ class ZorkEmulator:
             f"PLAYER_ROOM_TITLE: {room_title or 'Unknown'}\n"
             f"PLAYER_ROOM_SUMMARY: {room_summary or ''}\n"
             f"PLAYER_EXITS: {exits or []}\n"
-            f"WORLD_SUMMARY: {self._compose_world_summary(campaign, campaign_state, max_chars=1200)}\n"
+            f"WORLD_SUMMARY: {self._compose_world_summary(campaign, campaign_state, max_chars=6000)}\n"
             f"WORLD_STATE: {self._dump_json(model_state)}\n"
             f"LANDMARKS: {landmarks_text}\n"
             f"WORLD_CHARACTER_LOCATIONS: {chars_text}\n"

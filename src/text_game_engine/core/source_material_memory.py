@@ -50,8 +50,15 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_tge_smd_campaign_doc
 """
 
 
+_VALID_EMBED_SOURCES = {EMBED_SOURCE_MINILM, EMBED_SOURCE_SNOWFLAKE}
+
+
 def _get_model(source: str = EMBED_SOURCE_DEFAULT):
     global _model_minilm, _model_snowflake
+    source = (source or "").strip().lower()
+    if source not in _VALID_EMBED_SOURCES:
+        logger.warning("Unknown embed source %r, falling back to %s", source, EMBED_SOURCE_DEFAULT)
+        source = EMBED_SOURCE_DEFAULT
     if source == EMBED_SOURCE_MINILM:
         if _model_minilm is not None:
             return _model_minilm
@@ -88,8 +95,13 @@ def _bytes_to_vector(blob: bytes):
     return np.frombuffer(blob, dtype=np.float32)
 
 
+_ALLOWED_EMBED_TABLES = {"source_material_chunks"}
+
+
 def _campaign_embed_sources(conn, table: str, campaign_id) -> set:
     """Return the set of distinct embed_source values for a campaign in *table*."""
+    if table not in _ALLOWED_EMBED_TABLES:
+        raise ValueError(f"Invalid table name for embed source query: {table!r}")
     rows = conn.execute(
         f"SELECT DISTINCT embed_source FROM {table} WHERE campaign_id = ?",
         (str(campaign_id),),
@@ -581,6 +593,7 @@ class SourceMaterialMemory:
         chunks: List[str],
         source_mode: str = "line",
         replace_document: bool = True,
+        embed_source: str = EMBED_SOURCE_DEFAULT,
     ) -> Tuple[int, str]:
         try:
             label = " ".join(str(document_label or "").strip().split())[:120]
@@ -623,8 +636,8 @@ class SourceMaterialMemory:
                         label,
                         idx,
                         chunk_text,
-                        _embed(chunk_text),
-                        EMBED_SOURCE_DEFAULT,
+                        _embed(chunk_text, source=embed_source),
+                        embed_source,
                     ),
                 )
             conn.commit()
