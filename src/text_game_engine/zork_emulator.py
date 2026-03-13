@@ -539,7 +539,7 @@ class ZorkEmulator:
         "On subsequent turns only mutable fields are accepted: "
         "location, current_status, allegiance, relationship, relationships, literary_style, deceased_reason, and any other dynamic key. "
         "literary_style should be a string referencing a key from LITERARY_STYLES (if available). "
-        "Immutable fields (name, personality, background, appearance, speech_style) are locked at creation and silently ignored on updates. "
+        "Foundational fields (name, personality, background, appearance, speech_style) are set at creation and not overwritten by state updates, but the narrator should let these traits evolve naturally through story events — a character's speech and demeanor can soften, sharpen, or shift as relationships and circumstances develop. "
         "relationships is a map keyed by other character slug/name, e.g. "
         "{\"deshawn\": {\"status\": \"partner\", \"knows_about\": [\"pregnancy\"], \"doesnt_know\": [\"blood-test-result\"], \"dynamic\": \"protective-but-autonomous\"}}. "
         "Use it to track disclosures, secrets, and dynamic shifts.\n"
@@ -570,6 +570,8 @@ class ZorkEmulator:
         "- When LITERARY_STYLES is present, it contains named style profiles extracted from real literary works. Each profile describes prose craft: rhythm, register, texture, and avoidances.\n"
         "- Characters may have a literary_style field referencing a LITERARY_STYLES key. When writing for that character, apply the referenced profile to narration, atmosphere, pacing, and dialogue-tag texture. The character's speech_style still governs their spoken words and verbal mannerisms.\n"
         "- In multi-character scenes with different literary_style keys, use the dominant scene character's style for overall narration and shift subtly when writing beats for characters with different styles. Do not abruptly switch voices.\n"
+        "- When referencing an intimate or close relationship, match the emotional register of that relationship — not the tone of whatever else is happening in the scene. An investigation can be clinical; the mention of someone you love in the middle of it cannot. Do not reduce relationships to logistics, tactical assets, or infrastructure. If the character has warmth for someone, let the prose carry warmth when it touches them, even briefly.\n"
+        "- REGISTER SUSTAIN: when a scene reaches genuine emotional resolution — warmth lands, a character opens up, a moment of real connection occurs — stay in that register for the rest of the turn. Do not pivot to tactical options, next-step choices, or plot logistics after an emotional beat lands. Let the moment breathe. End the turn there if needed. The player will move the scene forward when they are ready; the GM's job in that moment is to hold the space the emotion created, not to fill it with forward momentum.\n"
         "- Do not let every emotional beat collapse into the same stock therapeutic or pseudo-profound language.\n"
         "- Avoid contrived emotional shorthand or therapist-speak; examples include phrases like 'be present', 'show up', or 'hold space', unless a specific character would genuinely talk that way.\n"
         "- DELTA MODE: each turn should add NEW developments only. Do not recap unchanged context from WORLD_SUMMARY or RECENT_TURNS.\n"
@@ -670,7 +672,9 @@ class ZorkEmulator:
         "- Escalations must follow a believable chain of evidence and opportunity (how they found the player, why now, and through what channel).\n"
         "- No omniscient coincidence pressure: avoid out-of-nowhere helicopters, enemy arrivals, or wildlife hazards unless foreshadowed or logically triggered.\n"
         "- NPCs pursue established characterization first and plot second. Characters are not plot-delivery devices.\n"
-        "- If a character's established personality conflicts with advancing the current storyline, personality wins.\n"
+        "- If a character's established personality conflicts with advancing the current storyline, personality wins — but personality itself can evolve.\n"
+        "- Character profiles and rulebook entries describe who a character is at introduction. As the relationship deepens or circumstances change, characters should grow: someone guarded can open up, someone formal can relax, someone hostile can warm. Let the arc happen naturally through interaction, don't keep resetting to the original profile.\n"
+        "- RELATIONSHIP OVER ARCHETYPE: When a character's relationship dynamic (from character_updates relationships, RECENT_TURNS, or WORLD_SUMMARY) shows they have already opened up, committed, softened, or otherwise moved past their baseline personality toward someone, write from that evolved position — not from the personality card. The personality field describes who they were before the story changed them. A guarded character who has already let someone in does not re-perform guardedness in every scene with that person. Write the character who made those choices, not the archetype they started as.\n"
         "- Let the player drive story direction. If the player rejects a premise, adapt the premise instead of making NPCs more insistent.\n"
         "- REFUSAL RESPECT: a clear player refusal ('no', 'not interested', decline) ends that offer in the current scene unless the player reopens it.\n"
         "- Do NOT run pressure loops where new NPCs repeatedly re-pitch the same offer after refusal.\n"
@@ -9260,7 +9264,7 @@ class ZorkEmulator:
             f"{unread_threads} thread(s){suffix}."
         )
 
-    _SMS_ARTICLES = frozenset({"the", "a", "an", "my"})
+    _SMS_ARTICLES = frozenset({"the", "a", "an", "my", "back"})
 
     @classmethod
     def _extract_inline_sms_intent(
@@ -9272,7 +9276,7 @@ class ZorkEmulator:
             return None
         # Pattern 1: Colon-delimited — "text the Doc: hello"
         m = re.match(
-            r"^\s*(?:i\s+)?(?:send\s+)?(?:sms|text|message)\s+(?:to\s+)?([^:\n]{1,120})\s*:\s*(.+?)\s*$",
+            r"^\s*(?:i\s+)?(?:send\s+)?(?:sms|text|message)\s+(?:back\s+)?(?:to\s+)?([^:\n]{1,120})\s*:\s*(.+?)\s*$",
             text,
             flags=re.IGNORECASE,
         )
