@@ -605,6 +605,13 @@ class ToolAwareZorkLLM:
         if not isinstance(character_updates, dict):
             character_updates = {}
 
+        tool_calls_raw = payload.get("tool_calls")
+        tool_calls: list[dict[str, Any]] = []
+        if isinstance(tool_calls_raw, list):
+            for tc in tool_calls_raw:
+                if isinstance(tc, dict) and isinstance(tc.get("tool_call"), str):
+                    tool_calls.append(tc)
+
         return LLMTurnOutput(
             narration=narration,
             reasoning=reasoning,
@@ -619,6 +626,7 @@ class ToolAwareZorkLLM:
             timer_instruction=timer_instruction,
             character_updates=character_updates,
             give_item=give_item,
+            tool_calls=tool_calls,
         )
 
     def _tool_memory_search(

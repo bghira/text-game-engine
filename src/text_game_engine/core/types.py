@@ -82,6 +82,7 @@ class LLMTurnOutput:
     dice_check: Optional[DiceCheckRequest] = None
     puzzle_trigger: Optional[PuzzleTrigger] = None
     minigame_challenge: Optional[MinigameChallenge] = None
+    tool_calls: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -122,6 +123,7 @@ class ResolveTurnResult:
     dice_result: Optional[DiceCheckResult] = None
     active_puzzle: Optional[dict[str, Any]] = None
     active_minigame: Optional[dict[str, Any]] = None
+    tool_calls: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass

@@ -927,6 +927,7 @@ class GameEngine:
                 dice_result=dice_result,
                 active_puzzle=campaign_state.get("_active_puzzle"),
                 active_minigame=campaign_state.get("_active_minigame"),
+                tool_calls=llm_output.tool_calls or [],
             )
 
     # ------------------------------------------------------------------
@@ -1201,7 +1202,7 @@ class GameEngine:
         merged = dict(existing) if isinstance(existing, dict) else {}
         if not isinstance(state_update, dict) or not merged:
             return merged, 0
-        overlay_mutable = {"location", "current_status", "allegiance"}
+        overlay_mutable = {"location", "current_status", "allegiance", "evolving_personality"}
         changed = 0
         for slug, overlay in state_update.items():
             if not isinstance(overlay, dict):
