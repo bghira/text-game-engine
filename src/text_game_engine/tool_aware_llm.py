@@ -605,6 +605,15 @@ class ToolAwareZorkLLM:
         if not isinstance(character_updates, dict):
             character_updates = {}
 
+        _TOOL_CALLS_ALLOWLIST = frozenset({"sms_write", "sms_schedule"})
+        tool_calls_raw = payload.get("tool_calls")
+        tool_calls: list[dict[str, Any]] = []
+        if isinstance(tool_calls_raw, list):
+            for tc in tool_calls_raw:
+                if isinstance(tc, dict) and isinstance(tc.get("tool_call"), str):
+                    if tc["tool_call"].strip().lower() in _TOOL_CALLS_ALLOWLIST:
+                        tool_calls.append(tc)
+
         return LLMTurnOutput(
             narration=narration,
             reasoning=reasoning,
@@ -619,6 +628,7 @@ class ToolAwareZorkLLM:
             timer_instruction=timer_instruction,
             character_updates=character_updates,
             give_item=give_item,
+            tool_calls=tool_calls,
         )
 
     def _tool_memory_search(
@@ -2246,7 +2256,16 @@ class ToolAwareZorkLLM:
             )
             if payload is None:
                 return await self._fallback.complete_turn(context)
-            return self._payload_to_output(payload, actor_id=context.actor_id)
+            output = self._payload_to_output(payload, actor_id=context.actor_id)
+            # Execute any inline tool_calls (sms_write / sms_schedule) that the
+            # LLM included alongside its final narration.  These have already
+            # been validated against the allowlist in _payload_to_output.
+            for tc in output.tool_calls:
+                try:
+                    self._execute_tool_call(context.campaign_id, tc, actor_id=context.actor_id)
+                except Exception:
+                    pass  # best-effort; don't break the turn
+            return output
         except Exception:
             return await self._fallback.complete_turn(context)
 
