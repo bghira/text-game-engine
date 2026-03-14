@@ -82,7 +82,9 @@ class ZorkEmulator:
     XP_BASE = 100
     XP_PER_LEVEL = 50
     ATTENTION_WINDOW_SECONDS = 600
-    IMMUTABLE_CHARACTER_FIELDS: set = set()  # slug is the dict key, not a field
+    IMMUTABLE_CHARACTER_FIELDS: set = frozenset({
+        "name", "personality", "background", "appearance", "speech_style",
+    })
     ATTACHMENT_MAX_BYTES = 500_000
     ATTACHMENT_CHUNK_TOKENS = 50_000
     ATTACHMENT_MODEL_CTX_TOKENS = 200_000

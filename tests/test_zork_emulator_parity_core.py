@@ -2087,3 +2087,241 @@ def test_speed_multiplier_scales_timer_delay_and_rendered_line(
         compat.cancel_pending_timer(campaign.id)
 
     asyncio.run(run_test())
+
+
+# ---------------------------------------------------------------------------
+# SMS "text back" syntax regression tests
+# ---------------------------------------------------------------------------
+
+
+def test_extract_inline_sms_intent_text_back_colon(session_factory):
+    """'text back to <recipient>: <message>' should parse via Pattern 1."""
+    compat = _build_compat(session_factory)
+
+    parsed = compat._extract_inline_sms_intent("text back to elizabeth: I'll be there soon")
+    assert parsed is not None
+    recipient, message = parsed
+    assert recipient == "elizabeth"
+    assert message == "I'll be there soon"
+
+
+def test_extract_inline_sms_intent_text_back_colon_no_to(session_factory):
+    """'text back elizabeth: <message>' (no 'to') should also parse."""
+    compat = _build_compat(session_factory)
+
+    parsed = compat._extract_inline_sms_intent("text back elizabeth: on my way")
+    assert parsed is not None
+    recipient, message = parsed
+    assert recipient == "elizabeth"
+    assert message == "on my way"
+
+
+def test_extract_inline_sms_intent_sms_back_colon(session_factory):
+    """'sms back to <recipient>: <message>' variant."""
+    compat = _build_compat(session_factory)
+
+    parsed = compat._extract_inline_sms_intent("sms back to saul: Meet at dock 9")
+    assert parsed is not None
+    recipient, message = parsed
+    assert recipient == "saul"
+    assert message == "Meet at dock 9"
+
+
+def test_extract_inline_sms_intent_i_text_back(session_factory):
+    """'i text back to <recipient>: <message>' variant."""
+    compat = _build_compat(session_factory)
+
+    parsed = compat._extract_inline_sms_intent("i text back to Doc: thanks for the tip")
+    assert parsed is not None
+    recipient, message = parsed
+    assert recipient == "Doc"
+    assert message == "thanks for the tip"
+
+
+def test_extract_inline_sms_intent_original_patterns_still_work(session_factory):
+    """Verify the original patterns are unbroken by the 'back' addition."""
+    compat = _build_compat(session_factory)
+
+    # Pattern 1: colon-delimited without "back"
+    p1 = compat._extract_inline_sms_intent("text elizabeth: hello there")
+    assert p1 is not None
+    assert p1[0] == "elizabeth"
+    assert p1[1] == "hello there"
+
+    # Pattern 2: space-delimited
+    p2 = compat._extract_inline_sms_intent("text Doc hello")
+    assert p2 is not None
+    assert p2[0] == "Doc"
+    assert p2[1] == "hello"
+
+
+# ---------------------------------------------------------------------------
+# Character field immutability tests
+# ---------------------------------------------------------------------------
+
+
+def test_apply_character_updates_immutable_fields_preserved(session_factory):
+    """Foundational fields on existing characters must not be overwritten."""
+    compat = _build_compat(session_factory)
+
+    existing = {
+        "saul": {
+            "name": "Saul Goodman",
+            "personality": "Charming, fast-talking",
+            "background": "Former lawyer",
+            "appearance": "Slicked-back hair, flashy suit",
+            "speech_style": "Rapid-fire legalese",
+            "location": "Strip mall office",
+            "current_status": "scheming",
+        },
+    }
+
+    updates = {
+        "saul": {
+            "name": "James McGill",  # immutable — should be ignored
+            "personality": "Reformed",  # immutable — should be ignored
+            "background": "New backstory",  # immutable — should be ignored
+            "appearance": "Casual clothes",  # immutable — should be ignored
+            "speech_style": "Soft-spoken",  # immutable — should be ignored
+            "location": "courthouse",  # mutable — should update
+            "current_status": "on trial",  # mutable — should update
+            "evolving_personality": "Worn down by guilt",  # mutable new field
+        },
+    }
+
+    result = compat._apply_character_updates(existing, updates)
+
+    # Immutable fields unchanged
+    assert result["saul"]["name"] == "Saul Goodman"
+    assert result["saul"]["personality"] == "Charming, fast-talking"
+    assert result["saul"]["background"] == "Former lawyer"
+    assert result["saul"]["appearance"] == "Slicked-back hair, flashy suit"
+    assert result["saul"]["speech_style"] == "Rapid-fire legalese"
+
+    # Mutable fields updated
+    assert result["saul"]["location"] == "courthouse"
+    assert result["saul"]["current_status"] == "on trial"
+    assert result["saul"]["evolving_personality"] == "Worn down by guilt"
+
+
+def test_apply_character_updates_new_char_gets_all_fields(session_factory):
+    """New characters should receive all fields including foundational ones."""
+    compat = _build_compat(session_factory)
+
+    existing = {}
+    updates = {
+        "mira": {
+            "name": "Mira",
+            "personality": "Quiet observer",
+            "background": "Unknown origins",
+            "appearance": "Dark cloak",
+            "speech_style": "Whispered fragments",
+            "location": "alley",
+        },
+    }
+
+    result = compat._apply_character_updates(existing, updates)
+
+    assert result["mira"]["name"] == "Mira"
+    assert result["mira"]["personality"] == "Quiet observer"
+    assert result["mira"]["background"] == "Unknown origins"
+    assert result["mira"]["appearance"] == "Dark cloak"
+    assert result["mira"]["speech_style"] == "Whispered fragments"
+    assert result["mira"]["location"] == "alley"
+
+
+# ---------------------------------------------------------------------------
+# tool_calls allowlist filtering and execution tests
+# ---------------------------------------------------------------------------
+
+
+def test_payload_to_output_filters_tool_calls_to_allowlist(session_factory, seed_campaign_and_actor):
+    """Only sms_write and sms_schedule should survive the allowlist filter."""
+    completion = StubCompletionPort()
+    tool_llm = ToolAwareZorkLLM(
+        session_factory=session_factory,
+        completion_port=completion,
+        temperature=0.8,
+        max_tokens=2048,
+    )
+    compat = _build_compat(session_factory)
+    tool_llm.bind_emulator(compat)
+
+    payload = {
+        "narration": "Test narration",
+        "state_update": {},
+        "tool_calls": [
+            {"tool_call": "sms_write", "thread": "saul", "from": "Saul", "to": "Dale", "message": "On my way."},
+            {"tool_call": "sms_schedule", "thread": "saul", "from": "Saul", "to": "Dale", "message": "Later.", "delay_seconds": 60},
+            {"tool_call": "memory_search", "queries": ["danger"]},  # NOT in allowlist
+            {"tool_call": "plot_plan"},  # NOT in allowlist
+        ],
+    }
+
+    output = tool_llm._payload_to_output(payload, actor_id=seed_campaign_and_actor["actor_id"])
+    assert len(output.tool_calls) == 2
+    assert output.tool_calls[0]["tool_call"] == "sms_write"
+    assert output.tool_calls[1]["tool_call"] == "sms_schedule"
+
+
+def test_tool_calls_sms_write_executed_in_complete_turn(session_factory, seed_campaign_and_actor):
+    """tool_calls with sms_write should actually persist the message."""
+
+    class SmsToolCallCompletionPort:
+        async def complete(self, system_prompt, prompt, *, temperature=0.8, max_tokens=2048):
+            return json.dumps({
+                "narration": "Saul fires off a quick text.",
+                "state_update": {
+                    "game_time": {"day": 1, "hour": 10, "minute": 0, "period": "morning", "date_label": "Day 1, Morning"},
+                },
+                "summary_update": "Saul texted Dale.",
+                "tool_calls": [
+                    {
+                        "tool_call": "sms_write",
+                        "thread": "dale",
+                        "from": "Saul",
+                        "to": "Dale",
+                        "message": "Meet me at Dock 9.",
+                    },
+                ],
+            })
+
+    completion = SmsToolCallCompletionPort()
+    tool_llm = ToolAwareZorkLLM(
+        session_factory=session_factory,
+        completion_port=completion,
+        temperature=0.8,
+        max_tokens=2048,
+    )
+    compat = _build_compat(session_factory, completion_port=completion)
+    tool_llm.bind_emulator(compat)
+
+    campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
+    # Ensure a Player row exists — complete_turn queries Player by campaign+actor.
+    compat.get_or_create_player(campaign.id, seed_campaign_and_actor["actor_id"])
+
+    async def run_test():
+        # Duck-typed context — complete_turn only reads campaign_id,
+        # actor_id, action, and session_id from the context object.
+        class _Ctx:
+            def __init__(self, campaign_id, actor_id, action):
+                self.campaign_id = campaign_id
+                self.actor_id = actor_id
+                self.action = action
+                self.session_id = None
+
+        ctx = _Ctx(
+            campaign_id=campaign.id,
+            actor_id=seed_campaign_and_actor["actor_id"],
+            action="text Dale",
+        )
+        output = await tool_llm.complete_turn(ctx)
+        assert output.narration == "Saul fires off a quick text."
+        assert len(output.tool_calls) == 1
+
+        # Verify the SMS was actually persisted
+        _key, _label, messages = compat.read_sms_thread(campaign.id, "dale", limit=10)
+        assert len(messages) >= 1
+        assert any(m["from"] == "Saul" and "Dock 9" in m["message"] for m in messages)
+
+    asyncio.run(run_test())
