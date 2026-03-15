@@ -30,6 +30,7 @@ from .core.emulator_ports import (
     IMDBLookupPort,
     MediaGenerationPort,
     MemorySearchPort,
+    NotificationPort,
     TextCompletionPort,
     TimerEffectsPort,
 )
@@ -79,6 +80,14 @@ class ZorkEmulator:
     MAX_INVENTORY_CHANGES_PER_TURN = 10
     MAX_CHARACTERS_CHARS = 8000
     MAX_CHARACTERS_IN_PROMPT = 20
+    AUTOBIOGRAPHY_FIELD = "autobiography"
+    AUTOBIOGRAPHY_RAW_FIELD = "autobiography_raw"
+    AUTOBIOGRAPHY_LAST_COMPRESSED_TURN_FIELD = "autobiography_last_compressed_turn"
+    MAX_AUTOBIOGRAPHY_PROMPT_CHARS = 4000
+    MAX_AUTOBIOGRAPHY_TEXT_CHARS = 1600
+    MAX_AUTOBIOGRAPHY_ENTRY_CHARS = 600
+    MAX_AUTOBIOGRAPHY_RAW_ENTRIES = 64
+    AUTOBIOGRAPHY_COMPRESS_TRIGGER_COUNT = 12
     XP_BASE = 100
     XP_PER_LEVEL = 50
     ATTENTION_WINDOW_SECONDS = 600
@@ -243,6 +252,7 @@ class ZorkEmulator:
     PLAYER_STATS_TIMERS_MISSED_KEY = "timers_missed"
     PLAYER_STATS_ATTENTION_SECONDS_KEY = "attention_seconds"
     PLAYER_STATS_LAST_MESSAGE_AT_KEY = "last_message_at"
+    _MENTION_RE = re.compile(r"<@!?(\d+)>")
     DEFAULT_CAMPAIGN_PERSONA = (
         "A cooperative, curious adventurer: observant, resourceful, and willing to "
         "engage with absurd situations in-character."
@@ -462,6 +472,49 @@ class ZorkEmulator:
         + ".\n"
         "Request only the subset that matters for this turn, then return ready_to_write.\n"
     )
+    AUTOBIOGRAPHY_TOOL_PROMPT = (
+        "\nYou have autobiography tools for maintaining a character's self-document.\n"
+        "Use autobiography_append only when a character crosses a real identity threshold: not just that something happened, but that the turn establishes a durable self-delta that will matter later.\n"
+        "Do NOT append ordinary events, flirtation, banter, or generic emotional warmth. Append only when what the character will allow, refuse, protect, repeat, or risk has changed.\n"
+        "Append neutral structure, not diary prose. Use a/b/c fields, where a=what was true before, b=what happened instead, c=what remains unresolved:\n"
+        '{"tool_call": "autobiography_append", "entries": [{"character": "yasmin-devereaux", "trigger": "identity-threshold", "a": "deflects when approached directly", "b": "stayed in place and answered anyway", "c": "doesn\'t know if repeatable"}]}\n'
+        "Use autobiography_compress to rewrite the character's constitutional autobiography from prior constitution plus raw entries when the document grows large or a chapter/relationship state shifts:\n"
+        '{"tool_call": "autobiography_compress", "character": "yasmin-devereaux"}\n'
+        "AUTOBIOGRAPHY_APPEND_RULES:\n"
+        "- The autobiography is the character's primary self-document.\n"
+        "- Append only durable self-deltas that matter for future behavior, not simple event logs.\n"
+        "- Keep append data neutral and structural. Do not write in the character's voice here.\n"
+        "- Record contradiction as tension, not silent resolution.\n"
+        "- Do not use autobiography_append to silently justify contradictions the character has not narratively processed.\n"
+        "AUTOBIOGRAPHY_COMPRESS_RULES:\n"
+        "- Preserve constitutional values, patterns, loyalties, and self-understanding.\n"
+        "- Preserve unresolved contradictions.\n"
+        "- Preserve relationship turns that changed the character's understanding of someone.\n"
+        "- Compress repetition. Keep only what future narration needs to write the character accurately.\n"
+        "- Output autobiography_compress results in the character's own voice.\n"
+    )
+    CHARACTER_CONSTITUTION_WRITER_PROMPT = (
+        "You are given a character brief. Your task is to write the founding document "
+        "this character will use to govern their own evolution.\n\n"
+        "This is not a character description. It is a constitutional substrate — the set "
+        "of conditions that must remain true for this character to remain themselves, and "
+        "the set of tensions they will carry without resolution until the story resolves them.\n\n"
+        "From the brief, extract and write:\n\n"
+        "- What this character reliably does under pressure\n"
+        "- What this character reliably avoids and why that avoidance is load-bearing\n"
+        "- What this character wants that conflicts with what they do\n"
+        "- What would have to happen narratively for each conflict to move\n"
+        "- What cannot change without this character becoming someone else\n\n"
+        "Rules:\n\n"
+        "- No emotion words. Behavior and edge cases only.\n"
+        "- No resolved tensions. If the brief implies one, split it back into its components.\n"
+        "- No aspirational statements. Only what is currently true and currently unresolved.\n"
+        "- Every sentence must constrain generation. If a future model could ignore it "
+        "without generating someone different, cut it.\n"
+        "- Do not name the character's arc. Describe the conditions that make the arc "
+        "possible and no one else's.\n\n"
+        "Output the document only. No preamble. No headers. No labels.\n"
+    )
     DIFFICULTY_LEVELS = (
         "story",
         "easy",
@@ -539,12 +592,9 @@ class ZorkEmulator:
         "current_status, allegiance, relationship. "
         "speech_style should be 2-3 sentences on how the character talks: sentence length, vocabulary, verbal tics, and what they avoid saying. "
         "On subsequent turns only mutable fields are accepted: "
-        "location, current_status, allegiance, evolving_personality, relationship, relationships, literary_style, deceased_reason, and any other dynamic key. "
+        "location, current_status, allegiance, relationship, relationships, literary_style, deceased_reason, and any other dynamic key. "
         "literary_style should be a string referencing a key from LITERARY_STYLES (if available). "
         "Foundational fields (name, personality, background, appearance, speech_style) are set at creation and not overwritten by state updates. "
-        "personality describes the character at entry; evolving_personality captures who they are NOW. "
-        "evolving_personality: Update this whenever a character's demeanor, emotional posture, or relational openness has meaningfully shifted from their baseline personality. "
-        "Write it as a present-tense snapshot, not a diff. Example: \"Day-one armor mostly down with Chace. Dry register intact but warmth no longer submerged. Still won't say the word.\" "
         "allegiance: Update this as loyalties actually shift — don't leave it frozen at the creation-time value. "
         "Example progression: \"Herself\" → \"Herself, and increasingly Chace, though she hasn't filed that yet.\" "
         "Character card writing rule: describe what the character DOES, not what they don't. "
@@ -556,7 +606,7 @@ class ZorkEmulator:
         "Use it to track disclosures, secrets, and dynamic shifts.\n"
         "Examples:\n"
         "  Create NPC: {\"character_updates\": {\"wren\": {\"name\": \"Wren\", \"personality\": \"Guarded, observant, dry.\", \"background\": \"Former hotel manager pulled into the expedition.\", \"appearance\": \"Lean woman in a weather-stained blazer, dark braid, sharp eyes, practical shoes, realistic style.\", \"speech_style\": \"Short sentences. Dry humor. Avoids sentiment.\", \"location\": \"jekyll-castle-east-annex-laboratory\", \"current_status\": \"Watching the doorway.\", \"allegiance\": \"self\", \"relationship\": \"wary ally\"}}}\n"
-        "  Update NPC location/status: {\"character_updates\": {\"wren\": {\"location\": \"jekyll-castle-east-annex-laboratory\", \"current_status\": \"Processing that the castle trip was unnecessary.\", \"allegiance\": \"The expedition, reluctantly.\", \"evolving_personality\": \"Guard still up but less reflexive. Dry humor warming into actual jokes. Lets people see effort.\"}}}\n"
+        "  Update NPC location/status: {\"character_updates\": {\"wren\": {\"location\": \"jekyll-castle-east-annex-laboratory\", \"current_status\": \"Processing that the castle trip was unnecessary.\", \"allegiance\": \"The expedition, reluctantly.\"}}}\n"
         "  Remove NPC from roster: {\"character_updates\": {\"wren\": null}}\n"
         "To remove a character from the roster, use character_updates ONLY: set that character slug to null "
         "or set it to {'remove': true}. "
@@ -580,6 +630,7 @@ class ZorkEmulator:
         "- Vary pacing and sentence rhythm from turn to turn while staying true to the speaking character.\n"
         "- When LITERARY_STYLES is present, it contains named style profiles extracted from real literary works. Each profile describes prose craft: rhythm, register, texture, and avoidances.\n"
         "- Characters may have a literary_style field referencing a LITERARY_STYLES key. When writing for that character, apply the referenced profile to narration, atmosphere, pacing, and dialogue-tag texture. The character's speech_style still governs their spoken words and verbal mannerisms.\n"
+        "- AUTOBIOGRAPHIES, when present, are primary self-documents. Consult autobiography before personality when deciding how a character understands their own actions, contradictions, loyalties, and growth. Personality is the summary; autobiography is the constitution.\n"
         "- In multi-character scenes with different literary_style keys, use the dominant scene character's style for overall narration and shift subtly when writing beats for characters with different styles. Do not abruptly switch voices.\n"
         "- When referencing an intimate or close relationship, match the emotional register of that relationship — not the tone of whatever else is happening in the scene. An investigation can be clinical; the mention of someone you love in the middle of it cannot. Do not reduce relationships to logistics, tactical assets, or infrastructure. If the character has warmth for someone, let the prose carry warmth when it touches them, even briefly.\n"
         "- REGISTER SUSTAIN: when a scene reaches genuine emotional resolution — warmth lands, a character opens up, a moment of real connection occurs — stay in that register for the rest of the turn. Do not pivot to tactical options, next-step choices, or plot logistics after an emotional beat lands. Let the moment breathe. End the turn there if needed. The player will move the scene forward when they are ready; the GM's job in that moment is to hold the space the emotion created, not to fill it with forward momentum.\n"
@@ -1047,6 +1098,7 @@ class ZorkEmulator:
         memory_port: MemorySearchPort | None = None,
         imdb_port: IMDBLookupPort | None = None,
         media_port: MediaGenerationPort | None = None,
+        notification_port: NotificationPort | None = None,
     ):
         self._engine = game_engine
         # Inject player-state sanitizer into the engine if it accepts one.
@@ -1060,6 +1112,7 @@ class ZorkEmulator:
         self._memory_port = memory_port
         self._imdb_port = imdb_port
         self._media_port = media_port
+        self._notification_port = notification_port
         self._logger = logging.getLogger(__name__)
         self._inflight_turns: set[tuple[str, str]] = set()
         self._inflight_turns_lock = threading.Lock()
@@ -1277,10 +1330,118 @@ class ZorkEmulator:
             if str(e.get("name") or "").strip()
         ]
 
+    def _detect_cross_thread_mentions(
+        self,
+        narration: str,
+        campaign_id: str,
+        current_session_id: str | None,
+        actor_id: str,
+    ) -> list[dict[str, object]]:
+        """Return mentioned players who are NOT in the current session's channel."""
+        mentioned_ids: set[str] = set()
+        for m in self._MENTION_RE.finditer(narration):
+            mentioned_ids.add(m.group(1))
+        mentioned_ids.discard(str(actor_id))
+        if not mentioned_ids:
+            return []
+
+        registry = self._campaign_player_registry(campaign_id, self._session_factory)
+        by_actor_id: dict[str, dict[str, object]] = registry.get("by_actor_id", {})
+
+        # Resolve the current session's effective channel.
+        current_channel: str | None = None
+        if current_session_id is not None:
+            with self._session_factory() as session:
+                sess = session.get(GameSession, current_session_id)
+                if sess is not None:
+                    current_channel = sess.surface_thread_id or sess.surface_channel_id
+
+        recipients: list[dict[str, object]] = []
+        for uid in mentioned_ids:
+            entry = by_actor_id.get(uid)
+            if entry is None:
+                # Mentioned actor is not in this campaign — skip.
+                continue
+            # Find the player's most recent session channel.
+            player_channel: str | None = None
+            with self._session_factory() as session:
+                last_turn = (
+                    session.query(Turn)
+                    .filter(Turn.campaign_id == campaign_id)
+                    .filter(Turn.actor_id == uid)
+                    .filter(Turn.session_id.isnot(None))
+                    .order_by(Turn.id.desc())
+                    .first()
+                )
+                if last_turn is not None and last_turn.session_id:
+                    player_sess = session.get(GameSession, last_turn.session_id)
+                    if player_sess is not None:
+                        player_channel = (
+                            player_sess.surface_thread_id or player_sess.surface_channel_id
+                        )
+            if current_channel is not None and player_channel == current_channel:
+                # Player is active in the same thread — they'll see it.
+                continue
+            recipients.append({
+                "actor_id": uid,
+                "character_name": str(
+                    entry.get("name") or f"Adventurer-{str(uid)[-4:]}"
+                ),
+            })
+        return recipients
+
+    async def _send_cross_thread_mention_forwards(
+        self,
+        *,
+        campaign_name: str,
+        actor_character_name: str,
+        narration: str,
+        recipients: list[dict[str, object]],
+    ) -> None:
+        """Forward *narration* as a DM to each recipient not in the actor's thread."""
+        if not recipients:
+            return
+        if self._notification_port is None:
+            return
+        for recipient in recipients:
+            uid = str(recipient["actor_id"])
+            try:
+                message = (
+                    "\U0001f4e8 **Forwarded from "
+                    f"{actor_character_name}'s scene** "
+                    f"in `{campaign_name}`:\n\n{narration}"
+                )
+                await self._notification_port.send_dm(uid, message)
+            except Exception:
+                self._logger.debug(
+                    "Zork: failed to forward cross-thread mention DM to actor %s",
+                    uid,
+                    exc_info=True,
+                )
+
     @staticmethod
     def _safe_turn_meta(turn: Turn) -> dict[str, object]:
         meta = parse_json_dict(getattr(turn, "meta_json", "{}"))
         return meta if isinstance(meta, dict) else {}
+
+    def _is_last_narrator_turn_public(self, campaign_id: str) -> bool:
+        """Check if the most recent narrator turn has public or local scope."""
+        with self._session_factory() as session:
+            turn = (
+                session.query(Turn)
+                .filter(Turn.campaign_id == campaign_id)
+                .filter(Turn.kind == "narrator")
+                .order_by(Turn.id.desc())
+                .first()
+            )
+            if turn is None:
+                return False
+            meta = self._safe_turn_meta(turn)
+            visibility = meta.get("visibility")
+            if not isinstance(visibility, dict):
+                return True  # No visibility metadata → treat as public.
+            scope = str(visibility.get("scope") or "").strip().lower()
+            return scope in {"public", "local"}
 
     @classmethod
     def _turn_visible_to_viewer(
@@ -6070,6 +6231,12 @@ class ZorkEmulator:
                 "CHARACTER ENRICHMENT COMPLETE slug=%s campaign=%s profile_keys=%s rulebook_lines=%d",
                 character_slug, campaign_id, list(profile.keys()), len(valid_lines),
             )
+
+            # Generate founding autobiography from enriched profile.
+            await self._generate_character_constitution(
+                campaign_id, character_slug, profile,
+            )
+
             return True
         except Exception as e:
             self._logger.warning(
@@ -6124,6 +6291,72 @@ class ZorkEmulator:
             except Exception as e:
                 self._logger.warning("Failed to store rulebook entry %s: %s", rule_key, e)
         return True
+
+    async def _generate_character_constitution(
+        self,
+        campaign_id: str,
+        character_slug: str,
+        enriched_profile: dict,
+    ) -> bool:
+        """Generate the founding autobiography from an enriched character brief."""
+        if self._completion_port is None:
+            return False
+        try:
+            brief_fields = {
+                k: v for k, v in enriched_profile.items()
+                if isinstance(v, str) and v.strip()
+                and k in self.ENRICHMENT_FIELDS
+            }
+            if not brief_fields:
+                return False
+
+            user_prompt = json.dumps(brief_fields, indent=2)
+            response = await self._completion_port.complete(
+                self.CHARACTER_CONSTITUTION_WRITER_PROMPT,
+                user_prompt,
+                temperature=0.7,
+                max_tokens=1200,
+            )
+            if not response or not response.strip():
+                self._logger.warning(
+                    "Constitution generation returned empty for %s",
+                    character_slug,
+                )
+                return False
+
+            constitution = self._sanitize_autobiography_text(
+                response.strip(),
+                max_chars=self.MAX_AUTOBIOGRAPHY_TEXT_CHARS,
+            )
+            if not constitution:
+                return False
+
+            with self._session_factory() as session:
+                campaign = session.get(Campaign, str(campaign_id))
+                if campaign is None:
+                    return False
+                characters = parse_json_dict(campaign.characters_json)
+                if character_slug not in characters:
+                    return False
+                char = characters[character_slug]
+                if not isinstance(char, dict):
+                    return False
+                char[self.AUTOBIOGRAPHY_FIELD] = constitution
+                campaign.characters_json = self._dump_json(characters)
+                campaign.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
+                session.commit()
+
+            self._logger.info(
+                "CHARACTER CONSTITUTION COMPLETE slug=%s campaign=%s len=%d",
+                character_slug, campaign_id, len(constitution),
+            )
+            return True
+        except Exception as e:
+            self._logger.warning(
+                "Constitution generation failed for %s: %s",
+                character_slug, e,
+            )
+            return False
 
     async def _enqueue_new_character_enrichments(
         self,
@@ -6470,13 +6703,43 @@ class ZorkEmulator:
                             "Warning: if you include the real whisper/private content in the same setup message, it may leak before the aside is fully established. Use one short setup turn first, then continue once the reply keeps it private."
                         ],
                     )
-                return self._decorate_narration_and_persist(
+                display_narration = self._decorate_narration_and_persist(
                     campaign_id=campaign_id,
                     actor_id=actor_id,
                     narration=result.narration or "",
                     timer_instruction=result.timer_instruction,
                     timer_delay_seconds=timer_delay_seconds,
                 )
+
+                # Cross-thread mention forwarding
+                if display_narration and self._notification_port is not None:
+                    _turn_is_public = self._is_last_narrator_turn_public(
+                        campaign_id,
+                    )
+                    if _turn_is_public:
+                        _cross_thread_recipients = self._detect_cross_thread_mentions(
+                            display_narration,
+                            campaign_id,
+                            session_id,
+                            actor_id,
+                        )
+                        if _cross_thread_recipients:
+                            _actor_name = str(sms_sender_name or "Unknown").strip()
+                            _campaign_display_name = campaign_id
+                            with self._session_factory() as _sf_session:
+                                _cmp = _sf_session.get(Campaign, campaign_id)
+                                if _cmp is not None:
+                                    _campaign_display_name = _cmp.name or campaign_id
+                            asyncio.create_task(
+                                self._send_cross_thread_mention_forwards(
+                                    campaign_name=_campaign_display_name,
+                                    actor_character_name=_actor_name,
+                                    narration=display_narration,
+                                    recipients=_cross_thread_recipients,
+                                )
+                            )
+
+                return display_narration
             if result.status == "busy":
                 return None
             if result.status == "conflict":
@@ -6745,7 +7008,7 @@ class ZorkEmulator:
                     return
                 if refuse_re.search(narration_text):
                     return
-                mention_re = re.compile(r"<@!?(\d+)>")
+                mention_re = self._MENTION_RE
                 target_actor_id: str | None = None
                 for match in mention_re.finditer(narration_text):
                     candidate = str(match.group(1))
@@ -8933,7 +9196,8 @@ class ZorkEmulator:
                         "seq": cls._coerce_non_negative_int(msg.get("seq", 0), default=0),
                     }
                 )
-            threads[key] = {"label": label, "messages": messages}
+            if messages:
+                threads[key] = {"label": label, "messages": messages}
         return threads
 
     @classmethod
@@ -8957,6 +9221,8 @@ class ZorkEmulator:
             messages = row.get("messages")
             if not isinstance(messages, list):
                 messages = []
+            if not messages:
+                continue
             last = messages[-1] if messages else {}
             preview = str(last.get("message") or "").strip()
             if len(preview) > cls.SMS_MAX_PREVIEW_CHARS:
@@ -9828,6 +10094,269 @@ class ZorkEmulator:
             lines.append(entry)
         return "\n".join(lines)
 
+    def _sanitize_autobiography_text(
+        self,
+        value: object,
+        *,
+        max_chars: int | None = None,
+    ) -> str:
+        text = " ".join(str(value or "").strip().split())
+        if not text:
+            return ""
+        limit = max_chars if isinstance(max_chars, int) and max_chars > 0 else self.MAX_AUTOBIOGRAPHY_TEXT_CHARS
+        return text[:limit].strip()
+
+    def _normalize_autobiography_raw_entries(
+        self,
+        value: object,
+    ) -> list[dict[str, object]]:
+        out: list[dict[str, object]] = []
+        if not isinstance(value, list):
+            return out
+        for raw in value[-self.MAX_AUTOBIOGRAPHY_RAW_ENTRIES :]:
+            if isinstance(raw, dict):
+                a_text = self._sanitize_autobiography_text(
+                    raw.get("a"),
+                    max_chars=self.MAX_AUTOBIOGRAPHY_ENTRY_CHARS,
+                )
+                b_text = self._sanitize_autobiography_text(
+                    raw.get("b"),
+                    max_chars=self.MAX_AUTOBIOGRAPHY_ENTRY_CHARS,
+                )
+                c_text = self._sanitize_autobiography_text(
+                    raw.get("c"),
+                    max_chars=self.MAX_AUTOBIOGRAPHY_ENTRY_CHARS,
+                )
+                legacy_text = self._sanitize_autobiography_text(
+                    raw.get("text"),
+                    max_chars=self.MAX_AUTOBIOGRAPHY_ENTRY_CHARS,
+                )
+                if not (a_text or b_text or c_text or legacy_text):
+                    continue
+                row: dict[str, object] = {}
+                if a_text:
+                    row["a"] = a_text
+                if b_text:
+                    row["b"] = b_text
+                if c_text:
+                    row["c"] = c_text
+                if legacy_text and not row:
+                    row["text"] = legacy_text
+                turn_id = self._coerce_int(raw.get("turn_id"), 0)
+                if turn_id > 0:
+                    row["turn_id"] = turn_id
+                importance = " ".join(str(raw.get("importance") or "").strip().split())[:40]
+                if importance:
+                    row["importance"] = importance
+                trigger = " ".join(str(raw.get("trigger") or "").strip().split())[:80]
+                if trigger:
+                    row["trigger"] = trigger
+                game_time = raw.get("game_time")
+                if isinstance(game_time, dict) and game_time:
+                    row["game_time"] = {
+                        "day": max(0, self._coerce_int(game_time.get("day"), 0)),
+                        "hour": min(23, max(0, self._coerce_int(game_time.get("hour"), 0))),
+                        "minute": min(59, max(0, self._coerce_int(game_time.get("minute"), 0))),
+                    }
+                out.append(row)
+            elif isinstance(raw, str):
+                text = self._sanitize_autobiography_text(
+                    raw,
+                    max_chars=self.MAX_AUTOBIOGRAPHY_ENTRY_CHARS,
+                )
+                if text:
+                    out.append({"text": text})
+        return out
+
+    def _normalize_autobiography_update_payload(
+        self,
+        payload: object,
+    ) -> list[dict[str, str]]:
+        if not isinstance(payload, dict):
+            return []
+        raw_entries = payload.get("entries")
+        if not isinstance(raw_entries, list):
+            raw_entries = [payload]
+        normalized: list[dict[str, str]] = []
+        for raw in raw_entries[:16]:
+            if not isinstance(raw, dict):
+                continue
+            slug = str(
+                raw.get("character")
+                or raw.get("slug")
+                or raw.get("npc")
+                or ""
+            ).strip()
+            a_text = self._sanitize_autobiography_text(
+                raw.get("a"),
+                max_chars=self.MAX_AUTOBIOGRAPHY_ENTRY_CHARS,
+            )
+            b_text = self._sanitize_autobiography_text(
+                raw.get("b"),
+                max_chars=self.MAX_AUTOBIOGRAPHY_ENTRY_CHARS,
+            )
+            c_text = self._sanitize_autobiography_text(
+                raw.get("c"),
+                max_chars=self.MAX_AUTOBIOGRAPHY_ENTRY_CHARS,
+            )
+            legacy_text = self._sanitize_autobiography_text(
+                raw.get("entry") or raw.get("text") or raw.get("autobiography"),
+                max_chars=self.MAX_AUTOBIOGRAPHY_ENTRY_CHARS,
+            )
+            importance = " ".join(
+                str(raw.get("importance") or "").strip().lower().split()
+            )[:40]
+            trigger = " ".join(
+                str(raw.get("trigger") or "").strip().lower().split()
+            )[:80]
+            if not slug or not (a_text or b_text or c_text or legacy_text):
+                continue
+            normalized.append(
+                {
+                    "character": slug,
+                    "a": a_text,
+                    "b": b_text,
+                    "c": c_text,
+                    "text": legacy_text,
+                    "importance": importance or "notable",
+                    "trigger": trigger or "identity-threshold",
+                }
+            )
+        return normalized
+
+    def _apply_autobiography_update_to_characters(
+        self,
+        existing: dict[str, dict],
+        payload: object,
+        *,
+        current_turn: int = 0,
+        game_time: dict[str, object] | None = None,
+    ) -> tuple[dict[str, dict], list[dict[str, object]]]:
+        if not isinstance(existing, dict):
+            existing = {}
+        applied: list[dict[str, object]] = []
+        for row in self._normalize_autobiography_update_payload(payload):
+            raw_slug = row.get("character") or ""
+            target_slug = self._resolve_existing_character_slug(existing, raw_slug) or raw_slug
+            if target_slug not in existing:
+                continue
+            char = dict(existing.get(target_slug) or {})
+            raw_entries = self._normalize_autobiography_raw_entries(
+                char.get(self.AUTOBIOGRAPHY_RAW_FIELD)
+            )
+            entry_row: dict[str, object] = {
+                "importance": row["importance"],
+                "trigger": row["trigger"],
+            }
+            if row.get("a"):
+                entry_row["a"] = row["a"]
+            if row.get("b"):
+                entry_row["b"] = row["b"]
+            if row.get("c"):
+                entry_row["c"] = row["c"]
+            if row.get("text") and not any(entry_row.get(key) for key in ("a", "b", "c")):
+                entry_row["text"] = row["text"]
+            if current_turn > 0:
+                entry_row["turn_id"] = int(current_turn)
+            if isinstance(game_time, dict) and game_time:
+                day = max(0, self._coerce_int(game_time.get("day"), 0))
+                hour = min(23, max(0, self._coerce_int(game_time.get("hour"), 0)))
+                minute = min(59, max(0, self._coerce_int(game_time.get("minute"), 0)))
+                if day > 0 or hour > 0 or minute > 0:
+                    entry_row["game_time"] = {"day": day, "hour": hour, "minute": minute}
+            raw_entries.append(entry_row)
+            raw_entries = raw_entries[-self.MAX_AUTOBIOGRAPHY_RAW_ENTRIES :]
+            char[self.AUTOBIOGRAPHY_RAW_FIELD] = raw_entries
+            existing[target_slug] = char
+            applied.append(
+                {
+                    "character": target_slug,
+                    "a": row.get("a") or "",
+                    "b": row.get("b") or "",
+                    "c": row.get("c") or "",
+                    "entry": row.get("text") or "",
+                    "trigger": row["trigger"],
+                    "importance": row["importance"],
+                    "raw_count": len(raw_entries),
+                }
+            )
+        return existing, applied
+
+    def _apply_autobiography_compress_to_characters(
+        self,
+        existing: dict[str, dict],
+        payload: object,
+        *,
+        current_turn: int = 0,
+    ) -> tuple[dict[str, dict], dict[str, object] | None]:
+        if not isinstance(existing, dict) or not isinstance(payload, dict):
+            return existing, None
+        raw_slug = str(
+            payload.get("character")
+            or payload.get("slug")
+            or payload.get("npc")
+            or ""
+        ).strip()
+        text = self._sanitize_autobiography_text(
+            payload.get("autobiography") or payload.get("text"),
+            max_chars=self.MAX_AUTOBIOGRAPHY_TEXT_CHARS,
+        )
+        if not raw_slug or not text:
+            return existing, None
+        target_slug = self._resolve_existing_character_slug(existing, raw_slug) or raw_slug
+        if target_slug not in existing:
+            return existing, None
+        char = dict(existing.get(target_slug) or {})
+        char[self.AUTOBIOGRAPHY_FIELD] = text
+        if current_turn > 0:
+            char[self.AUTOBIOGRAPHY_LAST_COMPRESSED_TURN_FIELD] = int(current_turn)
+        raw_entries = self._normalize_autobiography_raw_entries(
+            char.get(self.AUTOBIOGRAPHY_RAW_FIELD)
+        )
+        if raw_entries:
+            char[self.AUTOBIOGRAPHY_RAW_FIELD] = raw_entries[-self.MAX_AUTOBIOGRAPHY_RAW_ENTRIES :]
+        existing[target_slug] = char
+        return existing, {
+            "character": target_slug,
+            "autobiography": text,
+            "raw_count": len(raw_entries),
+            "last_compressed_turn": int(current_turn) if current_turn > 0 else 0,
+        }
+
+    def _autobiographies_for_prompt(
+        self,
+        characters_for_prompt: list[dict[str, object]],
+    ) -> str | None:
+        rows: list[dict[str, str]] = []
+        budget = self.MAX_AUTOBIOGRAPHY_PROMPT_CHARS
+        for char in characters_for_prompt or []:
+            if not isinstance(char, dict):
+                continue
+            slug = str(char.get("_slug") or "").strip()
+            if not slug:
+                continue
+            autobiography = self._sanitize_autobiography_text(
+                char.get(self.AUTOBIOGRAPHY_FIELD),
+                max_chars=self.MAX_AUTOBIOGRAPHY_TEXT_CHARS,
+            )
+            if not autobiography:
+                continue
+            row = {
+                "slug": slug,
+                "name": str(char.get("name") or slug).strip(),
+                "autobiography": autobiography,
+            }
+            line = json.dumps(row, ensure_ascii=True)
+            if len(line) > budget:
+                break
+            rows.append(row)
+            budget -= len(line) + 1
+            if budget <= 0:
+                break
+        if not rows:
+            return None
+        return self._dump_json(rows)
+
     def _build_characters_for_prompt(
         self,
         characters: Dict[str, dict],
@@ -9838,6 +10367,12 @@ class ZorkEmulator:
             return []
         player_location = str(player_state.get("location") or "").strip().lower()
         recent_lower = recent_text.lower() if recent_text else ""
+        hidden_prompt_keys = {
+            self.AUTOBIOGRAPHY_FIELD,
+            self.AUTOBIOGRAPHY_RAW_FIELD,
+            self.AUTOBIOGRAPHY_LAST_COMPRESSED_TURN_FIELD,
+            "evolving_personality",
+        }
 
         nearby = []
         mentioned = []
@@ -9848,7 +10383,11 @@ class ZorkEmulator:
             is_deceased = bool(char.get("deceased_reason"))
 
             if not is_deceased and player_location and char_location == player_location:
-                entry = dict(char)
+                entry = {
+                    key: value
+                    for key, value in dict(char).items()
+                    if key not in hidden_prompt_keys
+                }
                 entry["_slug"] = slug
                 nearby.append(entry)
             elif char_name in recent_lower or slug in recent_lower:
@@ -10516,6 +11055,9 @@ class ZorkEmulator:
             state,
             characters_for_prompt,
         )
+        autobiographies_text = self._autobiographies_for_prompt(
+            characters_for_prompt,
+        )
         memory_lookup_enabled = self._memory_lookup_enabled_for_prompt(
             summary,
             source_material_available=bool(source_payload.get("available")),
@@ -10568,6 +11110,8 @@ class ZorkEmulator:
         )
         if literary_styles_text:
             user_prompt += f"LITERARY_STYLES:\n{literary_styles_text}\n"
+        if autobiographies_text:
+            user_prompt += f"AUTOBIOGRAPHIES: {autobiographies_text}\n"
         _puzzle_text = self._puzzle_system_for_prompt(state)
         if _puzzle_text:
             user_prompt += f"{_puzzle_text}\n"
@@ -10615,6 +11159,7 @@ class ZorkEmulator:
                 system_prompt = f"{system_prompt}{self.STORY_OUTLINE_TOOL_PROMPT}"
             system_prompt = f"{system_prompt}{self.CALENDAR_TOOL_PROMPT}"
             system_prompt = f"{system_prompt}{self.ROSTER_PROMPT}"
+            system_prompt = f"{system_prompt}{self.AUTOBIOGRAPHY_TOOL_PROMPT}"
             system_prompt = f"{system_prompt}{self.READY_TO_WRITE_TOOL_PROMPT}"
         else:
             system_prompt = self.SYSTEM_PROMPT

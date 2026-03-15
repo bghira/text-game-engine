@@ -1097,6 +1097,186 @@ class ToolAwareZorkLLM:
             + ", ".join(self._emulator.COMMUNICATION_RULE_KEYS)  # noqa: SLF001
         )
 
+    def _tool_autobiography_append(self, campaign_id: str, payload: dict[str, Any]) -> str:
+        emulator = self._emulator
+        if emulator is None:
+            return "AUTOBIOGRAPHY_APPEND_RESULT: unavailable"
+        with self._session_factory() as session:
+            campaign = session.get(Campaign, campaign_id)
+            if campaign is None:
+                return "AUTOBIOGRAPHY_APPEND_RESULT: campaign not found"
+            characters = emulator.get_campaign_characters(campaign)
+            state = self._parse_json(campaign.state_json, {})
+            game_time = state.get("game_time") if isinstance(state, dict) else {}
+            latest_turn_id = 0
+            turn_rows = (
+                session.query(Turn.id)
+                .filter(Turn.campaign_id == campaign_id)
+                .order_by(Turn.id.desc())
+                .limit(1)
+                .all()
+            )
+            if turn_rows:
+                latest_turn_id = int(turn_rows[0][0] or 0)
+            characters, applied_rows = emulator._apply_autobiography_update_to_characters(  # noqa: SLF001
+                characters,
+                payload,
+                current_turn=latest_turn_id,
+                game_time=game_time if isinstance(game_time, dict) else {},
+            )
+            if not applied_rows:
+                return (
+                    "AUTOBIOGRAPHY_APPEND_RESULT: nothing stored. "
+                    "Use existing NPC slugs from WORLD_CHARACTERS and include a non-empty a/b/c delta."
+                )
+            campaign.characters_json = json.dumps(characters, ensure_ascii=True)
+            campaign.updated_at = datetime.now(UTC).replace(tzinfo=None)
+            session.commit()
+        lines = ["AUTOBIOGRAPHY_APPEND_RESULT:"]
+        for row in applied_rows[:8]:
+            suggestion = ""
+            if int(row.get("raw_count") or 0) >= emulator.AUTOBIOGRAPHY_COMPRESS_TRIGGER_COUNT:  # noqa: SLF001
+                suggestion = " [compression recommended]"
+            lines.append(
+                "- "
+                f"{row.get('character')}: {row.get('importance')} delta stored "
+                f"(raw_count={row.get('raw_count')}){suggestion}"
+            )
+        return "\n".join(lines)
+
+    async def _tool_autobiography_compress(self, campaign_id: str, payload: dict[str, Any]) -> str:
+        emulator = self._emulator
+        if emulator is None:
+            return "AUTOBIOGRAPHY_COMPRESS_RESULT: unavailable"
+        raw_slug = str(
+            payload.get("character")
+            or payload.get("slug")
+            or payload.get("npc")
+            or ""
+        ).strip()
+        if not raw_slug:
+            return "AUTOBIOGRAPHY_COMPRESS_RESULT: character not found. Use an existing NPC slug from WORLD_CHARACTERS."
+        with self._session_factory() as session:
+            campaign = session.get(Campaign, campaign_id)
+            if campaign is None:
+                return "AUTOBIOGRAPHY_COMPRESS_RESULT: campaign not found"
+            characters = emulator.get_campaign_characters(campaign)
+            resolved_slug = emulator._resolve_existing_character_slug(characters, raw_slug) or raw_slug  # noqa: SLF001
+            character_row = dict(characters.get(resolved_slug) or {})
+            if not character_row:
+                return "AUTOBIOGRAPHY_COMPRESS_RESULT: character not found. Use an existing NPC slug from WORLD_CHARACTERS."
+            raw_entries = emulator._normalize_autobiography_raw_entries(  # noqa: SLF001
+                character_row.get(emulator.AUTOBIOGRAPHY_RAW_FIELD)  # noqa: SLF001
+            )
+            current_auto = str(character_row.get(emulator.AUTOBIOGRAPHY_FIELD) or "").strip()  # noqa: SLF001
+            if not raw_entries and not current_auto:
+                return f"AUTOBIOGRAPHY_COMPRESS_RESULT: {resolved_slug} has no autobiography material yet."
+            entry_lines: list[str] = []
+            for row in raw_entries[-16:]:
+                if not isinstance(row, dict):
+                    continue
+                a_text = emulator._sanitize_autobiography_text(  # noqa: SLF001
+                    row.get("a"),
+                    max_chars=emulator.MAX_AUTOBIOGRAPHY_ENTRY_CHARS,  # noqa: SLF001
+                )
+                b_text = emulator._sanitize_autobiography_text(  # noqa: SLF001
+                    row.get("b"),
+                    max_chars=emulator.MAX_AUTOBIOGRAPHY_ENTRY_CHARS,  # noqa: SLF001
+                )
+                c_text = emulator._sanitize_autobiography_text(  # noqa: SLF001
+                    row.get("c"),
+                    max_chars=emulator.MAX_AUTOBIOGRAPHY_ENTRY_CHARS,  # noqa: SLF001
+                )
+                legacy_text = emulator._sanitize_autobiography_text(  # noqa: SLF001
+                    row.get("text"),
+                    max_chars=emulator.MAX_AUTOBIOGRAPHY_ENTRY_CHARS,  # noqa: SLF001
+                )
+                if not (a_text or b_text or c_text or legacy_text):
+                    continue
+                stamp = ""
+                gt = row.get("game_time")
+                if isinstance(gt, dict):
+                    day = max(0, emulator._coerce_int(gt.get("day"), 0))  # noqa: SLF001
+                    hour = min(23, max(0, emulator._coerce_int(gt.get("hour"), 0)))  # noqa: SLF001
+                    minute = min(59, max(0, emulator._coerce_int(gt.get("minute"), 0)))  # noqa: SLF001
+                    if day > 0:
+                        stamp = f"Day {day} {hour:02d}:{minute:02d} "
+                importance = " ".join(str(row.get("importance") or "").strip().split())[:40]
+                trigger = " ".join(str(row.get("trigger") or "").strip().split())[:80]
+                raw_row: dict[str, str] = {}
+                if trigger:
+                    raw_row["trigger"] = trigger
+                if importance:
+                    raw_row["importance"] = importance
+                if a_text:
+                    raw_row["a"] = a_text
+                if b_text:
+                    raw_row["b"] = b_text
+                if c_text:
+                    raw_row["c"] = c_text
+                if legacy_text and not raw_row.get("a") and not raw_row.get("b") and not raw_row.get("c"):
+                    raw_row["text"] = legacy_text
+                entry_lines.append(f"- {stamp}{json.dumps(raw_row, ensure_ascii=True)}".strip())
+            system_prompt = (
+                "You are compressing a character autobiography. "
+                "Output ONLY the rewritten autobiography text, in first person, in the character's own voice. "
+                "Do not output JSON, labels, bullets, or explanation.\n"
+                "Rules:\n"
+                "- Preserve values, patterns, loyalties, and self-understanding the character still acts from.\n"
+                "- Preserve unresolved contradictions as tension; do not resolve them unless the story already did.\n"
+                "- Preserve relationship turns that changed the character's understanding of someone.\n"
+                "- Compress repetition. Keep only what future narration needs to write the character accurately.\n"
+                "- The autobiography is constitutional: growth is allowed, drift without reckoning is not.\n"
+            )
+            user_prompt = (
+                f"CHARACTER: {character_row.get('name') or resolved_slug} ({resolved_slug})\n"
+                f"CURRENT_AUTOBIOGRAPHY: {current_auto or '(none)'}\n"
+                "RAW_ENTRIES:\n"
+                f"{chr(10).join(entry_lines) or '(none)'}\n"
+                f"Write a compressed autobiography no longer than {emulator.MAX_AUTOBIOGRAPHY_TEXT_CHARS} characters."
+            )
+            response = await self._completion.complete(
+                system_prompt,
+                user_prompt,
+                temperature=0.3,
+                max_tokens=min(self._max_tokens, 700),
+            )
+            cleaned = response or ""
+            cleaned = re.sub(r"^```[\w-]*\s*", "", cleaned).strip()
+            cleaned = re.sub(r"\s*```$", "", cleaned).strip()
+            compressed = emulator._sanitize_autobiography_text(  # noqa: SLF001
+                cleaned,
+                max_chars=emulator.MAX_AUTOBIOGRAPHY_TEXT_CHARS,  # noqa: SLF001
+            )
+            if not compressed:
+                return f"AUTOBIOGRAPHY_COMPRESS_RESULT: failed for {resolved_slug}."
+            latest_turn_id = 0
+            turn_rows = (
+                session.query(Turn.id)
+                .filter(Turn.campaign_id == campaign_id)
+                .order_by(Turn.id.desc())
+                .limit(1)
+                .all()
+            )
+            if turn_rows:
+                latest_turn_id = int(turn_rows[0][0] or 0)
+            characters, applied_row = emulator._apply_autobiography_compress_to_characters(  # noqa: SLF001
+                characters,
+                {"character": resolved_slug, "autobiography": compressed},
+                current_turn=latest_turn_id,
+            )
+            if not applied_row:
+                return f"AUTOBIOGRAPHY_COMPRESS_RESULT: failed for {resolved_slug}."
+            campaign.characters_json = json.dumps(characters, ensure_ascii=True)
+            campaign.updated_at = datetime.now(UTC).replace(tzinfo=None)
+            session.commit()
+        return (
+            "AUTOBIOGRAPHY_COMPRESS_RESULT:\n"
+            f"- character={resolved_slug}\n"
+            f"- raw_count={applied_row.get('raw_count')}\n"
+            f"- autobiography={compressed}"
+        )
+
     def _tool_name_generate(self, campaign_id: str, payload: dict[str, Any]) -> str:
         raw_origins = payload.get("origins") or []
         if isinstance(raw_origins, str):
@@ -1913,7 +2093,7 @@ class ToolAwareZorkLLM:
             session.commit()
         return f"CONSEQUENCE_LOG_RESULT: added={added} resolved={resolved} removed={removed} total={len(rows)}"
 
-    def _execute_tool_call(
+    async def _execute_tool_call(
         self,
         campaign_id: str,
         payload: dict[str, Any],
@@ -1933,6 +2113,10 @@ class ToolAwareZorkLLM:
             return self._tool_source_browse(campaign_id, payload)
         if name == "communication_rules":
             return self._tool_communication_rules(payload)
+        if name in {"autobiography_append", "autobiography_update"}:
+            return self._tool_autobiography_append(campaign_id, payload)
+        if name == "autobiography_compress":
+            return await self._tool_autobiography_compress(campaign_id, payload)
         if name == "name_generate":
             return self._tool_name_generate(campaign_id, payload)
         if name == "memory_turn":
@@ -2001,7 +2185,7 @@ class ToolAwareZorkLLM:
             )
             if forced_queries:
                 tool_payload = {"tool_call": "memory_search", "queries": forced_queries}
-                tool_result = self._execute_tool_call(
+                tool_result = await self._execute_tool_call(
                     campaign_id, tool_payload, actor_id=actor_id
                 )
                 tool_history += f"\n\n{tool_result}"
@@ -2073,7 +2257,7 @@ class ToolAwareZorkLLM:
                 continue
             if tool_signature:
                 seen_tool_signatures.add(tool_signature)
-            tool_result = self._execute_tool_call(
+            tool_result = await self._execute_tool_call(
                 campaign_id,
                 payload,
                 actor_id=actor_id,
@@ -2190,7 +2374,7 @@ class ToolAwareZorkLLM:
             if planning_payload is not None and emulator._is_tool_call(planning_payload):  # noqa: SLF001
                 planning_name = str(planning_payload.get("tool_call") or "").strip().lower()
                 if planning_name in {"plot_plan", "chapter_plan", "consequence_log"}:
-                    _ = self._execute_tool_call(
+                    _ = await self._execute_tool_call(
                         campaign_id,
                         planning_payload,
                         actor_id=actor_id,
@@ -2262,7 +2446,7 @@ class ToolAwareZorkLLM:
             # been validated against the allowlist in _payload_to_output.
             for tc in output.tool_calls:
                 try:
-                    self._execute_tool_call(context.campaign_id, tc, actor_id=context.actor_id)
+                    await self._execute_tool_call(context.campaign_id, tc, actor_id=context.actor_id)
                 except Exception:
                     pass  # best-effort; don't break the turn
             return output
