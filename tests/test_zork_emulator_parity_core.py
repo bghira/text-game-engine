@@ -2325,3 +2325,53 @@ def test_tool_calls_sms_write_executed_in_complete_turn(session_factory, seed_ca
         assert any(m["from"] == "Saul" and "Dock 9" in m["message"] for m in messages)
 
     asyncio.run(run_test())
+
+
+# ---------------------------------------------------------------------------
+# SMS empty-thread filtering tests
+# ---------------------------------------------------------------------------
+
+
+def test_sms_list_excludes_threads_with_zero_messages(session_factory):
+    """Threads that have 0 messages (or only empty-text messages) must not
+    appear in the sms_list output."""
+    compat = _build_compat(session_factory)
+
+    # Simulate campaign state with a mixture of real and ghost threads.
+    campaign_state = {
+        compat.SMS_STATE_KEY: {
+            "harry": {"label": "Harry", "messages": []},  # empty — should be excluded
+            "dawn": {
+                "label": "Dawn",
+                "messages": [{"message": "", "from": "Dawn", "to": "You"}],  # blank text
+            },
+            "saul": {
+                "label": "Saul",
+                "messages": [
+                    {
+                        "from": "Saul",
+                        "to": "Dale",
+                        "message": "Meet at Dock 9.",
+                        "day": 1,
+                        "hour": 10,
+                        "minute": 0,
+                        "turn_id": 1,
+                        "seq": 1,
+                    }
+                ],
+            },
+        }
+    }
+
+    threads = compat._sms_threads_from_state(campaign_state)
+    assert "harry" not in threads, "Empty-messages thread should be excluded from _sms_threads_from_state"
+    assert "dawn" not in threads, "Blank-text-only thread should be excluded from _sms_threads_from_state"
+    assert "saul" in threads, "Thread with real messages should be present"
+
+    listed = compat._sms_list_threads(campaign_state, wildcard="*", limit=20)
+    thread_keys = [t["thread"] for t in listed]
+    assert "harry" not in thread_keys, "Empty thread should not appear in sms_list"
+    assert "dawn" not in thread_keys, "Blank-text thread should not appear in sms_list"
+    assert "saul" in thread_keys, "Thread with messages should appear in sms_list"
+    assert listed[0]["count"] == 1
+    assert "Dock 9" in listed[0]["last_preview"]

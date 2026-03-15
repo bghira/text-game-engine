@@ -1156,6 +1156,8 @@ class ToolAwareZorkLLM:
         ).strip()
         if not raw_slug:
             return "AUTOBIOGRAPHY_COMPRESS_RESULT: character not found. Use an existing NPC slug from WORLD_CHARACTERS."
+
+        # Phase 1: read character data and build the LLM prompt.
         with self._session_factory() as session:
             campaign = session.get(Campaign, campaign_id)
             if campaign is None:
@@ -1169,86 +1171,98 @@ class ToolAwareZorkLLM:
                 character_row.get(emulator.AUTOBIOGRAPHY_RAW_FIELD)  # noqa: SLF001
             )
             current_auto = str(character_row.get(emulator.AUTOBIOGRAPHY_FIELD) or "").strip()  # noqa: SLF001
-            if not raw_entries and not current_auto:
-                return f"AUTOBIOGRAPHY_COMPRESS_RESULT: {resolved_slug} has no autobiography material yet."
-            entry_lines: list[str] = []
-            for row in raw_entries[-16:]:
-                if not isinstance(row, dict):
-                    continue
-                a_text = emulator._sanitize_autobiography_text(  # noqa: SLF001
-                    row.get("a"),
-                    max_chars=emulator.MAX_AUTOBIOGRAPHY_ENTRY_CHARS,  # noqa: SLF001
-                )
-                b_text = emulator._sanitize_autobiography_text(  # noqa: SLF001
-                    row.get("b"),
-                    max_chars=emulator.MAX_AUTOBIOGRAPHY_ENTRY_CHARS,  # noqa: SLF001
-                )
-                c_text = emulator._sanitize_autobiography_text(  # noqa: SLF001
-                    row.get("c"),
-                    max_chars=emulator.MAX_AUTOBIOGRAPHY_ENTRY_CHARS,  # noqa: SLF001
-                )
-                legacy_text = emulator._sanitize_autobiography_text(  # noqa: SLF001
-                    row.get("text"),
-                    max_chars=emulator.MAX_AUTOBIOGRAPHY_ENTRY_CHARS,  # noqa: SLF001
-                )
-                if not (a_text or b_text or c_text or legacy_text):
-                    continue
-                stamp = ""
-                gt = row.get("game_time")
-                if isinstance(gt, dict):
-                    day = max(0, emulator._coerce_int(gt.get("day"), 0))  # noqa: SLF001
-                    hour = min(23, max(0, emulator._coerce_int(gt.get("hour"), 0)))  # noqa: SLF001
-                    minute = min(59, max(0, emulator._coerce_int(gt.get("minute"), 0)))  # noqa: SLF001
-                    if day > 0:
-                        stamp = f"Day {day} {hour:02d}:{minute:02d} "
-                importance = " ".join(str(row.get("importance") or "").strip().split())[:40]
-                trigger = " ".join(str(row.get("trigger") or "").strip().split())[:80]
-                raw_row: dict[str, str] = {}
-                if trigger:
-                    raw_row["trigger"] = trigger
-                if importance:
-                    raw_row["importance"] = importance
-                if a_text:
-                    raw_row["a"] = a_text
-                if b_text:
-                    raw_row["b"] = b_text
-                if c_text:
-                    raw_row["c"] = c_text
-                if legacy_text and not raw_row.get("a") and not raw_row.get("b") and not raw_row.get("c"):
-                    raw_row["text"] = legacy_text
-                entry_lines.append(f"- {stamp}{json.dumps(raw_row, ensure_ascii=True)}".strip())
-            system_prompt = (
-                "You are compressing a character autobiography. "
-                "Output ONLY the rewritten autobiography text, in first person, in the character's own voice. "
-                "Do not output JSON, labels, bullets, or explanation.\n"
-                "Rules:\n"
-                "- Preserve values, patterns, loyalties, and self-understanding the character still acts from.\n"
-                "- Preserve unresolved contradictions as tension; do not resolve them unless the story already did.\n"
-                "- Preserve relationship turns that changed the character's understanding of someone.\n"
-                "- Compress repetition. Keep only what future narration needs to write the character accurately.\n"
-                "- The autobiography is constitutional: growth is allowed, drift without reckoning is not.\n"
+        if not raw_entries and not current_auto:
+            return f"AUTOBIOGRAPHY_COMPRESS_RESULT: {resolved_slug} has no autobiography material yet."
+        entry_lines: list[str] = []
+        for row in raw_entries[-16:]:
+            if not isinstance(row, dict):
+                continue
+            a_text = emulator._sanitize_autobiography_text(  # noqa: SLF001
+                row.get("a"),
+                max_chars=emulator.MAX_AUTOBIOGRAPHY_ENTRY_CHARS,  # noqa: SLF001
             )
-            user_prompt = (
-                f"CHARACTER: {character_row.get('name') or resolved_slug} ({resolved_slug})\n"
-                f"CURRENT_AUTOBIOGRAPHY: {current_auto or '(none)'}\n"
-                "RAW_ENTRIES:\n"
-                f"{chr(10).join(entry_lines) or '(none)'}\n"
-                f"Write a compressed autobiography no longer than {emulator.MAX_AUTOBIOGRAPHY_TEXT_CHARS} characters."
+            b_text = emulator._sanitize_autobiography_text(  # noqa: SLF001
+                row.get("b"),
+                max_chars=emulator.MAX_AUTOBIOGRAPHY_ENTRY_CHARS,  # noqa: SLF001
             )
-            response = await self._completion.complete(
-                system_prompt,
-                user_prompt,
-                temperature=0.3,
-                max_tokens=min(self._max_tokens, 700),
+            c_text = emulator._sanitize_autobiography_text(  # noqa: SLF001
+                row.get("c"),
+                max_chars=emulator.MAX_AUTOBIOGRAPHY_ENTRY_CHARS,  # noqa: SLF001
             )
-            cleaned = response or ""
-            cleaned = re.sub(r"^```[\w-]*\s*", "", cleaned).strip()
-            cleaned = re.sub(r"\s*```$", "", cleaned).strip()
-            compressed = emulator._sanitize_autobiography_text(  # noqa: SLF001
-                cleaned,
-                max_chars=emulator.MAX_AUTOBIOGRAPHY_TEXT_CHARS,  # noqa: SLF001
+            legacy_text = emulator._sanitize_autobiography_text(  # noqa: SLF001
+                row.get("text"),
+                max_chars=emulator.MAX_AUTOBIOGRAPHY_ENTRY_CHARS,  # noqa: SLF001
             )
-            if not compressed:
+            if not (a_text or b_text or c_text or legacy_text):
+                continue
+            stamp = ""
+            gt = row.get("game_time")
+            if isinstance(gt, dict):
+                day = max(0, emulator._coerce_int(gt.get("day"), 0))  # noqa: SLF001
+                hour = min(23, max(0, emulator._coerce_int(gt.get("hour"), 0)))  # noqa: SLF001
+                minute = min(59, max(0, emulator._coerce_int(gt.get("minute"), 0)))  # noqa: SLF001
+                if day > 0:
+                    stamp = f"Day {day} {hour:02d}:{minute:02d} "
+            importance = " ".join(str(row.get("importance") or "").strip().split())[:40]
+            trigger = " ".join(str(row.get("trigger") or "").strip().split())[:80]
+            raw_row: dict[str, str] = {}
+            if trigger:
+                raw_row["trigger"] = trigger
+            if importance:
+                raw_row["importance"] = importance
+            if a_text:
+                raw_row["a"] = a_text
+            if b_text:
+                raw_row["b"] = b_text
+            if c_text:
+                raw_row["c"] = c_text
+            if legacy_text and not raw_row.get("a") and not raw_row.get("b") and not raw_row.get("c"):
+                raw_row["text"] = legacy_text
+            entry_lines.append(f"- {stamp}{json.dumps(raw_row, ensure_ascii=True)}".strip())
+        system_prompt = (
+            "You are compressing a character autobiography. "
+            "Output ONLY the rewritten autobiography text, in first person, in the character's own voice. "
+            "Do not output JSON, labels, bullets, or explanation.\n"
+            "Rules:\n"
+            "- Preserve values, patterns, loyalties, and self-understanding the character still acts from.\n"
+            "- Preserve unresolved contradictions as tension; do not resolve them unless the story already did.\n"
+            "- Preserve relationship turns that changed the character's understanding of someone.\n"
+            "- Compress repetition. Keep only what future narration needs to write the character accurately.\n"
+            "- The autobiography is constitutional: growth is allowed, drift without reckoning is not.\n"
+        )
+        char_name = character_row.get("name") or resolved_slug
+        user_prompt = (
+            f"CHARACTER: {char_name} ({resolved_slug})\n"
+            f"CURRENT_AUTOBIOGRAPHY: {current_auto or '(none)'}\n"
+            "RAW_ENTRIES:\n"
+            f"{chr(10).join(entry_lines) or '(none)'}\n"
+            f"Write a compressed autobiography no longer than {emulator.MAX_AUTOBIOGRAPHY_TEXT_CHARS} characters."
+        )
+
+        # Phase 2: LLM call (no DB session held open).
+        response = await self._completion.complete(
+            system_prompt,
+            user_prompt,
+            temperature=0.3,
+            max_tokens=min(self._max_tokens, 700),
+        )
+        cleaned = response or ""
+        cleaned = re.sub(r"^```[\w-]*\s*", "", cleaned).strip()
+        cleaned = re.sub(r"\s*```$", "", cleaned).strip()
+        compressed = emulator._sanitize_autobiography_text(  # noqa: SLF001
+            cleaned,
+            max_chars=emulator.MAX_AUTOBIOGRAPHY_TEXT_CHARS,  # noqa: SLF001
+        )
+        if not compressed:
+            return f"AUTOBIOGRAPHY_COMPRESS_RESULT: failed for {resolved_slug}."
+
+        # Phase 3: re-load campaign and persist the compressed autobiography.
+        with self._session_factory() as session:
+            campaign = session.get(Campaign, campaign_id)
+            if campaign is None:
+                return f"AUTOBIOGRAPHY_COMPRESS_RESULT: failed for {resolved_slug}."
+            characters = emulator.get_campaign_characters(campaign)
+            if resolved_slug not in characters:
                 return f"AUTOBIOGRAPHY_COMPRESS_RESULT: failed for {resolved_slug}."
             latest_turn_id = 0
             turn_rows = (

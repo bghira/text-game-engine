@@ -17,7 +17,7 @@ from urllib import error as urllib_error
 from urllib import parse as urllib_parse
 from urllib import request as urllib_request
 
-from sqlalchemy import or_
+from sqlalchemy import func, or_
 
 from .core.attachments import (
     AttachmentProcessingConfig,
@@ -415,6 +415,7 @@ class ZorkEmulator:
         "(intent, decision, question, or action), not repetitive reaction text. "
         "Vary pacing and meter between turns: sometimes clipped, sometimes patient, sometimes blunt, sometimes practical. "
         "Do not default emotional beats to the same therapeutic language or cadence every time. "
+        "No closing cadence: do not end turns with a settlement phrase that resolves scene energy through rhythmic finality. If the scene is still tense, the last line stays tense. "
         "Avoid contrived emotional-summary language or therapist-speak "
         "unless that exact voice is canonically right for the speaking character. "
         "ANTI-ECHO: do NOT restate, paraphrase, or mirror the player's just-written wording. "
@@ -442,6 +443,7 @@ class ZorkEmulator:
         "- Never narrate 'a beat' (e.g. 'a beat of silence', 'there is a beat before...'). Show the pause through action, description, or pacing instead.\n"
         "- Structure matters: vary sentence length and rhythm. A short sentence after a long one lands harder.\n"
         "- Style is the differentiator. Don't just describe what happens — make how you describe it unmistakable.\n"
+        "- Vary your landing gear. Turns can end mid-exchange, on a practical detail, on a half-finished gesture, abruptly after dialogue. Not every turn needs a final settling sentence that signals 'scene complete' — most shouldn't.\n"
     )
     PROMPT_STAGE_BOOTSTRAP = "bootstrap"
     PROMPT_STAGE_RESEARCH = "research"
@@ -641,6 +643,7 @@ class ZorkEmulator:
         "- Avoid repetitive recap loops: at most one brief callback sentence to prior events, then move the scene forward.\n"
         "- Do not end the turn with a static room-summary coda. If props, plates, music, shadows, weather, parked cars, or seating geometry did not materially change, do not summarize them again.\n"
         "- Do not end the turn with a poetic wrap-up line, thematic echo, or atmospheric summary sentence. No 'The [place] holds its [emotion]', no 'whatever comes after X', no rhetorical questions framing the next beat. End on the last concrete action or line of dialogue, then stop.\n"
+        "- CLOSING CADENCE: do not write a settlement phrase — a rhythmically final sentence that resolves scene energy with prosodic falling meter. If tension is still live, the last sentence should leave it live. Vary how turns end: mid-dialogue, mid-action, on a question, on a practical detail, abruptly. A turn that always lands with the same settling rhythm trains the reader to stop feeling tension.\n"
         "- Keep diction plain and direct; prioritize immediate consequences and available choices.\n"
         "- RECENT_TURNS includes turn/time tags like [TURN #N | Day D HH:MM]. Use them to track pacing and chronology.\n"
         "- RECENT_TURNS is already filtered to what the acting player plausibly knows. Hidden/private turns from other players are omitted.\n"
@@ -1348,40 +1351,67 @@ class ZorkEmulator:
         registry = self._campaign_player_registry(campaign_id, self._session_factory)
         by_actor_id: dict[str, dict[str, object]] = registry.get("by_actor_id", {})
 
-        # Resolve the current session's effective channel.
+        # Filter to only campaign members.
+        campaign_mentioned = mentioned_ids & set(by_actor_id.keys())
+        if not campaign_mentioned:
+            return []
+
+        # Batch: resolve current session channel + all mentioned players'
+        # last session channels in a single DB session.
         current_channel: str | None = None
-        if current_session_id is not None:
-            with self._session_factory() as session:
+        player_channels: dict[str, str | None] = {}
+        with self._session_factory() as session:
+            # Current session's effective channel.
+            if current_session_id is not None:
                 sess = session.get(GameSession, current_session_id)
                 if sess is not None:
                     current_channel = sess.surface_thread_id or sess.surface_channel_id
 
-        recipients: list[dict[str, object]] = []
-        for uid in mentioned_ids:
-            entry = by_actor_id.get(uid)
-            if entry is None:
-                # Mentioned actor is not in this campaign — skip.
-                continue
-            # Find the player's most recent session channel.
-            player_channel: str | None = None
-            with self._session_factory() as session:
-                last_turn = (
-                    session.query(Turn)
-                    .filter(Turn.campaign_id == campaign_id)
-                    .filter(Turn.actor_id == uid)
-                    .filter(Turn.session_id.isnot(None))
-                    .order_by(Turn.id.desc())
-                    .first()
+            # Batch query: max turn ID per mentioned actor (with session_id).
+            max_turn_sub = (
+                session.query(
+                    Turn.actor_id,
+                    func.max(Turn.id).label("max_id"),
                 )
-                if last_turn is not None and last_turn.session_id:
-                    player_sess = session.get(GameSession, last_turn.session_id)
-                    if player_sess is not None:
-                        player_channel = (
-                            player_sess.surface_thread_id or player_sess.surface_channel_id
-                        )
+                .filter(Turn.campaign_id == campaign_id)
+                .filter(Turn.actor_id.in_(campaign_mentioned))
+                .filter(Turn.session_id.isnot(None))
+                .group_by(Turn.actor_id)
+                .subquery()
+            )
+            last_turns = (
+                session.query(Turn.actor_id, Turn.session_id)
+                .join(max_turn_sub, Turn.id == max_turn_sub.c.max_id)
+                .all()
+            )
+
+            # Batch fetch corresponding sessions.
+            session_ids = {
+                row.session_id for row in last_turns if row.session_id
+            }
+            sessions_by_id: dict[str, GameSession] = {}
+            if session_ids:
+                for sess_row in (
+                    session.query(GameSession)
+                    .filter(GameSession.id.in_(session_ids))
+                    .all()
+                ):
+                    sessions_by_id[sess_row.id] = sess_row
+
+            for row in last_turns:
+                player_sess = sessions_by_id.get(row.session_id or "")
+                if player_sess is not None:
+                    player_channels[row.actor_id] = (
+                        player_sess.surface_thread_id or player_sess.surface_channel_id
+                    )
+
+        recipients: list[dict[str, object]] = []
+        for uid in campaign_mentioned:
+            player_channel = player_channels.get(uid)
             if current_channel is not None and player_channel == current_channel:
                 # Player is active in the same thread — they'll see it.
                 continue
+            entry = by_actor_id[uid]
             recipients.append({
                 "actor_id": uid,
                 "character_name": str(
@@ -10326,24 +10356,31 @@ class ZorkEmulator:
     def _autobiographies_for_prompt(
         self,
         characters_for_prompt: list[dict[str, object]],
+        characters: Dict[str, dict] | None = None,
     ) -> str | None:
         rows: list[dict[str, str]] = []
         budget = self.MAX_AUTOBIOGRAPHY_PROMPT_CHARS
-        for char in characters_for_prompt or []:
-            if not isinstance(char, dict):
+        characters = characters or {}
+        for entry in characters_for_prompt or []:
+            if not isinstance(entry, dict):
                 continue
-            slug = str(char.get("_slug") or "").strip()
+            slug = str(entry.get("_slug") or "").strip()
             if not slug:
                 continue
+            # Read autobiography from the original characters dict
+            # (prompt entries have it stripped to keep WORLD_CHARACTERS lean).
+            source = characters.get(slug)
+            if not isinstance(source, dict):
+                continue
             autobiography = self._sanitize_autobiography_text(
-                char.get(self.AUTOBIOGRAPHY_FIELD),
+                source.get(self.AUTOBIOGRAPHY_FIELD),
                 max_chars=self.MAX_AUTOBIOGRAPHY_TEXT_CHARS,
             )
             if not autobiography:
                 continue
             row = {
                 "slug": slug,
-                "name": str(char.get("name") or slug).strip(),
+                "name": str(entry.get("name") or slug).strip(),
                 "autobiography": autobiography,
             }
             line = json.dumps(row, ensure_ascii=True)
@@ -11057,6 +11094,7 @@ class ZorkEmulator:
         )
         autobiographies_text = self._autobiographies_for_prompt(
             characters_for_prompt,
+            characters=characters,
         )
         memory_lookup_enabled = self._memory_lookup_enabled_for_prompt(
             summary,
