@@ -20,6 +20,15 @@ dev = [
 glm = [
   "transformers>=4.41",
 ]
+image = [
+  "Pillow>=10.0",
+  "diffusers>=0.28",
+  "numpy>=1.24",
+  "skrample",
+  "transformers>=4.41",
+  "sentencepiece>=0.1.99",
+  "accelerate>=0.17.0",
+]
 cuda = [
   "torch>=2.10.0",
   "nvidia-ml-py>=12.555",
