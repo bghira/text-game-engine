@@ -22,11 +22,29 @@ cd text-game-engine
 pip install -e .
 ```
 
-Optional GLM tokenizer support:
+Optional extras:
 
 ```bash
 pip install -e ".[glm]"
 ```
+
+Accelerator-targeted installs:
+
+```bash
+# NVIDIA / CUDA
+pip install -e ".[cuda]"
+
+# AMD / ROCm
+pip install -e ".[rocm]" --extra-index-url https://download.pytorch.org/whl/rocm7.1
+
+# Apple silicon / MPS
+pip install -e ".[apple]"
+```
+
+Notes:
+- `cuda` is the convenience extra for hosts that want Torch plus NVIDIA monitoring support.
+- `rocm` expects PyTorch ROCm wheels from the PyTorch index, so use the `--extra-index-url` above.
+- `apple` is for Apple silicon hosts using the PyTorch MPS backend.
 
 ## Documentation
 

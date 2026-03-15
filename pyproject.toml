@@ -20,6 +20,16 @@ dev = [
 glm = [
   "transformers>=4.41",
 ]
+cuda = [
+  "torch>=2.10.0",
+  "nvidia-ml-py>=12.555",
+]
+rocm = [
+  "torch>=2.10.0",
+]
+apple = [
+  "torch>=2.10.0",
+]
 
 [tool.setuptools]
 package-dir = {"" = "src"}
