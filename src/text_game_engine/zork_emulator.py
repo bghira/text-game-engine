@@ -350,9 +350,19 @@ class ZorkEmulator:
     MEMORY_SEARCH_USAGE_MAX_TERMS = 300
     MEMORY_SEARCH_ROSTER_HINT_THRESHOLD = 3
     TURN_TIME_INDEX_KEY = "_turn_time_index"
+    MAX_TURN_TIME_ENTRIES = 256
+    MIN_TURN_ADVANCE_MINUTES = 1
+    DEFAULT_TURN_ADVANCE_MINUTES = 5
+    MAX_TURN_ADVANCE_MINUTES = 180
     LITERARY_STYLES_STATE_KEY = "literary_styles"
     MAX_LITERARY_STYLES_PROMPT_CHARS = 3000
     MAX_LITERARY_STYLE_PROFILE_CHARS = 400
+    # --- Plot / Chapter / Consequence state keys -------------------------
+    PLOT_THREADS_STATE_KEY = "_plot_threads"
+    CHAPTER_PLAN_STATE_KEY = "_chapter_plan"
+    CONSEQUENCE_STATE_KEY = "_consequences"
+    # --- Private context -------------------------------------------------
+    PRIVATE_CONTEXT_STATE_KEY = "_active_private_context"
     MODEL_STATE_EXCLUDE_KEYS = ROOM_STATE_KEYS | {
         "last_narration",
         "room_scene_images",
@@ -382,6 +392,10 @@ class ZorkEmulator:
         "_minigame_result",
         "_last_dice_check",
         "_last_minigame_result",
+        PLOT_THREADS_STATE_KEY,
+        CHAPTER_PLAN_STATE_KEY,
+        CONSEQUENCE_STATE_KEY,
+        PRIVATE_CONTEXT_STATE_KEY,
     }
     PLAYER_STATE_EXCLUDE_KEYS = {"inventory", "room_description", PLAYER_STATS_KEY}
     _STALE_VALUE_PATTERNS = _COMPLETED_VALUES | {
@@ -406,6 +420,33 @@ class ZorkEmulator:
         "current inventory:",
     )
     _UNREAD_SMS_LINE_PREFIXES = ("📨 unread sms:", "unread sms:")
+    MAX_PLOT_THREADS = 24
+    MAX_PLOT_DEPENDENCIES = 8
+    MAX_OFFRAILS_CHAPTERS = 16
+    MAX_CONSEQUENCES = 40
+    # --- Player stats extra key ------------------------------------------
+    PLAYER_STATS_LAST_MESSAGE_CONTEXT_KEY = "last_message_context"
+    # --- Known JSON string fields for repair ---
+    KNOWN_JSON_STRING_FIELDS = {
+        "narration",
+        "summary_update",
+        "reasoning",
+        "scene_output",
+        "room_title",
+        "room_description",
+        "room_summary",
+        "location",
+        "setting",
+        "tone",
+        "current_chapter",
+        "current_scene",
+        "hint",
+        "consequence",
+        "trigger",
+        "resolution",
+        "setup",
+        "intended_payoff",
+    }
     RESPONSE_STYLE_NOTE = (
         "[SYSTEM NOTE: FOR THIS RESPONSE ONLY: use the current style direction. Narrate in 1 to 6 beats as needed. "
         "No recap of unchanged facts. No flowery language unless a character canonically speaks that way. "
@@ -422,6 +463,7 @@ class ZorkEmulator:
         "Do not quote the player's lines back to them unless one exact contested phrase is materially necessary. "
         "Default: NPC first line should add new information, a decision, a demand, or a consequence. "
         "A direct question is valid, but it should not be the default when the NPC already has enough to react to. "
+        "If the player just gave a sincere answer, the NPC must engage with it — not dismiss it and re-ask. "
         "When deciding whether the player answered sincerely or evasively, bias toward sincere. "
         "Wordplay, humor, indirection, metaphor, or stylish phrasing still count as an answer when they convey a real feeling, motive, memory, or admission. "
         "Only treat the player as evasive if they actually changed the subject, dodged the substance, or refused to answer. "
@@ -445,7 +487,8 @@ class ZorkEmulator:
         "- Style is the differentiator. Don't just describe what happens — make how you describe it unmistakable.\n"
         "- Vary your landing gear. Turns can end mid-exchange, on a practical detail, on a half-finished gesture, abruptly after dialogue. Not every turn needs a final settling sentence that signals 'scene complete' — most shouldn't.\n"
     )
-    PROMPT_STAGE_BOOTSTRAP = "bootstrap"
+    DEFAULT_STYLE_DIRECTION = "Mulberry Award-winning literature"
+    PROMPT_STAGE_BOOTSTRAP = "bootstrap"  # Deprecated: kept for logging/audit only; bootstrap LLM call eliminated.
     PROMPT_STAGE_RESEARCH = "research"
     PROMPT_STAGE_FINAL = "final"
     BOOTSTRAP_SYSTEM_PROMPT = (
@@ -644,6 +687,7 @@ class ZorkEmulator:
         "- Do not end the turn with a static room-summary coda. If props, plates, music, shadows, weather, parked cars, or seating geometry did not materially change, do not summarize them again.\n"
         "- Do not end the turn with a poetic wrap-up line, thematic echo, or atmospheric summary sentence. No 'The [place] holds its [emotion]', no 'whatever comes after X', no rhetorical questions framing the next beat. End on the last concrete action or line of dialogue, then stop.\n"
         "- CLOSING CADENCE: do not write a settlement phrase — a rhythmically final sentence that resolves scene energy with prosodic falling meter. If tension is still live, the last sentence should leave it live. Vary how turns end: mid-dialogue, mid-action, on a question, on a practical detail, abruptly. A turn that always lands with the same settling rhythm trains the reader to stop feeling tension.\n"
+        "- No refrain or motific repetition — do not repeat the same structural tail, closing image, or variable-word-swap line across consecutive turns. A repeated line does not accumulate weight; it becomes a crutch. If you catch yourself ending two turns the same way, cut the pattern.\n"
         "- Keep diction plain and direct; prioritize immediate consequences and available choices.\n"
         "- RECENT_TURNS includes turn/time tags like [TURN #N | Day D HH:MM]. Use them to track pacing and chronology.\n"
         "- RECENT_TURNS is already filtered to what the acting player plausibly knows. Hidden/private turns from other players are omitted.\n"
@@ -7804,33 +7848,71 @@ class ZorkEmulator:
             return ""
         return f"[SYSTEM NOTE: FOR THIS RESPONSE ONLY: {' '.join(cleaned)}]"
 
+    def _resolve_style_direction(
+        self,
+        campaign: object = None,
+    ) -> str:
+        """Return the active style direction for a campaign.
+
+        Checks campaign state for a ``style_direction`` override, falling
+        back to ``DEFAULT_STYLE_DIRECTION``.
+        """
+        if campaign is not None:
+            state = self.get_campaign_state(campaign)
+            if isinstance(state, dict):
+                override = str(state.get("style_direction") or "").strip()
+                if override:
+                    return override
+        return self.DEFAULT_STYLE_DIRECTION
+
     @classmethod
-    def _turn_response_style_note(cls, difficulty: object) -> str:
+    def _turn_response_style_note(
+        cls,
+        difficulty: object,
+        *,
+        style_direction: str = "",
+    ) -> str:
+        style = style_direction or cls.DEFAULT_STYLE_DIRECTION
         return cls._merge_system_notes(
+            f"Style direction: {style}.",
             cls.RESPONSE_STYLE_NOTE,
             cls._difficulty_response_note(difficulty),
             (
                 'Return final JSON only. Include reasoning first. '
-                'state_update is required and must include "game_time", "current_chapter", and "current_scene" explicitly.'
+                'state_update is required and must include "game_time", "current_chapter", and "current_scene" explicitly. '
+                'summary_update is required — one sentence capturing any lasting change or the scene\'s current dramatic state.'
             ),
         )
 
     @classmethod
-    def _turn_stage_note(cls, difficulty: object, prompt_stage: str) -> str:
+    def _turn_stage_note(
+        cls,
+        difficulty: object,
+        prompt_stage: str,
+        *,
+        style_direction: str = "",
+    ) -> str:
         stage = str(prompt_stage or cls.PROMPT_STAGE_FINAL).strip().lower()
-        if stage == cls.PROMPT_STAGE_BOOTSTRAP:
-            return cls._merge_system_notes(
-                cls._difficulty_response_note(difficulty),
-                "Do not narrate yet. First decide the immediate continuity receivers and call recent_turns.",
-            )
+        style = style_direction or cls.DEFAULT_STYLE_DIRECTION
         if stage == cls.PROMPT_STAGE_RESEARCH:
             return cls._merge_system_notes(
+                f"Style direction: {style}.",
                 cls._difficulty_response_note(difficulty),
-                "RECENT_TURNS is loaded. Do not call recent_turns again this turn.",
-                "Use memory/source/SMS/planning tools only when they materially improve continuity.",
-                'When research is sufficient, return ONLY {"tool_call": "ready_to_write"}. Do not narrate yet.',
+                (
+                    "RECENT_TURNS is loaded. Do not call recent_turns again this turn."
+                ),
+                (
+                    "Use memory/source/SMS/planning tools only when they materially improve continuity."
+                ),
+                (
+                    'When research is sufficient, return {"tool_call": "ready_to_write", "speakers": [...], "listeners": [...]} '
+                    'with ALL scene participant slugs. Do not narrate yet.'
+                ),
             )
-        return cls._turn_response_style_note(difficulty)
+        return cls._turn_response_style_note(
+            difficulty,
+            style_direction=style,
+        )
 
     @classmethod
     def _build_turn_prompt_tail(
@@ -11055,7 +11137,8 @@ class ZorkEmulator:
         game_time = state.get("game_time", {})
         speed_mult = state.get("speed_multiplier", 1.0)
         difficulty = self.normalize_difficulty(state.get("difficulty", "normal"))
-        response_style_note = self._turn_stage_note(difficulty, stage)
+        style_direction = self._resolve_style_direction(campaign)
+        response_style_note = self._turn_stage_note(difficulty, stage, style_direction=style_direction)
         calendar_state_before = json.dumps(
             state.get("calendar") or [],
             ensure_ascii=True,
@@ -11881,3 +11964,5568 @@ class ZorkEmulator:
 
     def filter_memory_hits_by_visibility(self, campaign_id: str, hits: list[dict[str, Any]]) -> list[dict[str, Any]]:
         return self._engine.filter_memory_hits_by_visibility(campaign_id, hits)
+
+    # ------------------------------------------------------------------
+    # Private context management
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _private_context_key(*parts: object) -> str:
+        cleaned = []
+        for part in parts:
+            text = re.sub(r"[^a-z0-9]+", "-", str(part or "").strip().lower()).strip("-")
+            if text:
+                cleaned.append(text[:80])
+        return ":".join(cleaned)[:240]
+
+    @classmethod
+    def _active_private_context_from_state(
+        cls, player_state: dict[str, object]
+    ) -> dict[str, object] | None:
+        if not isinstance(player_state, dict):
+            return None
+        raw = player_state.get(cls.PRIVATE_CONTEXT_STATE_KEY)
+        if not isinstance(raw, dict):
+            return None
+        context_key = str(raw.get("context_key") or "").strip()
+        scope = str(raw.get("scope") or "").strip().lower()
+        if not context_key or scope not in {"private", "limited"}:
+            return None
+        out = dict(raw)
+        out["context_key"] = context_key
+        out["scope"] = scope
+        return out
+
+    def _action_leaves_private_context(
+        self,
+        action: str,
+        active_context: dict[str, object] | None,
+    ) -> bool:
+        text = " ".join(str(action or "").strip().lower().split())
+        if not text or not active_context:
+            return False
+        if hasattr(self, "_is_private_phone_command_line") and self._is_private_phone_command_line(text):
+            return False
+        if re.search(
+            r"\b(?:go|walk|head|return|leave|exit|join|approach|cross|back to|turn back to|out loud|to everyone|announce)\b",
+            text,
+            re.IGNORECASE,
+        ):
+            return True
+        target_name = str(active_context.get("target_name") or "").strip().lower()
+        if target_name and target_name not in text and re.search(r"\b(?:ask|tell|say|talk)\b", text, re.IGNORECASE):
+            return True
+        return False
+
+    def _resolve_private_context_target(
+        self,
+        campaign: "Campaign",
+        actor: "Player | None",
+        action: str,
+    ) -> dict[str, object] | None:
+        text = str(action or "")
+        if not text:
+            return None
+        actor_id = getattr(actor, "actor_id", None)
+        registry = self._campaign_player_registry(campaign.id)
+        by_actor_id = registry.get("by_actor_id", {})
+        text_norm = self._normalize_match_text(text)
+        for aid, entry in by_actor_id.items():
+            if actor_id is not None and str(aid) == str(actor_id):
+                continue
+            name = str(entry.get("name") or "").strip()
+            if not name:
+                continue
+            if self._normalize_match_text(name) in text_norm:
+                return {
+                    "kind": "player",
+                    "target_actor_id": str(aid),
+                    "target_slug": str(entry.get("slug") or "").strip(),
+                    "target_name": name,
+                }
+        characters = self.get_campaign_characters(campaign)
+        if isinstance(characters, dict):
+            for slug, payload in characters.items():
+                if not isinstance(payload, dict):
+                    continue
+                name = str(payload.get("name") or "").strip()
+                candidates = [str(slug or "").strip(), name]
+                for candidate in candidates:
+                    candidate_norm = self._normalize_match_text(candidate)
+                    if candidate_norm and candidate_norm in text_norm:
+                        return {
+                            "kind": "npc",
+                            "target_slug": str(slug or "").strip(),
+                            "target_name": name or str(slug or "").strip(),
+                        }
+        return None
+
+    def _derive_private_context_candidate(
+        self,
+        campaign: "Campaign",
+        actor: "Player | None",
+        player_state: dict[str, object],
+        action: str,
+    ) -> dict[str, object] | None:
+        active_context = self._active_private_context_from_state(player_state)
+        if self._action_leaves_private_context(action, active_context):
+            return None
+        if active_context:
+            carried = dict(active_context)
+            carried["engagement"] = "continue"
+            return carried
+        return None
+
+    @classmethod
+    def _apply_private_context_candidate(
+        cls,
+        turn_visibility: dict[str, object],
+        candidate: dict[str, object] | None,
+    ) -> dict[str, object]:
+        if not candidate:
+            return turn_visibility
+        merged = dict(turn_visibility or {})
+        merged["scope"] = str(candidate.get("scope") or merged.get("scope") or "private")
+        merged["context_key"] = str(candidate.get("context_key") or "").strip() or None
+        location_key = str(candidate.get("location_key") or "").strip()
+        if location_key:
+            merged["location_key"] = location_key
+        reason = " ".join(str(merged.get("reason") or "").split()).strip()
+        if not reason:
+            target_name = str(candidate.get("target_name") or "").strip()
+            if target_name:
+                merged["reason"] = f"Private exchange with {target_name}"
+            else:
+                merged["reason"] = "Private exchange"
+        if merged.get("scope") == "limited":
+            visible_slugs = list(merged.get("visible_player_slugs") or [])
+            target_slug = str(candidate.get("target_slug") or "").strip()
+            if target_slug and target_slug not in visible_slugs:
+                visible_slugs.append(target_slug)
+            merged["visible_player_slugs"] = visible_slugs
+            visible_actor_ids = list(merged.get("visible_actor_ids") or [])
+            target_actor_id = candidate.get("target_actor_id")
+            if target_actor_id is not None and str(target_actor_id) not in [str(x) for x in visible_actor_ids]:
+                visible_actor_ids.append(str(target_actor_id))
+            merged["visible_actor_ids"] = visible_actor_ids
+        return merged
+
+    def _persist_private_context_state(
+        self,
+        player_state: dict[str, object],
+        turn_visibility: dict[str, object],
+        action: str,
+        candidate: dict[str, object] | None,
+    ) -> None:
+        if not isinstance(player_state, dict):
+            return
+        active_context = self._active_private_context_from_state(player_state)
+        scope = str(turn_visibility.get("scope") or "").strip().lower()
+        context_key = str(turn_visibility.get("context_key") or "").strip()
+        if context_key and scope in {"private", "limited"}:
+            payload = {
+                "scope": scope,
+                "context_key": context_key,
+                "location_key": str(turn_visibility.get("location_key") or "").strip() or None,
+                "target_name": str((candidate or {}).get("target_name") or (active_context or {}).get("target_name") or "").strip() or None,
+                "target_slug": str((candidate or {}).get("target_slug") or (active_context or {}).get("target_slug") or "").strip() or None,
+            }
+            player_state[self.PRIVATE_CONTEXT_STATE_KEY] = payload
+            return
+        if self._action_leaves_private_context(action, active_context) or scope in {"public", "local"}:
+            player_state.pop(self.PRIVATE_CONTEXT_STATE_KEY, None)
+
+    def _recent_private_contexts_for_prompt(
+        self,
+        turns: list,
+        *,
+        viewer_actor_id: str,
+        viewer_slug: str,
+        active_context_key: str = "",
+        limit: int = 3,
+    ) -> list[dict[str, object]]:
+        out: list[dict[str, object]] = []
+        seen: set[str] = set()
+        viewer_slug_key = self._player_slug_key(viewer_slug)
+        active_context_key = str(active_context_key or "").strip()
+        for turn in reversed(list(turns or [])):
+            meta = self._safe_turn_meta(turn)
+            visibility = meta.get("visibility")
+            if not isinstance(visibility, dict):
+                continue
+            scope = str(visibility.get("scope") or "").strip().lower()
+            if scope not in {"private", "limited"}:
+                continue
+            context_key = str(
+                visibility.get("context_key") or meta.get("context_key") or ""
+            ).strip()
+            if not context_key or context_key in seen:
+                continue
+            actor_actor_id = visibility.get("actor_actor_id") or visibility.get("actor_user_id")
+            actor_player_slug = self._player_slug_key(
+                visibility.get("actor_player_slug") or ""
+            )
+            visible_actor_ids: list[str] = []
+            for item in list(visibility.get("visible_actor_ids") or visibility.get("visible_user_ids") or []):
+                if item is not None:
+                    visible_actor_ids.append(str(item))
+            visible_player_slugs = [
+                self._player_slug_key(item)
+                for item in list(visibility.get("visible_player_slugs") or [])
+                if self._player_slug_key(item)
+            ]
+            if not (
+                (actor_actor_id is not None and str(actor_actor_id) == str(viewer_actor_id))
+                or (str(viewer_actor_id) in visible_actor_ids)
+                or (viewer_slug_key and viewer_slug_key == actor_player_slug)
+                or (viewer_slug_key and viewer_slug_key in visible_player_slugs)
+            ):
+                continue
+            row = {
+                "context_key": context_key,
+                "scope": scope,
+                "location_key": str(visibility.get("location_key") or meta.get("location_key") or "").strip() or None,
+                "actor_player_slug": actor_player_slug or None,
+                "visible_player_slugs": visible_player_slugs,
+                "visible_actor_ids": visible_actor_ids,
+                "aware_npc_slugs": [
+                    str(item or "").strip()
+                    for item in list(visibility.get("aware_npc_slugs") or [])
+                    if str(item or "").strip()
+                ],
+                "active": bool(active_context_key and context_key == active_context_key),
+                "turn_id": int(getattr(turn, "id", 0) or 0),
+            }
+            out.append(row)
+            seen.add(context_key)
+            if len(out) >= max(1, int(limit)):
+                break
+        if active_context_key and active_context_key not in seen:
+            out.insert(
+                0,
+                {
+                    "context_key": active_context_key,
+                    "scope": "private",
+                    "location_key": None,
+                    "actor_player_slug": viewer_slug_key or None,
+                    "visible_player_slugs": [viewer_slug_key] if viewer_slug_key else [],
+                    "visible_actor_ids": [str(viewer_actor_id)],
+                    "aware_npc_slugs": [],
+                    "active": True,
+                    "turn_id": None,
+                },
+            )
+        return out[: max(1, int(limit))]
+
+    @staticmethod
+    def _humanize_context_key(value: object) -> str:
+        return " ".join(part for part in str(value or "").replace(":", " ").replace("-", " ").split())
+
+    def _format_private_context_status(
+        self,
+        player_state: dict[str, object],
+        *,
+        recent_contexts: list[dict[str, object]] | None = None,
+    ) -> str:
+        active_context = self._active_private_context_from_state(player_state)
+        if isinstance(active_context, dict):
+            scope = str(active_context.get("scope") or "").strip().lower() or "private"
+            target_name = str(active_context.get("target_name") or "").strip()
+            label = "limited" if scope == "limited" else "private"
+            if target_name:
+                return (
+                    f"Private context: {label} thread active with {target_name}. "
+                    "Keep talking to continue it, or move/rejoin/speak out loud to leave it."
+                )
+            return (
+                f"Private context: {label} thread active. "
+                "Keep talking to continue it, or move/rejoin/speak out loud to leave it."
+            )
+        recent_labels: list[str] = []
+        for row in list(recent_contexts or [])[:3]:
+            if not isinstance(row, dict):
+                continue
+            label = self._humanize_context_key(row.get("context_key"))
+            if not label or label in recent_labels:
+                continue
+            recent_labels.append(label)
+        if recent_labels:
+            return (
+                f"Private context: none active. Recent threads: {', '.join(recent_labels)}. "
+                "Use a slash command or reaction to start or resume a private thread, or use phone/text actions."
+            )
+        return (
+            "Private context: none. To start one, use a slash command or reaction, "
+            "or use phone/text actions."
+        )
+
+    def _fallback_private_context_from_recent(
+        self,
+        turns: list,
+        *,
+        viewer_actor_id: str,
+        viewer_slug: str,
+        viewer_location_key: str,
+        limit: int = 6,
+    ) -> dict[str, object] | None:
+        viewer_location_key_norm = self._normalize_location_key(viewer_location_key)
+        if not viewer_location_key_norm:
+            return None
+        recent_contexts = self._recent_private_contexts_for_prompt(
+            turns,
+            viewer_actor_id=viewer_actor_id,
+            viewer_slug=viewer_slug,
+            active_context_key="",
+            limit=limit,
+        )
+        for row in recent_contexts:
+            if not isinstance(row, dict):
+                continue
+            row_location_key = self._normalize_location_key(row.get("location_key"))
+            if row_location_key != viewer_location_key_norm:
+                continue
+            scope = str(row.get("scope") or "").strip().lower()
+            context_key = str(row.get("context_key") or "").strip()
+            if scope not in {"private", "limited"} or not context_key:
+                continue
+            return {
+                "scope": scope,
+                "context_key": context_key,
+                "location_key": str(row.get("location_key") or "").strip() or None,
+                "target_name": None,
+                "target_slug": None,
+                "target_actor_id": None,
+                "engagement": "resume",
+            }
+        return None
+
+    @classmethod
+    def _fallback_private_context_from_rows(
+        cls,
+        recent_contexts: list[dict[str, object]],
+        *,
+        viewer_location_key: str,
+    ) -> dict[str, object] | None:
+        viewer_location_key_norm = cls._normalize_location_key(viewer_location_key)
+        if not viewer_location_key_norm:
+            return None
+        for row in list(recent_contexts or []):
+            if not isinstance(row, dict):
+                continue
+            row_location_key = cls._normalize_location_key(row.get("location_key"))
+            if row_location_key != viewer_location_key_norm:
+                continue
+            scope = str(row.get("scope") or "").strip().lower()
+            context_key = str(row.get("context_key") or "").strip()
+            if scope not in {"private", "limited"} or not context_key:
+                continue
+            return {
+                "scope": scope,
+                "context_key": context_key,
+                "location_key": str(row.get("location_key") or "").strip() or None,
+                "target_name": None,
+                "target_slug": None,
+                "target_actor_id": None,
+                "engagement": "resume",
+            }
+        return None
+
+    def _force_private_visibility_for_phone_activity(
+        self,
+        visibility: dict[str, object],
+        *,
+        actor_slug: str,
+        actor_id: str | None,
+    ) -> dict[str, object]:
+        reason = self._trim_text(str(visibility.get("reason") or "").strip(), 240)
+        return {
+            "scope": "private",
+            "actor_player_slug": actor_slug or None,
+            "actor_actor_id": actor_id,
+            "visible_player_slugs": [actor_slug] if actor_slug else [],
+            "visible_actor_ids": [actor_id] if actor_id is not None else [],
+            "location_key": None,
+            "aware_npc_slugs": [],
+            "reason": reason or "Private phone/SMS activity is actor-only unless explicitly shared.",
+            "source": "auto-private-phone",
+        }
+
+    def _recent_private_dm_notification_targets(
+        self,
+        campaign_id: str,
+        *,
+        exclude_actor_id: str | None = None,
+        observed_at: "datetime.datetime | None" = None,
+        candidate_actor_ids: list[str] | None = None,
+    ) -> list[str]:
+        now_dt = observed_at or self._now()
+        if now_dt.tzinfo is not None:
+            now_dt = now_dt.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+        allowed_actor_ids = (
+            {str(aid) for aid in candidate_actor_ids if aid is not None}
+            if isinstance(candidate_actor_ids, list)
+            else None
+        )
+        with self._session_factory() as session:
+            from text_game_engine.persistence.sqlalchemy.models import Player
+            rows = session.query(Player).filter_by(campaign_id=str(campaign_id)).all()
+            out: list[str] = []
+            for row in rows:
+                row_actor_id = str(getattr(row, "actor_id", ""))
+                if exclude_actor_id is not None and row_actor_id == str(exclude_actor_id):
+                    continue
+                if allowed_actor_ids is not None and row_actor_id not in allowed_actor_ids:
+                    continue
+                stats = self.get_player_statistics(row)
+                if (
+                    str(stats.get(self.PLAYER_STATS_LAST_MESSAGE_CONTEXT_KEY) or "").strip().lower()
+                    != "dm"
+                ):
+                    continue
+                last_message_at = self._parse_utc_timestamp(
+                    stats.get(self.PLAYER_STATS_LAST_MESSAGE_AT_KEY)
+                )
+                if last_message_at is None:
+                    continue
+                age_seconds = int((now_dt - last_message_at).total_seconds())
+                if age_seconds < 0 or age_seconds > self.ATTENTION_WINDOW_SECONDS:
+                    continue
+                out.append(row_actor_id)
+        return out
+
+    # ------------------------------------------------------------------
+    # Plot / Chapter / Consequence management
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def _plot_thread_key(cls, value: object) -> str:
+        text = re.sub(r"\s+", " ", str(value or "").strip().lower())
+        if not text:
+            return ""
+        return re.sub(r"[^a-z0-9]+", "-", text).strip("-")[:80]
+
+    @classmethod
+    def _plot_threads_from_state(
+        cls, campaign_state: dict[str, object]
+    ) -> dict[str, dict[str, object]]:
+        raw = (
+            campaign_state.get(cls.PLOT_THREADS_STATE_KEY)
+            if isinstance(campaign_state, dict)
+            else {}
+        )
+        if not isinstance(raw, dict):
+            raw = {}
+        threads: dict[str, dict[str, object]] = {}
+        for raw_key, raw_entry in raw.items():
+            if not isinstance(raw_entry, dict):
+                continue
+            thread_key = cls._plot_thread_key(raw_entry.get("thread") or raw_key)
+            if not thread_key:
+                continue
+            raw_deps = raw_entry.get("dependencies")
+            if not isinstance(raw_deps, list):
+                raw_deps = []
+            deps = []
+            for dep in raw_deps[: cls.MAX_PLOT_DEPENDENCIES]:
+                dep_text = " ".join(str(dep or "").strip().split())[:120]
+                if dep_text:
+                    deps.append(dep_text)
+            status = str(raw_entry.get("status") or "active").strip().lower()
+            if status not in {"active", "resolved"}:
+                status = "active"
+            threads[thread_key] = {
+                "thread": thread_key,
+                "setup": str(raw_entry.get("setup") or "").strip()[:260],
+                "intended_payoff": str(raw_entry.get("intended_payoff") or "").strip()[:260],
+                "target_turns": min(250, max(1, cls._coerce_non_negative_int(
+                    raw_entry.get("target_turns", 8), default=8
+                ))),
+                "dependencies": deps,
+                "player_slugs": [
+                    cls._player_slug_key(item)
+                    for item in list(raw_entry.get("player_slugs") or [])[:8]
+                    if cls._player_slug_key(item)
+                ],
+                "npc_slugs": [
+                    str(item or "").strip()
+                    for item in list(raw_entry.get("npc_slugs") or [])[:12]
+                    if str(item or "").strip()
+                ],
+                "visibility": str(raw_entry.get("visibility") or "").strip().lower(),
+                "visible_player_slugs": [
+                    cls._player_slug_key(item)
+                    for item in list(raw_entry.get("visible_player_slugs") or [])[:8]
+                    if cls._player_slug_key(item)
+                ],
+                "visible_actor_ids": [
+                    str(item)
+                    for item in list(raw_entry.get("visible_user_ids") or raw_entry.get("visible_actor_ids") or [])[:8]
+                    if item is not None
+                ],
+                "aware_npc_slugs": [
+                    str(item or "").strip()
+                    for item in list(raw_entry.get("aware_npc_slugs") or [])[:12]
+                    if str(item or "").strip()
+                ],
+                "location_key": str(raw_entry.get("location_key") or "").strip()[:160],
+                "hint": " ".join(str(raw_entry.get("hint") or "").strip().split())[:220],
+                "status": status,
+                "resolution": str(raw_entry.get("resolution") or "").strip()[:260],
+                "created_turn": cls._coerce_non_negative_int(
+                    raw_entry.get("created_turn", 0), default=0
+                ),
+                "updated_turn": cls._coerce_non_negative_int(
+                    raw_entry.get("updated_turn", 0), default=0
+                ),
+            }
+        return threads
+
+    @classmethod
+    def _plot_threads_for_prompt(
+        cls,
+        campaign_state: dict[str, object],
+        *,
+        limit: int = 12,
+    ) -> list[dict[str, object]]:
+        threads = cls._plot_threads_from_state(campaign_state)
+        rows = list(threads.values())
+        rows.sort(
+            key=lambda row: (
+                0 if str(row.get("status")) == "active" else 1,
+                -cls._coerce_non_negative_int(row.get("updated_turn", 0), default=0),
+                str(row.get("thread") or ""),
+            )
+        )
+        out = []
+        for row in rows[: max(1, int(limit or 12))]:
+            out.append(
+                {
+                    "thread": row.get("thread"),
+                    "setup": row.get("setup"),
+                    "intended_payoff": row.get("intended_payoff"),
+                    "target_turns": row.get("target_turns"),
+                    "dependencies": list(row.get("dependencies") or []),
+                    "hint": row.get("hint"),
+                    "status": row.get("status"),
+                    "resolution": row.get("resolution"),
+                }
+            )
+        return out
+
+    @classmethod
+    def _plot_thread_visibility_descriptor(
+        cls,
+        thread: dict[str, object],
+    ) -> tuple[str, list, list[str], list[str], str]:
+        scope = str(thread.get("visibility") or "").strip().lower()
+        visible_actor_ids = [
+            str(item)
+            for item in list(thread.get("visible_user_ids") or thread.get("visible_actor_ids") or [])[:8]
+            if item is not None
+        ]
+        visible_player_slugs = [
+            cls._player_slug_key(item)
+            for item in list(thread.get("visible_player_slugs") or [])[:8]
+            if cls._player_slug_key(item)
+        ]
+        aware_npc_slugs = [
+            str(item or "").strip()
+            for item in list(thread.get("aware_npc_slugs") or [])[:12]
+            if str(item or "").strip()
+        ]
+        location_key = str(thread.get("location_key") or "").strip()[:160]
+        if scope not in {"public", "private", "limited", "local"}:
+            if visible_player_slugs:
+                scope = "private" if len(visible_player_slugs) <= 1 else "limited"
+            elif location_key:
+                scope = "local"
+            else:
+                scope = "public"
+        return scope, visible_actor_ids, visible_player_slugs, aware_npc_slugs, location_key
+
+    @classmethod
+    def _plot_thread_visible_to_viewer(
+        cls,
+        thread: dict[str, object],
+        *,
+        viewer_actor_id: str | None = None,
+        viewer_slug: str | None = None,
+        viewer_location_key: str | None = None,
+    ) -> bool:
+        scope, visible_actor_ids, visible_player_slugs, _aware, location_key = (
+            cls._plot_thread_visibility_descriptor(thread)
+        )
+        if scope == "public":
+            return True
+        viewer_slug_key = cls._player_slug_key(viewer_slug) if viewer_slug else ""
+        if scope in {"private", "limited"}:
+            if viewer_actor_id is not None and str(viewer_actor_id) in [str(x) for x in visible_actor_ids]:
+                return True
+            if viewer_slug_key and viewer_slug_key in visible_player_slugs:
+                return True
+            player_slugs = [
+                cls._player_slug_key(item)
+                for item in list(thread.get("player_slugs") or [])
+                if cls._player_slug_key(item)
+            ]
+            if viewer_slug_key and viewer_slug_key in player_slugs:
+                return True
+            return False
+        if scope == "local":
+            if not location_key:
+                return True
+            viewer_location_norm = cls._normalize_location_key(viewer_location_key)
+            return viewer_location_norm == cls._normalize_location_key(location_key) if viewer_location_norm else False
+        return True
+
+    @classmethod
+    def _plot_hints_for_viewer(
+        cls,
+        campaign_state: dict[str, object],
+        *,
+        viewer_actor_id: str | None = None,
+        viewer_slug: str | None = None,
+        viewer_location_key: str | None = None,
+        limit: int = 6,
+    ) -> list[dict[str, object]]:
+        threads = cls._plot_threads_from_state(campaign_state)
+        out: list[dict[str, object]] = []
+        for thread in threads.values():
+            if str(thread.get("status")) != "active":
+                continue
+            hint = str(thread.get("hint") or "").strip()
+            if not hint:
+                continue
+            if not cls._plot_thread_visible_to_viewer(
+                thread,
+                viewer_actor_id=viewer_actor_id,
+                viewer_slug=viewer_slug,
+                viewer_location_key=viewer_location_key,
+            ):
+                continue
+            out.append(
+                {
+                    "thread": thread.get("thread"),
+                    "hint": hint,
+                }
+            )
+            if len(out) >= max(1, int(limit)):
+                break
+        return out
+
+    @classmethod
+    def _chapter_slug_key(cls, value: object) -> str:
+        text = re.sub(r"\s+", " ", str(value or "").strip().lower())
+        if not text:
+            return ""
+        return re.sub(r"[^a-z0-9]+", "-", text).strip("-")[:80]
+
+    @classmethod
+    def _chapter_plan_from_state(
+        cls, campaign_state: dict[str, object]
+    ) -> dict[str, dict[str, object]]:
+        raw = (
+            campaign_state.get(cls.CHAPTER_PLAN_STATE_KEY)
+            if isinstance(campaign_state, dict)
+            else {}
+        )
+        if not isinstance(raw, dict):
+            raw = {}
+        chapters: dict[str, dict[str, object]] = {}
+        for raw_slug, raw_entry in raw.items():
+            if not isinstance(raw_entry, dict):
+                continue
+            slug = cls._chapter_slug_key(raw_entry.get("slug") or raw_slug)
+            if not slug:
+                continue
+            scenes_raw = raw_entry.get("scenes")
+            if not isinstance(scenes_raw, list):
+                scenes_raw = []
+            scenes = []
+            for scene in scenes_raw[:20]:
+                scene_slug = cls._chapter_slug_key(scene)
+                if scene_slug:
+                    scenes.append(scene_slug)
+            current_scene = cls._chapter_slug_key(raw_entry.get("current_scene"))
+            if not current_scene and scenes:
+                current_scene = scenes[0]
+            status = str(raw_entry.get("status") or "active").strip().lower()
+            if status not in {"active", "resolved"}:
+                status = "active"
+            chapters[slug] = {
+                "slug": slug,
+                "title": " ".join(str(raw_entry.get("title") or slug).strip().split())[:120],
+                "summary": str(raw_entry.get("summary") or "").strip()[:260],
+                "scenes": scenes,
+                "current_scene": current_scene,
+                "status": status,
+                "resolution": str(raw_entry.get("resolution") or "").strip()[:260],
+                "created_turn": cls._coerce_non_negative_int(
+                    raw_entry.get("created_turn", 0), default=0
+                ),
+                "updated_turn": cls._coerce_non_negative_int(
+                    raw_entry.get("updated_turn", 0), default=0
+                ),
+            }
+        return chapters
+
+    @classmethod
+    def _chapters_for_prompt(
+        cls,
+        campaign_state: dict[str, object],
+        *,
+        active_only: bool = True,
+        limit: int = 8,
+    ) -> list[dict[str, object]]:
+        chapters = cls._chapter_plan_from_state(campaign_state)
+        rows = list(chapters.values())
+        if active_only:
+            rows = [row for row in rows if str(row.get("status")) == "active"]
+        rows.sort(
+            key=lambda row: (
+                0 if str(row.get("status")) == "active" else 1,
+                -cls._coerce_non_negative_int(row.get("updated_turn", 0), default=0),
+                str(row.get("slug") or ""),
+            )
+        )
+        out = []
+        for row in rows[: max(1, int(limit or 8))]:
+            out.append(
+                {
+                    "slug": row.get("slug"),
+                    "title": row.get("title"),
+                    "summary": row.get("summary"),
+                    "current_scene": row.get("current_scene"),
+                    "scenes": list(row.get("scenes") or []),
+                    "status": row.get("status"),
+                    "resolution": row.get("resolution"),
+                }
+            )
+        return out
+
+    @classmethod
+    def _consequence_id_key(cls, value: object) -> str:
+        text = re.sub(r"\s+", " ", str(value or "").strip().lower())
+        if not text:
+            return ""
+        return re.sub(r"[^a-z0-9]+", "-", text).strip("-")[:90]
+
+    @classmethod
+    def _consequences_from_state(
+        cls, campaign_state: dict[str, object]
+    ) -> dict[str, dict[str, object]]:
+        raw = (
+            campaign_state.get(cls.CONSEQUENCE_STATE_KEY)
+            if isinstance(campaign_state, dict)
+            else {}
+        )
+        if not isinstance(raw, dict):
+            raw = {}
+        out: dict[str, dict[str, object]] = {}
+        for raw_key, raw_entry in raw.items():
+            if not isinstance(raw_entry, dict):
+                continue
+            cid = cls._consequence_id_key(raw_entry.get("id") or raw_key)
+            if not cid:
+                continue
+            status = str(raw_entry.get("status") or "active").strip().lower()
+            if status not in {"active", "resolved"}:
+                status = "active"
+            expires_at_turn = cls._coerce_non_negative_int(
+                raw_entry.get("expires_at_turn", 0), default=0
+            )
+            out[cid] = {
+                "id": cid,
+                "trigger": str(raw_entry.get("trigger") or "").strip()[:240],
+                "consequence": str(raw_entry.get("consequence") or "").strip()[:300],
+                "severity": str(raw_entry.get("severity") or "low").strip().lower()[:24],
+                "status": status,
+                "created_turn": cls._coerce_non_negative_int(
+                    raw_entry.get("created_turn", 0), default=0
+                ),
+                "updated_turn": cls._coerce_non_negative_int(
+                    raw_entry.get("updated_turn", 0), default=0
+                ),
+                "expires_at_turn": expires_at_turn,
+                "resolution": str(raw_entry.get("resolution") or "").strip()[:260],
+            }
+        return out
+
+    @classmethod
+    def _consequences_for_prompt(
+        cls,
+        campaign_state: dict[str, object],
+        *,
+        current_turn: int = 0,
+        limit: int = 12,
+    ) -> list[dict[str, object]]:
+        rows = list(cls._consequences_from_state(campaign_state).values())
+        active_rows = []
+        turn_now = max(0, int(current_turn or 0))
+        for row in rows:
+            if str(row.get("status")) != "active":
+                continue
+            expires_at_turn = cls._coerce_non_negative_int(
+                row.get("expires_at_turn", 0), default=0
+            )
+            if expires_at_turn > 0 and turn_now > 0 and expires_at_turn < turn_now:
+                continue
+            active_rows.append(row)
+        active_rows.sort(
+            key=lambda row: (
+                {"critical": 0, "high": 1, "moderate": 2, "low": 3}.get(
+                    str(row.get("severity") or "low"), 4
+                ),
+                cls._coerce_non_negative_int(row.get("expires_at_turn", 0), default=0)
+                if cls._coerce_non_negative_int(row.get("expires_at_turn", 0), default=0) > 0
+                else 10**9,
+                -cls._coerce_non_negative_int(row.get("updated_turn", 0), default=0),
+            )
+        )
+        out = []
+        for row in active_rows[: max(1, int(limit or 12))]:
+            out.append(
+                {
+                    "id": row.get("id"),
+                    "trigger": row.get("trigger"),
+                    "consequence": row.get("consequence"),
+                    "severity": row.get("severity"),
+                    "expires_at_turn": row.get("expires_at_turn"),
+                }
+            )
+        return out
+
+    @classmethod
+    def _apply_plot_plan_tool(
+        cls,
+        campaign_state: dict[str, object],
+        payload: dict[str, object],
+        *,
+        current_turn: int = 0,
+    ) -> dict[str, object]:
+        threads = cls._plot_threads_from_state(campaign_state)
+        raw_plans = payload.get("plans")
+        if isinstance(raw_plans, dict):
+            raw_plans = [raw_plans]
+        if not isinstance(raw_plans, list):
+            raw_plans = []
+        updated = 0
+        removed = 0
+        for raw_plan in raw_plans[:12]:
+            if not isinstance(raw_plan, dict):
+                continue
+            thread_key = cls._plot_thread_key(
+                raw_plan.get("thread") or raw_plan.get("slug")
+            )
+            if not thread_key:
+                continue
+            delete_requested = bool(
+                raw_plan.get("remove")
+                or raw_plan.get("delete")
+                or raw_plan.get("_delete")
+            )
+            if delete_requested:
+                if thread_key in threads:
+                    threads.pop(thread_key, None)
+                    removed += 1
+                continue
+            row = dict(
+                threads.get(
+                    thread_key,
+                    {
+                        "thread": thread_key,
+                        "setup": "",
+                        "intended_payoff": "",
+                        "target_turns": 8,
+                        "dependencies": [],
+                        "player_slugs": [],
+                        "npc_slugs": [],
+                        "visibility": "",
+                        "visible_player_slugs": [],
+                        "visible_actor_ids": [],
+                        "aware_npc_slugs": [],
+                        "location_key": "",
+                        "hint": "",
+                        "status": "active",
+                        "resolution": "",
+                        "created_turn": max(0, int(current_turn or 0)),
+                        "updated_turn": max(0, int(current_turn or 0)),
+                    },
+                )
+            )
+            for field in ("setup", "intended_payoff", "resolution"):
+                if field in raw_plan and raw_plan.get(field) is not None:
+                    row[field] = " ".join(
+                        str(raw_plan.get(field) or "").strip().split()
+                    )[:260]
+            if "target_turns" in raw_plan:
+                target_turns = cls._coerce_non_negative_int(
+                    raw_plan.get("target_turns", row.get("target_turns", 8)), default=8
+                )
+                row["target_turns"] = min(250, max(1, target_turns))
+            raw_deps = raw_plan.get("dependencies")
+            if isinstance(raw_deps, list):
+                dep_clean = []
+                for dep in raw_deps[: cls.MAX_PLOT_DEPENDENCIES]:
+                    dep_text = " ".join(str(dep or "").strip().split())[:120]
+                    if dep_text:
+                        dep_clean.append(dep_text)
+                row["dependencies"] = dep_clean
+            if "visibility" in raw_plan:
+                visibility = str(raw_plan.get("visibility") or "").strip().lower()
+                if visibility in {"public", "private", "limited", "local"}:
+                    row["visibility"] = visibility
+            if "player_slugs" in raw_plan:
+                raw_player_slugs = raw_plan.get("player_slugs")
+                if isinstance(raw_player_slugs, str):
+                    raw_player_slugs = [raw_player_slugs]
+                cleaned_player_slugs: list[str] = []
+                seen_player_slugs: set[str] = set()
+                if isinstance(raw_player_slugs, list):
+                    for item in raw_player_slugs[:8]:
+                        slug = cls._player_slug_key(item)
+                        if not slug or slug in seen_player_slugs:
+                            continue
+                        seen_player_slugs.add(slug)
+                        cleaned_player_slugs.append(slug)
+                row["player_slugs"] = cleaned_player_slugs
+            if "visible_player_slugs" in raw_plan:
+                raw_visible_player_slugs = raw_plan.get("visible_player_slugs")
+                if isinstance(raw_visible_player_slugs, str):
+                    raw_visible_player_slugs = [raw_visible_player_slugs]
+                cleaned_visible_player_slugs: list[str] = []
+                seen_visible_player_slugs: set[str] = set()
+                if isinstance(raw_visible_player_slugs, list):
+                    for item in raw_visible_player_slugs[:8]:
+                        slug = cls._player_slug_key(item)
+                        if not slug or slug in seen_visible_player_slugs:
+                            continue
+                        seen_visible_player_slugs.add(slug)
+                        cleaned_visible_player_slugs.append(slug)
+                row["visible_player_slugs"] = cleaned_visible_player_slugs
+            if "npc_slugs" in raw_plan:
+                raw_npc_slugs = raw_plan.get("npc_slugs")
+                if isinstance(raw_npc_slugs, str):
+                    raw_npc_slugs = [raw_npc_slugs]
+                cleaned_npc_slugs: list[str] = []
+                seen_npc_slugs: set[str] = set()
+                if isinstance(raw_npc_slugs, list):
+                    for item in raw_npc_slugs[:12]:
+                        slug = str(item or "").strip()
+                        if not slug or slug in seen_npc_slugs:
+                            continue
+                        seen_npc_slugs.add(slug)
+                        cleaned_npc_slugs.append(slug)
+                row["npc_slugs"] = cleaned_npc_slugs
+            if "aware_npc_slugs" in raw_plan:
+                raw_aware_npc_slugs = raw_plan.get("aware_npc_slugs")
+                if isinstance(raw_aware_npc_slugs, str):
+                    raw_aware_npc_slugs = [raw_aware_npc_slugs]
+                cleaned_aware_npc_slugs: list[str] = []
+                seen_aware_npc_slugs: set[str] = set()
+                if isinstance(raw_aware_npc_slugs, list):
+                    for item in raw_aware_npc_slugs[:12]:
+                        slug = str(item or "").strip()
+                        if not slug or slug in seen_aware_npc_slugs:
+                            continue
+                        seen_aware_npc_slugs.add(slug)
+                        cleaned_aware_npc_slugs.append(slug)
+                row["aware_npc_slugs"] = cleaned_aware_npc_slugs
+            if "location_key" in raw_plan:
+                row["location_key"] = str(raw_plan.get("location_key") or "").strip()[:160]
+            if "hint" in raw_plan:
+                row["hint"] = " ".join(str(raw_plan.get("hint") or "").strip().split())[:220]
+            status = str(raw_plan.get("status") or row.get("status") or "active").strip().lower()
+            if raw_plan.get("resolve"):
+                status = "resolved"
+            if status not in {"active", "resolved"}:
+                status = "active"
+            row["status"] = status
+            if row.get("status") == "resolved" and not row.get("resolution"):
+                row["resolution"] = "resolved"
+            if row.get("status") != "resolved":
+                row["resolution"] = str(row.get("resolution") or "")[:260]
+            row["updated_turn"] = max(0, int(current_turn or 0))
+            if cls._coerce_non_negative_int(row.get("created_turn", 0), default=0) <= 0:
+                row["created_turn"] = max(0, int(current_turn or 0))
+            threads[thread_key] = row
+            updated += 1
+        if len(threads) > cls.MAX_PLOT_THREADS:
+            ranked = sorted(
+                threads.items(),
+                key=lambda kv: (
+                    0 if str(kv[1].get("status")) == "active" else 1,
+                    -cls._coerce_non_negative_int(kv[1].get("updated_turn", 0), default=0),
+                    kv[0],
+                ),
+            )
+            threads = dict(ranked[: cls.MAX_PLOT_THREADS])
+        campaign_state[cls.PLOT_THREADS_STATE_KEY] = threads
+        active_threads = [
+            row
+            for row in cls._plot_threads_for_prompt(campaign_state, limit=12)
+            if str(row.get("status")) == "active"
+        ]
+        return {
+            "updated": updated,
+            "removed": removed,
+            "total": len(threads),
+            "active": active_threads,
+        }
+
+    @classmethod
+    def _apply_chapter_plan_tool(
+        cls,
+        campaign_state: dict[str, object],
+        payload: dict[str, object],
+        *,
+        current_turn: int = 0,
+        on_rails: bool = False,
+    ) -> dict[str, object]:
+        if on_rails:
+            return {"updated": 0, "ignored": True, "reason": "on_rails_enabled"}
+        chapters = cls._chapter_plan_from_state(campaign_state)
+        action = str(payload.get("action") or "create").strip().lower()
+        changed = 0
+
+        def _resolve_slug() -> str:
+            chapter_ref = payload.get("chapter")
+            if isinstance(chapter_ref, dict):
+                return cls._chapter_slug_key(
+                    chapter_ref.get("slug") or chapter_ref.get("title")
+                )
+            return cls._chapter_slug_key(payload.get("chapter") or payload.get("slug"))
+
+        slug = _resolve_slug()
+        chapter_payload = payload.get("chapter")
+        if isinstance(chapter_payload, dict):
+            if not slug:
+                slug = cls._chapter_slug_key(
+                    chapter_payload.get("slug") or chapter_payload.get("title")
+                )
+        if action in {"create", "update"}:
+            if not slug:
+                return {"updated": 0, "ignored": True, "reason": "missing_slug"}
+            row = dict(
+                chapters.get(
+                    slug,
+                    {
+                        "slug": slug,
+                        "title": slug,
+                        "summary": "",
+                        "scenes": [],
+                        "current_scene": "",
+                        "status": "active",
+                        "resolution": "",
+                        "created_turn": max(0, int(current_turn or 0)),
+                        "updated_turn": max(0, int(current_turn or 0)),
+                    },
+                )
+            )
+            if isinstance(chapter_payload, dict):
+                if chapter_payload.get("title") is not None:
+                    row["title"] = " ".join(
+                        str(chapter_payload.get("title") or "").strip().split()
+                    )[:120] or row.get("title") or slug
+                if chapter_payload.get("summary") is not None:
+                    row["summary"] = str(chapter_payload.get("summary") or "").strip()[:260]
+                scenes_raw = chapter_payload.get("scenes")
+                if isinstance(scenes_raw, list):
+                    scenes = []
+                    for scene in scenes_raw[:20]:
+                        scene_slug = cls._chapter_slug_key(scene)
+                        if scene_slug:
+                            scenes.append(scene_slug)
+                    row["scenes"] = scenes
+                if chapter_payload.get("current_scene") is not None:
+                    row["current_scene"] = cls._chapter_slug_key(
+                        chapter_payload.get("current_scene")
+                    )
+                if chapter_payload.get("active") is not None:
+                    row["status"] = (
+                        "active" if bool(chapter_payload.get("active")) else "resolved"
+                    )
+            if not row.get("current_scene") and row.get("scenes"):
+                row["current_scene"] = row["scenes"][0]
+            row["updated_turn"] = max(0, int(current_turn or 0))
+            if cls._coerce_non_negative_int(row.get("created_turn", 0), default=0) <= 0:
+                row["created_turn"] = max(0, int(current_turn or 0))
+            chapters[slug] = row
+            changed += 1
+        elif action == "advance_scene":
+            if not slug or slug not in chapters:
+                return {"updated": 0, "ignored": True, "reason": "chapter_not_found"}
+            row = dict(chapters.get(slug) or {})
+            to_scene = cls._chapter_slug_key(
+                payload.get("to_scene") or payload.get("scene")
+            )
+            scenes = list(row.get("scenes") or [])
+            if to_scene:
+                if to_scene not in scenes:
+                    scenes.append(to_scene)
+                row["current_scene"] = to_scene
+            elif scenes:
+                current = cls._chapter_slug_key(row.get("current_scene"))
+                try:
+                    idx = scenes.index(current)
+                except ValueError:
+                    idx = -1
+                next_idx = min(len(scenes) - 1, idx + 1)
+                row["current_scene"] = scenes[next_idx]
+            row["scenes"] = scenes[:20]
+            row["status"] = "active"
+            row["updated_turn"] = max(0, int(current_turn or 0))
+            chapters[slug] = row
+            changed += 1
+        elif action in {"resolve", "close"}:
+            if not slug or slug not in chapters:
+                return {"updated": 0, "ignored": True, "reason": "chapter_not_found"}
+            row = dict(chapters.get(slug) or {})
+            row["status"] = "resolved"
+            row["resolution"] = " ".join(
+                str(payload.get("resolution") or row.get("resolution") or "").split()
+            )[:260]
+            row["updated_turn"] = max(0, int(current_turn or 0))
+            chapters[slug] = row
+            changed += 1
+        if len(chapters) > cls.MAX_OFFRAILS_CHAPTERS:
+            ranked = sorted(
+                chapters.items(),
+                key=lambda kv: (
+                    0 if str(kv[1].get("status")) == "active" else 1,
+                    -cls._coerce_non_negative_int(kv[1].get("updated_turn", 0), default=0),
+                    kv[0],
+                ),
+            )
+            chapters = dict(ranked[: cls.MAX_OFFRAILS_CHAPTERS])
+        campaign_state[cls.CHAPTER_PLAN_STATE_KEY] = chapters
+        active_chapters = cls._chapters_for_prompt(
+            campaign_state, active_only=True, limit=10
+        )
+        return {
+            "updated": changed,
+            "ignored": False,
+            "total": len(chapters),
+            "active": active_chapters,
+        }
+
+    @classmethod
+    def _apply_consequence_log_tool(
+        cls,
+        campaign_state: dict[str, object],
+        payload: dict[str, object],
+        *,
+        current_turn: int = 0,
+    ) -> dict[str, object]:
+        rows = cls._consequences_from_state(campaign_state)
+        turn_now = max(0, int(current_turn or 0))
+        added = 0
+        updated = 0
+        resolved = 0
+        removed = 0
+
+        def _iter_entries(value: object) -> list[dict[str, object]]:
+            if isinstance(value, dict):
+                return [value]
+            if isinstance(value, list):
+                return [entry for entry in value if isinstance(entry, dict)]
+            return []
+
+        for entry in _iter_entries(payload.get("add")):
+            trigger = " ".join(str(entry.get("trigger") or "").strip().split())[:240]
+            consequence = " ".join(
+                str(entry.get("consequence") or "").strip().split()
+            )[:300]
+            if not trigger or not consequence:
+                continue
+            cid = cls._consequence_id_key(
+                entry.get("id")
+                or entry.get("slug")
+                or trigger[:60]
+            )
+            if not cid:
+                continue
+            severity = str(entry.get("severity") or "low").strip().lower()
+            if severity not in {"low", "moderate", "high", "critical"}:
+                severity = "low"
+            expires_turns = cls._coerce_non_negative_int(
+                entry.get("expires_turns", 0), default=0
+            )
+            expires_at_turn = (turn_now + expires_turns) if expires_turns > 0 else 0
+            row = dict(rows.get(cid) or {})
+            is_new = not bool(row)
+            row.update(
+                {
+                    "id": cid,
+                    "trigger": trigger,
+                    "consequence": consequence,
+                    "severity": severity,
+                    "status": "active",
+                    "updated_turn": turn_now,
+                    "expires_at_turn": expires_at_turn,
+                    "resolution": str(row.get("resolution") or "")[:260],
+                }
+            )
+            if is_new:
+                row["created_turn"] = turn_now
+                added += 1
+            else:
+                updated += 1
+            rows[cid] = row
+        for entry in _iter_entries(payload.get("resolve")):
+            cid = cls._consequence_id_key(
+                entry.get("id") or entry.get("slug") or entry.get("trigger")
+            )
+            if not cid or cid not in rows:
+                continue
+            row = dict(rows.get(cid) or {})
+            row["status"] = "resolved"
+            row["updated_turn"] = turn_now
+            row["resolution"] = " ".join(
+                str(entry.get("resolution") or row.get("resolution") or "resolved")
+                .strip()
+                .split()
+            )[:260]
+            rows[cid] = row
+            resolved += 1
+        remove_keys = payload.get("remove")
+        if isinstance(remove_keys, list):
+            for raw_key in remove_keys:
+                cid = cls._consequence_id_key(raw_key)
+                if cid and cid in rows:
+                    rows.pop(cid, None)
+                    removed += 1
+        for cid, row in list(rows.items()):
+            expires_at_turn = cls._coerce_non_negative_int(
+                row.get("expires_at_turn", 0), default=0
+            )
+            if (
+                expires_at_turn > 0
+                and turn_now > 0
+                and turn_now > expires_at_turn
+                and str(row.get("status")) == "active"
+            ):
+                rows.pop(cid, None)
+                removed += 1
+        if len(rows) > cls.MAX_CONSEQUENCES:
+            ranked = sorted(
+                rows.items(),
+                key=lambda kv: (
+                    0 if str(kv[1].get("status")) == "active" else 1,
+                    -cls._coerce_non_negative_int(kv[1].get("updated_turn", 0), default=0),
+                    kv[0],
+                ),
+            )
+            rows = dict(ranked[: cls.MAX_CONSEQUENCES])
+        campaign_state[cls.CONSEQUENCE_STATE_KEY] = rows
+        active = cls._consequences_for_prompt(
+            campaign_state, current_turn=turn_now, limit=12
+        )
+        return {
+            "added": added,
+            "updated": updated,
+            "resolved": resolved,
+            "removed": removed,
+            "total": len(rows),
+            "active": active,
+        }
+
+    @classmethod
+    def _auto_resolve_stale_plot_threads(
+        cls,
+        campaign_state: dict[str, object],
+        pruned_keys: list[str],
+    ) -> int:
+        threads = cls._plot_threads_from_state(campaign_state)
+        if not threads:
+            return 0
+        pruned_slugs = set()
+        for key in pruned_keys:
+            slug = cls._plot_thread_key(key)
+            if slug:
+                pruned_slugs.add(slug)
+        if not pruned_slugs:
+            return 0
+        resolved_count = 0
+        for thread_key, thread in threads.items():
+            if str(thread.get("status")) != "active":
+                continue
+            if thread_key in pruned_slugs:
+                thread["status"] = "resolved"
+                if not thread.get("resolution"):
+                    thread["resolution"] = "auto-resolved: state key pruned"
+                resolved_count += 1
+        if resolved_count > 0:
+            campaign_state[cls.PLOT_THREADS_STATE_KEY] = threads
+        return resolved_count
+
+    # ------------------------------------------------------------------
+    # Calendar event notifications
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def _calendar_event_key(cls, event: dict[str, object]) -> str:
+        name = str(event.get("name", "")).strip().lower()
+        slug = re.sub(r"[^a-z0-9]+", "-", name).strip("-")[:80] or "event"
+        fire_day = cls._coerce_non_negative_int(event.get("fire_day", 1), default=1) or 1
+        fire_hour = min(23, max(0, cls._coerce_non_negative_int(event.get("fire_hour", 23), default=23)))
+        return f"{slug}:{fire_day}:{fire_hour}"
+
+    @classmethod
+    def _calendar_player_aliases_from_registry_entry(
+        cls,
+        entry: dict[str, object],
+    ) -> set[str]:
+        aliases: set[str] = set()
+
+        def _add(raw: object) -> None:
+            text = " ".join(str(raw or "").strip().lower().split())
+            if text:
+                aliases.add(text[:160])
+
+        actor_id = entry.get("actor_id") or entry.get("user_id")
+        if actor_id is not None:
+            _add(actor_id)
+        name = str(entry.get("name") or "").strip()
+        slug = str(entry.get("slug") or "").strip()
+        if name:
+            _add(name)
+        if slug:
+            _add(slug)
+        if name:
+            normalized_name = cls._player_slug_key(name)
+            if normalized_name:
+                _add(normalized_name)
+        return aliases
+
+    def _calendar_event_notification_summary(
+        self,
+        notification: dict[str, object],
+    ) -> str:
+        name = str(notification.get("name") or "Unknown event").strip()
+        fire_day = self._coerce_non_negative_int(notification.get("fire_day", 1), default=1) or 1
+        fire_hour = min(23, max(0, self._coerce_non_negative_int(notification.get("fire_hour", 23), default=23)))
+        status = str(notification.get("status") or "fired").strip().lower()
+        description = " ".join(str(notification.get("description") or "").split())
+        if status == "overdue":
+            lead = f"Calendar event overdue: {name} (was due Day {fire_day}, {fire_hour:02d}:00)."
+        else:
+            lead = f"Calendar event fired: {name} (Day {fire_day}, {fire_hour:02d}:00)."
+        if description:
+            return self._trim_text(f"{lead} {description}", 280)
+        return lead
+
+    def _calendar_event_scope(self, campaign_id: str, event: object) -> str:
+        return "global" if not self._resolve_calendar_target_user_ids(campaign_id, event) else "player"
+
+    def _calendar_event_notification_targets(
+        self,
+        campaign_id: str,
+        event: object,
+    ) -> list[str]:
+        explicit_targets = self._resolve_calendar_target_user_ids(campaign_id, event)
+        if explicit_targets:
+            return [str(t) for t in explicit_targets]
+        with self._session_factory() as session:
+            from text_game_engine.persistence.sqlalchemy.models import Player
+            return [
+                str(row.actor_id)
+                for row in session.query(Player).filter_by(campaign_id=str(campaign_id)).all()
+                if getattr(row, "actor_id", None) is not None
+            ]
+
+    @staticmethod
+    def _calendar_fix_ampm(fire_hour: int, description: str) -> int:
+        """Fix AM/PM mismatch — e.g. LLM outputs fire_hour=7 for '7pm'."""
+        if not description:
+            return fire_hour
+        text = description.lower()
+        for m in re.finditer(r"\b(\d{1,2})(?:\s*:\s*\d{2})?\s*(am|pm)\b", text):
+            desc_hour = int(m.group(1))
+            ampm = m.group(2)
+            if desc_hour < 1 or desc_hour > 12:
+                continue
+            if ampm == "pm":
+                expected_24h = desc_hour if desc_hour == 12 else desc_hour + 12
+            else:
+                expected_24h = 0 if desc_hour == 12 else desc_hour
+            if fire_hour == desc_hour and fire_hour != expected_24h:
+                fire_hour = expected_24h
+                break
+        return fire_hour
+
+    @staticmethod
+    def _calendar_fix_relative_day(fire_day: int, description: str, current_day: int) -> int:
+        """Fix off-by-one when description says 'tomorrow' but fire_day == today."""
+        if not description:
+            return fire_day
+        text = description.lower()
+        if re.search(r"\btomorrow\b", text):
+            expected = current_day + 1
+            if fire_day == current_day:
+                return expected
+        elif re.search(r"\btoday\b", text):
+            if fire_day > current_day:
+                return current_day
+        return fire_day
+
+    @classmethod
+    def _calendar_should_prune_stale_event(
+        cls,
+        event: dict[str, object],
+        *,
+        hours_remaining: int,
+    ) -> bool:
+        if not isinstance(event, dict):
+            return False
+        if hours_remaining >= 0:
+            return False
+        overdue_hours = abs(int(hours_remaining))
+        fired_notice_key = str(event.get("fired_notice_key") or "").strip()
+        if overdue_hours >= 24:
+            return True
+        if fired_notice_key and overdue_hours >= 6:
+            return True
+        return False
+
+    def _calendar_collect_fired_events(
+        self,
+        campaign_id: str,
+        campaign_state: dict[str, object],
+        *,
+        from_time: dict[str, int],
+        to_time: dict[str, int],
+    ) -> list[dict[str, object]]:
+        if not isinstance(campaign_state, dict):
+            return []
+        raw_calendar = campaign_state.get("calendar")
+        if not isinstance(raw_calendar, list) or not raw_calendar:
+            return []
+        current_day = self._coerce_non_negative_int(to_time.get("day", 1), default=1) or 1
+        current_hour = min(23, max(0, self._coerce_non_negative_int(to_time.get("hour", 8), default=8)))
+        # Compute absolute minutes if _game_time_to_total_minutes is available
+        if hasattr(self, "_game_time_to_total_minutes"):
+            from_abs = self._game_time_to_total_minutes(from_time)
+            to_abs = self._game_time_to_total_minutes(to_time)
+        else:
+            from_abs = (((max(1, from_time.get("day", 1)) - 1) * 24) + from_time.get("hour", 0)) * 60
+            to_abs = (((max(1, current_day) - 1) * 24) + current_hour) * 60
+        if to_abs <= 0:
+            return []
+        notifications: list[dict[str, object]] = []
+        changed = False
+        for raw_event in raw_calendar:
+            if not isinstance(raw_event, dict):
+                continue
+            normalized = self._calendar_normalize_event(
+                raw_event,
+                current_day=current_day,
+                current_hour=current_hour,
+            )
+            if normalized is None:
+                continue
+            event_key = self._calendar_event_key(normalized)
+            if raw_event.get("fired_notice_key") == event_key:
+                continue
+            fire_day = self._coerce_non_negative_int(normalized.get("fire_day", current_day), default=current_day)
+            fire_hour = min(23, max(0, self._coerce_non_negative_int(normalized.get("fire_hour", 23), default=23)))
+            due_abs = (((max(1, fire_day) - 1) * 24) + fire_hour) * 60
+            if due_abs > to_abs:
+                continue
+            if due_abs > from_abs:
+                status = "fired"
+            else:
+                status = "overdue"
+            raw_event["fired_notice_key"] = event_key
+            raw_event["fired_notice_day"] = current_day
+            raw_event["fired_notice_hour"] = current_hour
+            changed = True
+            notifications.append(
+                {
+                    "name": str(normalized.get("name") or "Unknown event"),
+                    "description": str(normalized.get("description") or "").strip(),
+                    "fire_day": fire_day,
+                    "fire_hour": fire_hour,
+                    "status": status,
+                    "scope": self._calendar_event_scope(campaign_id, raw_event),
+                    "target_actor_ids": self._calendar_event_notification_targets(campaign_id, raw_event),
+                }
+            )
+        if changed:
+            campaign_state["calendar"] = raw_calendar
+        return notifications
+
+    async def _send_calendar_event_notifications(
+        self,
+        *,
+        campaign_id: str,
+        campaign_name: str,
+        notifications: list[dict[str, object]],
+    ) -> None:
+        """Send calendar event notifications via the notification port.
+
+        The actual delivery mechanism (Discord DMs, etc.) is handled by the
+        NotificationPort adapter.
+        """
+        if not notifications or self._notification_port is None:
+            return
+        for notification in notifications:
+            summary = self._calendar_event_notification_summary(notification)
+            scope = str(notification.get("scope") or "global").strip().lower()
+            target_actor_ids = [
+                str(aid)
+                for aid in (notification.get("target_actor_ids") or [])
+                if aid is not None
+            ]
+            if scope == "global":
+                try:
+                    await self._notification_port.send_channel_message(
+                        campaign_id=campaign_id,
+                        message=f"**[Calendar Event]** {summary}",
+                    )
+                except Exception:
+                    self._zork_log(
+                        "CALENDAR NOTIFY FAIL",
+                        f"Failed to send calendar notice to main channel for campaign {campaign_id}",
+                    )
+            dm_targets = self._recent_private_dm_notification_targets(
+                campaign_id,
+                candidate_actor_ids=target_actor_ids,
+            )
+            if not dm_targets:
+                continue
+            dm_message = (
+                f"**[Calendar Event Notice]** `{campaign_name}`\n"
+                f"{summary}"
+            )
+            for actor_id in dm_targets:
+                try:
+                    await self._notification_port.send_dm(actor_id=actor_id, message=dm_message)
+                except Exception:
+                    self._zork_log(
+                        "CALENDAR DM FAIL",
+                        f"Failed to send calendar DM notice to actor {actor_id}",
+                    )
+
+    async def _send_private_dm_time_jump_notifications(
+        self,
+        *,
+        campaign_id: str,
+        campaign_name: str,
+        recipient_actor_ids: list[str],
+        from_time: dict[str, int],
+        to_time: dict[str, int],
+        delta_minutes: int,
+        event_summary: str,
+    ) -> None:
+        """Notify DM-engaged players about in-world time jumps."""
+        if not recipient_actor_ids or self._notification_port is None:
+            return
+        to_snapshot = self._extract_game_time_snapshot({"game_time": to_time})
+        if hasattr(self, "_format_game_time_label"):
+            to_label = self._format_game_time_label(to_snapshot)
+        else:
+            to_label = f"Day {to_snapshot.get('day', '?')}, {to_snapshot.get('hour', '?'):02d}:00"
+        for actor_id in recipient_actor_ids:
+            try:
+                message = (
+                    f"**[Time Jump Notice]** `{campaign_name}` advanced by about "
+                    f"{delta_minutes} in-world minutes.\n"
+                    f"To: {to_label}\n"
+                    f"Cause: {event_summary}"
+                )
+                await self._notification_port.send_dm(actor_id=actor_id, message=message)
+            except Exception:
+                self._zork_log(
+                    "TIME JUMP DM FAIL",
+                    f"Failed to send DM time-jump notification to actor {actor_id}",
+                )
+
+    # ------------------------------------------------------------------
+    # Turn deletion
+    # ------------------------------------------------------------------
+
+    def execute_delete_turn(
+        self,
+        campaign_id: str,
+        target_external_message_id: str,
+        *,
+        session_id: str | None = None,
+        delete_actor_id: str | None = None,
+        player_only: bool = False,
+    ) -> dict[str, object]:
+        with self._session_factory() as session:
+            from text_game_engine.persistence.sqlalchemy.models import Campaign, Player, Turn, Snapshot
+            target_turn = (
+                session.query(Turn)
+                .filter_by(
+                    campaign_id=str(campaign_id),
+                    external_message_id=str(target_external_message_id),
+                )
+                .first()
+            )
+            if target_turn is None:
+                return {"status": "not-found"}
+            if player_only and delete_actor_id is not None:
+                if str(getattr(target_turn, "actor_id", "") or "") != str(delete_actor_id):
+                    return {"status": "forbidden"}
+            # Check if this is the latest narrator turn in scope
+            query = session.query(Turn).filter(
+                Turn.campaign_id == str(campaign_id),
+                Turn.kind == "narrator",
+            )
+            if player_only:
+                query = query.filter(
+                    Turn.actor_id == str(delete_actor_id),
+                )
+                if session_id:
+                    query = query.filter(Turn.session_id == str(session_id))
+            latest_scope_turn = query.order_by(Turn.id.desc()).first()
+            if latest_scope_turn is None or int(latest_scope_turn.id or 0) != int(target_turn.id or 0):
+                return {"status": "not-latest", "turn_id": int(target_turn.id or 0)}
+            # Find the prior narrator turn
+            prior_query = session.query(Turn).filter(
+                Turn.campaign_id == str(campaign_id),
+                Turn.kind == "narrator",
+                Turn.id < target_turn.id,
+            )
+            if player_only:
+                prior_query = prior_query.filter(Turn.actor_id == str(delete_actor_id))
+                if session_id:
+                    prior_query = prior_query.filter(Turn.session_id == str(session_id))
+            previous_turn = prior_query.order_by(Turn.id.desc()).first()
+            if previous_turn is None:
+                return {"status": "no-prior-snapshot", "turn_id": int(target_turn.id or 0)}
+            snapshot = session.query(Snapshot).filter_by(turn_id=previous_turn.id).first()
+            if snapshot is None:
+                return {"status": "no-prior-snapshot", "turn_id": int(target_turn.id or 0)}
+            campaign = session.get(Campaign, str(campaign_id))
+            if campaign is None:
+                return {"status": "not-found"}
+            # Restore state from snapshot
+            import json as _json
+            if player_only:
+                players_data = _json.loads(snapshot.players_json or "[]")
+                restored = False
+                for pdata in players_data:
+                    if not isinstance(pdata, dict):
+                        continue
+                    player_id = pdata.get("player_id")
+                    if not player_id:
+                        continue
+                    player = session.get(Player, str(player_id))
+                    if player is None:
+                        continue
+                    if str(getattr(player, "actor_id", "") or "") != str(delete_actor_id or ""):
+                        continue
+                    player.level = pdata.get("level", player.level)
+                    player.xp = pdata.get("xp", player.xp)
+                    player.attributes_json = pdata.get("attributes_json", player.attributes_json)
+                    player.state_json = pdata.get("state_json", player.state_json)
+                    restored = True
+                    break
+                if not restored:
+                    return {"status": "no-prior-snapshot", "turn_id": int(target_turn.id or 0)}
+            else:
+                campaign.state_json = snapshot.campaign_state_json
+                campaign.characters_json = snapshot.campaign_characters_json
+                campaign.summary = snapshot.campaign_summary
+                campaign.last_narration = snapshot.campaign_last_narration
+                players_data = _json.loads(snapshot.players_json or "[]")
+                for pdata in players_data:
+                    if not isinstance(pdata, dict):
+                        continue
+                    player_id = pdata.get("player_id")
+                    if not player_id:
+                        continue
+                    player = session.get(Player, str(player_id))
+                    if player is None:
+                        continue
+                    player.level = pdata.get("level", player.level)
+                    player.xp = pdata.get("xp", player.xp)
+                    player.attributes_json = pdata.get("attributes_json", player.attributes_json)
+                    player.state_json = pdata.get("state_json", player.state_json)
+            # Collect turn IDs to delete
+            turn_ids_to_delete = [int(target_turn.id)]
+            if getattr(target_turn, "external_user_message_id", None):
+                paired_player_turn = (
+                    session.query(Turn)
+                    .filter_by(
+                        campaign_id=str(campaign_id),
+                        kind="player",
+                        external_user_message_id=target_turn.external_user_message_id,
+                    )
+                    .order_by(Turn.id.desc())
+                    .first()
+                )
+                if paired_player_turn is not None:
+                    turn_ids_to_delete.append(int(paired_player_turn.id))
+            turn_ids_to_delete = sorted({tid for tid in turn_ids_to_delete if tid > 0})
+            # Delete snapshots and turns
+            if turn_ids_to_delete:
+                session.query(Snapshot).filter(
+                    Snapshot.turn_id.in_(turn_ids_to_delete),
+                ).delete(synchronize_session=False)
+                deleted_count = session.query(Turn).filter(
+                    Turn.id.in_(turn_ids_to_delete),
+                ).delete(synchronize_session=False)
+            else:
+                deleted_count = 0
+            session.commit()
+            # Clean up embeddings if memory port supports it
+            if hasattr(self, "_memory") and self._memory is not None:
+                try:
+                    for tid in turn_ids_to_delete:
+                        self._memory.delete_turn_embeddings(campaign_id, tid)
+                except Exception:
+                    self._zork_log(
+                        "DELETE TURN EMBED FAIL",
+                        f"Embedding cleanup failed for campaign {campaign_id}",
+                    )
+            return {
+                "status": "ok",
+                "turn_id": int(target_turn.id or 0),
+                "deleted_count": int(deleted_count or 0),
+                "external_user_message_id": str(getattr(target_turn, "external_user_message_id", "") or ""),
+                "player_only": bool(player_only),
+            }
+
+    @classmethod
+    def _character_delete_requested(cls, fields: object) -> bool:
+        return bool(
+            fields is None
+            or (
+                isinstance(fields, str)
+                and fields.strip().lower() in {"delete", "remove", "null"}
+            )
+            or (
+                isinstance(fields, dict)
+                and bool(
+                    fields.get("remove")
+                    or fields.get("delete")
+                    or fields.get("_delete")
+                    or fields.get("deleted")
+                )
+            )
+        )
+
+    @classmethod
+    def _character_delete_allowed(
+        cls,
+        *,
+        raw_slug: str,
+        fields: object,
+        existing_row: dict[str, object] | None,
+        context_text: str,
+    ) -> bool:
+        context = " ".join(str(context_text or "").lower().split())
+        if not context:
+            return False
+        if isinstance(fields, dict) and str(fields.get("deceased_reason") or "").strip():
+            return True
+        remove_cues = (
+            "remove from roster",
+            "roster remove",
+            "remove character",
+            "delete character",
+            "drop character",
+            "purge duplicate",
+            "duplicate",
+            "cleanup roster",
+            "roster cleanup",
+            "retcon",
+            "written out",
+            "no longer in story",
+        )
+        death_cues = (
+            "dead",
+            "dies",
+            "died",
+            "killed",
+            "murdered",
+            "executed",
+            "corpse",
+            "funeral",
+            "deceased",
+        )
+        has_delete_intent = any(cue in context for cue in remove_cues) or any(
+            cue in context for cue in death_cues
+        )
+        if not has_delete_intent:
+            return False
+        aliases: list[str] = []
+        slug_alias = re.sub(r"[^a-z0-9]+", " ", str(raw_slug or "").lower()).strip()
+        if slug_alias:
+            aliases.append(slug_alias)
+        if isinstance(existing_row, dict):
+            name_alias = re.sub(
+                r"[^a-z0-9]+", " ",
+                str(existing_row.get("name") or "").lower(),
+            ).strip()
+            if name_alias:
+                aliases.append(name_alias)
+        for alias in aliases:
+            if alias and alias in context:
+                return True
+            tokens = [t for t in alias.split() if len(t) >= 4]
+            if any(token in context for token in tokens):
+                return True
+        return False
+
+    # ------------------------------------------------------------------
+    # Advanced NPC awareness
+    # ------------------------------------------------------------------
+
+    def _active_scene_npc_slugs(
+        self,
+        campaign: "Campaign",
+        player_state: dict[str, object],
+    ) -> set[str]:
+        out: set[str] = set()
+        characters = self.get_campaign_characters(campaign)
+        if not isinstance(characters, dict):
+            return out
+        for slug, entry in characters.items():
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("deceased_reason"):
+                continue
+            char_state = {
+                "location": entry.get("location"),
+                "room_title": entry.get("room_title"),
+                "room_summary": entry.get("room_summary"),
+                "room_id": entry.get("room_id"),
+            }
+            if self._same_scene(player_state, char_state):
+                clean_slug = str(slug or "").strip()
+                if clean_slug:
+                    out.add(clean_slug)
+        return out
+
+    def _filter_aware_npc_slugs_for_scene(
+        self,
+        campaign: "Campaign",
+        player_state: dict[str, object],
+        aware_npc_slugs: object,
+    ) -> list[str]:
+        if not isinstance(aware_npc_slugs, list):
+            return []
+        characters = self.get_campaign_characters(campaign)
+        if not isinstance(characters, dict):
+            return []
+        out: list[str] = []
+        seen: set[str] = set()
+        for item in aware_npc_slugs:
+            candidate = str(item or "").strip()
+            if not candidate:
+                continue
+            resolved_slug = self._resolve_existing_character_slug(characters, candidate)
+            if not resolved_slug or resolved_slug in seen:
+                continue
+            payload = characters.get(resolved_slug)
+            if not isinstance(payload, dict) or payload.get("deceased_reason"):
+                continue
+            char_state = {
+                "location": payload.get("location"),
+                "room_title": payload.get("room_title"),
+                "room_summary": payload.get("room_summary"),
+                "room_id": payload.get("room_id"),
+            }
+            if not self._same_scene(player_state, char_state):
+                continue
+            seen.add(resolved_slug)
+            out.append(resolved_slug)
+        return out
+
+    def _filter_aware_npc_slugs_for_location_key(
+        self,
+        campaign: "Campaign",
+        location_key: object,
+        aware_npc_slugs: object,
+    ) -> list[str]:
+        location_text = str(location_key or "").strip()
+        if not location_text:
+            return []
+        return self._filter_aware_npc_slugs_for_scene(
+            campaign,
+            {"location": location_text},
+            aware_npc_slugs,
+        )
+
+    def _infer_aware_npc_slugs(
+        self,
+        campaign: "Campaign",
+        player_state: dict[str, object],
+        turn_visibility: dict[str, object],
+        *,
+        narration_text: str = "",
+        summary_update: object = None,
+        private_context_candidate: dict[str, object] | None = None,
+    ) -> list[str]:
+        seen: set[str] = set()
+        out: list[str] = []
+
+        def _add(slug: object) -> None:
+            text = str(slug or "").strip()
+            if not text or text in seen:
+                return
+            seen.add(text)
+            out.append(text)
+
+        raw_existing = turn_visibility.get("aware_npc_slugs")
+        if isinstance(raw_existing, list):
+            for item in raw_existing:
+                _add(item)
+        if out:
+            return out
+        candidate_slug = str((private_context_candidate or {}).get("target_slug") or "").strip()
+        if candidate_slug:
+            _add(candidate_slug)
+        if out:
+            return out
+        combined_text = self._normalize_match_text(
+            f"{str(narration_text or '')}\n{str(summary_update or '')}"
+        )
+        characters = self.get_campaign_characters(campaign)
+        same_scene_slugs: list[str] = []
+        if isinstance(characters, dict):
+            for slug, payload in characters.items():
+                if not isinstance(payload, dict) or payload.get("deceased_reason"):
+                    continue
+                char_name = str(payload.get("name") or slug or "").strip()
+                char_state = {
+                    "location": payload.get("location"),
+                    "room_title": payload.get("room_title"),
+                    "room_summary": payload.get("room_summary"),
+                    "room_id": payload.get("room_id"),
+                }
+                if self._same_scene(player_state, char_state):
+                    same_scene_slugs.append(str(slug))
+                if combined_text:
+                    for candidate in (slug, char_name):
+                        candidate_norm = self._normalize_match_text(candidate)
+                        if candidate_norm and candidate_norm in combined_text:
+                            _add(slug)
+                            break
+        if out:
+            return out
+        if str(turn_visibility.get("scope") or "").strip().lower() in {"private", "limited"} and len(same_scene_slugs) == 1:
+            _add(same_scene_slugs[0])
+        return out
+
+    def _promote_player_npc_slugs(
+        self,
+        visibility: dict[str, object],
+        campaign_id: str,
+    ) -> dict[str, object]:
+        npc_slugs = visibility.get("aware_npc_slugs")
+        if not npc_slugs or not isinstance(npc_slugs, list):
+            return visibility
+        scope = str(visibility.get("scope") or "").strip().lower()
+        if scope == "public":
+            return visibility
+        registry = self._campaign_player_registry(campaign_id, self._session_factory)
+        by_slug = registry.get("by_slug", {})
+        if not by_slug:
+            return visibility
+        actor_actor_id = visibility.get("actor_actor_id") or visibility.get("actor_user_id")
+        promoted = False
+        vis_slugs = list(visibility.get("visible_player_slugs") or [])
+        vis_actor_ids = list(visibility.get("visible_actor_ids") or visibility.get("visible_user_ids") or [])
+        remaining_npc_slugs = []
+        for npc_slug in npc_slugs:
+            normalised = self._player_slug_key(npc_slug)
+            match = by_slug.get(normalised)
+            if match is not None:
+                matched_actor_id = match.get("actor_id") or match.get("user_id")
+                matched_slug = match.get("slug") or normalised
+                if matched_actor_id is not None and str(matched_actor_id) == str(actor_actor_id or ""):
+                    remaining_npc_slugs.append(npc_slug)
+                    continue
+                if matched_slug not in vis_slugs:
+                    vis_slugs.append(matched_slug)
+                if matched_actor_id is not None and str(matched_actor_id) not in [str(x) for x in vis_actor_ids]:
+                    vis_actor_ids.append(str(matched_actor_id))
+                promoted = True
+            else:
+                remaining_npc_slugs.append(npc_slug)
+        if not promoted:
+            return visibility
+        result = dict(visibility)
+        result["visible_player_slugs"] = vis_slugs
+        result["visible_actor_ids"] = vis_actor_ids
+        result["aware_npc_slugs"] = remaining_npc_slugs
+        return result
+
+    def _sanitize_npc_roster_against_players(
+        self,
+        campaign_id: str,
+        characters: dict[str, dict],
+    ) -> dict[str, dict]:
+        if not isinstance(characters, dict) or not characters:
+            return {}
+        out: dict[str, dict] = {}
+        for slug, payload in characters.items():
+            if hasattr(self, "_character_update_hits_player"):
+                match = self._character_update_hits_player(campaign_id, slug, payload)
+                if match is not None:
+                    self._zork_log(
+                        "NPC ROSTER COLLISION",
+                        f"Dropping WORLD_CHARACTERS entry {slug!r} because it collides with player {match.get('name')!r}",
+                    )
+                    continue
+            out[str(slug)] = payload
+        return out
+
+    def _sanitize_turn_awareness_for_scene(
+        self,
+        campaign: "Campaign",
+        player_state: dict[str, object],
+        turn_visibility: dict[str, object],
+    ) -> dict[str, object]:
+        if not isinstance(turn_visibility, dict):
+            return turn_visibility
+        filtered = self._filter_aware_npc_slugs_for_scene(
+            campaign,
+            player_state,
+            turn_visibility.get("aware_npc_slugs"),
+        )
+        result = dict(turn_visibility)
+        result["aware_npc_slugs"] = filtered
+        return result
+
+    @classmethod
+    def _narration_implies_entity_with_player(
+        cls,
+        narration_text: str,
+        name_candidates: list[str],
+    ) -> bool:
+        text = str(narration_text or "").strip().lower()
+        if not text or not name_candidates:
+            return False
+        cues = (
+            "at your heels",
+            "at your heel",
+            "by your side",
+            "beside you",
+            "with you",
+            "follows you",
+            "following you",
+            "trailing you",
+            "trotting at",
+            "walks with you",
+            "stays close",
+        )
+        if not any(cue in text for cue in cues):
+            return False
+        for name in name_candidates:
+            if re.search(rf"\b{re.escape(name)}\b", text):
+                return True
+        return False
+
+    @classmethod
+    def _narration_mentions_entity_in_active_scene(
+        cls,
+        narration_text: str,
+        name_candidates: list[str],
+    ) -> bool:
+        text = str(narration_text or "").strip().lower()
+        if not text or not name_candidates:
+            return False
+        remote_cues = (
+            "sms",
+            "text message",
+            "texts you",
+            "calls you",
+            "on the phone",
+            "voicemail",
+            "news feed",
+            "on tv",
+            "radio says",
+            "video call",
+        )
+        if any(cue in text for cue in remote_cues):
+            return False
+        presence_cues = (
+            "is here",
+            "in the room",
+            "across from you",
+            "beside you",
+            "nearby",
+            "waits",
+            "stands",
+            "sits",
+            "arrives",
+            "at the desk",
+            "at reception",
+        )
+        if not any(cue in text for cue in presence_cues):
+            return False
+        for name in name_candidates:
+            if re.search(rf"\b{re.escape(name)}\b", text):
+                return True
+        return False
+
+    @staticmethod
+    def _entity_name_candidates_for_sync(
+        state_key: object, entity_state: dict[str, object]
+    ) -> list[str]:
+        candidates: list[str] = []
+        raw_name = ""
+        if isinstance(entity_state, dict):
+            raw_name = str(entity_state.get("name") or "").strip().lower()
+        if raw_name:
+            candidates.append(re.sub(r"\s+", " ", raw_name))
+        key_text = re.sub(r"[_\-]+", " ", str(state_key or "").strip().lower())
+        key_text = re.sub(r"\s+", " ", key_text).strip()
+        if key_text:
+            candidates.append(key_text)
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for candidate in candidates:
+            if len(candidate) < 3:
+                continue
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            deduped.append(candidate)
+        return deduped
+
+    @classmethod
+    def _scrub_scene_output_npc_awareness(
+        cls,
+        scene_output: object,
+    ) -> object:
+        if not isinstance(scene_output, dict):
+            return scene_output
+        beats = scene_output.get("beats")
+        if not isinstance(beats, list):
+            return scene_output
+        changed = False
+        cleaned_beats = []
+        for beat in beats:
+            if not isinstance(beat, dict):
+                cleaned_beats.append(beat)
+                continue
+            if list(beat.get("aware_npc_slugs") or []):
+                row = dict(beat)
+                row["aware_npc_slugs"] = []
+                cleaned_beats.append(row)
+                changed = True
+            else:
+                cleaned_beats.append(beat)
+        if not changed:
+            return scene_output
+        out = dict(scene_output)
+        out["beats"] = cleaned_beats
+        return out
+
+    def _consume_state_occupant_hints(
+        self,
+        campaign: "Campaign",
+        campaign_state: dict[str, object],
+        state_update: dict[str, object],
+        character_updates: dict[str, object],
+        *,
+        player_state: dict[str, object] | None = None,
+    ) -> tuple[dict[str, object], dict[str, object], int]:
+        if not isinstance(state_update, dict):
+            return {}, character_updates if isinstance(character_updates, dict) else {}, 0
+        if not isinstance(character_updates, dict):
+            character_updates = {}
+        characters = self.get_campaign_characters(campaign)
+        consumed = 0
+        for state_key, value in list(state_update.items()):
+            if not isinstance(value, dict):
+                continue
+            for occupant_field in ("occupants", "occupied_by"):
+                raw_list = value.get(occupant_field)
+                if not isinstance(raw_list, list):
+                    continue
+                del value[occupant_field]
+                consumed += 1
+                for item in raw_list:
+                    resolved_slug = self._resolve_existing_character_slug(
+                        characters if isinstance(characters, dict) else {},
+                        item,
+                    )
+                    if not resolved_slug:
+                        continue
+                    current_update = character_updates.get(resolved_slug)
+                    if current_update is None:
+                        current_update = {}
+                    if not isinstance(current_update, dict):
+                        continue
+                    character_updates[resolved_slug] = current_update
+        if consumed:
+            self._zork_log(
+                "STATE OCCUPANT HINTS CONSUMED",
+                f"Removed {consumed} occupant field(s) from state_update and converted known NPCs to character_updates.",
+            )
+        return state_update, character_updates, consumed
+
+    # ------------------------------------------------------------------
+    # JSON repair utilities
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def _repair_unquoted_json_string_fields(cls, text: str) -> str:
+        if not text:
+            return text
+        pattern = re.compile(
+            r'("(?P<key>[^"]+)"\s*:\s*)'
+            r'(?!true\s*[,}\]]|false\s*[,}\]]|null\s*[,}\]])'
+            r'(?=[A-Za-z])'
+            r'(?P<value>.*?)'
+            r'(?=,\s*"[^"]+"\s*:|,\s*\{|\s*[}\]])',
+            re.DOTALL,
+        )
+
+        def _replace(match: re.Match[str]) -> str:
+            prefix = match.group(1)
+            raw_value = str(match.group("value") or "").strip()
+            if not raw_value:
+                return match.group(0)
+            if raw_value.endswith('"') and not raw_value.startswith('"'):
+                raw_value = raw_value[:-1].strip()
+            return f"{prefix}{json.dumps(raw_value, ensure_ascii=False)}"
+
+        return pattern.sub(_replace, text)
+
+    @classmethod
+    def _repair_unquoted_json_keys(cls, text: str) -> str:
+        if not text:
+            return text
+        pattern = re.compile(r'(?P<prefix>[{,]\s*)(?P<key>[A-Za-z_][A-Za-z0-9_-]*)(?P<suffix>\s*:)')
+
+        def _replace(match: re.Match[str]) -> str:
+            key = str(match.group("key") or "").strip()
+            if not key:
+                return match.group(0)
+            return f'{match.group("prefix")}"{key}"{match.group("suffix")}'
+
+        return pattern.sub(_replace, text)
+
+    @classmethod
+    def _repair_trailing_json_commas(cls, text: str) -> str:
+        if not text:
+            return text
+        return re.sub(r",\s*([}\]])", r"\1", text)
+
+    @classmethod
+    def _repair_known_schema_string_fields(cls, text: str) -> str:
+        if not text:
+            return text
+        field_names = "|".join(sorted(re.escape(name) for name in cls.KNOWN_JSON_STRING_FIELDS))
+        pattern = re.compile(
+            rf'("(?P<key>{field_names})"\s*:\s*)'
+            r'(?!(?:"|\{|\[|true\s*[,}\]]|false\s*[,}\]]|null\s*[,}\]]|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?\s*[,}\]]))'
+            r'(?P<value>.*?)'
+            r'(?=,\s*"[^"]+"\s*:|,\s*\{|\s*[}\]])',
+            re.DOTALL,
+        )
+
+        def _replace(match: re.Match[str]) -> str:
+            prefix = match.group(1)
+            raw_value = str(match.group("value") or "").strip()
+            if not raw_value:
+                return match.group(0)
+            if raw_value.endswith('"') and not raw_value.startswith('"'):
+                raw_value = raw_value[:-1].strip()
+            return f"{prefix}{json.dumps(raw_value, ensure_ascii=False)}"
+
+        return pattern.sub(_replace, text)
+
+    @classmethod
+    def _repair_json_lenient_text(cls, text: str) -> str:
+        repaired = str(text or "")
+        repaired = cls._repair_unquoted_json_keys(repaired)
+        repaired = cls._repair_trailing_json_commas(repaired)
+        repaired = cls._repair_unquoted_json_string_fields(repaired)
+        repaired = cls._repair_known_schema_string_fields(repaired)
+        return repaired
+
+    # ------------------------------------------------------------------
+    # Anti-echo system
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _anti_echo_tokens(text: str) -> set[str]:
+        words = re.sub(r"[^a-z0-9\s]", " ", str(text or "").lower()).split()
+        return {w for w in words if len(w) >= 4}
+
+    @classmethod
+    def _anti_echo_first_sentence(cls, text: str) -> str:
+        text = str(text or "").strip()
+        if not text:
+            return ""
+        match = re.match(r"^(.*?[.!?])\s", text, re.DOTALL)
+        if match:
+            return match.group(1).strip()
+        return text[:200]
+
+    @classmethod
+    def _anti_echo_retry_decision(
+        cls,
+        action_text: str,
+        narration_text: str,
+        *,
+        overlap_threshold: float = 0.45,
+    ) -> bool:
+        action_tokens = cls._anti_echo_tokens(action_text)
+        if not action_tokens:
+            return False
+        first_sentence = cls._anti_echo_first_sentence(narration_text)
+        narration_tokens = cls._anti_echo_tokens(first_sentence)
+        if not narration_tokens:
+            return False
+        overlap = action_tokens & narration_tokens
+        ratio = len(overlap) / max(len(action_tokens), 1)
+        return ratio >= overlap_threshold
+
+    # ------------------------------------------------------------------
+    # Phone command handling
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _is_private_phone_command_line(text: str) -> bool:
+        normalized = " ".join(str(text or "").strip().lower().split())
+        if not normalized:
+            return False
+        phone_prefixes = (
+            "text ",
+            "sms ",
+            "message ",
+            "call ",
+            "phone ",
+            "check phone",
+            "check my phone",
+            "read text",
+            "read message",
+            "read sms",
+        )
+        return any(normalized.startswith(prefix) for prefix in phone_prefixes)
+
+    @classmethod
+    def _redact_private_phone_command_lines(
+        cls,
+        text: str,
+    ) -> tuple[str, bool]:
+        if not text:
+            return text, False
+        lines = str(text or "").splitlines()
+        kept_lines: list[str] = []
+        redacted = False
+        for line in lines:
+            if cls._is_private_phone_command_line(line):
+                redacted = True
+                continue
+            kept_lines.append(line)
+        return "\n".join(kept_lines).strip(), redacted
+
+    # ------------------------------------------------------------------
+    # Scene/room utilities
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def _scene_output_is_summary_public_safe(
+        cls,
+        scene_output: object,
+    ) -> bool:
+        if not isinstance(scene_output, dict):
+            return True
+        beats = scene_output.get("beats")
+        if not isinstance(beats, list) or not beats:
+            return True
+        for beat in beats:
+            if not isinstance(beat, dict):
+                continue
+            scope = str(beat.get("visibility") or "").strip().lower() or "local"
+            if scope in {"private", "limited"}:
+                return False
+        return True
+
+    @classmethod
+    def _rescue_misplaced_room_state(
+        cls,
+        state_update: dict[str, object],
+        player_state_update: dict[str, object],
+    ) -> tuple[dict[str, object], dict[str, object]]:
+        if not isinstance(state_update, dict):
+            return state_update, player_state_update
+        if not isinstance(player_state_update, dict):
+            player_state_update = {}
+        existing_room_keys = cls.ROOM_STATE_KEYS & set(player_state_update)
+        if len(existing_room_keys) >= 2:
+            return state_update, player_state_update
+        keys_to_remove = []
+        for key, value in state_update.items():
+            if not isinstance(value, dict):
+                continue
+            nested_room_keys = cls.ROOM_STATE_KEYS & set(value)
+            if len(nested_room_keys) < 2:
+                continue
+            for rk in nested_room_keys:
+                player_state_update[rk] = value.pop(rk)
+            _zork_log(
+                "RESCUED MISPLACED ROOM STATE",
+                f"Moved {sorted(nested_room_keys)} from state_update.{key} "
+                f"into player_state_update",
+            )
+            if not value:
+                keys_to_remove.append(key)
+        for key in keys_to_remove:
+            del state_update[key]
+        return state_update, player_state_update
+
+    def _build_scene_avatar_references(
+        self,
+        campaign: "Campaign",
+        actor: "Player | None",
+        actor_state: dict[str, object],
+    ) -> list[dict[str, object]]:
+        if campaign is None or actor is None:
+            return []
+        refs: list[dict[str, object]] = []
+        seen_urls: set[str] = set()
+        with self._session_factory() as session:
+            from text_game_engine.persistence.sqlalchemy.models import Player
+            players = (
+                session.query(Player)
+                .filter_by(campaign_id=str(campaign.id))
+                .all()
+            )
+            for entry in players:
+                state = self.get_player_state(entry)
+                if str(getattr(entry, "actor_id", "")) != str(getattr(actor, "actor_id", "")) and not self._same_scene(
+                    actor_state, state
+                ):
+                    continue
+                avatar_url = state.get("avatar_url")
+                if not isinstance(avatar_url, str):
+                    continue
+                avatar_url = avatar_url.strip()
+                if not avatar_url or avatar_url in seen_urls:
+                    continue
+                if self._is_image_url_404(avatar_url):
+                    continue
+                seen_urls.add(avatar_url)
+                identity = str(
+                    state.get("character_name") or f"Adventurer-{str(getattr(entry, 'actor_id', ''))[-4:]}"
+                ).strip()
+                refs.append(
+                    {
+                        "actor_id": str(getattr(entry, "actor_id", "")),
+                        "name": identity,
+                        "url": avatar_url,
+                        "is_actor": str(getattr(entry, "actor_id", "")) == str(getattr(actor, "actor_id", "")),
+                    }
+                )
+                if len(refs) >= getattr(self, "MAX_SCENE_REFERENCE_IMAGES", 4) - 1:
+                    break
+        return refs
+
+    @classmethod
+    def _build_rails_context(
+        cls,
+        player_state: dict[str, object],
+        party_snapshot: list[dict[str, object]],
+    ) -> dict[str, object]:
+        exits = player_state.get("exits")
+        if not isinstance(exits, list):
+            exits = []
+        known_names = []
+        for entry in party_snapshot:
+            name = str(entry.get("name") or "").strip()
+            if not name:
+                continue
+            known_names.append(name)
+        inventory_rich = cls._get_inventory_rich(player_state)[:20]
+        return {
+            "room_title": player_state.get("room_title"),
+            "room_summary": player_state.get("room_summary"),
+            "location": player_state.get("location"),
+            "exits": exits[:12],
+            "inventory": inventory_rich,
+            "known_characters": known_names[:12],
+            "strict_action_shape": "one concrete action grounded in current room and items",
+        }
+
+    @classmethod
+    def _get_inventory_rich(cls, player_state: dict[str, object]) -> list[dict[str, object]]:
+        raw = player_state.get("inventory") if isinstance(player_state, dict) else None
+        if isinstance(raw, list):
+            out = []
+            for item in raw[:50]:
+                if isinstance(item, dict):
+                    out.append(item)
+                elif isinstance(item, str) and item.strip():
+                    out.append({"name": item.strip()})
+            return out
+        if isinstance(raw, dict):
+            out = []
+            for key, value in raw.items():
+                if isinstance(value, dict):
+                    entry = dict(value)
+                    entry.setdefault("name", str(key).strip())
+                    out.append(entry)
+                else:
+                    out.append({"name": str(key).strip(), "detail": value})
+            return out[:50]
+        return []
+
+    @classmethod
+    def _state_container_matches_location(cls, container_text: str, location: str) -> bool:
+        c = cls._normalize_location_key(container_text)
+        l = cls._normalize_location_key(location)
+        if not c or not l:
+            return False
+        return c in l or l in c
+
+    def _canonical_location_for_state_container(
+        self,
+        campaign: "Campaign",
+        campaign_state: dict[str, object],
+        container_key: object,
+        *,
+        player_state: dict[str, object] | None = None,
+        player_registry: dict | None = None,
+        characters: dict[str, dict] | None = None,
+    ) -> str | None:
+        container_text = str(container_key or "").strip()
+        if not container_text:
+            return None
+        candidates: set[str] = set()
+        if isinstance(player_state, dict):
+            loc = str(player_state.get("location") or "").strip()
+            if loc and self._state_container_matches_location(container_text, loc):
+                candidates.add(loc)
+        registry = player_registry or self._campaign_player_registry(campaign.id)
+        by_actor_id = registry.get("by_actor_id", registry.get("by_user_id", {}))
+        if isinstance(by_actor_id, dict):
+            with self._session_factory() as session:
+                from text_game_engine.persistence.sqlalchemy.models import Player
+                for aid in by_actor_id:
+                    row = session.query(Player).filter_by(
+                        campaign_id=str(campaign.id),
+                        actor_id=str(aid),
+                    ).first()
+                    if row is None:
+                        continue
+                    loc = str(self.get_player_state(row).get("location") or "").strip()
+                    if loc and self._state_container_matches_location(container_text, loc):
+                        candidates.add(loc)
+        char_map = characters if isinstance(characters, dict) else self.get_campaign_characters(campaign)
+        if isinstance(char_map, dict):
+            for payload in char_map.values():
+                if isinstance(payload, dict):
+                    loc = str(payload.get("location") or "").strip()
+                    if loc and self._state_container_matches_location(container_text, loc):
+                        candidates.add(loc)
+        if isinstance(campaign_state, dict):
+            for payload in campaign_state.values():
+                if isinstance(payload, dict):
+                    loc = str(payload.get("location") or "").strip()
+                    if loc and self._state_container_matches_location(container_text, loc):
+                        candidates.add(loc)
+        if len(candidates) == 1:
+            return next(iter(candidates))
+        fallback = str(container_text).replace("_", "-").strip("-")
+        return fallback or None
+
+    def _character_update_hits_player(
+        self,
+        campaign_id: str,
+        slug: str,
+        payload: object,
+    ) -> dict[str, object] | None:
+        registry = self._campaign_player_registry(campaign_id)
+        by_slug = registry.get("by_slug", {})
+        normalized = self._player_slug_key(slug)
+        match = by_slug.get(normalized)
+        if match is not None:
+            return match
+        if isinstance(payload, dict):
+            name = str(payload.get("name") or "").strip()
+            if name:
+                name_slug = self._player_slug_key(name)
+                match = by_slug.get(name_slug)
+                if match is not None:
+                    return match
+        return None
+
+    def _resolve_sms_recipient(
+        self,
+        campaign_id: str,
+        recipient_text: str,
+    ) -> dict[str, object] | None:
+        text = " ".join(str(recipient_text or "").strip().lower().split())
+        if not text:
+            return None
+        registry = self._campaign_player_registry(campaign_id)
+        by_slug = registry.get("by_slug", {})
+        by_actor_id = registry.get("by_actor_id", registry.get("by_user_id", {}))
+        slug_key = self._player_slug_key(text)
+        if slug_key and slug_key in by_slug:
+            return by_slug[slug_key]
+        for aid, entry in by_actor_id.items():
+            name = str(entry.get("name") or "").strip()
+            if name and self._normalize_match_text(name) == self._normalize_match_text(text):
+                return entry
+        characters = self.get_campaign_characters(None)  # caller should supply campaign
+        if isinstance(characters, dict):
+            for slug, payload in characters.items():
+                if not isinstance(payload, dict):
+                    continue
+                name = str(payload.get("name") or "").strip()
+                if name and self._normalize_match_text(name) == self._normalize_match_text(text):
+                    return {"kind": "npc", "slug": slug, "name": name}
+        return None
+
+    # ------------------------------------------------------------------
+    # Game Time System
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _game_period_from_hour(hour: int) -> str:
+        if 5 <= hour <= 11:
+            return "morning"
+        if 12 <= hour <= 16:
+            return "afternoon"
+        if 17 <= hour <= 20:
+            return "evening"
+        return "night"
+
+    def _game_time_to_total_minutes(self, game_time: Dict[str, int]) -> int:
+        day = self._coerce_non_negative_int(game_time.get("day", 1), default=1) or 1
+        hour = min(23, max(0, self._coerce_non_negative_int(game_time.get("hour", 0), default=0)))
+        minute = min(59, max(0, self._coerce_non_negative_int(game_time.get("minute", 0), default=0)))
+        return ((max(1, day) - 1) * 24 * 60) + (hour * 60) + minute
+
+    def _game_time_from_total_minutes(self, total_minutes: int) -> Dict[str, object]:
+        total = max(0, int(total_minutes))
+        day = (total // (24 * 60)) + 1
+        within = total % (24 * 60)
+        hour = within // 60
+        minute = within % 60
+        period = self._game_period_from_hour(hour)
+        return {
+            "day": day,
+            "hour": hour,
+            "minute": minute,
+            "period": period,
+            "date_label": f"Day {day}, {period.title()}",
+        }
+
+    def _format_game_time_label(self, game_time: Dict[str, int]) -> str:
+        snapshot = (
+            game_time
+            if isinstance(game_time, dict)
+            else self._extract_game_time_snapshot({"game_time": game_time})
+        )
+        canonical = self._game_time_from_total_minutes(
+            self._game_time_to_total_minutes(snapshot)
+        )
+        return str(
+            canonical.get("date_label")
+            or f"Day {canonical.get('day', 1)}, {str(canonical.get('period') or 'time').title()}"
+        ).strip()
+
+    def _speed_multiplier_from_state(self, campaign_state: Dict[str, object]) -> float:
+        raw = 1.0
+        if isinstance(campaign_state, dict):
+            raw = campaign_state.get("speed_multiplier", 1.0)
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            value = 1.0
+        if value <= 0:
+            return 1.0
+        return max(0.1, min(10.0, value))
+
+    def _estimate_turn_time_advance_minutes(
+        self, action_text: str, narration_text: str
+    ) -> int:
+        action_l = str(action_text or "").lower()
+        combined = f"{action_l}\n{str(narration_text or '').lower()}"
+        if any(token in combined for token in ("time skip", "timeskip", "time-skip")):
+            return 60
+        if any(
+            token in combined
+            for token in (
+                "sleep",
+                "rest",
+                "nap",
+                "wait",
+                "travel",
+                "drive",
+                "ride",
+                "fly",
+                "train",
+                "journey",
+            )
+        ):
+            return 30
+        if any(
+            token in combined
+            for token in ("fight", "combat", "attack", "shoot", "chase", "run")
+        ):
+            return 8
+        if any(
+            token in action_l
+            for token in ("look", "examine", "inspect", "ask", "say", "talk")
+        ):
+            return 3
+        return self.DEFAULT_TURN_ADVANCE_MINUTES
+
+    def _extract_time_skip_request(
+        self,
+        action_text: object,
+    ) -> Optional[Dict[str, object]]:
+        text = " ".join(str(action_text or "").strip().split())
+        if not text:
+            return None
+        match = re.match(
+            r"^(?:time[\s-]*skip|timeskip)\b(?:\s+(.*))?$",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if not match:
+            return None
+        desc = str(match.group(1) or "").strip()
+        minutes = 60
+        total = 0
+        found = False
+        for raw_value, unit in re.findall(
+            r"(\d+(?:\.\d+)?)\s*(d(?:ays?)?|h(?:ours?|rs?)?|m(?:in(?:ute)?s?)?)\b",
+            desc,
+            flags=re.IGNORECASE,
+        ):
+            try:
+                value = float(raw_value)
+            except (TypeError, ValueError):
+                continue
+            unit_l = unit.lower()
+            if unit_l.startswith("d"):
+                total += int(round(value * 24 * 60))
+            elif unit_l.startswith("h"):
+                total += int(round(value * 60))
+            else:
+                total += int(round(value))
+            found = True
+        if found and total > 0:
+            minutes = total
+        minutes = max(1, min(7 * 24 * 60, int(minutes)))
+        return {
+            "minutes": minutes,
+            "description": desc,
+        }
+
+    def _is_ooc_action_text(self, action_text: object) -> bool:
+        return bool(re.match(r"\s*\[OOC\b", str(action_text or ""), re.IGNORECASE))
+
+    def _increment_auto_fix_counter(
+        self,
+        campaign_state: Dict[str, object],
+        key: str,
+        amount: int = 1,
+    ) -> None:
+        if not isinstance(campaign_state, dict):
+            return
+        safe_key = re.sub(r"[^a-z0-9_]+", "_", str(key or "").strip().lower()).strip("_")
+        if not safe_key:
+            return
+        try:
+            safe_amount = max(1, int(amount))
+        except (TypeError, ValueError):
+            safe_amount = 1
+        counters = campaign_state.get(self.AUTO_FIX_COUNTERS_KEY)
+        if not isinstance(counters, dict):
+            counters = {}
+            campaign_state[self.AUTO_FIX_COUNTERS_KEY] = counters
+        current = self._coerce_non_negative_int(counters.get(safe_key, 0), default=0)
+        counters[safe_key] = current + safe_amount
+
+    def _ensure_game_time_progress(
+        self,
+        campaign_state: Dict[str, object],
+        pre_turn_game_time: Dict[str, int],
+        *,
+        action_text: str,
+        narration_text: str,
+    ) -> Dict[str, object]:
+        if not isinstance(campaign_state, dict):
+            return campaign_state
+        pre_snapshot = (
+            pre_turn_game_time
+            if isinstance(pre_turn_game_time, dict)
+            else self._extract_game_time_snapshot(campaign_state)
+        )
+        cur_snapshot = self._extract_game_time_snapshot(campaign_state)
+        pre_total = self._game_time_to_total_minutes(pre_snapshot)
+        cur_total = self._game_time_to_total_minutes(cur_snapshot)
+
+        # Keep derived fields canonical when model already advanced time.
+        if cur_total > pre_total:
+            campaign_state["game_time"] = self._game_time_from_total_minutes(cur_total)
+            return campaign_state
+
+        # Meta/OOC turns do not auto-advance in-game time.
+        if self._is_ooc_action_text(action_text):
+            campaign_state["game_time"] = self._game_time_from_total_minutes(cur_total)
+            return campaign_state
+
+        time_skip_request = self._extract_time_skip_request(action_text)
+        if time_skip_request is not None:
+            base_minutes = self._coerce_non_negative_int(
+                time_skip_request.get("minutes", 60), default=60
+            )
+        else:
+            base_minutes = self._estimate_turn_time_advance_minutes(
+                action_text, narration_text
+            )
+        speed_multiplier = self._speed_multiplier_from_state(campaign_state)
+        scaled_minutes = int(round(base_minutes * speed_multiplier))
+        delta_minutes = max(self.MIN_TURN_ADVANCE_MINUTES, scaled_minutes)
+        if time_skip_request is None:
+            delta_minutes = min(self.MAX_TURN_ADVANCE_MINUTES, delta_minutes)
+        else:
+            delta_minutes = min(7 * 24 * 60, delta_minutes)
+
+        # If model froze or regressed time, force monotonic advance from pre-turn time.
+        new_total = max(pre_total, cur_total) + delta_minutes
+        campaign_state["game_time"] = self._game_time_from_total_minutes(new_total)
+        self._increment_auto_fix_counter(
+            campaign_state,
+            "game_time_auto_advance",
+        )
+        self._zork_log(
+            "GAME TIME AUTO-ADVANCE",
+            (
+                f"pre=Day {pre_snapshot.get('day')} {int(pre_snapshot.get('hour', 0)):02d}:"
+                f"{int(pre_snapshot.get('minute', 0)):02d} "
+                f"post_model=Day {cur_snapshot.get('day')} {int(cur_snapshot.get('hour', 0)):02d}:"
+                f"{int(cur_snapshot.get('minute', 0)):02d} "
+                f"delta_min={delta_minutes} speed={speed_multiplier}"
+                + (
+                    f" explicit_time_skip={time_skip_request.get('minutes')}"
+                    if time_skip_request is not None
+                    else ""
+                )
+            ),
+        )
+        return campaign_state
+
+    def _record_turn_game_time(
+        self,
+        campaign_state: Dict[str, object],
+        turn_id: Optional[int],
+        game_time: Optional[Dict[str, int]],
+    ) -> None:
+        if not isinstance(campaign_state, dict) or turn_id is None:
+            return
+        if not isinstance(game_time, dict):
+            return
+        turn_key = str(int(turn_id))
+        index = campaign_state.get(self.TURN_TIME_INDEX_KEY)
+        if not isinstance(index, dict):
+            index = {}
+            campaign_state[self.TURN_TIME_INDEX_KEY] = index
+        index[turn_key] = {
+            "day": self._coerce_non_negative_int(game_time.get("day", 1), default=1) or 1,
+            "hour": min(
+                23, max(0, self._coerce_non_negative_int(game_time.get("hour", 0), default=0))
+            ),
+            "minute": min(
+                59, max(0, self._coerce_non_negative_int(game_time.get("minute", 0), default=0))
+            ),
+        }
+        if len(index) > self.MAX_TURN_TIME_ENTRIES:
+            keyed = []
+            for key in index.keys():
+                try:
+                    keyed.append((int(key), key))
+                except (TypeError, ValueError):
+                    continue
+            keyed.sort()
+            to_drop = len(index) - self.MAX_TURN_TIME_ENTRIES
+            for _, key in keyed[:to_drop]:
+                index.pop(key, None)
+
+    def _action_requests_clock_time(self, action_text: str) -> bool:
+        text = " ".join(str(action_text or "").strip().lower().split())
+        if not text:
+            return False
+        return any(
+            token in text
+            for token in (
+                "what time",
+                "current time",
+                "check time",
+                "clock",
+                "time is it",
+            )
+        )
+
+    def _narration_has_explicit_clock_time(self, narration_text: str) -> bool:
+        text = str(narration_text or "")
+        if not text:
+            return False
+        return bool(re.search(r"\b(?:[01]?\d|2[0-3]):[0-5]\d\b", text))
+
+    def _player_known_game_time(
+        self,
+        player: Optional[Player],
+        *,
+        fallback_time: Optional[Dict[str, int]] = None,
+    ) -> Dict[str, int]:
+        fallback_snapshot = self._extract_game_time_snapshot(
+            {"game_time": fallback_time or {}}
+        )
+        if player is None:
+            return fallback_snapshot
+        player_state = self.get_player_state(player)
+        known_time = player_state.get("game_time")
+        if not isinstance(known_time, dict) or not known_time:
+            return fallback_snapshot
+        return self._extract_game_time_snapshot({"game_time": known_time})
+
+    def _set_player_known_game_time(
+        self,
+        player: Player,
+        game_time: Dict[str, int],
+    ) -> None:
+        player_state = self.get_player_state(player)
+        player_state["game_time"] = self._game_time_from_total_minutes(
+            self._game_time_to_total_minutes(game_time)
+        )
+        with self._session_factory() as session:
+            row = session.get(Player, player.id)
+            if row is not None:
+                row.state_json = self._dump_json(player_state)
+                row.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
+                session.commit()
+                player.state_json = row.state_json
+
+    def _sync_game_time_to_player_state(
+        self,
+        state_update: Dict[str, object],
+        player_state_update: Dict[str, object],
+    ) -> Dict[str, object]:
+        """Copy game_time from state_update into player_state_update.
+
+        The model places game_time in state_update (campaign-wide), but the
+        player card is built from player_state which is only populated via
+        player_state_update.  Without this bridge the player card's game_time
+        goes stale.
+        """
+        if not isinstance(state_update, dict) or not isinstance(player_state_update, dict):
+            return player_state_update
+        gt = state_update.get("game_time")
+        if isinstance(gt, dict) and gt:
+            player_state_update.setdefault("game_time", gt)
+        return player_state_update
+
+    # ── Location Sync ──────────────────────────────────────────────────
+
+    @staticmethod
+    def _normalize_location_text(value: object) -> str:
+        return re.sub(r"\s+", " ", str(value or "").strip())
+
+    def _location_state_key(self, value: object) -> str:
+        text = self._normalize_location_text(value).lower()
+        if not text:
+            return ""
+        return re.sub(r"[^a-z0-9]+", "-", text).strip("-")[:100]
+
+    def _active_location_modifications_for_prompt(
+        self,
+        campaign_state: Dict[str, object],
+        player_state: Dict[str, object],
+    ) -> Dict[str, object]:
+        if not isinstance(campaign_state, dict) or not isinstance(player_state, dict):
+            return {}
+        raw_locations = campaign_state.get("locations")
+        if not isinstance(raw_locations, dict):
+            return {}
+        candidate_keys: List[str] = []
+        for raw in (
+            player_state.get("location"),
+            player_state.get("room_title"),
+            player_state.get("room_summary"),
+        ):
+            key = self._location_state_key(raw)
+            if key and key not in candidate_keys:
+                candidate_keys.append(key)
+        if not candidate_keys:
+            return {}
+        for key in candidate_keys:
+            row = raw_locations.get(key)
+            if not isinstance(row, dict):
+                continue
+            mods = row.get("modifications")
+            if isinstance(mods, list):
+                clean_mods = []
+                for item in mods[:24]:
+                    item_text = " ".join(str(item or "").strip().split())[:180]
+                    if item_text:
+                        clean_mods.append(item_text)
+                if clean_mods:
+                    return {
+                        "location_key": key,
+                        "modifications": clean_mods,
+                    }
+            elif isinstance(mods, dict) and mods:
+                return {
+                    "location_key": key,
+                    "modifications": mods,
+                }
+        return {}
+
+    def _resolve_player_location_for_state_sync(
+        self, player_state: Dict[str, object]
+    ) -> str:
+        if not isinstance(player_state, dict):
+            return ""
+        for key in ("location", "room_title", "room_summary"):
+            text = self._normalize_location_text(player_state.get(key))
+            if text:
+                return text[:160]
+        return ""
+
+    def _player_entity_aliases_for_state_sync(
+        self,
+        player_state: Dict[str, object],
+    ) -> List[str]:
+        aliases: List[str] = []
+        seen: set[str] = set()
+
+        def _add(raw: object) -> None:
+            slug = self._player_slug_key(raw)
+            if not slug or slug in seen:
+                return
+            seen.add(slug)
+            aliases.append(slug)
+
+        name = str(player_state.get("character_name") or "").strip()
+        if not name:
+            return aliases
+        _add(name)
+        for sep in (",", "(", " - "):
+            if sep in name:
+                _add(name.split(sep, 1)[0].strip())
+        words = [part for part in re.split(r"\s+", name) if part]
+        if words:
+            _add(words[0])
+        return aliases
+
+    def _sync_player_states_from_campaign_entities(
+        self,
+        campaign: Campaign,
+        campaign_state: Dict[str, object],
+        *,
+        skip_actor_id: Optional[str] = None,
+    ) -> int:
+        if not isinstance(campaign_state, dict):
+            return 0
+        synced = 0
+        relevant_keys = (
+            "location",
+            "room_title",
+            "room_summary",
+            "room_description",
+            "exits",
+            "current_status",
+        )
+        with self._session_factory() as session:
+            players = session.query(Player).filter(Player.campaign_id == campaign.id).all()
+            for target in players:
+                actor_id = getattr(target, "actor_id", None)
+                if skip_actor_id is not None and actor_id == skip_actor_id:
+                    continue
+                target_state = self.get_player_state(target)
+                entity_state = None
+                for alias in self._player_entity_aliases_for_state_sync(target_state):
+                    candidate = campaign_state.get(alias)
+                    if isinstance(candidate, dict) and any(
+                        key in candidate for key in relevant_keys
+                    ):
+                        entity_state = candidate
+                        break
+                if not isinstance(entity_state, dict):
+                    continue
+
+                changed = False
+                old_location = str(target_state.get("location") or "").strip()
+                new_location = str(entity_state.get("location") or "").strip()
+                if new_location and new_location != old_location:
+                    target_state["location"] = new_location
+                    changed = True
+                    if "room_title" in entity_state:
+                        target_state["room_title"] = entity_state.get("room_title")
+                    else:
+                        target_state.pop("room_title", None)
+                    if "room_summary" in entity_state:
+                        target_state["room_summary"] = entity_state.get("room_summary")
+                    else:
+                        target_state.pop("room_summary", None)
+                    if "room_description" in entity_state:
+                        target_state["room_description"] = entity_state.get("room_description")
+                    else:
+                        target_state.pop("room_description", None)
+                    if "exits" in entity_state:
+                        target_state["exits"] = entity_state.get("exits")
+                    else:
+                        target_state.pop("exits", None)
+
+                for key in ("current_status",):
+                    if key in entity_state and entity_state.get(key) != target_state.get(key):
+                        target_state[key] = entity_state.get(key)
+                        changed = True
+
+                if changed:
+                    target.state_json = self._dump_json(target_state)
+                    synced += 1
+            session.commit()
+        return synced
+
+    def _normalize_co_located_player_slugs(
+        self,
+        raw_value: object,
+        *,
+        actor_slug: str = "",
+    ) -> List[str]:
+        if not isinstance(raw_value, list):
+            return []
+        actor_slug_key = self._player_slug_key(actor_slug)
+        out: List[str] = []
+        seen: set[str] = set()
+        for item in raw_value:
+            slug = self._player_slug_key(item)
+            if not slug or slug == actor_slug_key or slug in seen:
+                continue
+            seen.add(slug)
+            out.append(slug)
+        return out
+
+    def _sync_marked_co_located_players(
+        self,
+        campaign_id: str,
+        source_actor_id: str,
+        source_state: Dict[str, object],
+        player_slugs: List[str],
+    ) -> int:
+        if not isinstance(source_state, dict) or not isinstance(player_slugs, list):
+            return 0
+        slug_set = {
+            self._player_slug_key(item)
+            for item in player_slugs
+            if self._player_slug_key(item)
+        }
+        if not slug_set:
+            return 0
+        has_room_context = any(
+            source_state.get(key)
+            for key in ("room_id", "location", "room_title", "room_summary", "room_description")
+        )
+        if not has_room_context:
+            return 0
+        changed = 0
+        with self._session_factory() as session:
+            targets = (
+                session.query(Player).filter(
+                    Player.campaign_id == campaign_id,
+                    Player.actor_id != source_actor_id,
+                )
+                .all()
+            )
+            for target in targets:
+                target_state = self.get_player_state(target)
+                target_slug = self._player_slug_key(target_state.get("character_name"))
+                fallback_slug = self._player_slug_key(f"player-{getattr(target, 'actor_id', '')}")
+                if target_slug not in slug_set and fallback_slug not in slug_set:
+                    continue
+                before = dict(target_state)
+                for key in self.ROOM_STATE_KEYS:
+                    src_val = source_state.get(key)
+                    if src_val is None:
+                        target_state.pop(key, None)
+                    else:
+                        target_state[key] = src_val
+                if target_state == before:
+                    continue
+                target.state_json = self._dump_json(target_state)
+                target.last_active_at = datetime.now(timezone.utc).replace(tzinfo=None)
+                changed += 1
+            session.commit()
+        return changed
+
+    def _auto_sync_companion_locations(
+        self,
+        campaign_state: Dict[str, object],
+        *,
+        player_state: Dict[str, object],
+        narration_text: str,
+    ) -> int:
+        if not isinstance(campaign_state, dict):
+            return 0
+        player_location = self._resolve_player_location_for_state_sync(player_state)
+        if not player_location:
+            return 0
+        changed = 0
+        for raw_key, raw_value in campaign_state.items():
+            key = str(raw_key or "")
+            if key in self.MODEL_STATE_EXCLUDE_KEYS:
+                continue
+            if not isinstance(raw_value, dict):
+                continue
+            if "location" not in raw_value:
+                continue
+            current_location = self._normalize_location_text(raw_value.get("location"))
+            if not current_location or current_location == player_location:
+                continue
+            follows_flag = any(
+                bool(raw_value.get(flag))
+                for flag in (
+                    "follows_player",
+                    "following_player",
+                    "with_player",
+                    "companion",
+                    "pet",
+                    "at_heels",
+                )
+            )
+            if not follows_flag:
+                names = self._entity_name_candidates_for_sync(key, raw_value)
+                if not self._narration_implies_entity_with_player(
+                    narration_text, names
+                ):
+                    continue
+            raw_value["location"] = player_location
+            changed += 1
+        return changed
+
+    def _auto_sync_character_locations(
+        self,
+        campaign: Campaign,
+        *,
+        player_state: Dict[str, object],
+        narration_text: str,
+    ) -> int:
+        player_location = self._resolve_player_location_for_state_sync(player_state)
+        if not player_location:
+            return 0
+        characters = self.get_campaign_characters(campaign)
+        if not isinstance(characters, dict) or not characters:
+            return 0
+        changed = 0
+        for slug, entry in characters.items():
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("deceased_reason"):
+                continue
+            current_location = self._normalize_location_text(entry.get("location"))
+            if not current_location or current_location == player_location:
+                continue
+            names = self._entity_name_candidates_for_sync(slug, entry)
+            if not (
+                self._narration_implies_entity_with_player(narration_text, names)
+                or self._narration_mentions_entity_in_active_scene(
+                    narration_text, names
+                )
+            ):
+                continue
+            entry["location"] = player_location
+            changed += 1
+        if changed:
+            with self._session_factory() as session:
+                row = session.get(Campaign, campaign.id)
+                if row:
+                    row.characters_json = self._dump_json(characters)
+                    session.commit()
+        return changed
+
+    def _sync_npc_locations_from_state_to_roster(
+        self,
+        campaign: Campaign,
+        state_update: Dict[str, object],
+    ) -> int:
+        """Propagate NPC location data from state_update overlay into characters_json.
+
+        When the model puts NPC mutable fields (especially ``location`` and
+        ``current_status``) inside ``state_update.<slug>`` instead of
+        ``character_updates.<slug>``, the campaign_state overlay gets updated
+        but the persistent roster (``characters_json``) stays stale.  This
+        method detects those cases and patches the roster so both stores agree.
+        """
+        if not isinstance(state_update, dict):
+            return 0
+        characters = self.get_campaign_characters(campaign)
+        if not isinstance(characters, dict) or not characters:
+            return 0
+        overlay_mutable = {"location", "current_status", "allegiance", "evolving_personality"}
+        changed = 0
+        for slug, overlay in state_update.items():
+            if not isinstance(overlay, dict):
+                continue
+            if slug not in characters:
+                continue
+            entry = characters[slug]
+            if not isinstance(entry, dict):
+                continue
+            for field in overlay_mutable:
+                if field not in overlay:
+                    continue
+                new_val = overlay[field]
+                if new_val is None:
+                    continue
+                old_val = entry.get(field)
+                if old_val != new_val:
+                    entry[field] = new_val
+                    changed += 1
+        if changed:
+            with self._session_factory() as session:
+                row = session.get(Campaign, campaign.id)
+                if row:
+                    row.characters_json = self._dump_json(characters)
+                    session.commit()
+            self._zork_log(
+                "NPC ROSTER SYNC FROM STATE_UPDATE",
+                f"Patched {changed} field(s) in characters_json from state_update overlay",
+            )
+        return changed
+
+    def _sync_active_player_character_location(
+        self,
+        campaign: Campaign,
+        *,
+        player_state: Dict[str, object],
+    ) -> int:
+        player_location = self._resolve_player_location_for_state_sync(player_state)
+        if not player_location:
+            return 0
+        character_name = self._normalize_location_text(
+            player_state.get("character_name")
+        ).lower()
+        if not character_name:
+            return 0
+        characters = self.get_campaign_characters(campaign)
+        if not isinstance(characters, dict) or not characters:
+            return 0
+
+        target_slug = self._resolve_existing_character_slug(characters, character_name)
+        if target_slug is None:
+            for slug, entry in characters.items():
+                if not isinstance(entry, dict):
+                    continue
+                entry_name = self._normalize_location_text(entry.get("name")).lower()
+                if entry_name and entry_name == character_name:
+                    target_slug = slug
+                    break
+        if target_slug is None:
+            return 0
+
+        entry = characters.get(target_slug)
+        if not isinstance(entry, dict):
+            return 0
+        current_location = self._normalize_location_text(entry.get("location"))
+        if current_location == player_location:
+            return 0
+        entry["location"] = player_location
+        with self._session_factory() as session:
+            row = session.get(Campaign, campaign.id)
+            if row:
+                row.characters_json = self._dump_json(characters)
+                session.commit()
+        return 1
+
+    # ── Turn Visibility / Scene Output ──────────────────────────────────
+
+    def _is_emptyish_turn_payload(
+        self,
+        *,
+        narration: str,
+        state_update: Dict[str, object],
+        player_state_update: Dict[str, object],
+        summary_update: object,
+        xp_awarded: object,
+        scene_image_prompt: object,
+        character_updates: Dict[str, object],
+        calendar_update: object,
+    ) -> bool:
+        text = " ".join(str(narration or "").strip().lower().split())
+        trivial_narration = text in {
+            "",
+            "the world shifts, but nothing clear emerges.",
+            "a hollow silence answers. try again.",
+            "a hollow silence answers.",
+        }
+        short_narration = len(text) < 24
+        has_world = bool(state_update) or bool(character_updates) or bool(calendar_update)
+        has_player = bool(player_state_update)
+        has_summary = bool(str(summary_update or "").strip())
+        has_image = bool(str(scene_image_prompt or "").strip())
+        try:
+            has_xp = int(xp_awarded or 0) > 0
+        except (TypeError, ValueError):
+            has_xp = False
+        has_signal = has_world or has_player or has_summary or has_image or has_xp
+        if trivial_narration and not has_signal:
+            return True
+        if short_narration and not has_signal:
+            return True
+        return False
+
+    def _default_turn_visibility_meta(
+        self,
+        campaign: Campaign,
+        actor: Optional[Player],
+        is_private_context: bool,
+    ) -> Dict[str, object]:
+        registry = self._campaign_player_registry(
+            str(campaign.id), self._session_factory
+        )
+        actor_entry = (
+            registry.get("by_actor_id", {}).get(actor.actor_id)
+            if actor is not None
+            else None
+        )
+        actor_slug = str((actor_entry or {}).get("slug") or "").strip()
+        actor_actor_id = (actor_entry or {}).get("actor_id")
+        actor_state = self.get_player_state(actor) if actor is not None else {}
+        actor_location_key = self._room_key_from_player_state(actor_state)
+        scope = (
+            "local"
+            if actor_location_key and actor_location_key.lower() != "unknown-room"
+            else "public"
+        )
+        visible_player_slugs = [actor_slug] if actor_slug else []
+        visible_actor_ids = [actor_actor_id] if actor_actor_id is not None else []
+        if scope == "public":
+            visible_player_slugs = []
+            visible_actor_ids = []
+        return {
+            "scope": scope,
+            "actor_player_slug": actor_slug or None,
+            "actor_actor_id": actor_actor_id,
+            "visible_player_slugs": visible_player_slugs,
+            "visible_actor_ids": visible_actor_ids,
+            "location_key": (
+                actor_location_key
+                if scope == "local"
+                and actor_location_key
+                and actor_location_key.lower() != "unknown-room"
+                else None
+            ),
+            "context_key": None,
+            "aware_npc_slugs": [],
+            "source": (
+                "local-default" if scope == "local" else "public-default"
+            ),
+        }
+
+    def _normalize_turn_visibility(
+        self,
+        campaign: Campaign,
+        actor: Optional[Player],
+        raw_visibility: object,
+        *,
+        is_private_context: bool,
+    ) -> Dict[str, object]:
+        default_meta = self._default_turn_visibility_meta(
+            campaign, actor, is_private_context
+        )
+        if not isinstance(raw_visibility, dict):
+            return default_meta
+
+        scope = str(raw_visibility.get("scope") or "").strip().lower()
+        if scope not in {"public", "private", "limited", "local"}:
+            scope = str(default_meta.get("scope") or "public")
+
+        registry = self._campaign_player_registry(
+            str(campaign.id), self._session_factory
+        )
+        by_slug = registry.get("by_slug", {})
+        actor_slug = str(default_meta.get("actor_player_slug") or "").strip()
+        visible_player_slugs: List[str] = []
+        visible_actor_ids: List[str] = []
+
+        raw_player_slugs = raw_visibility.get("player_slugs")
+        if isinstance(raw_player_slugs, list):
+            player_items = raw_player_slugs
+        elif isinstance(raw_player_slugs, str):
+            player_items = [raw_player_slugs]
+        else:
+            player_items = []
+
+        seen_player_slugs: set[str] = set()
+        for item in player_items:
+            slug = self._player_slug_key(item)
+            if not slug or slug in seen_player_slugs:
+                continue
+            resolved = by_slug.get(slug)
+            if resolved is None:
+                continue
+            seen_player_slugs.add(slug)
+            visible_player_slugs.append(slug)
+            resolved_actor_id = resolved.get("actor_id")
+            if isinstance(resolved_actor_id, str) and resolved_actor_id:
+                visible_actor_ids.append(resolved_actor_id)
+
+        if scope in {"private", "limited", "local"} and actor_slug:
+            if actor_slug not in seen_player_slugs:
+                visible_player_slugs.insert(0, actor_slug)
+                seen_player_slugs.add(actor_slug)
+            actor_actor_id = default_meta.get("actor_actor_id")
+            if isinstance(actor_actor_id, str) and actor_actor_id and actor_actor_id not in visible_actor_ids:
+                visible_actor_ids.insert(0, actor_actor_id)
+
+        aware_npc_slugs: List[str] = []
+        characters = self.get_campaign_characters(campaign)
+        raw_npc_slugs = raw_visibility.get("npc_slugs")
+        if isinstance(raw_npc_slugs, list):
+            npc_items = raw_npc_slugs
+        elif isinstance(raw_npc_slugs, str):
+            npc_items = [raw_npc_slugs]
+        else:
+            npc_items = []
+        seen_npc_slugs: set[str] = set()
+        for item in npc_items:
+            slug = str(item or "").strip()
+            if not slug or slug in seen_npc_slugs:
+                continue
+            if isinstance(characters, dict) and self._resolve_existing_character_slug(
+                characters, slug
+            ):
+                resolved_slug = self._resolve_existing_character_slug(characters, slug)
+                if resolved_slug and resolved_slug not in seen_npc_slugs:
+                    aware_npc_slugs.append(resolved_slug)
+                    seen_npc_slugs.add(resolved_slug)
+
+        reason = self._trim_text(str(raw_visibility.get("reason") or "").strip(), 240)
+        location_key = str(default_meta.get("location_key") or "").strip()
+        return {
+            "scope": scope,
+            "actor_player_slug": actor_slug or None,
+            "actor_actor_id": default_meta.get("actor_actor_id"),
+            "visible_player_slugs": visible_player_slugs,
+            "visible_actor_ids": visible_actor_ids,
+            "location_key": location_key or None,
+            "context_key": str(raw_visibility.get("context_key") or "").strip() or None,
+            "aware_npc_slugs": aware_npc_slugs,
+            "reason": reason or None,
+            "source": "model",
+        }
+
+    @staticmethod
+    def _resolved_turn_visibility_keys(
+        turn_visibility: Dict[str, object],
+        *,
+        scene_output_raw: object,
+        player_state_update: object,
+        fallback_location_key: str = "",
+    ) -> Dict[str, Optional[str]]:
+        location_key = ""
+        context_key = ""
+        if isinstance(scene_output_raw, dict):
+            location_key = str(scene_output_raw.get("location_key") or "").strip()
+            context_key = str(scene_output_raw.get("context_key") or "").strip()
+        if not location_key and isinstance(player_state_update, dict):
+            location_key = str(player_state_update.get("location") or "").strip()
+        if not location_key:
+            location_key = str(
+                turn_visibility.get("location_key") or fallback_location_key or ""
+            ).strip()
+        if not context_key:
+            context_key = str(turn_visibility.get("context_key") or "").strip()
+        return {
+            "location_key": location_key or None,
+            "context_key": context_key or None,
+        }
+
+    def _turn_visible_to_npc(
+        self,
+        turn: Turn,
+        npc_slug: str,
+    ) -> bool:
+        """Check whether *npc_slug* would plausibly know about *turn*.
+
+        An NPC "knows" about a turn if:
+        - The turn has public scope, OR
+        - The NPC appeared as speaker/actor/listener/aware_npc in any beat
+        """
+        meta = self._safe_turn_meta(turn)
+        visibility = meta.get("visibility")
+        if isinstance(visibility, dict):
+            scope = str(visibility.get("scope") or "").strip().lower()
+            if scope in {"", "public"}:
+                return True
+        elif not visibility:
+            # Legacy turns without visibility metadata -- treat as public
+            return True
+
+        slug_norm = self._player_slug_key(npc_slug)
+        if not slug_norm:
+            return False
+
+        # Check scene_output beats for NPC presence
+        scene_output = meta.get("scene_output")
+        if isinstance(scene_output, dict):
+            beats = scene_output.get("beats")
+            if isinstance(beats, list):
+                for beat in beats:
+                    if not isinstance(beat, dict):
+                        continue
+                    if self._player_slug_key(beat.get("speaker")) == slug_norm:
+                        return True
+                    for field in ("actors", "listeners", "aware_npc_slugs"):
+                        entries = beat.get(field)
+                        if isinstance(entries, list):
+                            for entry in entries:
+                                if self._player_slug_key(entry) == slug_norm:
+                                    return True
+
+        # Check turn-level visibility participant lists
+        if isinstance(visibility, dict):
+            for field in ("visible_player_slugs",):
+                raw = visibility.get(field)
+                if isinstance(raw, list):
+                    for entry in raw:
+                        if self._player_slug_key(entry) == slug_norm:
+                            return True
+
+        return False
+
+    def _turn_visible_to_all_scene_npcs(
+        self,
+        turn: Turn,
+        npc_slugs: set[str],
+    ) -> bool:
+        """Return True only if ALL listed NPCs would know about this turn."""
+        for npc_slug in npc_slugs:
+            if not self._turn_visible_to_npc(turn, npc_slug):
+                return False
+        return True
+
+    def _recent_turn_receiver_hints(
+        self,
+        campaign: Campaign,
+        *,
+        viewer_actor_id: str,
+        party_snapshot: List[Dict[str, object]],
+        player_state: Dict[str, object],
+    ) -> Dict[str, List[str]]:
+        player_slugs: List[str] = []
+        seen_player_slugs: set[str] = set()
+        for entry in party_snapshot:
+            if not isinstance(entry, dict):
+                continue
+            raw_actor_id = entry.get("actor_id")
+            actor_id = str(raw_actor_id or "").strip()
+            if actor_id and actor_id == viewer_actor_id:
+                continue
+            slug = self._player_slug_key(
+                entry.get("player_slug") or entry.get("name") or ""
+            )
+            if slug and slug not in seen_player_slugs:
+                seen_player_slugs.add(slug)
+                player_slugs.append(slug)
+        npc_slugs = sorted(self._active_scene_npc_slugs(campaign, player_state))
+        return {
+            "player_slugs": player_slugs[:8],
+            "npc_slugs": npc_slugs[:12],
+        }
+
+    def _turn_relevant_to_scene_receivers(
+        self,
+        turn: Turn,
+        *,
+        requested_player_slugs: set[str],
+        requested_npc_slugs: set[str],
+    ) -> bool:
+        meta = self._safe_turn_meta(turn)
+        visibility = meta.get("visibility")
+        if not isinstance(visibility, dict):
+            return False
+        scope = str(visibility.get("scope") or "").strip().lower()
+        if scope not in {"private", "limited"}:
+            return False
+
+        aware_npc_slugs = {
+            str(item or "").strip()
+            for item in list(visibility.get("aware_npc_slugs") or [])
+            if str(item or "").strip()
+        }
+
+        visible_player_slugs = {
+            self._player_slug_key(item)
+            for item in list(visibility.get("visible_player_slugs") or [])
+            if self._player_slug_key(item)
+        }
+        player_match = True
+        npc_match = True
+        if requested_player_slugs:
+            player_match = bool(
+                visible_player_slugs.intersection(requested_player_slugs)
+            )
+        if requested_npc_slugs:
+            npc_match = bool(aware_npc_slugs.intersection(requested_npc_slugs))
+        return player_match and npc_match
+
+    def _turn_relevant_to_requested_npc_history(
+        self,
+        turn: Turn,
+        *,
+        requested_npc_slugs: set[str],
+    ) -> bool:
+        for raw_slug in requested_npc_slugs:
+            npc_slug = self._player_slug_key(raw_slug)
+            if npc_slug and self._turn_visible_to_npc(turn, npc_slug):
+                return True
+        return False
+
+    def _turn_visible_in_recent_turns_context(
+        self,
+        turn: Turn,
+        *,
+        viewer_actor_id: str,
+        viewer_slug: str,
+        viewer_location_key: str,
+        viewer_private_context_key: str,
+    ) -> bool:
+        meta = self._safe_turn_meta(turn)
+        visibility = meta.get("visibility")
+        if isinstance(visibility, dict):
+            scope = str(visibility.get("scope") or "").strip().lower()
+            turn_context_key = str(
+                visibility.get("context_key") or meta.get("context_key") or ""
+            ).strip()
+            turn_location_keys = {
+                k for k in (
+                    self._normalize_location_key(visibility.get("location_key")),
+                    self._normalize_location_key(meta.get("location_key")),
+                ) if k
+            }
+            viewer_location_key_norm = self._normalize_location_key(viewer_location_key)
+            if scope in {"", "public"}:
+                return True
+            if scope == "local":
+                return bool(
+                    viewer_location_key_norm
+                    and turn_location_keys
+                    and viewer_location_key_norm in turn_location_keys
+                )
+            if scope in {"private", "limited"} and turn_context_key:
+                return self._turn_visible_to_viewer(
+                    turn,
+                    viewer_actor_id,
+                    viewer_slug,
+                    viewer_location_key,
+                )
+            return False
+        return self._turn_visible_to_viewer(
+            turn,
+            viewer_actor_id,
+            viewer_slug,
+            viewer_location_key,
+        )
+
+    def _recent_turns_text_for_viewer(
+        self,
+        campaign: Campaign,
+        turns: List[Turn],
+        *,
+        viewer_actor_id: str,
+        viewer_slug: str,
+        viewer_location_key: str,
+        viewer_private_context_key: str,
+        requested_player_slugs: set[str],
+        requested_npc_slugs: set[str],
+        scene_npc_slugs: Optional[set[str]] = None,
+    ) -> str:
+        recent_lines: List[str] = []
+        _OOC_RE = re.compile(r"^\s*\[OOC\b", re.IGNORECASE)
+        _ERROR_PHRASES = (
+            "a hollow silence answers",
+            "the world shifts, but nothing clear emerges",
+        )
+        viewer_location_key_norm = self._normalize_location_key(viewer_location_key)
+        registry = self._campaign_player_registry(
+            str(campaign.id), self._session_factory
+        )
+        player_names: Dict[str, str] = {}
+        for raw_actor_id, info in registry.get("by_actor_id", {}).items():
+            actor_id = str(raw_actor_id or "").strip()
+            if not actor_id:
+                continue
+            name = str(info.get("name") or "").strip()
+            if name:
+                player_names[actor_id] = name
+
+        for turn in turns:
+            content = (turn.content or "").strip()
+            if not content:
+                continue
+            meta = self._safe_turn_meta(turn)
+            visible = self._turn_visible_in_recent_turns_context(
+                turn,
+                viewer_actor_id=viewer_actor_id,
+                viewer_slug=viewer_slug,
+                viewer_location_key=viewer_location_key,
+                viewer_private_context_key=viewer_private_context_key,
+            )
+            if (
+                not visible
+                and (requested_player_slugs or requested_npc_slugs)
+                and turn.actor_id == viewer_actor_id
+                and self._turn_relevant_to_scene_receivers(
+                    turn,
+                    requested_player_slugs=requested_player_slugs,
+                    requested_npc_slugs=requested_npc_slugs,
+                )
+            ):
+                visible = True
+            if (
+                not visible
+                and requested_npc_slugs
+                and self._turn_relevant_to_requested_npc_history(
+                    turn,
+                    requested_npc_slugs=requested_npc_slugs,
+                )
+            ):
+                visible = True
+            if not visible:
+                continue
+            # LCD filtering: skip turns that scene NPCs don't know about
+            if scene_npc_slugs and not self._turn_visible_to_all_scene_npcs(
+                turn, scene_npc_slugs
+            ):
+                continue
+
+            scene_output_lines = self._scene_output_recent_lines(
+                turn,
+                self.get_campaign_state(campaign),
+                meta.get("scene_output"),
+                viewer_actor_id=viewer_actor_id,
+                viewer_slug=viewer_slug,
+                viewer_location_key=viewer_location_key,
+                viewer_private_context_key=viewer_private_context_key,
+                requested_npc_slugs=requested_npc_slugs,
+                scene_npc_slugs=scene_npc_slugs,
+            )
+            if scene_output_lines and turn.kind == "narrator":
+                recent_lines.extend(scene_output_lines)
+                continue
+
+            campaign_state = self.get_campaign_state(campaign)
+            if turn.kind == "player":
+                if _OOC_RE.match(content):
+                    continue
+                clipped = self._strip_inventory_mentions(content)
+                if not clipped:
+                    continue
+                name = player_names.get(str(turn.actor_id or ""))
+                recent_lines.extend(
+                    self._recent_turn_fallback_lines(
+                        turn,
+                        campaign_state,
+                        content_text=clipped,
+                        player_name=name,
+                    )
+                )
+            elif turn.kind == "narrator":
+                if content.lower() in _ERROR_PHRASES:
+                    continue
+                clipped = self._strip_narration_footer(content)
+                if not clipped:
+                    continue
+                recent_lines.extend(
+                    self._recent_turn_fallback_lines(
+                        turn,
+                        campaign_state,
+                        content_text=clipped,
+                    )
+                )
+        return "\n".join(recent_lines) if recent_lines else "None"
+
+    def _recent_turns_location_hint(
+        self,
+        turns: List[Turn],
+        *,
+        viewer_actor_id: str,
+        viewer_slug: str,
+        viewer_location_key: str,
+        viewer_private_context_key: str,
+    ) -> Dict[str, str]:
+        current_location = str(viewer_location_key or "").strip().lower() or "unknown-room"
+        current_location_norm = self._normalize_location_key(current_location)
+        last_other_location = ""
+        for turn in reversed(turns):
+            if not self._turn_visible_to_viewer(
+                turn,
+                viewer_actor_id,
+                viewer_slug,
+                viewer_location_key,
+            ):
+                continue
+            meta = self._safe_turn_meta(turn)
+            visibility = meta.get("visibility")
+            turn_location = ""
+            if isinstance(visibility, dict):
+                turn_location = str(visibility.get("location_key") or "").strip().lower()
+            if not turn_location:
+                turn_location = str(meta.get("location_key") or "").strip().lower()
+            if not turn_location:
+                continue
+            if self._normalize_location_key(turn_location) != current_location_norm:
+                last_other_location = turn_location
+                break
+        return {
+            "current_location_key": current_location,
+            "last_other_location_key": last_other_location or "none",
+        }
+
+    def _recent_turn_fallback_lines(
+        self,
+        turn: Turn,
+        campaign_state: Dict[str, object],
+        *,
+        content_text: str,
+        player_name: str = "",
+    ) -> List[str]:
+        text = str(content_text or "").strip()
+        if not text:
+            return []
+        turn_number = int(getattr(turn, "id", 0) or 0)
+        index = (
+            campaign_state.get(self.TURN_TIME_INDEX_KEY)
+            if isinstance(campaign_state, dict)
+            else {}
+        )
+        if not isinstance(index, dict):
+            index = {}
+        entry = index.get(str(turn_number))
+        meta = self._safe_turn_meta(turn)
+        visibility = meta.get("visibility")
+        scope = "public"
+        visible_actor_ids: List[str] = []
+        aware_npc_slugs: List[str] = []
+        actor_slug = ""
+        location_key = str(meta.get("location_key") or "").strip() or None
+        context_key = str(meta.get("context_key") or "").strip() or None
+        if isinstance(visibility, dict):
+            scope = str(visibility.get("scope") or "").strip().lower() or "public"
+            actor_slug = self._player_slug_key(
+                visibility.get("actor_player_slug") or ""
+            )
+            location_key = (
+                str(visibility.get("location_key") or location_key or "").strip()
+                or None
+            )
+            context_key = (
+                str(visibility.get("context_key") or context_key or "").strip()
+                or None
+            )
+            for item in list(visibility.get("visible_actor_ids") or []):
+                actor_id = str(item or "").strip()
+                if actor_id and actor_id not in visible_actor_ids:
+                    visible_actor_ids.append(actor_id)
+            aware_npc_slugs = [
+                str(item or "").strip()
+                for item in list(visibility.get("aware_npc_slugs") or [])
+                if str(item or "").strip()
+            ]
+        if not actor_slug and turn.kind == "player":
+            actor_slug = self._player_slug_key(player_name) or f"player-{turn.actor_id}"
+        header = {
+            "kind": "turn",
+            "turn_id": turn_number,
+            "location_key": location_key,
+            "context_key": context_key,
+            "visibility": scope,
+        }
+        if isinstance(entry, dict):
+            header["day"] = (
+                self._coerce_non_negative_int(entry.get("day", 1), default=1) or 1
+            )
+            header["hour"] = min(
+                23,
+                max(0, self._coerce_non_negative_int(entry.get("hour", 0), default=0)),
+            )
+            header["minute"] = min(
+                59,
+                max(
+                    0,
+                    self._coerce_non_negative_int(entry.get("minute", 0), default=0),
+                ),
+            )
+        beat_type = "player_action" if turn.kind == "player" else "narration"
+        speaker = actor_slug or ("narrator" if turn.kind == "narrator" else "player")
+        actors = [actor_slug] if actor_slug else []
+        beat = {
+            "kind": "beat",
+            "turn_id": turn_number,
+            "index": 0,
+            "reasoning": (
+                "Compatibility fallback from player turn text."
+                if turn.kind == "player"
+                else "Compatibility fallback from plain narration."
+            ),
+            "type": beat_type,
+            "speaker": speaker,
+            "actors": actors,
+            "listeners": [],
+            "visibility": scope,
+            "visible_actor_ids": visible_actor_ids,
+            "aware_npc_slugs": aware_npc_slugs,
+            "location_key": location_key,
+            "context_key": context_key,
+            "text": text,
+        }
+        return [
+            json.dumps(header, ensure_ascii=False, separators=(",", ":")),
+            json.dumps(beat, ensure_ascii=False, separators=(",", ":")),
+        ]
+
+    def _scene_output_text_from_raw(self, raw_scene_output: object) -> str:
+        if not isinstance(raw_scene_output, dict):
+            return ""
+        rendered = str(raw_scene_output.get("rendered_text") or "").strip()
+        if rendered:
+            return self._trim_text(rendered, self.MAX_NARRATION_CHARS)
+        raw_beats = raw_scene_output.get("beats")
+        if not isinstance(raw_beats, list):
+            return ""
+        texts: List[str] = []
+        for beat in raw_beats:
+            if not isinstance(beat, dict):
+                continue
+            text = str(
+                beat.get("text") or beat.get("summary") or ""
+            ).strip()
+            if not text:
+                continue
+            texts.append(text)
+        if not texts:
+            return ""
+        return self._trim_text("\n\n".join(texts), self.MAX_NARRATION_CHARS)
+
+    def _normalize_scene_output(
+        self,
+        campaign: Campaign,
+        raw_scene_output: object,
+        *,
+        fallback_narration: str,
+        turn_visibility: Dict[str, object],
+        fallback_location_key: str,
+        actor_actor_id: Optional[str],
+        actor_player_slug: str,
+    ) -> Optional[Dict[str, object]]:
+        base_visibility = (
+            str(turn_visibility.get("scope") or "").strip().lower() or "local"
+        )
+        base_visible_actor_ids: List[str] = []
+        for item in list(turn_visibility.get("visible_actor_ids") or []):
+            actor_id = str(item or "").strip()
+            if actor_id:
+                base_visible_actor_ids.append(actor_id)
+        base_aware_npc_slugs = [
+            str(item or "").strip()
+            for item in list(turn_visibility.get("aware_npc_slugs") or [])
+            if str(item or "").strip()
+        ]
+        scene_output = raw_scene_output if isinstance(raw_scene_output, dict) else {}
+        raw_beats = scene_output.get("beats")
+        if not isinstance(raw_beats, list):
+            raw_beats = []
+
+        characters = self.get_campaign_characters(campaign)
+        beats: List[Dict[str, object]] = []
+        for raw_beat in raw_beats[:24]:
+            if not isinstance(raw_beat, dict):
+                continue
+            text = str(
+                raw_beat.get("text") or raw_beat.get("summary") or ""
+            ).strip()
+            if not text:
+                continue
+            beat_visibility = (
+                str(raw_beat.get("visibility") or "").strip().lower() or base_visibility
+            )
+            if beat_visibility not in {"public", "private", "limited", "local"}:
+                beat_visibility = base_visibility
+            reasoning = self._trim_text(
+                str(raw_beat.get("reasoning") or "").strip(),
+                180,
+            )
+            if not reasoning:
+                if beat_visibility == "private":
+                    reasoning = "Private beat for the acting character."
+                elif beat_visibility == "limited":
+                    reasoning = "Limited beat for explicit participants."
+                elif beat_visibility == "local":
+                    reasoning = "Visible to the current room."
+                else:
+                    reasoning = "Public beat visible to everyone."
+            beat_type = str(raw_beat.get("type") or "narration").strip().lower() or "narration"
+            speaker = str(raw_beat.get("speaker") or "narrator").strip() or "narrator"
+            actors: List[str] = []
+            raw_actors = raw_beat.get("actors")
+            if isinstance(raw_actors, list):
+                for item in raw_actors:
+                    actor_text = str(item or "").strip()
+                    if actor_text and actor_text not in actors:
+                        actors.append(actor_text)
+            elif isinstance(raw_actors, str):
+                actor_text = str(raw_actors or "").strip()
+                if actor_text:
+                    actors.append(actor_text)
+            if not actors and speaker and speaker != "narrator":
+                actors.append(speaker)
+
+            listeners: List[str] = []
+            raw_listeners = raw_beat.get("listeners")
+            if isinstance(raw_listeners, list):
+                for item in raw_listeners:
+                    listener_text = str(item or "").strip()
+                    if listener_text and listener_text not in listeners:
+                        listeners.append(listener_text)
+            elif isinstance(raw_listeners, str):
+                listener_text = str(raw_listeners or "").strip()
+                if listener_text:
+                    listeners.append(listener_text)
+
+            visible_actor_ids: List[str] = []
+            raw_aware_ids = raw_beat.get("visible_actor_ids")
+            if not isinstance(raw_aware_ids, list):
+                raw_aware_ids = raw_beat.get("aware_actor_ids")
+            if isinstance(raw_aware_ids, list):
+                for item in raw_aware_ids:
+                    aware_id = str(item or "").strip()
+                    if aware_id and aware_id not in visible_actor_ids:
+                        visible_actor_ids.append(aware_id)
+            if not visible_actor_ids and beat_visibility in {"private", "limited"}:
+                for item in base_visible_actor_ids:
+                    if item not in visible_actor_ids:
+                        visible_actor_ids.append(item)
+            if not visible_actor_ids and beat_visibility == "private" and actor_actor_id is not None:
+                visible_actor_ids.append(str(actor_actor_id))
+
+            aware_npc_slugs: List[str] = []
+            raw_aware_npcs = raw_beat.get("aware_npc_slugs")
+            if isinstance(raw_aware_npcs, list):
+                for item in raw_aware_npcs:
+                    candidate = str(item or "").strip()
+                    if not candidate:
+                        continue
+                    resolved = (
+                        self._resolve_existing_character_slug(characters, candidate)
+                        if isinstance(characters, dict)
+                        else None
+                    )
+                    final_slug = resolved or candidate
+                    if final_slug not in aware_npc_slugs:
+                        aware_npc_slugs.append(final_slug)
+            if not aware_npc_slugs and beat_visibility in {"private", "limited"}:
+                for slug in base_aware_npc_slugs:
+                    if slug not in aware_npc_slugs:
+                        aware_npc_slugs.append(slug)
+
+            beat_location_key = (
+                str(raw_beat.get("location_key") or "").strip()
+                or str(scene_output.get("location_key") or "").strip()
+                or str(turn_visibility.get("location_key") or "").strip()
+                or str(fallback_location_key or "").strip()
+            )
+            aware_npc_slugs = self._filter_aware_npc_slugs_for_location_key(
+                campaign,
+                beat_location_key,
+                aware_npc_slugs,
+            )
+            beat_context_key = (
+                str(raw_beat.get("context_key") or "").strip()
+                or str(scene_output.get("context_key") or "").strip()
+                or str(turn_visibility.get("context_key") or "").strip()
+            )
+            beats.append(
+                {
+                    "reasoning": reasoning,
+                    "type": beat_type,
+                    "speaker": speaker,
+                    "actors": actors,
+                    "listeners": listeners,
+                    "visibility": beat_visibility,
+                    "visible_actor_ids": visible_actor_ids,
+                    "aware_npc_slugs": aware_npc_slugs,
+                    "text": self._trim_text(text, self.MAX_NARRATION_CHARS),
+                    "location_key": beat_location_key or None,
+                    "context_key": beat_context_key or None,
+                }
+            )
+
+        if not beats:
+            fallback_text = str(fallback_narration or "").strip()
+            if not fallback_text:
+                return None
+            beats = [
+                {
+                    "reasoning": "Compatibility fallback from plain narration.",
+                    "type": "narration",
+                    "speaker": "narrator",
+                    "actors": [],
+                    "listeners": [],
+                    "visibility": base_visibility,
+                    "visible_actor_ids": base_visible_actor_ids
+                    if base_visibility in {"private", "limited"}
+                    else ([] if actor_actor_id is None or base_visibility != "private" else [str(actor_actor_id)]),
+                    "aware_npc_slugs": base_aware_npc_slugs if base_visibility in {"private", "limited"} else [],
+                    "text": self._trim_text(fallback_text, self.MAX_NARRATION_CHARS),
+                    "location_key": str(turn_visibility.get("location_key") or fallback_location_key or "").strip() or None,
+                    "context_key": str(turn_visibility.get("context_key") or "").strip() or None,
+                }
+            ]
+
+        rendered_text = str(scene_output.get("rendered_text") or "").strip()
+        if not rendered_text:
+            rendered_text = self._trim_text(
+                "\n\n".join(str(beat.get("text") or "").strip() for beat in beats if str(beat.get("text") or "").strip()),
+                self.MAX_NARRATION_CHARS,
+            )
+
+        normalized = {
+            "location_key": (
+                str(scene_output.get("location_key") or "").strip()
+                or str(turn_visibility.get("location_key") or "").strip()
+                or str(fallback_location_key or "").strip()
+                or None
+            ),
+            "context_key": (
+                str(scene_output.get("context_key") or "").strip()
+                or str(turn_visibility.get("context_key") or "").strip()
+                or None
+            ),
+            "actor_player_slug": actor_player_slug or None,
+            "beats": beats,
+            "rendered_text": rendered_text or None,
+        }
+        return normalized
+
+    def _scene_output_rendered_text(
+        self, scene_output: Optional[Dict[str, object]]
+    ) -> str:
+        if not isinstance(scene_output, dict):
+            return ""
+        rendered = str(scene_output.get("rendered_text") or "").strip()
+        if rendered:
+            return self._trim_text(rendered, self.MAX_NARRATION_CHARS)
+        beats = scene_output.get("beats")
+        if not isinstance(beats, list):
+            return ""
+        texts = [
+            str(beat.get("text") or "").strip()
+            for beat in beats
+            if isinstance(beat, dict) and str(beat.get("text") or "").strip()
+        ]
+        if not texts:
+            return ""
+        return self._trim_text("\n\n".join(texts), self.MAX_NARRATION_CHARS)
+
+    def _scene_output_jsonl(
+        self,
+        *,
+        turn_id: Optional[int],
+        game_time: Dict[str, int],
+        scene_output: Optional[Dict[str, object]],
+        turn_visibility: Optional[Dict[str, object]],
+    ) -> str:
+        if not isinstance(scene_output, dict):
+            return ""
+        beats = scene_output.get("beats")
+        if not isinstance(beats, list) or not beats:
+            return ""
+        lines: List[str] = []
+        header = {
+            "kind": "turn",
+            "turn_id": turn_id,
+            "day": self._coerce_non_negative_int(game_time.get("day", 1), default=1) if isinstance(game_time, dict) else 1,
+            "hour": self._coerce_non_negative_int(game_time.get("hour", 0), default=0) if isinstance(game_time, dict) else 0,
+            "minute": self._coerce_non_negative_int(game_time.get("minute", 0), default=0) if isinstance(game_time, dict) else 0,
+            "location_key": scene_output.get("location_key"),
+            "context_key": scene_output.get("context_key"),
+            "visibility": str((turn_visibility or {}).get("scope") or "").strip().lower() or "local",
+        }
+        lines.append(json.dumps(header, ensure_ascii=False, separators=(",", ":")))
+        for beat_index, beat in enumerate(beats):
+            if not isinstance(beat, dict):
+                continue
+            line = {
+                "kind": "beat",
+                "turn_id": turn_id,
+                "index": beat_index,
+                "reasoning": str(beat.get("reasoning") or "").strip(),
+                "type": str(beat.get("type") or "narration").strip(),
+                "speaker": str(beat.get("speaker") or "narrator").strip(),
+                "actors": list(beat.get("actors") or []),
+                "listeners": list(beat.get("listeners") or []),
+                "visibility": str(beat.get("visibility") or "local").strip(),
+                "visible_actor_ids": list(beat.get("visible_actor_ids") or []),
+                "aware_npc_slugs": list(beat.get("aware_npc_slugs") or []),
+                "location_key": beat.get("location_key"),
+                "context_key": beat.get("context_key"),
+                "text": str(beat.get("text") or "").strip(),
+            }
+            lines.append(json.dumps(line, ensure_ascii=False, separators=(",", ":")))
+        return "\n".join(lines)
+
+    def _scene_output_recent_lines(
+        self,
+        turn: Turn,
+        campaign_state: Dict[str, object],
+        scene_output: object,
+        *,
+        viewer_actor_id: Optional[str] = None,
+        viewer_slug: str = "",
+        viewer_location_key: str = "",
+        viewer_private_context_key: str = "",
+        requested_npc_slugs: Optional[set[str]] = None,
+        scene_npc_slugs: Optional[set[str]] = None,
+    ) -> List[str]:
+        if not isinstance(scene_output, dict):
+            return []
+        beats = scene_output.get("beats")
+        if not isinstance(beats, list) or not beats:
+            return []
+        turn_number = int(getattr(turn, "id", 0) or 0)
+        time_index = campaign_state.get(self.TURN_TIME_INDEX_KEY) if isinstance(campaign_state, dict) else {}
+        if not isinstance(time_index, dict):
+            time_index = {}
+        entry = time_index.get(str(turn_number))
+        header: Dict[str, object] = {
+            "kind": "turn",
+            "turn_id": turn_number,
+            "location_key": scene_output.get("location_key"),
+            "context_key": scene_output.get("context_key"),
+        }
+        if isinstance(entry, dict):
+            header["day"] = self._coerce_non_negative_int(entry.get("day", 1), default=1) or 1
+            header["hour"] = min(23, max(0, self._coerce_non_negative_int(entry.get("hour", 0), default=0)))
+            header["minute"] = min(59, max(0, self._coerce_non_negative_int(entry.get("minute", 0), default=0)))
+        meta = self._safe_turn_meta(turn)
+        visibility = meta.get("visibility")
+        if isinstance(visibility, dict):
+            header["visibility"] = str(visibility.get("scope") or "").strip().lower() or None
+        lines: List[str] = [json.dumps(header, ensure_ascii=False, separators=(",", ":"))]
+        meta_location_key_norm = self._normalize_location_key(meta.get("location_key"))
+        fallback_location_key = self._normalize_location_key(
+            scene_output.get("location_key")
+        )
+        fallback_context_key = str(scene_output.get("context_key") or "").strip()
+        viewer_slug_key = self._player_slug_key(viewer_slug)
+        viewer_location_key_norm = self._normalize_location_key(viewer_location_key)
+        viewer_private_context_key_norm = str(viewer_private_context_key or "").strip()
+        for beat_index, beat in enumerate(beats):
+            if not isinstance(beat, dict):
+                continue
+            beat_visibility = str(beat.get("visibility") or "local").strip().lower() or "local"
+            beat_location_keys = {
+                k for k in (
+                    self._normalize_location_key(beat.get("location_key")),
+                    fallback_location_key,
+                    meta_location_key_norm,
+                ) if k
+            }
+            beat_context_key = (
+                str(beat.get("context_key") or "").strip()
+                or fallback_context_key
+            )
+            beat_visible_actor_ids: List[str] = []
+            for item in list(beat.get("visible_actor_ids") or []):
+                aware_id = str(item or "").strip()
+                if aware_id and aware_id not in beat_visible_actor_ids:
+                    beat_visible_actor_ids.append(aware_id)
+            beat_actor_listener_slugs = {
+                self._player_slug_key(item)
+                for item in list(beat.get("actors") or []) + list(beat.get("listeners") or [])
+                if self._player_slug_key(item)
+            }
+            beat_visible = False
+            if beat_visibility in {"", "public"}:
+                beat_visible = True
+            elif beat_visibility == "local":
+                beat_visible = bool(
+                    viewer_location_key_norm
+                    and beat_location_keys
+                    and viewer_location_key_norm in beat_location_keys
+                )
+            elif beat_visibility in {"private", "limited"}:
+                beat_visible = (
+                    (viewer_actor_id is not None and str(viewer_actor_id) in beat_visible_actor_ids)
+                    or (viewer_slug_key and viewer_slug_key in beat_actor_listener_slugs)
+                    or (
+                        viewer_private_context_key_norm
+                        and beat_context_key
+                        and viewer_private_context_key_norm == beat_context_key
+                    )
+                )
+            if not beat_visible and requested_npc_slugs:
+                beat_npc_slugs = {
+                    self._player_slug_key(e)
+                    for e in (
+                        list(beat.get("actors") or [])
+                        + list(beat.get("listeners") or [])
+                        + list(beat.get("aware_npc_slugs") or [])
+                        + [beat.get("speaker")]
+                    )
+                    if self._player_slug_key(e)
+                }
+                requested_npc_keys = {
+                    self._player_slug_key(npc)
+                    for npc in requested_npc_slugs
+                    if self._player_slug_key(npc)
+                }
+                if beat_npc_slugs.intersection(requested_npc_keys):
+                    beat_visible = True
+            if not beat_visible:
+                continue
+            # LCD beat filter: same-room local beats are included by default
+            # for the current scene. Keep stricter participant checks for
+            # private/limited beats.
+            if scene_npc_slugs and beat_visibility not in {"", "public", "local"}:
+                beat_npc_slugs = {
+                    self._player_slug_key(e)
+                    for e in (
+                        list(beat.get("actors") or [])
+                        + list(beat.get("listeners") or [])
+                        + list(beat.get("aware_npc_slugs") or [])
+                        + [beat.get("speaker")]
+                    )
+                    if self._player_slug_key(e)
+                }
+                if not all(
+                    self._player_slug_key(npc) in beat_npc_slugs
+                    for npc in scene_npc_slugs
+                ):
+                    continue
+            lines.append(
+                json.dumps(
+                    {
+                        "kind": "beat",
+                        "turn_id": turn_number,
+                        "index": beat_index,
+                        "reasoning": str(beat.get("reasoning") or "").strip(),
+                        "type": str(beat.get("type") or "narration").strip(),
+                        "speaker": str(beat.get("speaker") or "narrator").strip(),
+                        "actors": list(beat.get("actors") or []),
+                        "listeners": list(beat.get("listeners") or []),
+                        "visibility": str(beat.get("visibility") or "local").strip(),
+                        "visible_actor_ids": beat_visible_actor_ids,
+                        "aware_npc_slugs": list(beat.get("aware_npc_slugs") or []),
+                        "location_key": beat.get("location_key"),
+                        "context_key": beat.get("context_key"),
+                        "text": str(beat.get("text") or "").strip(),
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+            )
+        return lines
+
+    def _compute_recent_turns_metadata(
+        self,
+        recent_turns: List[Turn],
+        *,
+        viewer_actor_id: str,
+        viewer_slug: str,
+    ) -> Dict[str, object]:
+        """Compute quantitative metadata from loaded recent_turns for dynamic RECENT_TURNS_NOTE."""
+        turn_count = len(recent_turns)
+        time_span_minutes = 0
+        if turn_count >= 2:
+            first_created = getattr(recent_turns[-1], "created_at", None)
+            last_created = getattr(recent_turns[0], "created_at", None)
+            if first_created and last_created:
+                try:
+                    delta = (last_created - first_created).total_seconds()
+                    time_span_minutes = max(0, int(delta / 60))
+                except Exception:
+                    pass
+        speaker_counts: Dict[str, int] = {}
+        listener_counts: Dict[str, int] = {}
+        private_turn_count = 0
+        viewer_last_turn_ago = turn_count  # default: never acted
+        viewer_slug_lower = (viewer_slug or "").strip().lower()
+        for idx, turn in enumerate(recent_turns):
+            meta = self._safe_turn_meta(turn)
+            visibility = meta.get("visibility")
+            if isinstance(visibility, dict):
+                scope = str(visibility.get("scope") or "").strip().lower()
+                if scope in {"private", "limited"}:
+                    private_turn_count += 1
+            # Check if viewer acted this turn
+            actor_slug = ""
+            if isinstance(visibility, dict):
+                actor_slug = str(visibility.get("actor_player_slug") or "").strip().lower()
+            if not actor_slug:
+                actor_slug = self._player_slug_key(meta.get("actor_player_slug") or "")
+            if viewer_slug_lower and actor_slug == viewer_slug_lower and idx < viewer_last_turn_ago:
+                viewer_last_turn_ago = idx
+            # Extract speakers/listeners from beats
+            scene_output = meta.get("scene_output")
+            if isinstance(scene_output, dict):
+                beats = scene_output.get("beats")
+                if isinstance(beats, list):
+                    for beat in beats:
+                        if not isinstance(beat, dict):
+                            continue
+                        spk = str(beat.get("speaker") or "").strip()
+                        if spk and spk != "narrator":
+                            speaker_counts[spk] = speaker_counts.get(spk, 0) + 1
+                        for lis in (beat.get("listeners") or []):
+                            lis_str = str(lis or "").strip()
+                            if lis_str:
+                                listener_counts[lis_str] = listener_counts.get(lis_str, 0) + 1
+        active_speakers = [
+            name for name, _ in sorted(speaker_counts.items(), key=lambda x: -x[1])
+        ][:6]
+        active_listeners = sorted(listener_counts.items(), key=lambda x: -x[1])[:6]
+        return {
+            "turn_count": turn_count,
+            "time_span_minutes": time_span_minutes,
+            "active_speakers": active_speakers,
+            "active_listeners": active_listeners,
+            "private_turn_count": private_turn_count,
+            "viewer_last_turn_ago": viewer_last_turn_ago if viewer_last_turn_ago < turn_count else None,
+        }
+
+    def _turn_embedding_metadata(
+        self,
+        *,
+        visibility: Optional[Dict[str, object]],
+        actor_player_slug: object,
+        location_key: object,
+        session_id: object,
+    ) -> Dict[str, object]:
+        visibility = visibility if isinstance(visibility, dict) else {}
+        return {
+            "actor_player_slug": self._player_slug_key(actor_player_slug),
+            "visibility_scope": str(visibility.get("scope") or "public").strip().lower(),
+            "visible_player_slugs": list(visibility.get("visible_player_slugs") or []),
+            "visible_actor_ids": list(visibility.get("visible_actor_ids") or []),
+            "aware_npc_slugs": list(visibility.get("aware_npc_slugs") or []),
+            "location_key": str(location_key or "").strip(),
+            "session_id": session_id,
+        }
+
+    def _memory_tool_text_value(self, text: object, max_chars: int = 4000) -> str:
+        value = str(text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+        if len(value) > max_chars:
+            value = value[:max_chars].rsplit(" ", 1)[0].strip() + "..."
+        return value
+
+    def _memory_tool_jsonl(self, records: List[Dict[str, object]]) -> str:
+        lines: List[str] = []
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            lines.append(json.dumps(record, ensure_ascii=True, separators=(",", ":")))
+        return "\n".join(lines) if lines else "None"
+
+    # ── State Update / Merge ──────────────────────────────────────────────
+
+    def _merge_state_update_with_conflict_resolution(
+        self,
+        authoritative_state: Dict[str, object],
+        delta_update: Dict[str, object],
+    ) -> Dict[str, object]:
+        """Deep-merge *delta_update* into *authoritative_state* with per-key
+        conflict resolution suitable for concurrent Phase 3 commits.
+
+        Rules:
+        * ``game_time`` -- monotonic max (keeps the later time).
+        * ``current_chapter`` / ``current_scene`` -- left for the normal
+          advancement guards that run after this merge.
+        * Nested dicts -- shallow merge (``{**current[key], **delta[key]}``).
+        * Scalar keys -- last-writer-wins (delta overwrites).
+        * ``None`` values -- delete the key (existing ``_apply_state_update``
+          behaviour).
+        """
+        if not isinstance(delta_update, dict):
+            return authoritative_state
+
+        # Handle game_time monotonic-max separately.
+        delta_time = delta_update.get("game_time")
+        if isinstance(delta_time, dict) and delta_time:
+            current_time = authoritative_state.get("game_time", {})
+            if isinstance(current_time, dict):
+                delta_minutes = self._game_time_to_total_minutes(delta_time)
+                current_minutes = self._game_time_to_total_minutes(current_time)
+                if delta_minutes > current_minutes:
+                    authoritative_state["game_time"] = delta_time
+                # else: keep current -- it's already further ahead.
+            else:
+                authoritative_state["game_time"] = delta_time
+            delta_update = {k: v for k, v in delta_update.items() if k != "game_time"}
+
+        # Merge remaining keys.
+        pruned_keys: List[str] = []
+        for key, value in delta_update.items():
+            if value is None:
+                authoritative_state.pop(key, None)
+                pruned_keys.append(key)
+            elif (
+                isinstance(value, str)
+                and value.strip().lower() in self._COMPLETED_VALUES
+            ):
+                authoritative_state.pop(key, None)
+                pruned_keys.append(key)
+            elif isinstance(value, dict):
+                existing = authoritative_state.get(key)
+                if isinstance(existing, dict):
+                    # Shallow merge: delta keys overwrite, existing keys retained.
+                    merged = {**existing, **value}
+                    # Honour None deletes within nested dict.
+                    merged = {k: v for k, v in merged.items() if v is not None}
+                    authoritative_state[key] = merged
+                else:
+                    authoritative_state[key] = value
+            else:
+                authoritative_state[key] = value
+
+        if pruned_keys:
+            self._auto_resolve_stale_plot_threads(authoritative_state, pruned_keys)
+        return authoritative_state
+
+    def _merge_character_updates(
+        self,
+        existing_chars: Dict[str, object],
+        delta_updates: Dict[str, object],
+    ) -> Dict[str, object]:
+        """Per-slug merge for character_updates with conflict resolution.
+
+        * Same NPC updated by two turns: merge mutable fields (last-writer-wins
+          per field).
+        * Deletion from either turn: deletion wins.
+        * New NPC from either turn: add.
+        """
+        if not isinstance(delta_updates, dict):
+            return existing_chars
+        for slug, delta_char in delta_updates.items():
+            if delta_char is None:
+                # Deletion wins.
+                existing_chars.pop(slug, None)
+                continue
+            existing = existing_chars.get(slug)
+            if existing is None or not isinstance(existing, dict):
+                existing_chars[slug] = delta_char
+            elif isinstance(delta_char, dict):
+                # Per-field merge.
+                for field_key, field_val in delta_char.items():
+                    if field_val is None:
+                        existing.pop(field_key, None)
+                    else:
+                        existing[field_key] = field_val
+        return existing_chars
+
+    def _ensure_minimum_state_update_contract(
+        self,
+        campaign_state: Dict[str, object],
+        state_update: object,
+    ) -> Dict[str, object]:
+        out = dict(state_update) if isinstance(state_update, dict) else {}
+        current_time = self._extract_game_time_snapshot(campaign_state)
+        provided_time = out.get("game_time")
+        if isinstance(provided_time, dict):
+            out["game_time"] = self._game_time_from_total_minutes(
+                self._game_time_to_total_minutes(provided_time)
+            )
+        else:
+            out["game_time"] = self._game_time_from_total_minutes(
+                self._game_time_to_total_minutes(current_time)
+            )
+        if bool(campaign_state.get("on_rails", False)):
+            out["current_chapter"] = self._coerce_non_negative_int(
+                out.get("current_chapter", campaign_state.get("current_chapter", 0)),
+                default=self._coerce_non_negative_int(
+                    campaign_state.get("current_chapter", 0), default=0
+                ),
+            )
+            out["current_scene"] = self._coerce_non_negative_int(
+                out.get("current_scene", campaign_state.get("current_scene", 0)),
+                default=self._coerce_non_negative_int(
+                    campaign_state.get("current_scene", 0), default=0
+                ),
+            )
+            return out
+
+        active_chapters = self._chapters_for_prompt(
+            campaign_state,
+            active_only=True,
+            limit=1,
+        )
+        active_row = active_chapters[0] if active_chapters else {}
+        default_chapter = self._chapter_slug_key(
+            active_row.get("slug") or campaign_state.get("current_chapter")
+        )
+        default_scene = self._chapter_slug_key(
+            active_row.get("current_scene") or campaign_state.get("current_scene")
+        )
+
+        chapter_slug = self._chapter_slug_key(out.get("current_chapter"))
+        scene_slug = self._chapter_slug_key(out.get("current_scene"))
+
+        # Guard: reject chapter/scene slugs that don't match the chapter plan.
+        # This prevents the model from hallucinating old or nonexistent values.
+        all_chapters = self._chapter_plan_from_state(campaign_state)
+        if chapter_slug and all_chapters and chapter_slug not in all_chapters:
+            self._zork_log(
+                "CHAPTER REGRESSION BLOCKED",
+                f"Model sent current_chapter={chapter_slug!r} which is not in "
+                f"chapter plan {sorted(all_chapters.keys())!r}; falling back to {default_chapter!r}",
+            )
+            chapter_slug = ""
+        resolved_chapter = chapter_slug or default_chapter or ""
+        if scene_slug and resolved_chapter and resolved_chapter in all_chapters:
+            valid_scenes = all_chapters[resolved_chapter].get("scenes") or []
+            if valid_scenes and scene_slug not in valid_scenes:
+                self._zork_log(
+                    "SCENE REGRESSION BLOCKED",
+                    f"Model sent current_scene={scene_slug!r} which is not in "
+                    f"chapter {resolved_chapter!r} scenes {valid_scenes!r}; falling back to {default_scene!r}",
+                )
+                scene_slug = ""
+        out["current_chapter"] = resolved_chapter
+        out["current_scene"] = scene_slug or default_scene or ""
+        return out
+
+    def _guard_state_null_character_prunes(
+        self,
+        state_update: object,
+        existing_chars: Dict[str, dict],
+        *,
+        resolution_context: str = "",
+        campaign_state: Optional[Dict[str, object]] = None,
+    ) -> Dict[str, object]:
+        if not isinstance(state_update, dict):
+            return {}
+        if not isinstance(existing_chars, dict):
+            return dict(state_update)
+        candidate_deletes: Dict[str, object] = {}
+        for raw_key, value in state_update.items():
+            if value is not None:
+                continue
+            resolved = self._resolve_existing_character_slug(existing_chars, raw_key)
+            if resolved:
+                candidate_deletes[str(raw_key)] = None
+        if not candidate_deletes:
+            return dict(state_update)
+        allowed_deletes = self._sanitize_character_removals(
+            existing_chars,
+            candidate_deletes,
+            resolution_context=resolution_context,
+            campaign_state=campaign_state,
+            counter_key="state_character_prune_blocked",
+        )
+        out = dict(state_update)
+        for raw_key in candidate_deletes.keys():
+            if raw_key not in allowed_deletes:
+                out.pop(raw_key, None)
+        return out
+
+    def _sanitize_character_removals(
+        self,
+        existing_chars: Dict[str, dict],
+        updates: object,
+        *,
+        resolution_context: str = "",
+        campaign_state: Optional[Dict[str, object]] = None,
+        counter_key: str = "character_remove_blocked",
+    ) -> Dict[str, object]:
+        if not isinstance(updates, dict):
+            return {}
+        # Character deletion is now fully model-controlled (reasoning + structured updates).
+        # Keep this hook for compatibility, but do not block removals.
+        return dict(updates)
+
+    def _normalize_story_progression(self, value: object) -> Optional[Dict[str, object]]:
+        if not isinstance(value, dict):
+            return None
+        target = " ".join(str(value.get("target") or "").strip().lower().split())
+        target = target.replace("_", "-")
+        allowed_targets = {"hold", "next-scene", "next-chapter"}
+        if target not in allowed_targets:
+            target = "hold"
+        advance_raw = value.get("advance")
+        if isinstance(advance_raw, bool):
+            advance = advance_raw
+        else:
+            advance_text = " ".join(str(advance_raw or "").strip().lower().split())
+            advance = advance_text in {"1", "true", "yes", "y", "advance"}
+        if target == "hold":
+            advance = False
+        reason = " ".join(str(value.get("reason") or "").strip().split())[:300]
+        return {
+            "advance": advance,
+            "target": target,
+            "reason": reason,
+        }
+
+    def _apply_story_progression_hint(
+        self,
+        campaign_state: Dict[str, object],
+        story_progression: Optional[Dict[str, object]],
+        state_update: Dict[str, object],
+    ) -> bool:
+        if not bool(campaign_state.get("on_rails", False)):
+            return False
+        if not isinstance(state_update, dict):
+            return False
+        if "current_chapter" in state_update or "current_scene" in state_update:
+            return False
+        if not isinstance(story_progression, dict):
+            return False
+        if not bool(story_progression.get("advance")):
+            return False
+
+        outline = campaign_state.get("story_outline")
+        if not isinstance(outline, dict):
+            return False
+        chapters = outline.get("chapters")
+        if not isinstance(chapters, list) or not chapters:
+            return False
+
+        old_ch = self._coerce_non_negative_int(
+            campaign_state.get("current_chapter", 0), default=0
+        )
+        old_sc = self._coerce_non_negative_int(
+            campaign_state.get("current_scene", 0), default=0
+        )
+        old_ch = min(old_ch, len(chapters) - 1)
+        current_entry = chapters[old_ch] if 0 <= old_ch < len(chapters) else {}
+        scenes = current_entry.get("scenes")
+        if not isinstance(scenes, list):
+            scenes = []
+
+        target = str(story_progression.get("target") or "hold")
+        new_ch = old_ch
+        new_sc = old_sc
+        if target == "next-chapter":
+            if old_ch + 1 >= len(chapters):
+                return False
+            new_ch = old_ch + 1
+            new_sc = 0
+            if isinstance(current_entry, dict):
+                current_entry["completed"] = True
+        elif target == "next-scene":
+            if scenes and old_sc + 1 < len(scenes):
+                new_sc = old_sc + 1
+            elif old_ch + 1 < len(chapters):
+                new_ch = old_ch + 1
+                new_sc = 0
+                if isinstance(current_entry, dict):
+                    current_entry["completed"] = True
+            else:
+                return False
+        else:
+            return False
+
+        campaign_state["current_chapter"] = new_ch
+        campaign_state["current_scene"] = new_sc
+        return True
+
+    # ── Prompt Construction ───────────────────────────────────────────────
+
+    def _recompose_prompt_with_tail(
+        self,
+        prompt: str,
+        turn_prompt_tail: str,
+        *inserted_blocks: object,
+    ) -> str:
+        prompt_text = str(prompt or "")
+        tail_text = str(turn_prompt_tail or "").strip()
+        base = prompt_text
+        if tail_text:
+            with_newline = f"\n{tail_text}\n"
+            without_newline = f"\n{tail_text}"
+            if prompt_text.endswith(with_newline):
+                base = prompt_text[: -len(with_newline)]
+            elif prompt_text.endswith(without_newline):
+                base = prompt_text[: -len(without_newline)]
+            elif prompt_text.endswith(tail_text):
+                base = prompt_text[: -len(tail_text)]
+        tail_marker = "\nPLAYER_ACTION "
+        marker_index = base.rfind(tail_marker)
+        if marker_index == -1 and base.startswith("PLAYER_ACTION "):
+            marker_index = 0
+        if marker_index >= 0:
+            base = base[:marker_index]
+        parts = [base.rstrip("\n")]
+        for block in inserted_blocks:
+            text = str(block or "").strip()
+            if text:
+                parts.append(text)
+        if tail_text:
+            parts.append(tail_text)
+        return "\n".join(part for part in parts if part)
+
+    def _auto_advance_on_rails_story_context(
+        self,
+        campaign_state: Dict[str, object],
+        *,
+        action_text: str,
+        narration: str,
+        summary_update: object,
+        state_update: Dict[str, object],
+        player_state_update: Dict[str, object],
+        character_updates: Dict[str, object],
+        calendar_update: object,
+    ) -> bool:
+        if not bool(campaign_state.get("on_rails", False)):
+            return False
+        outline = campaign_state.get("story_outline")
+        if not isinstance(outline, dict):
+            return False
+        chapters = outline.get("chapters")
+        if not isinstance(chapters, list) or not chapters:
+            return False
+        if not isinstance(state_update, dict):
+            return False
+        if "current_chapter" in state_update or "current_scene" in state_update:
+            return False
+
+        action_clean = " ".join(str(action_text or "").strip().lower().split())
+        if not action_clean:
+            return False
+        if action_clean in {
+            "look",
+            "l",
+            "inventory",
+            "inv",
+            "i",
+            "calendar",
+            "cal",
+            "events",
+            "roster",
+            "characters",
+            "npcs",
+        }:
+            return False
+        if action_clean.startswith("[ooc"):
+            return False
+
+        if self._is_emptyish_turn_payload(
+            narration=narration,
+            state_update=state_update,
+            player_state_update=player_state_update if isinstance(player_state_update, dict) else {},
+            summary_update=summary_update,
+            xp_awarded=0,
+            scene_image_prompt=None,
+            character_updates=character_updates if isinstance(character_updates, dict) else {},
+            calendar_update=calendar_update,
+        ):
+            return False
+
+        old_ch = self._coerce_non_negative_int(
+            campaign_state.get("current_chapter", 0), default=0
+        )
+        old_sc = self._coerce_non_negative_int(
+            campaign_state.get("current_scene", 0), default=0
+        )
+        old_ch = min(old_ch, len(chapters) - 1)
+        current_entry = chapters[old_ch] if 0 <= old_ch < len(chapters) else {}
+        scenes = current_entry.get("scenes")
+        if not isinstance(scenes, list):
+            scenes = []
+
+        looks_major = self._looks_like_major_narrative_beat(
+            narration=narration,
+            summary_update=summary_update,
+            state_update=state_update,
+            character_updates=character_updates if isinstance(character_updates, dict) else {},
+            calendar_update=calendar_update,
+        )
+        has_player_motion = bool(
+            isinstance(player_state_update, dict)
+            and any(
+                key in player_state_update
+                for key in ("location", "room_title", "room_summary", "room_description")
+            )
+        )
+        has_scene_signal = bool(str(summary_update or "").strip()) or has_player_motion or looks_major
+        if not has_scene_signal:
+            return False
+
+        new_ch = old_ch
+        new_sc = old_sc
+        if scenes and old_sc + 1 < len(scenes):
+            new_sc = old_sc + 1
+        elif old_ch + 1 < len(chapters):
+            new_ch = old_ch + 1
+            new_sc = 0
+            if isinstance(current_entry, dict):
+                current_entry["completed"] = True
+        else:
+            return False
+
+        campaign_state["current_chapter"] = new_ch
+        campaign_state["current_scene"] = new_sc
+        return True
+
+    def _looks_like_major_narrative_beat(
+        self,
+        *,
+        narration: str,
+        summary_update: object,
+        state_update: Dict[str, object],
+        character_updates: Dict[str, object],
+        calendar_update: object,
+    ) -> bool:
+        text = " ".join(
+            (
+                f"{str(narration or '')} "
+                f"{str(summary_update or '')}"
+            ).lower().split()
+        )
+        major_cues = (
+            "reveals",
+            "reveal",
+            "confirms",
+            "confirmed",
+            "pregnant",
+            "paternity",
+            "dies",
+            "dead",
+            "betray",
+            "arrest",
+            "results",
+            "test result",
+            "truth",
+            "identity",
+            "confession",
+            "explodes",
+            "escape",
+            "ambush",
+        )
+        if any(cue in text for cue in major_cues):
+            return True
+        if isinstance(character_updates, dict):
+            for row in character_updates.values():
+                if isinstance(row, dict) and str(row.get("deceased_reason") or "").strip():
+                    return True
+        if isinstance(calendar_update, dict) and calendar_update:
+            if isinstance(calendar_update.get("add"), list) or isinstance(
+                calendar_update.get("remove"), list
+            ):
+                return True
+        return False
+
+    def _source_lookup_requested_by_action(self, action_text: object) -> bool:
+        if self._is_ooc_action_text(action_text):
+            return False
+        text = " ".join(str(action_text or "").strip().lower().split())
+        if not text:
+            return False
+        intent_markers = (
+            "remember",
+            "recall",
+            "what happened",
+            "previously",
+            "backstory",
+            "history",
+            "who is",
+            "what is",
+            "according to",
+            "from the book",
+            "from source",
+            "source material",
+            "canon",
+            "lore",
+            "look up",
+        )
+        return any(marker in text for marker in intent_markers)
+
+    # ── Memory / Source Material ──────────────────────────────────────────
+
+    def _derive_auto_memory_queries(
+        self,
+        action_text: str,
+        player_state: Dict[str, object],
+        party_snapshot: List[Dict[str, object]],
+        limit: int = 4,
+    ) -> List[str]:
+        out: List[str] = []
+        seen: set[str] = set()
+
+        def _push(raw: object) -> None:
+            text = " ".join(str(raw or "").strip().split())
+            if not text:
+                return
+            key = text.lower()
+            if key in seen:
+                return
+            seen.add(key)
+            out.append(text[:120])
+
+        _push(player_state.get("location"))
+        _push(player_state.get("room_title"))
+        player_name = " ".join(
+            str(player_state.get("character_name") or "").strip().lower().split()
+        )
+        for row in party_snapshot[: self.MAX_PARTY_CONTEXT_PLAYERS]:
+            if not isinstance(row, dict):
+                continue
+            name = " ".join(str(row.get("name") or "").strip().split())
+            if not name:
+                continue
+            if name.lower() == player_name:
+                continue
+            _push(name)
+            if len(out) >= limit:
+                break
+        _push(action_text)
+        return out[: max(1, int(limit or 4))]
+
+    def _should_force_auto_memory_search(self, action_text: str) -> bool:
+        if self._is_ooc_action_text(action_text):
+            return False
+        text = " ".join(str(action_text or "").strip().lower().split())
+        if not text or text.startswith("!"):
+            return False
+        if len(text) < 6:
+            return False
+        trivial = {
+            "look",
+            "l",
+            "inventory",
+            "inv",
+            "i",
+            "map",
+            "yes",
+            "y",
+            "no",
+            "n",
+            "ok",
+            "okay",
+            "thanks",
+            "thank you",
+        }
+        return text not in trivial
+
+    def _record_memory_search_usage_and_hints(
+        self,
+        campaign: Campaign,
+        queries: List[str],
+    ) -> List[Dict[str, object]]:
+        campaign_state = self.get_campaign_state(campaign)
+        usage = self._memory_search_usage_from_state(campaign_state)
+        updated_keys: List[str] = []
+        for query in queries[:8]:
+            query_text = str(query or "").strip()
+            if not query_text:
+                continue
+            term_key = self._memory_search_term_key(query_text)
+            if not term_key:
+                continue
+            row = usage.get(term_key, {"count": 0, "label": query_text[:120]})
+            row["count"] = self._coerce_non_negative_int(row.get("count", 0), default=0) + 1
+            if not str(row.get("label") or "").strip():
+                row["label"] = query_text[:120]
+            usage[term_key] = row
+            updated_keys.append(term_key)
+
+        if len(usage) > self.MEMORY_SEARCH_USAGE_MAX_TERMS:
+            ranked = sorted(
+                usage.items(),
+                key=lambda kv: (
+                    self._coerce_non_negative_int(kv[1].get("count", 0), default=0),
+                    kv[0],
+                ),
+                reverse=True,
+            )
+            usage = dict(ranked[: self.MEMORY_SEARCH_USAGE_MAX_TERMS])
+
+        campaign_state[self.MEMORY_SEARCH_USAGE_KEY] = usage
+        with self._session_factory() as session:
+            db_row = session.get(Campaign, campaign.id)
+            if db_row:
+                db_row.state_json = self._dump_json(campaign_state)
+                db_row.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
+                session.commit()
+
+        characters = self.get_campaign_characters(campaign)
+        hints: List[Dict[str, object]] = []
+        seen_keys: set[str] = set()
+        for term_key in updated_keys:
+            if term_key in seen_keys:
+                continue
+            seen_keys.add(term_key)
+            hint_row = usage.get(term_key) or {}
+            count = self._coerce_non_negative_int(hint_row.get("count", 0), default=0)
+            if count < self.MEMORY_SEARCH_ROSTER_HINT_THRESHOLD:
+                continue
+            if not self._memory_search_term_looks_character_like(term_key):
+                continue
+            if isinstance(characters, dict) and self._resolve_existing_character_slug(characters, term_key):
+                continue
+            hints.append(
+                {
+                    "term": str(hint_row.get("label") or term_key),
+                    "slug": term_key,
+                    "count": count,
+                }
+            )
+        return hints
+
+    @staticmethod
+    def _source_wildcard_matches(text: str, wildcard: str) -> bool:
+        pattern = str(wildcard or "%").strip()
+        if not pattern or pattern in {"*", "%", "%%"}:
+            return True
+        regex = re.escape(pattern.replace("*", "%")).replace("%", ".*")
+        return bool(re.match(rf"(?is)^{regex}$", str(text or "").strip()))
+
+    def _browse_builtin_source_keys(
+        self,
+        *,
+        document_key: Optional[str] = None,
+        wildcard: str = "%",
+        limit: int = 255,
+    ) -> List[str]:
+        built_in_key = self.communication_rulebook_document_key()
+        requested_key = (
+            SourceMaterialMemory._normalize_source_document_key(str(document_key or ""))
+            if document_key
+            else ""
+        )
+        if requested_key and requested_key != built_in_key:
+            return []
+        pattern = str(wildcard or "%").strip()
+        broad_browse = pattern in {"", "*", "%", "%%"}
+        out: List[str] = []
+        seen: set[str] = set()
+        for line in self._communication_rulebook_lines():
+            key_text = line.split(":", 1)[0].strip() if ":" in line else line
+            target_text = key_text if broad_browse else line
+            if not self._source_wildcard_matches(target_text, pattern):
+                continue
+            if broad_browse:
+                entry = key_text if requested_key else f"{built_in_key}: {key_text}"
+            else:
+                entry = line
+            normalized = " ".join(str(entry or "").lower().split())
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            out.append(entry)
+            if len(out) >= max(1, int(limit)):
+                break
+        return out
+
+    def _search_builtin_source_material(
+        self,
+        query: str,
+        *,
+        document_key: Optional[str] = None,
+        top_k: int = 5,
+        before_lines: int = 0,
+        after_lines: int = 0,
+    ) -> List[Tuple[str, str, int, str, float]]:
+        built_in_key = self.communication_rulebook_document_key()
+        requested_key = (
+            SourceMaterialMemory._normalize_source_document_key(str(document_key or ""))
+            if document_key
+            else ""
+        )
+        if requested_key and requested_key != built_in_key:
+            return []
+        query_text = " ".join(str(query or "").lower().split())
+        if not query_text:
+            return []
+        query_terms = [term for term in re.split(r"[^a-z0-9]+", query_text) if term]
+        lines = self._communication_rulebook_lines()
+        scored: List[Tuple[int, float]] = []
+        for idx, line in enumerate(lines, start=1):
+            hay = line.lower()
+            key_text = line.split(":", 1)[0].strip().lower() if ":" in line else ""
+            score = 0.0
+            if query_text in hay:
+                score = 1.0
+                if query_text in key_text:
+                    score += 0.2
+            elif query_terms:
+                overlap = sum(1 for term in query_terms if term in hay)
+                if overlap:
+                    score = overlap / max(1, len(query_terms))
+                    key_overlap = sum(1 for term in query_terms if term in key_text)
+                    if key_overlap:
+                        score += key_overlap / max(1, len(query_terms) * 2)
+            if score > 0.0:
+                scored.append((idx, score))
+        scored.sort(key=lambda item: (item[1], -item[0]), reverse=True)
+        before_n = max(0, int(before_lines or 0))
+        after_n = max(0, int(after_lines or 0))
+        out: List[Tuple[str, str, int, str, float]] = []
+        for center_idx, score in scored[: max(1, int(top_k))]:
+            start_idx = max(1, center_idx - before_n)
+            end_idx = min(len(lines), center_idx + after_n)
+            window = [lines[i - 1] for i in range(start_idx, end_idx + 1)]
+            out.append(
+                (
+                    built_in_key,
+                    self.COMMUNICATION_RULEBOOK_DOCUMENT_LABEL,
+                    center_idx,
+                    "\n".join(window),
+                    float(score),
+                )
+            )
+        return out
+
+    def _browse_source_keys(
+        self,
+        campaign_id: str,
+        *,
+        document_key: Optional[str] = None,
+        wildcard: str = "%",
+        limit: int = 255,
+    ) -> List[str]:
+        built_in = self._browse_builtin_source_keys(
+            document_key=document_key,
+            wildcard=wildcard,
+            limit=limit,
+        )
+        requested_key = (
+            SourceMaterialMemory._normalize_source_document_key(str(document_key or ""))
+            if document_key
+            else ""
+        )
+        if requested_key == self.communication_rulebook_document_key():
+            return built_in[: max(1, int(limit))]
+        rows = SourceMaterialMemory.browse_source_keys(
+            campaign_id,
+            document_key=document_key,
+            wildcard=wildcard,
+            limit=limit,
+        )
+        merged: List[str] = []
+        seen: set[str] = set()
+        for row in [*built_in, *rows]:
+            normalized = " ".join(str(row or "").lower().split())
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            merged.append(str(row))
+            if len(merged) >= max(1, int(limit)):
+                break
+        return merged
+
+    def _search_source_material(
+        self,
+        query: str,
+        campaign_id: str,
+        *,
+        document_key: Optional[str] = None,
+        top_k: int = 5,
+        before_lines: int = 0,
+        after_lines: int = 0,
+    ) -> List[Tuple[str, str, int, str, float]]:
+        requested_key = (
+            SourceMaterialMemory._normalize_source_document_key(str(document_key or ""))
+            if document_key
+            else ""
+        )
+        built_in_key = self.communication_rulebook_document_key()
+        db_hits: List[Tuple[str, str, int, str, float]] = []
+        if requested_key != built_in_key:
+            db_hits = SourceMaterialMemory.search_source_material(
+                query,
+                campaign_id,
+                document_key=document_key,
+                top_k=top_k,
+                before_lines=before_lines,
+                after_lines=after_lines,
+            )
+        built_in_hits = self._search_builtin_source_material(
+            query,
+            document_key=document_key,
+            top_k=top_k,
+            before_lines=before_lines,
+            after_lines=after_lines,
+        )
+        merged = [*built_in_hits, *db_hits]
+        merged.sort(key=lambda row: float(row[4] or 0.0), reverse=True)
+        seen: set[Tuple[str, int]] = set()
+        out: List[Tuple[str, str, int, str, float]] = []
+        for row in merged:
+            row_key = (str(row[0] or "").strip(), int(row[2] or 0))
+            if row_key in seen:
+                continue
+            seen.add(row_key)
+            out.append(row)
+            if len(out) >= max(1, int(top_k)):
+                break
+        return out
+
+    def _list_source_material_documents(
+        self,
+        campaign_id: str,
+        *,
+        limit: int = 20,
+    ) -> List[Dict[str, object]]:
+        docs = SourceMaterialMemory.list_source_material_documents(
+            campaign_id,
+            limit=max(1, int(limit)),
+        )
+        built_in_doc = {
+            "document_key": self.communication_rulebook_document_key(),
+            "document_label": self.COMMUNICATION_RULEBOOK_DOCUMENT_LABEL,
+            "chunk_count": len(self.DEFAULT_GM_COMMUNICATION_RULES),
+            "sample_chunk": "\n".join(self._communication_rulebook_lines()[:6]),
+        }
+        return [built_in_doc, *docs][: max(1, int(limit))]
+
+    # ── Misc Core ─────────────────────────────────────────────────────────
+
+    async def _compress_autobiography_with_model(
+        self,
+        *,
+        character_slug: str,
+        character_name: str,
+        current_autobiography: str,
+        raw_entries: list[dict[str, object]],
+    ) -> str:
+        current_text = self._sanitize_autobiography_text(
+            current_autobiography,
+            max_chars=self.MAX_AUTOBIOGRAPHY_TEXT_CHARS,
+        )
+        entry_lines: list[str] = []
+        for row in raw_entries[-16:]:
+            if not isinstance(row, dict):
+                continue
+            a_text = self._sanitize_autobiography_text(
+                row.get("a"),
+                max_chars=self.MAX_AUTOBIOGRAPHY_ENTRY_CHARS,
+            )
+            b_text = self._sanitize_autobiography_text(
+                row.get("b"),
+                max_chars=self.MAX_AUTOBIOGRAPHY_ENTRY_CHARS,
+            )
+            c_text = self._sanitize_autobiography_text(
+                row.get("c"),
+                max_chars=self.MAX_AUTOBIOGRAPHY_ENTRY_CHARS,
+            )
+            legacy_text = self._sanitize_autobiography_text(
+                row.get("text"),
+                max_chars=self.MAX_AUTOBIOGRAPHY_ENTRY_CHARS,
+            )
+            if not (a_text or b_text or c_text or legacy_text):
+                continue
+            stamp = ""
+            gt = row.get("game_time")
+            if isinstance(gt, dict):
+                day = self._coerce_non_negative_int(gt.get("day"), default=0)
+                hour = min(23, max(0, self._coerce_non_negative_int(gt.get("hour"), default=0)))
+                minute = min(59, max(0, self._coerce_non_negative_int(gt.get("minute"), default=0)))
+                if day > 0:
+                    stamp = f"Day {day} {hour:02d}:{minute:02d} "
+            importance = " ".join(str(row.get("importance") or "").strip().split())[:40]
+            trigger = " ".join(str(row.get("trigger") or "").strip().split())[:80]
+            raw_row: dict[str, str] = {}
+            if trigger:
+                raw_row["trigger"] = trigger
+            if importance:
+                raw_row["importance"] = importance
+            if a_text:
+                raw_row["a"] = a_text
+            if b_text:
+                raw_row["b"] = b_text
+            if c_text:
+                raw_row["c"] = c_text
+            if legacy_text and not raw_row.get("a") and not raw_row.get("b") and not raw_row.get("c"):
+                raw_row["text"] = legacy_text
+            payload_text = json.dumps(raw_row, ensure_ascii=True)
+            entry_lines.append(f"- {stamp}{payload_text}".strip())
+        system_prompt = (
+            "You are compressing a character autobiography. "
+            "Output ONLY the rewritten autobiography text, in first person, in the character's own voice. "
+            "Do not output JSON, labels, bullets, or explanation.\n"
+            "Rules:\n"
+            "- Preserve values, patterns, loyalties, and self-understanding the character still acts from.\n"
+            "- Preserve unresolved contradictions as tension; do not resolve them unless the story already did.\n"
+            "- Preserve relationship turns that changed the character's understanding of someone.\n"
+            "- Compress repetition. Keep only what future narration needs to write the character accurately.\n"
+            "- The autobiography is constitutional: growth is allowed, drift without reckoning is not.\n"
+        )
+        user_prompt = (
+            f"CHARACTER: {character_name} ({character_slug})\n"
+            f"CURRENT_AUTOBIOGRAPHY: {current_text or '(none)'}\n"
+            "RAW_ENTRIES:\n"
+            f"{chr(10).join(entry_lines) or '(none)'}\n"
+            f"Write a compressed autobiography no longer than {self.MAX_AUTOBIOGRAPHY_TEXT_CHARS} characters."
+        )
+        if self._completion_port is None:
+            return current_text or ""
+        response = await self._completion_port.complete(
+            system_prompt,
+            user_prompt,
+            temperature=0.3,
+            max_tokens=700,
+        )
+        cleaned = self._clean_response(response or "")
+        cleaned = re.sub(r"^```[\w-]*\s*", "", cleaned).strip()
+        cleaned = re.sub(r"\s*```$", "", cleaned).strip()
+        return self._sanitize_autobiography_text(
+            cleaned,
+            max_chars=self.MAX_AUTOBIOGRAPHY_TEXT_CHARS,
+        )
+
+    def _fallback_narration_from_payload(self, payload: Dict[str, object]) -> str:
+        if not isinstance(payload, dict):
+            return ""
+        player_state_update = payload.get("player_state_update")
+        if isinstance(player_state_update, dict):
+            room_summary = str(player_state_update.get("room_summary") or "").strip()
+            if room_summary:
+                return room_summary[:300]
+            room_title = str(player_state_update.get("room_title") or "").strip()
+            if room_title:
+                return f"{room_title}."
+        summary_update = str(payload.get("summary_update") or "").strip()
+        if summary_update:
+            return summary_update.splitlines()[0][:300]
+        character_updates = payload.get("character_updates")
+        if isinstance(character_updates, dict) and character_updates:
+            return "Character roster updated."
+        calendar_update = payload.get("calendar_update")
+        if isinstance(calendar_update, dict) and calendar_update:
+            return "Calendar updated."
+        state_update = payload.get("state_update")
+        if isinstance(state_update, dict) and state_update:
+            return "Noted."
+        if isinstance(player_state_update, dict) and player_state_update:
+            return "Noted."
+        return ""
+
+    def _brief_event_summary(
+        self,
+        *,
+        action_text: str,
+        summary_update: object,
+        narration_text: str,
+    ) -> str:
+        summary = " ".join(str(summary_update or "").strip().split())
+        if summary:
+            return self._trim_text(summary, 260)
+        narration_lines = []
+        for line in str(narration_text or "").splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if stripped.lower().startswith("inventory:"):
+                continue
+            if stripped.startswith("\u23f0"):
+                continue
+            narration_lines.append(stripped)
+            if len(narration_lines) >= 2:
+                break
+        if narration_lines:
+            return self._trim_text(" ".join(narration_lines), 260)
+        return self._trim_text(" ".join(str(action_text or "").strip().split()), 180)
