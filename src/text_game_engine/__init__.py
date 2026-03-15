@@ -20,7 +20,7 @@ from .backends import (
 )
 from .core.dice import format_dice_result, resolve_dice_check, roll_d20, skill_check
 from .core.engine import GameEngine
-from .core.emulator_ports import IMDBLookupPort, MediaGenerationPort, MemorySearchPort, TextCompletionPort, TimerEffectsPort
+from .core.emulator_ports import IMDBLookupPort, MediaGenerationPort, MemorySearchPort, NotificationPort, TextCompletionPort, TimerEffectsPort
 from .core.minigames import MinigameEngine, MinigameState
 from .core.puzzles import PuzzleEngine, PuzzleState
 from .core.tokens import glm_token_count

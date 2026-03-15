@@ -86,6 +86,15 @@ class IMDBLookupPort(Protocol):
         ...
 
 
+class NotificationPort(Protocol):
+    async def send_dm(
+        self,
+        actor_id: str,
+        message: str,
+    ) -> None:
+        ...
+
+
 class MediaGenerationPort(Protocol):
     def gpu_worker_available(self) -> bool:
         ...
