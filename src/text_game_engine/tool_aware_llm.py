@@ -315,6 +315,7 @@ class ToolAwareZorkLLM:
         short_narration = len(narration) < 24
         state_update = payload.get("state_update")
         player_state_update = payload.get("player_state_update")
+        other_player_state_updates = payload.get("other_player_state_updates")
         summary_update = payload.get("summary_update")
         character_updates = payload.get("character_updates")
         calendar_update = payload.get("calendar_update")
@@ -323,6 +324,7 @@ class ToolAwareZorkLLM:
         has_signal = (
             bool(state_update)
             or bool(player_state_update)
+            or bool(other_player_state_updates)
             or bool(character_updates)
             or bool(calendar_update)
         )
@@ -369,6 +371,10 @@ class ToolAwareZorkLLM:
             return True
         if isinstance(payload.get("character_updates"), dict):
             for row in payload.get("character_updates", {}).values():
+                if isinstance(row, dict) and str(row.get("deceased_reason") or "").strip():
+                    return True
+        if isinstance(payload.get("other_player_state_updates"), dict):
+            for row in payload.get("other_player_state_updates", {}).values():
                 if isinstance(row, dict) and str(row.get("deceased_reason") or "").strip():
                     return True
         if isinstance(payload.get("calendar_update"), dict):
@@ -449,6 +455,7 @@ class ToolAwareZorkLLM:
         payload: dict[str, Any],
         *,
         actor_id: str | None = None,
+        character_name: str | None = None,
     ) -> LLMTurnOutput:
         emulator = self._emulator
         if emulator is None:
@@ -476,6 +483,28 @@ class ToolAwareZorkLLM:
         player_state_update = payload.get("player_state_update")
         if not isinstance(player_state_update, dict):
             player_state_update = {}
+
+        other_player_state_updates = payload.get("other_player_state_updates")
+        if isinstance(other_player_state_updates, dict):
+            normalized_other_player_state_updates: dict[str, dict[str, Any]] = {}
+            actor_visibility_slug = (
+                emulator._player_visibility_slug(actor_id) if actor_id else ""
+            )  # noqa: SLF001
+            actor_name_slug = ""
+            if actor_id and character_name:
+                actor_name_slug = emulator._player_slug_key(  # noqa: SLF001
+                    character_name
+                )
+            for raw_slug, raw_update in other_player_state_updates.items():
+                slug = str(raw_slug or "").strip().lower()
+                if not slug or slug in {actor_visibility_slug, actor_name_slug}:
+                    continue
+                if not isinstance(raw_update, dict):
+                    continue
+                normalized_other_player_state_updates[slug] = dict(raw_update)
+            other_player_state_updates = normalized_other_player_state_updates
+        else:
+            other_player_state_updates = {}
 
         co_located_player_slugs = payload.get("co_located_player_slugs")
         if isinstance(co_located_player_slugs, list):
@@ -622,6 +651,7 @@ class ToolAwareZorkLLM:
             summary_update=summary_update,
             xp_awarded=xp_awarded,
             player_state_update=player_state_update,
+            other_player_state_updates=other_player_state_updates,
             co_located_player_slugs=co_located_player_slugs,
             turn_visibility=turn_visibility,
             scene_image_prompt=scene_image_prompt,
@@ -2454,7 +2484,11 @@ class ToolAwareZorkLLM:
             )
             if payload is None:
                 return await self._fallback.complete_turn(context)
-            output = self._payload_to_output(payload, actor_id=context.actor_id)
+            output = self._payload_to_output(
+                payload,
+                actor_id=context.actor_id,
+                character_name=context.player_state.get("character_name"),
+            )
             # Execute any inline tool_calls (sms_write / sms_schedule) that the
             # LLM included alongside its final narration.  These have already
             # been validated against the allowlist in _payload_to_output.

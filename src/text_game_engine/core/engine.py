@@ -238,6 +238,60 @@ class GameEngine:
             changed += 1
         return changed
 
+    @classmethod
+    def _apply_other_player_state_updates(
+        cls,
+        uow: Any,
+        campaign_id: str,
+        source_actor_id: str,
+        updates: dict[str, dict[str, Any]],
+        *,
+        game_time_update: dict[str, Any] | None = None,
+        player_state_sanitizer: Callable[[dict[str, Any], dict[str, Any], str, str], dict[str, Any]] | None = None,
+        action_text: str = "",
+        narration_text: str = "",
+    ) -> int:
+        if not isinstance(updates, dict) or not updates:
+            return 0
+
+        changed = 0
+        for target in uow.players.list_by_campaign(campaign_id):
+            if str(getattr(target, "actor_id", "")) == str(source_actor_id):
+                continue
+            target_state = parse_json_dict(target.state_json)
+            actor_slug = cls._player_visibility_slug(str(getattr(target, "actor_id", "") or ""))
+            name_slug = cls._player_slug_key(target_state.get("character_name"))
+            update_payload = None
+            for slug in (actor_slug, name_slug):
+                if slug and slug in updates:
+                    update_payload = updates[slug]
+                    break
+            if not isinstance(update_payload, dict):
+                continue
+
+            raw_update = dict(update_payload)
+            if isinstance(game_time_update, dict) and game_time_update:
+                raw_update.setdefault("game_time", game_time_update)
+            if player_state_sanitizer is not None:
+                raw_update = player_state_sanitizer(
+                    target_state,
+                    raw_update,
+                    action_text,
+                    narration_text,
+                )
+            next_state = apply_patch(target_state, raw_update)
+            current_name = next_state.get("character_name")
+            if isinstance(current_name, dict):
+                next_state["character_name"] = str(
+                    current_name.get("name") or current_name.get("character_name") or ""
+                ).strip() or str(current_name)
+            if next_state == target_state:
+                continue
+            target.state_json = dump_json(next_state)
+            target.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
+            changed += 1
+        return changed
+
     @staticmethod
     def _default_visibility_scope(actor_location_key: str) -> str:
         location_key = str(actor_location_key or "").strip().lower()
@@ -677,6 +731,13 @@ class GameEngine:
                     llm_output.narration or "",
                 )
             player_state = apply_patch(player_state, raw_player_update)
+            # Normalise character_name to a plain string if the LLM
+            # returned a structured object like {"name": "...", "role": "..."}.
+            _cn = player_state.get("character_name")
+            if isinstance(_cn, dict):
+                player_state["character_name"] = str(
+                    _cn.get("name") or _cn.get("character_name") or ""
+                ).strip() or str(_cn)
             post_turn_game_time = self._extract_game_time_snapshot(campaign_state)
             actor_location_key = self._room_key_from_state(player_state)
             turn_visibility = self._normalize_turn_visibility(
@@ -755,6 +816,22 @@ class GameEngine:
                     campaign_state,
                     "location_auto_sync_co_located_players",
                     amount=co_located_player_sync,
+                )
+            other_player_state_sync = self._apply_other_player_state_updates(
+                uow,
+                turn_input.campaign_id,
+                turn_input.actor_id,
+                dict(getattr(llm_output, "other_player_state_updates", {}) or {}),
+                game_time_update=post_turn_game_time if isinstance(post_turn_game_time, dict) else None,
+                player_state_sanitizer=self._player_state_sanitizer,
+                action_text=turn_input.action,
+                narration_text=narration,
+            )
+            if other_player_state_sync:
+                self._increment_auto_fix_counter(
+                    campaign_state,
+                    "other_player_state_updates",
+                    amount=other_player_state_sync,
                 )
 
             # give_item compatibility path - unresolved targets are non-fatal.

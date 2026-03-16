@@ -363,6 +363,8 @@ def test_build_prompt_shape(session_factory, seed_campaign_and_actor):
     assert "CALENDAR:" in user_prompt
     assert "RECENT_TURNS:\n" in user_prompt
     assert "PLAYER_ACTION" in user_prompt
+    assert "other_player_state_updates" in system_prompt
+    assert "not plot-armored" in system_prompt
     assert '{"tool_call": "memory_terms"' not in system_prompt
     assert '{"tool_call": "sms_list"' not in system_prompt
     assert "CALENDAR & GAME TIME SYSTEM:" not in system_prompt
@@ -907,11 +909,18 @@ def test_setup_flow_with_attachment_and_confirm(session_factory, seed_campaign_a
         )
         assert "I recognize" in msg
 
-        variants_msg = await compat.handle_setup_message(
+        genre_msg = await compat.handle_setup_message(
             campaign_id=campaign.id,
             actor_id=seed_campaign_and_actor["actor_id"],
             message_text="yes",
             attachments=[StubAttachment("lore.txt", b"Neo wakes up in a false city.\n\nAgents hunt him.")],
+        )
+        assert "genre direction" in genre_msg.lower()
+
+        variants_msg = await compat.handle_setup_message(
+            campaign_id=campaign.id,
+            actor_id=seed_campaign_and_actor["actor_id"],
+            message_text="noir",
         )
         assert "Choose a storyline variant" in variants_msg
         assert "retry: <guidance>" in variants_msg
@@ -953,13 +962,20 @@ def test_classify_confirm_negative_with_novel_guidance_skips_reclassify(
         assert "Is this correct?" in msg
         assert probe.initial_classify_calls == 1
 
-        variants_msg = await compat.handle_setup_message(
+        genre_msg = await compat.handle_setup_message(
             campaign_id=campaign.id,
             actor_id=seed_campaign_and_actor["actor_id"],
             message_text="no, i'd rather do a novel thing where the moon is a prison colony",
         )
-        assert "Choose a storyline variant" in variants_msg
+        assert "genre direction" in genre_msg.lower()
         assert probe.reclassify_calls == 0
+
+        variants_msg = await compat.handle_setup_message(
+            campaign_id=campaign.id,
+            actor_id=seed_campaign_and_actor["actor_id"],
+            message_text="noir",
+        )
+        assert "Choose a storyline variant" in variants_msg
         assert probe.variant_prompts
         assert "moon is a prison colony" in probe.variant_prompts[-1].lower()
 
@@ -1561,9 +1577,17 @@ def test_legacy_setup_signatures(session_factory, seed_campaign_and_actor):
         )
         assert "I recognize" in msg
 
-        variants = await compat.handle_setup_message(
+        genre_msg = await compat.handle_setup_message(
             ctx,
             "yes",
+            campaign,
+            command_prefix="!",
+        )
+        assert "genre direction" in genre_msg.lower()
+
+        variants = await compat.handle_setup_message(
+            ctx,
+            "noir",
             campaign,
             command_prefix="!",
         )

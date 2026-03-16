@@ -956,6 +956,85 @@ def test_character_updates_null_removes_character(session_factory, uow_factory, 
     asyncio.run(run_test())
 
 
+def test_other_player_state_updates_can_mark_real_player_dead(
+    session_factory,
+    uow_factory,
+    seed_campaign_and_actor,
+):
+    async def run_test():
+        with session_factory() as session:
+            session.add(Actor(id="actor-2", display_name="Other Player", kind="human", metadata_json="{}"))
+            session.add_all(
+                [
+                    Player(
+                        campaign_id=seed_campaign_and_actor["campaign_id"],
+                        actor_id=seed_campaign_and_actor["actor_id"],
+                        state_json=json.dumps(
+                            {
+                                "character_name": "Lead Player",
+                                "location": "sanctuary",
+                            }
+                        ),
+                    ),
+                    Player(
+                        campaign_id=seed_campaign_and_actor["campaign_id"],
+                        actor_id="actor-2",
+                        state_json=json.dumps(
+                            {
+                                "character_name": "Other Player",
+                                "location": "sanctuary",
+                            }
+                        ),
+                    ),
+                ]
+            )
+            session.commit()
+
+        llm = StubLLM(
+            LLMTurnOutput(
+                narration="The ambush drops the second shooter instantly.",
+                other_player_state_updates={
+                    "other-player": {
+                        "deceased_reason": "Shot through the throat during the sanctuary ambush.",
+                        "current_status": "Dead on the sanctuary floor.",
+                        "location": "sanctuary",
+                    }
+                },
+            )
+        )
+        engine = GameEngine(uow_factory=uow_factory, llm=llm)
+
+        result = await engine.resolve_turn(
+            ResolveTurnInput(
+                campaign_id=seed_campaign_and_actor["campaign_id"],
+                actor_id=seed_campaign_and_actor["actor_id"],
+                action="return fire",
+            )
+        )
+        assert result.status == "ok"
+
+        with session_factory() as session:
+            other = (
+                session.query(Player)
+                .filter(Player.campaign_id == seed_campaign_and_actor["campaign_id"])
+                .filter(Player.actor_id == "actor-2")
+                .first()
+            )
+            assert other is not None
+            other_state = json.loads(other.state_json or "{}")
+            assert other_state.get("deceased_reason") == "Shot through the throat during the sanctuary ambush."
+            assert other_state.get("current_status") == "Dead on the sanctuary floor."
+            assert other_state.get("location") == "sanctuary"
+
+            campaign = session.get(Campaign, seed_campaign_and_actor["campaign_id"])
+            assert campaign is not None
+            campaign_state = json.loads(campaign.state_json or "{}")
+            counters = campaign_state.get(GameEngine.AUTO_FIX_COUNTERS_KEY) or {}
+            assert counters.get("other_player_state_updates") == 1
+
+    asyncio.run(run_test())
+
+
 def test_rewind_requires_snapshot_from_same_campaign(session_factory, uow_factory, seed_campaign_and_actor):
     async def run_test():
         llm = StubLLM(LLMTurnOutput(narration="Turn narration"))
