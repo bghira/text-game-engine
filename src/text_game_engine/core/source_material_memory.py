@@ -110,9 +110,11 @@ def _embed(text: str, source: str = EMBED_SOURCE_DEFAULT, *, query: bool = False
                 )
                 _EMBED_FALLBACK_WARNED = True
         return np.zeros(_EMBED_DIM, dtype=np.float32).tobytes()
-    raw = (text or "")[:_MAX_INPUT_CHARS]
     if query and source == EMBED_SOURCE_SNOWFLAKE:
-        raw = _SNOWFLAKE_QUERY_PREFIX + raw
+        max_text = _MAX_INPUT_CHARS - len(_SNOWFLAKE_QUERY_PREFIX)
+        raw = _SNOWFLAKE_QUERY_PREFIX + (text or "")[:max_text]
+    else:
+        raw = (text or "")[:_MAX_INPUT_CHARS]
     vector = model.encode(raw, normalize_embeddings=True)
     return np.asarray(vector, dtype=np.float32).tobytes()
 

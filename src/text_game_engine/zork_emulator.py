@@ -923,8 +923,8 @@ class ZorkEmulator:
         "\nYou have memory/source retrieval tools for older continuity and canon.\n"
         "Do NOT use them before recent_turns unless the system explicitly says recent_turns is already loaded.\n"
         "After recent_turns, use memory_search when deeper or older recall materially matters.\n"
-        'memory_search syntax: {"tool_call": "memory_search", "queries": ["name", "location"]}\n'
-        'Optional source scope: {"tool_call": "memory_search", "category": "source", "queries": ["character", "location", "event"]}\n'
+        'memory_search syntax: {"tool_call": "memory_search", "queries": ["Marcus at the penthouse", "the deal in the warehouse"]}\n'
+        'Optional source scope: {"tool_call": "memory_search", "category": "source", "queries": ["description of the character or event you need"]}\n'
         'Rulebook key browsing: {"tool_call": "source_browse", "document_key": "document-key"}\n'
         'Exact turn retrieval after a hit: {"tool_call": "memory_turn", "turn_id": 1234}\n'
     )
