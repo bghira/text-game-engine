@@ -88,7 +88,6 @@ class TestDigestStorage:
 
     def test_delete_document_cascades_digest(self):
         # Directly insert a chunk row to simulate stored document (no ML model needed)
-        import struct
         fake_embedding = struct.pack("f" * 384, *([0.0] * 384))
         self._conn.execute(
             """
