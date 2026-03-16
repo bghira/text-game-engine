@@ -951,7 +951,7 @@ class ZorkEmulator:
         '{"tool_call": "memory_search", "queries": ["query1", "query2", ...]}\n'
         "No other keys alongside tool_call except optional 'category'. You may provide one or more queries.\n"
         "Optional category scope example:\n"
-        '{"tool_call": "memory_search", "category": "char:marcus-blackwell", "queries": ["penthouse", "deal"]}\n'
+        '{"tool_call": "memory_search", "category": "char:marcus-blackwell", "queries": ["Marcus at the penthouse", "the deal Marcus offered"]}\n'
         "If results are weak or empty, you may immediately call memory_search again with refined queries.\n"
         "\nTOOL USAGE POLICY (HIGH PRIORITY):\n"
         "- On every normal gameplay turn, call recent_turns BEFORE final narration/state JSON.\n"
@@ -967,7 +967,7 @@ class ZorkEmulator:
         "Only sms_write and sms_schedule are supported in tool_calls. "
         "If you narrate an NPC texting back but don't sms_write it (either way), the reply is lost permanently.\n"
         "- Only skip tools for trivial immediate physical follow-ups where continuity risk is near zero.\n"
-        "- If unsure what to query, use current location + active NPC names + key nouns from PLAYER_ACTION.\n"
+        "- If unsure what to query, describe the situation: combine current location, active NPC names, and what the player is doing into a phrase.\n"
         "\nYou also have a memory_terms tool for wildcard term/category listing. Use it BEFORE storing memories:\n"
         '{"tool_call": "memory_terms", "wildcard": "marcus*"}\n'
         "This returns existing category/term buckets so you can avoid duplicates.\n"
@@ -982,7 +982,7 @@ class ZorkEmulator:
         "When SOURCE_MATERIAL_DOCS is present, source canon is indexed in vector memory.\n"
         "Each source doc has one format: story, rulebook, or generic.\n"
         "Use memory_search with category 'source' for canon facts before narration. On normal turns, include only the relevant subset of source canon for this turn rather than trying to fetch every document:\n"
-        '{"tool_call": "memory_search", "category": "source", "queries": ["character name", "location", "event"]}\n'
+        '{"tool_call": "memory_search", "category": "source", "queries": ["description of the character or event you need"]}\n'
         "You can scope one source document with category 'source:<document_key>' when SOURCE_MATERIAL_DOCS provides keys.\n"
         "Format notes: rulebook = line facts in KEY: value form; story = prose/scripted scenes; generic = mixed notes.\n"
         "Default return is one snippet. For surrounding context use before_lines and after_lines (defaults 0/0).\n"
@@ -1032,9 +1032,6 @@ class ZorkEmulator:
         "SMS continuity rule: do NOT leak scene context into SMS content unless the SMS explicitly mentions it.\n"
         "NPC SMS responses/knowledge must be limited to what that thread and established continuity plausibly reveal.\n"
         "Use SEPARATE queries for each character or topic — do NOT combine multiple subjects into one query.\n"
-        "Example: to recall Marcus and Anastasia, use:\n"
-        '{"tool_call": "memory_search", "queries": ["Marcus", "Anastasia"]}\n'
-        'NOT: {"tool_call": "memory_search", "queries": ["Marcus Anastasia relationship"]}\n'
         "USE memory_search AGGRESSIVELY when deeper or older continuity matters.\n"
         "You SHOULD use memory_search often, especially:\n"
         "- when a character, NPC, or named entity appears and older context may matter\n"
@@ -1044,11 +1041,19 @@ class ZorkEmulator:
         "Do not call memory_search reflexively after every recent_turns. Use it when it will materially improve continuity.\n"
         "When in doubt between guessing and searching, search.\n"
         "IMPORTANT: Memories are stored as narrator event text (e.g. what happened in a scene). "
-        "Queries are matched by semantic similarity against these narration snippets. "
-        "Use short, concrete keyword queries with names and places — e.g. "
-        '"Marcus penthouse", "Anastasia garden", "sword cave". '
-        "Do NOT use abstract or relational queries like "
-        '"character identity role relationship" — these will not match stored events.\n'
+        "Queries are matched by semantic similarity against these narration snippets.\n"
+        "QUERY STYLE: Use descriptive natural-language phrases that read like a sentence describing what you want to find. "
+        "Include names, places, and situational context. Longer, more specific queries retrieve better results.\n"
+        "Good examples:\n"
+        '  "Marcus meeting at the penthouse"\n'
+        '  "what happened when Anastasia visited the garden"\n'
+        '  "the deal Marcus offered in the warehouse"\n'
+        '  "sword hidden in the cave behind the waterfall"\n'
+        "Bad examples (too vague or abstract):\n"
+        '  "Marcus" (too short — add what about Marcus)\n'
+        '  "character identity role relationship" (abstract; will not match stored events)\n'
+        "To recall two separate topics, use two separate descriptive queries:\n"
+        '{"tool_call": "memory_search", "queries": ["Marcus meeting at the penthouse", "Anastasia in the garden"]}\n'
     )
     STORY_OUTLINE_TOOL_PROMPT = (
         "\nYou have a story_outline tool. To use it, return ONLY:\n"
