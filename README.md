@@ -1,7 +1,9 @@
 # text-game-engine
 
 Standalone Python package for running the Zork runtime extracted from
-`discord-tron-master`, with a built-in SQL persistence layer.
+[bghira/discord-tron-master](https://github.com/bghira/discord-tron-master), with a built-in SQL persistence layer.
+
+If you're looking for the webUI, that's in [bghira/text-engine-webui](https://github.com/bghira/text-engine-webui), which relies on this engine.
 
 ## Features
 
