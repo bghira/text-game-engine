@@ -70,6 +70,8 @@ class GameEngine:
         self,
         turn_input: ResolveTurnInput,
         before_phase_c: Callable[[TurnContext, int], Awaitable[None] | None] | None = None,
+        *,
+        progress=None,
     ) -> ResolveTurnResult:
         for attempt in range(self._max_conflict_retries + 1):
             claim_token = uuid.uuid4().hex
@@ -80,7 +82,7 @@ class GameEngine:
                 # Pre-LLM: validate active puzzle / minigame input
                 self._pre_llm_puzzle_minigame(context, turn_input)
 
-                llm_output = await self._llm.complete_turn(context)
+                llm_output = await self._llm.complete_turn(context, progress=progress)
 
                 if before_phase_c is not None:
                     maybe = before_phase_c(context, attempt)

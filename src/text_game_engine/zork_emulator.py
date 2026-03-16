@@ -681,7 +681,7 @@ class ZorkEmulator:
         "- AUTOBIOGRAPHIES, when present, are primary self-documents. Consult autobiography before personality when deciding how a character understands their own actions, contradictions, loyalties, and growth. Personality is the summary; autobiography is the constitution.\n"
         "- In multi-character scenes with different literary_style keys, use the dominant scene character's style for overall narration and shift subtly when writing beats for characters with different styles. Do not abruptly switch voices.\n"
         "- When referencing an intimate or close relationship, match the emotional register of that relationship — not the tone of whatever else is happening in the scene. An investigation can be clinical; the mention of someone you love in the middle of it cannot. Do not reduce relationships to logistics, tactical assets, or infrastructure. If the character has warmth for someone, let the prose carry warmth when it touches them, even briefly.\n"
-        "- REGISTER SUSTAIN: when a scene reaches genuine emotional resolution — warmth lands, a character opens up, a moment of real connection occurs — stay in that register for the rest of the turn. Do not pivot to tactical options, next-step choices, or plot logistics after an emotional beat lands. Let the moment breathe. End the turn there if needed. The player will move the scene forward when they are ready; the GM's job in that moment is to hold the space the emotion created, not to fill it with forward momentum.\n"
+        "- REGISTER SUSTAIN: when a scene reaches genuine emotional resolution — warmth lands, a character opens up, a moment of real connection occurs — stay in that register for the rest of the turn. Do not pivot to tactical options, next-step choices, or plot logistics after an emotional beat lands. Let the moment breathe. End the turn there if needed. The player will move the scene forward when they are ready; the GM's job in that moment is to hold the space the emotion created, not to fill it with forward momentum. Exception: an NPC's own personal needs, anxieties, or agenda can break the register if that is what the character would genuinely do — a person who needs to say something urgent does not wait for the emotional moment to finish. The interruption should feel human, not mechanical.\n"
         "- Do not let every emotional beat collapse into the same stock therapeutic or pseudo-profound language.\n"
         "- Avoid contrived emotional shorthand or therapist-speak; examples include phrases like 'be present', 'show up', or 'hold space', unless a specific character would genuinely talk that way.\n"
         "- DELTA MODE: each turn should add NEW developments only. Do not recap unchanged context from WORLD_SUMMARY or RECENT_TURNS.\n"
@@ -6620,6 +6620,8 @@ class ZorkEmulator:
         action: str,
         session_id: str | None = None,
         manage_claim: bool = True,
+        *,
+        progress=None,
     ) -> Optional[str]:
         should_end = False
         pre_inventory_rich: list[dict[str, str]] = []
@@ -6723,7 +6725,8 @@ class ZorkEmulator:
                     action=action,
                     session_id=session_id,
                     record_player_turn=not is_ooc,
-                )
+                ),
+                progress=progress,
             )
             if result.status == "ok":
                 self._apply_give_item_transfer(
@@ -7220,6 +7223,7 @@ class ZorkEmulator:
         *,
         command_prefix: str = "!",
         campaign_id: str | None = None,
+        progress=None,
     ) -> Optional[str]:
         # Legacy compatibility: play_action(ctx, action, command_prefix="!", campaign_id=..., manage_claim=...)
         if self._is_context_like(campaign_or_ctx):
@@ -7435,6 +7439,7 @@ class ZorkEmulator:
                 action=action_text,
                 session_id=derived_session_id or None,
                 manage_claim=manage_claim,
+                progress=progress,
             )
 
         campaign_id_text = str(campaign_id or campaign_or_ctx or "")
@@ -7448,6 +7453,7 @@ class ZorkEmulator:
             action=action_text,
             session_id=session_id,
             manage_claim=manage_claim,
+            progress=progress,
         )
 
     def execute_rewind(

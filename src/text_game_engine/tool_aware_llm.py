@@ -45,7 +45,7 @@ class DeterministicLLM:
             "date_label": f"Day {day}, {period.title()}",
         }
 
-    async def complete_turn(self, context) -> LLMTurnOutput:
+    async def complete_turn(self, context, *, progress=None) -> LLMTurnOutput:
         action = (context.action or "").strip()
         lowered = action.lower()
         current_time = (
@@ -2198,7 +2198,11 @@ class ToolAwareZorkLLM:
         user_prompt: str,
         final_system_prompt: str,
         final_user_prompt: str,
+        *,
+        progress=None,
     ) -> dict[str, Any] | None:
+        if progress is not None:
+            await progress("thinking", None)
         first = await self._completion.complete(
             system_prompt,
             user_prompt,
@@ -2301,6 +2305,8 @@ class ToolAwareZorkLLM:
                 continue
             if tool_signature:
                 seen_tool_signatures.add(tool_signature)
+            if progress is not None:
+                await progress("tool_call", {"tool": tool_name})
             tool_result = await self._execute_tool_call(
                 campaign_id,
                 payload,
@@ -2328,6 +2334,8 @@ class ToolAwareZorkLLM:
         # Dedicated ready_to_write finalization: the payload is the tool call
         # itself (no narration), so issue the actual writing call with craft guidance.
         if emulator._is_tool_call(payload) and str(payload.get("tool_call") or "").strip().lower() == "ready_to_write":  # noqa: E501, SLF001
+            if progress is not None:
+                await progress("writing", None)
             _pc_names = emulator.get_pc_names(campaign_id)
             _pc_reminder = ""
             if _pc_names:
@@ -2355,6 +2363,8 @@ class ToolAwareZorkLLM:
                 payload = finalized_payload
 
         if self._is_emptyish_payload(payload):
+            if progress is not None:
+                await progress("refining", None)
             self._bump_auto_fix_counter(campaign_id, "empty_response_repair_retry")
             repair_prompt = (
                 f"{user_prompt}\n"
@@ -2378,6 +2388,8 @@ class ToolAwareZorkLLM:
 
         narration = str(payload.get("narration") or "")
         if self._narration_has_explicit_clock_time(narration) and not self._action_requests_clock_time(action_text):
+            if progress is not None:
+                await progress("refining", None)
             self._bump_auto_fix_counter(campaign_id, "clock_drift_retry")
             clock_prompt = (
                 f"{user_prompt}\n"
@@ -2400,6 +2412,8 @@ class ToolAwareZorkLLM:
             {"plot_plan", "chapter_plan", "consequence_log"} & used_tool_names
         )
         if not planning_used and self._looks_like_major_narrative_beat(payload):
+            if progress is not None:
+                await progress("refining", None)
             planning_prompt = (
                 f"{user_prompt}\n"
                 f"{tool_history}\n\n"
@@ -2426,7 +2440,7 @@ class ToolAwareZorkLLM:
                     self._bump_auto_fix_counter(campaign_id, "forced_planning_tool")
         return payload
 
-    async def complete_turn(self, context) -> LLMTurnOutput:
+    async def complete_turn(self, context, *, progress=None) -> LLMTurnOutput:
         emulator = self._emulator
         if emulator is None:
             return await self._fallback.complete_turn(context)
@@ -2481,6 +2495,7 @@ class ToolAwareZorkLLM:
                 user_prompt,
                 final_system_prompt,
                 final_user_prompt,
+                progress=progress,
             )
             if payload is None:
                 return await self._fallback.complete_turn(context)

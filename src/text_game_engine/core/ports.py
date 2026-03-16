@@ -6,7 +6,7 @@ from .types import LLMTurnOutput, TurnContext
 
 
 class LLMPort(Protocol):
-    async def complete_turn(self, context: TurnContext) -> LLMTurnOutput:
+    async def complete_turn(self, context: TurnContext, *, progress=None) -> LLMTurnOutput:
         ...
 
 
