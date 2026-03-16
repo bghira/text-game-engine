@@ -11,6 +11,8 @@ requires-python = ">=3.10"
 authors = [{name = "text-game-engine contributors"}]
 dependencies = [
   "SQLAlchemy>=2.0,<3",
+  "sentence-transformers>=2.2",
+  "numpy>=1.24",
 ]
 
 [project.optional-dependencies]
