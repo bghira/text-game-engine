@@ -90,12 +90,13 @@ def _embed(text: str, source: str = EMBED_SOURCE_DEFAULT) -> bytes:
         model = _get_model(source)
     except Exception:
         global _EMBED_FALLBACK_WARNED
-        if not _EMBED_FALLBACK_WARNED:
-            logger.warning(
-                "sentence-transformers not available; storing zero-vector embeddings. "
-                "Install text-game-engine[embeddings] for semantic search."
-            )
-            _EMBED_FALLBACK_WARNED = True
+        with _MODEL_LOCK:
+            if not _EMBED_FALLBACK_WARNED:
+                logger.warning(
+                    "sentence-transformers not available; storing zero-vector embeddings. "
+                    "Install text-game-engine[embeddings] for semantic search."
+                )
+                _EMBED_FALLBACK_WARNED = True
         return np.zeros(_EMBED_DIM, dtype=np.float32).tobytes()
     vector = model.encode((text or "")[:_MAX_INPUT_CHARS], normalize_embeddings=True)
     return np.asarray(vector, dtype=np.float32).tobytes()

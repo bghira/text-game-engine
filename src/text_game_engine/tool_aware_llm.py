@@ -455,6 +455,7 @@ class ToolAwareZorkLLM:
         payload: dict[str, Any],
         *,
         actor_id: str | None = None,
+        character_name: str | None = None,
     ) -> LLMTurnOutput:
         emulator = self._emulator
         if emulator is None:
@@ -490,9 +491,9 @@ class ToolAwareZorkLLM:
                 emulator._player_visibility_slug(actor_id) if actor_id else ""
             )  # noqa: SLF001
             actor_name_slug = ""
-            if actor_id:
+            if actor_id and character_name:
                 actor_name_slug = emulator._player_slug_key(  # noqa: SLF001
-                    context.player_state.get("character_name")
+                    character_name
                 )
             for raw_slug, raw_update in other_player_state_updates.items():
                 slug = str(raw_slug or "").strip().lower()
@@ -2483,7 +2484,11 @@ class ToolAwareZorkLLM:
             )
             if payload is None:
                 return await self._fallback.complete_turn(context)
-            output = self._payload_to_output(payload, actor_id=context.actor_id)
+            output = self._payload_to_output(
+                payload,
+                actor_id=context.actor_id,
+                character_name=context.player_state.get("character_name"),
+            )
             # Execute any inline tool_calls (sms_write / sms_schedule) that the
             # LLM included alongside its final narration.  These have already
             # been validated against the allowlist in _payload_to_output.
