@@ -3,10 +3,21 @@
 from __future__ import annotations
 
 import sqlite3
+import struct
 import threading
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
-from text_game_engine.core.source_material_memory import SourceMaterialMemory
+import numpy as np
+
+from text_game_engine.core.source_material_memory import (
+    EMBED_SOURCE_MINILM,
+    EMBED_SOURCE_SNOWFLAKE,
+    SourceMaterialMemory,
+    _EMBED_DIM,
+    _MAX_INPUT_CHARS,
+    _SNOWFLAKE_QUERY_PREFIX,
+    _embed,
+)
 
 
 def _fresh_conn():
@@ -117,3 +128,73 @@ class TestDigestStorage:
         assert ok
         digest = SourceMaterialMemory.get_source_material_digest("camp1", "source-material")
         assert digest == "content"
+
+
+class TestEmbedQueryPrefix:
+    """Verify that _embed() applies the Snowflake query prefix correctly."""
+
+    def _stub_model(self):
+        """Return a mock model whose .encode() captures its input string."""
+        model = MagicMock()
+        model.encode = MagicMock(
+            side_effect=lambda text, **_kw: np.zeros(_EMBED_DIM, dtype=np.float32)
+        )
+        return model
+
+    def test_snowflake_query_prepends_prefix(self):
+        model = self._stub_model()
+        with patch(
+            "text_game_engine.core.source_material_memory._get_model",
+            return_value=model,
+        ):
+            _embed("sword in the cave", source=EMBED_SOURCE_SNOWFLAKE, query=True)
+        encoded_text = model.encode.call_args[0][0]
+        assert encoded_text.startswith(_SNOWFLAKE_QUERY_PREFIX)
+        assert "sword in the cave" in encoded_text
+
+    def test_snowflake_document_no_prefix(self):
+        model = self._stub_model()
+        with patch(
+            "text_game_engine.core.source_material_memory._get_model",
+            return_value=model,
+        ):
+            _embed("sword in the cave", source=EMBED_SOURCE_SNOWFLAKE, query=False)
+        encoded_text = model.encode.call_args[0][0]
+        assert not encoded_text.startswith(_SNOWFLAKE_QUERY_PREFIX)
+        assert encoded_text == "sword in the cave"
+
+    def test_minilm_query_no_prefix(self):
+        model = self._stub_model()
+        with patch(
+            "text_game_engine.core.source_material_memory._get_model",
+            return_value=model,
+        ):
+            _embed("sword in the cave", source=EMBED_SOURCE_MINILM, query=True)
+        encoded_text = model.encode.call_args[0][0]
+        assert not encoded_text.startswith(_SNOWFLAKE_QUERY_PREFIX)
+        assert encoded_text == "sword in the cave"
+
+    def test_query_truncation_respects_max_chars(self):
+        """Total encoded string (prefix + text) must not exceed _MAX_INPUT_CHARS."""
+        model = self._stub_model()
+        long_text = "a" * (_MAX_INPUT_CHARS + 100)
+        with patch(
+            "text_game_engine.core.source_material_memory._get_model",
+            return_value=model,
+        ):
+            _embed(long_text, source=EMBED_SOURCE_SNOWFLAKE, query=True)
+        encoded_text = model.encode.call_args[0][0]
+        assert len(encoded_text) <= _MAX_INPUT_CHARS
+        assert encoded_text.startswith(_SNOWFLAKE_QUERY_PREFIX)
+
+    def test_document_truncation_respects_max_chars(self):
+        model = self._stub_model()
+        long_text = "b" * (_MAX_INPUT_CHARS + 100)
+        with patch(
+            "text_game_engine.core.source_material_memory._get_model",
+            return_value=model,
+        ):
+            _embed(long_text, source=EMBED_SOURCE_SNOWFLAKE, query=False)
+        encoded_text = model.encode.call_args[0][0]
+        assert len(encoded_text) <= _MAX_INPUT_CHARS
+        assert not encoded_text.startswith(_SNOWFLAKE_QUERY_PREFIX)

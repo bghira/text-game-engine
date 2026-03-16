@@ -22,6 +22,11 @@ EMBED_SOURCE_MINILM = "minilm"
 EMBED_SOURCE_SNOWFLAKE = "snowflake"
 EMBED_SOURCE_DEFAULT = EMBED_SOURCE_SNOWFLAKE
 
+# Snowflake arctic-embed models are trained with a query prefix that improves
+# retrieval quality.  The prefix is prepended to *queries only*, never to
+# stored document chunks.
+_SNOWFLAKE_QUERY_PREFIX = "Represent this sentence for searching relevant passages: "
+
 _DB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "data")
 _DB_PATH = os.path.join(_DB_DIR, "tge_source_embeddings.db")
 
@@ -83,7 +88,14 @@ def _get_model(source: str = EMBED_SOURCE_DEFAULT):
             return _model_snowflake
 
 
-def _embed(text: str, source: str = EMBED_SOURCE_DEFAULT) -> bytes:
+def _embed(text: str, source: str = EMBED_SOURCE_DEFAULT, *, query: bool = False) -> bytes:
+    """Encode *text* into a normalised float32 embedding vector.
+
+    When *query* is True the appropriate model-specific query prefix is
+    prepended (e.g. the Snowflake ``Represent this sentence …`` prefix).
+    Pass ``query=False`` (the default) when embedding document chunks for
+    storage.
+    """
     import numpy as np
 
     try:
@@ -98,7 +110,12 @@ def _embed(text: str, source: str = EMBED_SOURCE_DEFAULT) -> bytes:
                 )
                 _EMBED_FALLBACK_WARNED = True
         return np.zeros(_EMBED_DIM, dtype=np.float32).tobytes()
-    vector = model.encode((text or "")[:_MAX_INPUT_CHARS], normalize_embeddings=True)
+    if query and source == EMBED_SOURCE_SNOWFLAKE:
+        max_text = _MAX_INPUT_CHARS - len(_SNOWFLAKE_QUERY_PREFIX)
+        raw = _SNOWFLAKE_QUERY_PREFIX + (text or "")[:max_text]
+    else:
+        raw = (text or "")[:_MAX_INPUT_CHARS]
+    vector = model.encode(raw, normalize_embeddings=True)
     return np.asarray(vector, dtype=np.float32).tobytes()
 
 
@@ -831,7 +848,7 @@ class SourceMaterialMemory:
 
             scored: List[Tuple[str, str, int, str, float]] = []
             for source in sources:
-                query_vec = _bytes_to_vector(_embed(query or "", source=source))
+                query_vec = _bytes_to_vector(_embed(query or "", source=source, query=True))
                 if key:
                     rows = conn.execute(
                         """
