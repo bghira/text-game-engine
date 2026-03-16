@@ -12,7 +12,7 @@ from .dice import format_dice_result, resolve_dice_check
 from .errors import StaleClaimError, TurnBusyError
 from .minigames import MinigameEngine, MinigameState
 from .normalize import apply_patch, dump_json, normalize_give_item, parse_json_dict
-from .ports import ActorResolverPort, LLMPort
+from .ports import ActorResolverPort, LLMPort, ProgressCallback
 from .puzzles import PuzzleEngine, PuzzleState
 from .types import DiceCheckRequest, DiceCheckResult, ResolveTurnInput, ResolveTurnResult, RewindResult, TurnContext
 
@@ -70,6 +70,8 @@ class GameEngine:
         self,
         turn_input: ResolveTurnInput,
         before_phase_c: Callable[[TurnContext, int], Awaitable[None] | None] | None = None,
+        *,
+        progress: ProgressCallback | None = None,
     ) -> ResolveTurnResult:
         for attempt in range(self._max_conflict_retries + 1):
             claim_token = uuid.uuid4().hex
@@ -80,7 +82,10 @@ class GameEngine:
                 # Pre-LLM: validate active puzzle / minigame input
                 self._pre_llm_puzzle_minigame(context, turn_input)
 
-                llm_output = await self._llm.complete_turn(context)
+                llm_kwargs: dict[str, Any] = {}
+                if progress is not None:
+                    llm_kwargs["progress"] = progress
+                llm_output = await self._llm.complete_turn(context, **llm_kwargs)
 
                 if before_phase_c is not None:
                     maybe = before_phase_c(context, attempt)
