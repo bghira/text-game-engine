@@ -615,6 +615,9 @@ class ZorkEmulator:
         "- summary_update: string (one or two sentences of lasting changes)\n"
         "- xp_awarded: integer (0-10)\n"
         "- player_state_update: object (optional, player state patches)\n"
+        "- other_player_state_updates: object (optional; keyed by exact PARTY_SNAPSHOT player_slugs for OTHER CAMPAIGN_PLAYERS only. "
+        "Use this only for durable state consequences the scene clearly caused to them: death, injury, capture, relocation, separation, or other status changes. "
+        "It does NOT authorize new dialogue, actions, choices, or invented reactions for them.)\n"
         '- co_located_player_slugs: array (optional; exact PARTY_SNAPSHOT player_slugs for OTHER CAMPAIGN_PLAYERS who remain physically with the acting player after this turn. Use only for room/location sync; it does NOT authorize new dialogue, actions, or decisions for them.)\n'
         '- turn_visibility: object (optional; who should get this turn in future prompt context. Keys: "scope" ("public"|"private"|"limited"|"local"), "player_slugs" (array of player slugs from PARTY_SNAPSHOT, typically in `player-<actor_id>` form), "npc_slugs" (array of WORLD_CHARACTERS slugs who overheard/noticed), and optional "reason". This changes prompt visibility only; it does NOT change shared world state.)\n'
         "- scene_image_prompt: string (optional; include whenever the visible scene changes in a meaningful way: entering a room, newly visible characters/objects, reveals, or strong visual shifts)\n"
@@ -701,13 +704,16 @@ class ZorkEmulator:
         "- Use player_state_update.room_summary for a short one-line room summary for future context.\n"
         "- MULTI-PLAYER LOCATION SYNC: if another real player character from PARTY_SNAPSHOT is still physically with the acting player after this turn, include their exact PARTY_SNAPSHOT slug in co_located_player_slugs. The harness will mirror the acting player's room fields to them without inventing new behavior.\n"
         'Example: {"player_state_update":{"location":"side-room-b","room_title":"Side Room B","room_summary":"Private side room off Fellowship Hall.","room_description":"A narrow side room with a low lamp and one upholstered bench.","exits":["Fellowship Hall"]},"co_located_player_slugs":["player-249794335095128065"]}\n'
+        "- PLAYER CONSEQUENCE SYNC: real player characters are allowed to suffer lasting consequences, including death, through normal play when the fiction supports it. "
+        "For the acting player, use player_state_update. For OTHER real players, use other_player_state_updates keyed by PARTY_SNAPSHOT slug.\n"
+        'Example: {"other_player_state_updates":{"dawn-preston-the-androgynous-sibling-of-chace-preston":{"deceased_reason":"Shot during the sanctuary ambush.","current_status":"Dead on the sanctuary floor.","location":"oakhaven-sanctuary"}}}\n'
         "- CRITICAL — ROOM STATE COHERENCE: whenever the player's physical location changes (movement, teleport, time-skip, "
         "reuniting with party, being picked up, waking in a new place, etc.) you MUST update ALL of: "
         "location, room_title, room_summary, room_description, and exits in player_state_update. "
         "ACTIVE_PLAYER_LOCATION reflects the CURRENT stored state — if it is stale/wrong, your response MUST correct it. "
         "Narration alone does NOT move the player; only player_state_update changes their actual location.\n"
         "- Use player_state_update.exits as a short list of exits if applicable.\n"
-        "- Use player_state_update for inventory, hp, or conditions.\n"
+        "- Use player_state_update for inventory, hp, conditions, deceased_reason, and other durable player-state consequences.\n"
         "- Treat each player's inventory as private and never copy items from other players.\n"
         "- For inventory changes, ONLY use player_state_update.inventory_add and player_state_update.inventory_remove arrays.\n"
         "- Do not return player_state_update.inventory full lists.\n"
@@ -759,13 +765,14 @@ class ZorkEmulator:
         "    * Actions, movements, or decisions (e.g. 'she draws her sword', 'he follows you')\n"
         "    * Emotional reactions, facial expressions, or gestures in response to events\n"
         "    * Plot advancement involving them (e.g. 'together you storm the gate')\n"
-        "    * Moving them to a new location or changing their state in any way\n"
+        "    * Invented state changes that are not clearly caused by the scene\n"
         "  You MAY reference another player character in two cases:\n"
         "    1. Static presence — note they are in the room (e.g. 'X is here'), nothing more.\n"
         "    2. Continuing a prior action — if RECENT_TURNS shows that player ALREADY performed an action on their own turn\n"
         "       (e.g. 'I toss the key to you', 'I hold the door open'), you may narrate the CONSEQUENCE of that\n"
         "       established action as it affects the acting player (e.g. 'You catch the key X tossed'). \n"
         "       You are acknowledging what they did, not inventing new behaviour for them.\n"
+        "    3. Durable consequences plainly caused by the scene — if the event itself injures, kills, captures, or relocates another real player character, you may record that ONLY through other_player_state_updates. That records consequence; it does not authorize you to invent their dialogue or choices.\n"
         "  In ALL other cases, treat other player characters as scenery — they exist but do nothing until THEY act.\n"
         "  This turn's narration concerns ONLY the acting player identified by PLAYER_ACTION.\n"
         "- When mentioning a player character in narration, use their Discord mention from PARTY_SNAPSHOT followed by their name in parentheses, e.g. '<@123456> (Bruce Wayne)'. This pings the player in Discord so they know they were referenced.\n"
@@ -780,6 +787,7 @@ class ZorkEmulator:
         "- Causality first: do not introduce new pursuers, attacks, disasters, media attention, or environmental threats without concrete setup in prior turns/state.\n"
         "- Escalations must follow a believable chain of evidence and opportunity (how they found the player, why now, and through what channel).\n"
         "- No omniscient coincidence pressure: avoid out-of-nowhere helicopters, enemy arrivals, or wildlife hazards unless foreshadowed or logically triggered.\n"
+        "- NPCs and real player characters are not plot-armored. They may die, be maimed, or be permanently altered if the fiction and consequences support it. Do not protect major characters just because they are important.\n"
         "- NPCs pursue established characterization first and plot second. Characters are not plot-delivery devices.\n"
         "- If a character's established personality conflicts with advancing the current storyline, personality wins — but personality itself can evolve.\n"
         "- Character profiles and rulebook entries describe who a character is at introduction. As the relationship deepens or circumstances change, characters should grow: someone guarded can open up, someone formal can relax, someone hostile can warm. Let the arc happen naturally through interaction, don't keep resetting to the original profile.\n"
@@ -2013,8 +2021,12 @@ class ZorkEmulator:
             return self.DEFAULT_CAMPAIGN_PERSONA
         prompt = (
             f"The campaign is titled: '{campaign_name}'.\n"
-            "If this references a known movie, book, show, or story, create a persona for the main character.\n"
-            "Return only a brief persona (1-2 sentences, max 140 chars)."
+            "If this references a known movie, book, show, or story, describe the MAIN CHARACTER as a person — "
+            "age, vibe, background, and what makes them tick. Not how they speak or narrate.\n"
+            "If it's an original setting, describe a fitting protagonist the same way.\n"
+            "Write it like a casting brief: '28-year-old ambitious junior associate at a top law firm, "
+            "smart but naive about office politics' — not a voice direction or writing style.\n"
+            "Return ONLY the persona (1-2 sentences, max 140 chars). No quotes or explanation."
         )
         try:
             response = await self._completion_port.complete(
@@ -4564,7 +4576,7 @@ class ZorkEmulator:
                         {
                             "id": str(row.get("id") or f"variant-{idx}"),
                             "title": str(row.get("title") or f"Variant {idx}").strip(),
-                            "summary": self._trim_text(summary, 300),
+                            "summary": summary,
                             "main_character": str(row.get("main_character") or "The Protagonist").strip(),
                             "essential_npcs": row.get("essential_npcs", []),
                             "chapter_outline": row.get("chapter_outline", []),
@@ -5287,6 +5299,8 @@ class ZorkEmulator:
                     active_session.flush()
                 player_state = parse_json_dict(player.state_json)
                 main_char = chosen.get("main_character", "")
+                if isinstance(main_char, dict):
+                    main_char = str(main_char.get("name") or "").strip()
                 if main_char and not player_state.get("character_name"):
                     player_state["character_name"] = main_char
                 if default_persona and not player_state.get("persona"):
@@ -8142,7 +8156,7 @@ class ZorkEmulator:
             return ""
         if len(text) <= max_chars:
             return text
-        return text[-max_chars:]
+        return text[:max_chars]
 
     def _append_summary(self, existing: str, update: str) -> str:
         if not update:
@@ -11382,7 +11396,18 @@ class ZorkEmulator:
         model_state = self._build_model_state(campaign_state)
         model_state = self._fit_state_to_budget(model_state, 800)
         landmarks = campaign_state.get("landmarks", [])
-        landmarks_text = ", ".join(landmarks) if isinstance(landmarks, list) and landmarks else "none"
+        if isinstance(landmarks, list) and landmarks:
+            parts = []
+            for lm in landmarks:
+                if isinstance(lm, dict):
+                    name = str(lm.get("name") or "")
+                    role = str(lm.get("role") or "")
+                    parts.append(f"{name} ({role})" if name and role else name or str(lm))
+                else:
+                    parts.append(str(lm))
+            landmarks_text = ", ".join(parts)
+        else:
+            landmarks_text = "none"
 
         characters = self.get_campaign_characters(campaign)
         char_entries: list[dict[str, str]] = []
