@@ -30,6 +30,10 @@ _SNOWFLAKE_QUERY_PREFIX = "Represent this sentence for searching relevant passag
 _DB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "data")
 _DB_PATH = os.path.join(_DB_DIR, "tge_source_embeddings.db")
 
+# Optional overrides set via configure().
+_DB_PATH_OVERRIDE: Optional[str] = None
+_CAMPAIGN_ID_TRANSLATOR: Optional[object] = None  # callable(str) -> str
+
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS source_material_chunks (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -143,12 +147,51 @@ class SourceMaterialMemory:
     _conn_local = threading.local()
 
     @classmethod
+    def configure(
+        cls,
+        *,
+        db_path: Optional[str] = None,
+        campaign_id_translator: Optional[object] = None,
+    ) -> None:
+        """Override the default SQLite database path and/or campaign-ID translator.
+
+        Parameters
+        ----------
+        db_path:
+            Absolute path to an existing SQLite database that contains a
+            ``source_material_chunks`` table.  When set, SourceMaterialMemory
+            reads from this database instead of the built-in TGE one.
+        campaign_id_translator:
+            A callable ``(str) -> str`` that maps TGE campaign IDs (UUIDs) to
+            the campaign-ID format used in the target database (e.g. legacy
+            integer IDs).  Applied transparently before every query.
+        """
+        global _DB_PATH_OVERRIDE, _CAMPAIGN_ID_TRANSLATOR  # noqa: PLW0603
+        if db_path is not None:
+            _DB_PATH_OVERRIDE = str(db_path)
+            # Reset cached connections so the next call opens the new DB.
+            cls._conn_local = threading.local()
+        if campaign_id_translator is not None:
+            _CAMPAIGN_ID_TRANSLATOR = campaign_id_translator
+
+    @classmethod
+    def _resolve_campaign_id(cls, campaign_id: str) -> str:
+        if _CAMPAIGN_ID_TRANSLATOR is not None:
+            try:
+                return str(_CAMPAIGN_ID_TRANSLATOR(campaign_id))
+            except Exception:
+                pass
+        return str(campaign_id)
+
+    @classmethod
     def _get_conn(cls) -> sqlite3.Connection:
         conn = getattr(cls._conn_local, "conn", None)
         if conn is not None:
             return conn
-        os.makedirs(_DB_DIR, exist_ok=True)
-        conn = sqlite3.connect(_DB_PATH, check_same_thread=False)
+        db_path = _DB_PATH_OVERRIDE or _DB_PATH
+        db_dir = os.path.dirname(db_path)
+        os.makedirs(db_dir, exist_ok=True)
+        conn = sqlite3.connect(db_path, check_same_thread=False)
         conn.execute("PRAGMA journal_mode=WAL")
         conn.executescript(_SCHEMA_SQL)
         cls._ensure_schema(conn)
@@ -299,6 +342,7 @@ class SourceMaterialMemory:
         limit: int = 20,
     ) -> List[Dict[str, object]]:
         try:
+            campaign_id = cls._resolve_campaign_id(campaign_id)
             conn = cls._get_conn()
             rows = conn.execute(
                 """
@@ -360,6 +404,7 @@ class SourceMaterialMemory:
         document_key: str,
     ) -> List[str]:
         try:
+            campaign_id = cls._resolve_campaign_id(campaign_id)
             key = str(document_key or "").strip()
             if not key:
                 return []
@@ -559,6 +604,7 @@ class SourceMaterialMemory:
         document_key: str,
     ) -> int:
         try:
+            campaign_id = cls._resolve_campaign_id(campaign_id)
             key = str(document_key or "").strip()
             if not key:
                 return 0
@@ -590,6 +636,7 @@ class SourceMaterialMemory:
     @classmethod
     def clear_source_material_documents(cls, campaign_id: str) -> int:
         try:
+            campaign_id = cls._resolve_campaign_id(campaign_id)
             conn = cls._get_conn()
             cur = conn.execute(
                 """
@@ -626,6 +673,7 @@ class SourceMaterialMemory:
         embed_source: str = EMBED_SOURCE_DEFAULT,
     ) -> Tuple[int, str]:
         try:
+            campaign_id = cls._resolve_campaign_id(campaign_id)
             label = " ".join(str(document_label or "").strip().split())[:120]
             if not label:
                 label = "source-material"
@@ -687,6 +735,7 @@ class SourceMaterialMemory:
         digest_text: str,
     ) -> bool:
         try:
+            campaign_id = cls._resolve_campaign_id(campaign_id)
             key = cls._normalize_source_document_key(document_key)
             text = str(digest_text or "").strip()
             if not key or not text:
@@ -719,6 +768,7 @@ class SourceMaterialMemory:
         document_key: str,
     ) -> Optional[str]:
         try:
+            campaign_id = cls._resolve_campaign_id(campaign_id)
             key = cls._normalize_source_document_key(document_key)
             if not key:
                 return None
@@ -748,6 +798,7 @@ class SourceMaterialMemory:
         campaign_id: str,
     ) -> Dict[str, str]:
         try:
+            campaign_id = cls._resolve_campaign_id(campaign_id)
             conn = cls._get_conn()
             rows = conn.execute(
                 """
@@ -776,6 +827,7 @@ class SourceMaterialMemory:
         document_key: str,
     ) -> bool:
         try:
+            campaign_id = cls._resolve_campaign_id(campaign_id)
             key = cls._normalize_source_document_key(document_key)
             if not key:
                 return False
@@ -811,6 +863,7 @@ class SourceMaterialMemory:
         try:
             import numpy as np
 
+            campaign_id = cls._resolve_campaign_id(campaign_id)
             conn = cls._get_conn()
             sources = _campaign_embed_sources(conn, "source_material_chunks", campaign_id)
             if not sources:
@@ -944,6 +997,7 @@ class SourceMaterialMemory:
         raw matching source lines.
         """
         try:
+            campaign_id = cls._resolve_campaign_id(campaign_id)
             conn = cls._get_conn()
             pattern = str(wildcard or "%").strip()
             if not pattern or pattern == "*":
