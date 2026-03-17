@@ -2251,7 +2251,7 @@ class ToolAwareZorkLLM:
         logger.debug("_resolve_payload: sending initial LLM request for campaign=%s actor=%s", campaign_id, actor_id)
         self._zork_log(
             f"RESEARCH REQUEST campaign={campaign_id}",
-            f"SYSTEM:\n{system_prompt[:2000]}\n\nUSER:\n{user_prompt[:4000]}",
+            f"SYSTEM:\n{system_prompt}\n\nUSER:\n{user_prompt}",
         )
         first = await self._completion.complete(
             system_prompt,
@@ -2264,7 +2264,7 @@ class ToolAwareZorkLLM:
         payload = self._parse_model_payload(first)
         if payload is None:
             logger.warning("_resolve_payload: initial payload parse failed → DeterministicLLM fallback")
-            self._zork_log(f"PARSE FAILED campaign={campaign_id}", f"raw[:1000]={( first or '')[:1000]}")
+            self._zork_log(f"PARSE FAILED campaign={campaign_id}", first or "(empty)")
             return None
 
         tool_history = ""
@@ -2366,13 +2366,13 @@ class ToolAwareZorkLLM:
             if tool_signature:
                 seen_tool_signatures.add(tool_signature)
             await _notify_progress(progress, "tool_call", {"tool": tool_name})
-            self._zork_log(f"TOOL CALL campaign={campaign_id}", f"tool={tool_name}\npayload={json.dumps(payload, default=str)[:2000]}")
+            self._zork_log(f"TOOL CALL campaign={campaign_id}", f"tool={tool_name}\npayload={json.dumps(payload, default=str)}")
             tool_result = await self._execute_tool_call(
                 campaign_id,
                 payload,
                 actor_id=actor_id,
             )
-            self._zork_log(f"TOOL RESULT campaign={campaign_id}", f"tool={tool_name}\nresult={str(tool_result)[:2000]}")
+            self._zork_log(f"TOOL RESULT campaign={campaign_id}", f"tool={tool_name}\nresult={str(tool_result)}")
             tool_history += f"\n\n{tool_result}"
             if not memory_obligation_met and tool_name in (
                 "recent_turns",
@@ -2424,7 +2424,7 @@ class ToolAwareZorkLLM:
                 + _pc_reminder
                 + emulator.WRITING_CRAFT_PROMPT
             )
-            self._zork_log(f"FINALIZATION REQUEST campaign={campaign_id}", f"SYSTEM:\n{final_system_prompt[:2000]}\n\nUSER:\n{finalize_prompt[:4000]}")
+            self._zork_log(f"FINALIZATION REQUEST campaign={campaign_id}", f"SYSTEM:\n{final_system_prompt}\n\nUSER:\n{finalize_prompt}")
             finalized = await self._completion.complete(
                 final_system_prompt,
                 finalize_prompt,
