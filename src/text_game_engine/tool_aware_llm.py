@@ -2299,12 +2299,14 @@ class ToolAwareZorkLLM:
                     f"{tool_history}\n\n"
                     "Use the memory results above. Return ONLY the final turn JSON object."
                 )
+                self._zork_log(f"FORCED MEMORY SEARCH campaign={campaign_id}", augmented_prompt)
                 nxt = await self._completion.complete(
                     system_prompt,
                     augmented_prompt,
                     temperature=max(0.1, self._temperature - 0.2),
                     max_tokens=self._max_tokens,
                 )
+                self._zork_log(f"FORCED MEMORY SEARCH RESPONSE campaign={campaign_id}", nxt or "(empty)")
                 payload = self._parse_model_payload(nxt)
                 self._bump_auto_fix_counter(campaign_id, "forced_memory_search")
                 if payload is None:
@@ -2330,12 +2332,14 @@ class ToolAwareZorkLLM:
                     f"{tool_history}\n\n"
                     "Return ONLY the final turn JSON object."
                 )
+                self._zork_log(f"MEMORY TOOL DISABLED AUGMENTED RESPONSE campaign={campaign_id}", augmented_prompt)
                 nxt = await self._completion.complete(
                     system_prompt,
                     augmented_prompt,
                     temperature=max(0.1, self._temperature - 0.2),
                     max_tokens=self._max_tokens,
                 )
+                self._zork_log(f"MEMORY TOOL DISABLED RESPONSE campaign={campaign_id}", nxt or "(empty)")
                 payload = self._parse_model_payload(nxt)
                 if payload is None:
                     logger.warning("_resolve_payload: memory-disabled retry unparseable")
@@ -2352,12 +2356,14 @@ class ToolAwareZorkLLM:
                     f"{tool_history}\n\n"
                     "Return ONLY the final turn JSON object."
                 )
+                self._zork_log(f"TOOL DEDUP AUGMENTED RESPONSE campaign={campaign_id}", augmented_prompt)
                 nxt = await self._completion.complete(
                     system_prompt,
                     augmented_prompt,
                     temperature=max(0.1, self._temperature - 0.2),
                     max_tokens=self._max_tokens,
                 )
+                self._zork_log(f"TOOL DEDUP RESPONSE campaign={campaign_id}", nxt or "(empty)")
                 payload = self._parse_model_payload(nxt)
                 if payload is None:
                     logger.warning("_resolve_payload: dedup retry unparseable")
@@ -2389,12 +2395,14 @@ class ToolAwareZorkLLM:
                 f"{tool_history}\n\n"
                 "Use the tool results above. Return ONLY the final turn JSON object."
             )
+            self._zork_log(f"AUGMENTED API REQUEST campaign={campaign_id} tool={tool_name}", augmented_prompt)
             nxt = await self._completion.complete(
                 system_prompt,
                 augmented_prompt,
                 temperature=max(0.1, self._temperature - 0.2),
                 max_tokens=self._max_tokens,
             )
+            self._zork_log(f"AUGMENTED API RESPONSE campaign={campaign_id} tool={tool_name}", nxt or "(empty)")
             payload = self._parse_model_payload(nxt)
             if payload is None:
                 logger.warning("_resolve_payload: post-tool-execution response unparseable (tool=%s)", tool_name)
@@ -2449,12 +2457,14 @@ class ToolAwareZorkLLM:
                 "- state_update object with game_time advanced\n"
                 "- summary_update with durable consequence when applicable.\n"
             )
+            self._zork_log(f"EMPTY RESPONSE REPAIR campaign={campaign_id}", repair_prompt)
             repaired = await self._completion.complete(
                 system_prompt,
                 repair_prompt,
                 temperature=max(0.1, self._temperature - 0.1),
                 max_tokens=self._max_tokens,
             )
+            self._zork_log(f"EMPTY RESPONSE REPAIR RESPONSE campaign={campaign_id}", repaired or "(empty)")
             repaired_payload = self._parse_model_payload(repaired)
             if repaired_payload is not None and not emulator._is_tool_call(repaired_payload):  # noqa: SLF001
                 payload = repaired_payload
@@ -2470,12 +2480,14 @@ class ToolAwareZorkLLM:
                 "Use canonical CURRENT_GAME_TIME or omit exact times.\n"
                 "Return ONLY final JSON (no tool_call) with reasoning.\n"
             )
+            self._zork_log(f"CLOCK DRIFT RETRY campaign={campaign_id}", clock_prompt)
             clock_retry = await self._completion.complete(
                 system_prompt,
                 clock_prompt,
                 temperature=max(0.1, self._temperature - 0.1),
                 max_tokens=self._max_tokens,
             )
+            self._zork_log(f"CLOCK DRIFT RETRY RESPONSE campaign={campaign_id}", clock_retry or "(empty)")
             clock_payload = self._parse_model_payload(clock_retry)
             if clock_payload is not None and not emulator._is_tool_call(clock_payload):  # noqa: SLF001
                 payload = clock_payload
@@ -2493,12 +2505,14 @@ class ToolAwareZorkLLM:
                 "(chapter_plan optional off-rails).\n"
                 "No narration.\n"
             )
+            self._zork_log(f"PLANNING ENFORCEMENT campaign={campaign_id}", planning_prompt)
             planning_resp = await self._completion.complete(
                 system_prompt,
                 planning_prompt,
                 temperature=max(0.1, self._temperature - 0.2),
                 max_tokens=700,
             )
+            self._zork_log(f"PLANNING ENFORCEMENT RESPONSE campaign={campaign_id}", planning_resp or "(empty)")
             planning_payload = self._parse_model_payload(planning_resp)
             if planning_payload is not None and emulator._is_tool_call(planning_payload):  # noqa: SLF001
                 planning_name = str(planning_payload.get("tool_call") or "").strip().lower()
