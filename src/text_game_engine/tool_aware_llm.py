@@ -480,12 +480,28 @@ class ToolAwareZorkLLM:
             return None
         cleaned = emulator._clean_response(response)  # noqa: SLF001
         json_text = emulator._extract_json(cleaned)  # noqa: SLF001
+        logger.debug(
+            "_parse_model_payload: cleaned_len=%d json_text_len=%d has_fences=%s",
+            len(cleaned or ""),
+            len(json_text or ""),
+            "```" in (response or ""),
+        )
         try:
             payload = emulator._parse_json_lenient(json_text or cleaned)  # noqa: SLF001
         except Exception:
             logger.warning(
-                "_parse_model_payload: JSON parse failed; response[:500]=%s",
-                (response or "")[:500],
+                "_parse_model_payload: JSON parse failed; cleaned[:300]=%s json_text[:300]=%s",
+                (cleaned or "")[:300],
+                (json_text or "")[:300],
+            )
+            self._zork_log(
+                "PARSE CHAIN DETAIL",
+                f"response_len={len(response or '')}\n"
+                f"cleaned_len={len(cleaned or '')}\n"
+                f"json_text_len={len(json_text or '')}\n"
+                f"had_fences={'```' in (response or '')}\n"
+                f"cleaned[:500]={cleaned[:500] if cleaned else '(empty)'}\n"
+                f"json_text[:500]={json_text[:500] if json_text else '(None)'}",
             )
             return None
         if not isinstance(payload, dict):
@@ -494,6 +510,13 @@ class ToolAwareZorkLLM:
                 type(payload).__name__,
             )
             return None
+        is_tool = emulator._is_tool_call(payload)  # noqa: SLF001
+        logger.debug(
+            "_parse_model_payload: success keys=%s is_tool_call=%s narration_len=%d",
+            list(payload.keys())[:10],
+            is_tool,
+            len(str(payload.get("narration") or "")),
+        )
         return payload
 
     def _payload_to_output(
@@ -2275,6 +2298,14 @@ class ToolAwareZorkLLM:
         if emulator is None:
             logger.warning("_resolve_payload: emulator is None (second check)")
             return None
+        is_initial_tool_call = emulator._is_tool_call(payload)  # noqa: SLF001
+        logger.debug(
+            "_resolve_payload: initial parse ok — is_tool_call=%s tool=%s has_narration=%s keys=%s",
+            is_initial_tool_call,
+            payload.get("tool_call", "(none)"),
+            bool(payload.get("narration")),
+            list(payload.keys())[:8],
+        )
         memory_lookup_enabled = "memory_lookup_enabled: true" in user_prompt.lower()
         if (
             not emulator._is_tool_call(payload)  # noqa: SLF001
@@ -2313,10 +2344,12 @@ class ToolAwareZorkLLM:
                     logger.warning("_resolve_payload: forced memory search response unparseable")
                     return None
 
-        for _ in range(max(0, self._max_tool_rounds)):
+        for _round_idx in range(max(0, self._max_tool_rounds)):
             if not emulator._is_tool_call(payload):  # noqa: SLF001
+                logger.debug("_resolve_payload: round %d — not a tool call, breaking loop", _round_idx)
                 break
             tool_name = str(payload.get("tool_call") or "").strip().lower()
+            logger.debug("_resolve_payload: round %d — tool_call=%s keys=%s", _round_idx, tool_name, list(payload.keys())[:8])
             if tool_name:
                 used_tool_names.add(tool_name)
             if tool_name == "ready_to_write":
@@ -2589,10 +2622,25 @@ class ToolAwareZorkLLM:
             if payload is None:
                 logger.warning("complete_turn: _resolve_payload returned None → DeterministicLLM fallback (campaign=%s)", context.campaign_id)
                 return await self._fallback.complete_turn(context)
+            logger.debug(
+                "complete_turn: _resolve_payload succeeded, keys=%s narration_len=%d, calling _payload_to_output (campaign=%s)",
+                list(payload.keys())[:10],
+                len(str(payload.get("narration") or "")),
+                context.campaign_id,
+            )
+            self._zork_log(
+                f"RESOLVE_PAYLOAD RESULT campaign={context.campaign_id}",
+                json.dumps(payload, default=str, ensure_ascii=False),
+            )
             output = self._payload_to_output(
                 payload,
                 actor_id=context.actor_id,
                 character_name=context.player_state.get("character_name"),
+            )
+            logger.debug(
+                "complete_turn: _payload_to_output succeeded, narration_len=%d (campaign=%s)",
+                len(output.narration or ""),
+                context.campaign_id,
             )
             # Execute any inline tool_calls (sms_write / sms_schedule) that the
             # LLM included alongside its final narration.  These have already
@@ -2604,7 +2652,7 @@ class ToolAwareZorkLLM:
                     pass  # best-effort; don't break the turn
             return output
         except Exception:
-            logger.exception("complete_turn: unhandled exception → DeterministicLLM fallback (campaign=%s)", context.campaign_id)
+            logger.exception("complete_turn: unhandled exception → DeterministicLLM fallback (campaign=%s action=%s)", context.campaign_id, (context.action or "")[:100])
             return await self._fallback.complete_turn(context)
 
 

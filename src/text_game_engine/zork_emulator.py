@@ -10736,7 +10736,12 @@ class ZorkEmulator:
         return text[start : end + 1]
 
     def _is_tool_call(self, payload: dict[str, Any]) -> bool:
-        return isinstance(payload, dict) and "tool_call" in payload and "narration" not in payload
+        if not isinstance(payload, dict):
+            return False
+        tool_val = payload.get("tool_call")
+        if not tool_val or not isinstance(tool_val, str) or not tool_val.strip():
+            return False
+        return "narration" not in payload
 
     def _coerce_python_dict(self, text: str) -> dict[str, Any] | None:
         try:

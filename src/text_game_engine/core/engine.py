@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 import uuid
+
+logger = logging.getLogger(__name__)
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable
@@ -635,8 +638,19 @@ class GameEngine:
             if campaign is None or player is None:
                 raise StaleClaimError("missing_campaign_or_player")
 
-            if campaign.row_version != context.start_row_version:
-                raise StaleClaimError("row_version_changed")
+            current_row_version = campaign.row_version
+            if current_row_version != context.start_row_version:
+                # Row version changed during LLM call (e.g. timer event or
+                # concurrent background update).  The claim is still valid
+                # and we already re-read current state below, so proceed
+                # with the current row_version rather than discarding the
+                # expensive LLM work.
+                logger.warning(
+                    "_phase_c: row_version drift (start=%d current=%d) for campaign=%s — proceeding with current version",
+                    context.start_row_version,
+                    current_row_version,
+                    turn_input.campaign_id,
+                )
 
             campaign_state = parse_json_dict(campaign.state_json)
             campaign_characters = parse_json_dict(campaign.characters_json)
@@ -985,7 +999,7 @@ class GameEngine:
 
             cas_ok = uow.campaigns.cas_apply_update(
                 campaign_id=turn_input.campaign_id,
-                expected_row_version=context.start_row_version,
+                expected_row_version=current_row_version,
                 values={
                     "summary": summary,
                     "state_json": dump_json(campaign_state),
