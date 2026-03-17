@@ -818,15 +818,19 @@ class ToolAwareZorkLLM:
             elif category_scope.startswith("source:"):
                 source_scope = True
                 source_scope_key = category_scope.split(":", 1)[1].strip() or None
+            curated_seen: set[tuple[str, str]] = set()
             for query in queries[:4]:
-                curated_hits.extend(
-                    self._emulator.search_curated_memories(
-                        query=query,
-                        campaign_id=campaign_id,
-                        category=category,
-                        top_k=5,
-                    )
-                )
+                for hit in self._emulator.search_curated_memories(
+                    query=query,
+                    campaign_id=campaign_id,
+                    category=category,
+                    top_k=5,
+                ):
+                    dedup_key = (str(hit[0] or "").strip(), str(hit[1] or "").strip())
+                    if dedup_key in curated_seen:
+                        continue
+                    curated_seen.add(dedup_key)
+                    curated_hits.append(hit)
 
         roster_hints: list[dict[str, Any]] = []
         if self._emulator is not None and hasattr(
@@ -1001,66 +1005,62 @@ class ToolAwareZorkLLM:
         source_hits_unique = source_hits_unique[:12]
 
         records: list[dict[str, Any]] = []
-        for query in queries[:4]:
-            query_hits = 0
-            for hit in ordered_narrator:
-                query_hits += 1
-                records.append(
-                    {
-                        "kind": "memory_hit",
-                        "query": query,
-                        "memory_type": "turn",
-                        "turn_id": int(hit.get("turn_id", 0) or 0),
-                        "relevance": round(float(hit.get("score", 0.0) or 0.0), 4),
-                        "actor_player_slug": str(hit.get("actor_player_slug") or "").strip(),
-                        "visibility_scope": str(hit.get("visibility_scope") or "public").strip(),
-                        "location_key": str(hit.get("location_key") or "").strip(),
-                        "text": self._memory_tool_text_value(hit.get("content") or "", max_chars=280),
-                    }
-                )
-            for term, memory, score in curated_hits[:5]:
-                query_hits += 1
-                records.append(
-                    {
-                        "kind": "memory_hit",
-                        "query": query,
-                        "memory_type": "manual",
-                        "term": str(term or "").strip(),
-                        "relevance": round(float(score or 0.0), 4),
-                        "text": self._memory_tool_text_value(memory or "", max_chars=220),
-                    }
-                )
-            for (
-                source_doc_key,
-                source_doc_label,
-                source_chunk_index,
-                source_chunk_text,
-                source_score,
-            ) in source_hits_unique:
-                if float(source_score) < 0.40:
-                    continue
-                query_hits += 1
-                records.append(
-                    {
-                        "kind": "memory_hit",
-                        "query": query,
-                        "memory_type": "source",
-                        "document_key": str(source_doc_key or ""),
-                        "document_label": str(source_doc_label or ""),
-                        "chunk_index": int(source_chunk_index or 0),
-                        "relevance": round(float(source_score or 0.0), 4),
-                        "text": self._memory_tool_text_value(source_chunk_text or "", max_chars=4000),
-                    }
-                )
-            records.insert(
-                len(records) - query_hits,
+        total_hits = 0
+        for hit in ordered_narrator:
+            total_hits += 1
+            records.append(
                 {
-                    "kind": "memory_query_result",
-                    "query": query,
-                    "category": category or "",
-                    "hit_count": query_hits,
-                },
+                    "kind": "memory_hit",
+                    "memory_type": "turn",
+                    "turn_id": int(hit.get("turn_id", 0) or 0),
+                    "relevance": round(float(hit.get("score", 0.0) or 0.0), 4),
+                    "actor_player_slug": str(hit.get("actor_player_slug") or "").strip(),
+                    "visibility_scope": str(hit.get("visibility_scope") or "public").strip(),
+                    "location_key": str(hit.get("location_key") or "").strip(),
+                    "text": self._memory_tool_text_value(hit.get("content") or "", max_chars=280),
+                }
             )
+        for term, memory, score in curated_hits[:5]:
+            total_hits += 1
+            records.append(
+                {
+                    "kind": "memory_hit",
+                    "memory_type": "manual",
+                    "term": str(term or "").strip(),
+                    "relevance": round(float(score or 0.0), 4),
+                    "text": self._memory_tool_text_value(memory or "", max_chars=220),
+                }
+            )
+        for (
+            source_doc_key,
+            source_doc_label,
+            source_chunk_index,
+            source_chunk_text,
+            source_score,
+        ) in source_hits_unique:
+            if float(source_score) < 0.40:
+                continue
+            total_hits += 1
+            records.append(
+                {
+                    "kind": "memory_hit",
+                    "memory_type": "source",
+                    "document_key": str(source_doc_key or ""),
+                    "document_label": str(source_doc_label or ""),
+                    "chunk_index": int(source_chunk_index or 0),
+                    "relevance": round(float(source_score or 0.0), 4),
+                    "text": self._memory_tool_text_value(source_chunk_text or "", max_chars=4000),
+                }
+            )
+        records.insert(
+            0,
+            {
+                "kind": "memory_query_result",
+                "queries": queries[:4],
+                "category": category or "",
+                "hit_count": total_hits,
+            },
+        )
         if has_source_material:
             total_snippets = 0
             for row in source_docs:
