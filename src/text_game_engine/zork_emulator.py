@@ -11140,6 +11140,10 @@ class ZorkEmulator:
             "a hollow silence answers",
             "the world shifts, but nothing clear emerges",
         )
+        active_pc = self._active_private_context_from_state(player_state)
+        viewer_private_context_key = str(
+            (active_pc or {}).get("context_key") or ""
+        ).strip()
         for turn in turns:
             content = (turn.content or "").strip()
             if not content:
@@ -11166,6 +11170,23 @@ class ZorkEmulator:
             elif turn.kind == "narrator":
                 if content.lower() in error_phrases:
                     continue
+                # Prefer structured JSONL beats when the turn has scene_output.
+                meta = self._safe_turn_meta(turn)
+                scene_output = meta.get("scene_output")
+                if isinstance(scene_output, dict) and scene_output.get("beats"):
+                    jsonl_lines = self._scene_output_recent_lines(
+                        turn,
+                        state,
+                        scene_output,
+                        viewer_actor_id=player.actor_id,
+                        viewer_slug=viewer_slug,
+                        viewer_location_key=viewer_location_key,
+                        viewer_private_context_key=viewer_private_context_key,
+                    )
+                    if jsonl_lines:
+                        recent_lines.extend(jsonl_lines)
+                        continue
+                # Fallback: plain text for legacy turns without scene_output.
                 clipped_lines = []
                 for line in content.splitlines():
                     stripped = line.strip()
