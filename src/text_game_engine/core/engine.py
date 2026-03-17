@@ -85,9 +85,15 @@ class GameEngine:
                 # Pre-LLM: validate active puzzle / minigame input
                 self._pre_llm_puzzle_minigame(context, turn_input)
 
+                # Wrap the progress callback so that every progress
+                # notification also heartbeats the inflight claim,
+                # preventing lease expiry during long LLM calls.
+                heartbeat_progress = self._make_heartbeat_progress(
+                    turn_input, claim_token, progress,
+                )
+
                 llm_kwargs: dict[str, Any] = {}
-                if progress is not None:
-                    llm_kwargs["progress"] = progress
+                llm_kwargs["progress"] = heartbeat_progress
                 llm_output = await self._llm.complete_turn(context, **llm_kwargs)
 
                 if before_phase_c is not None:
@@ -108,6 +114,49 @@ class GameEngine:
                 return ResolveTurnResult(status="error", conflict_reason=str(e))
 
         return ResolveTurnResult(status="conflict", conflict_reason="max_retries_exhausted")
+
+    def _make_heartbeat_progress(
+        self,
+        turn_input: ResolveTurnInput,
+        claim_token: str,
+        inner: ProgressCallback | None,
+    ) -> ProgressCallback:
+        """Wrap a progress callback to also heartbeat the inflight claim.
+
+        Every progress notification extends the lease by ``_lease_ttl_seconds``
+        so that long-running LLM calls (tool loops, retries) don't cause the
+        claim to expire and trigger spurious ``StaleClaimError`` / "world shifts"
+        failures.
+        """
+        async def _heartbeat_and_forward(
+            phase: str,
+            metadata: dict[str, Any] | None = None,
+        ) -> None:
+            # Best-effort heartbeat — failures are non-fatal.
+            try:
+                now = self._clock()
+                new_expires = now + timedelta(seconds=self._lease_ttl_seconds)
+                with self._uow_factory() as uow:
+                    uow.inflight.heartbeat(
+                        campaign_id=turn_input.campaign_id,
+                        actor_id=turn_input.actor_id,
+                        claim_token=claim_token,
+                        now=now,
+                        expires_at=new_expires,
+                    )
+                    uow.commit()
+            except Exception:
+                pass
+            # Forward to the original progress callback if present.
+            if inner is not None:
+                try:
+                    maybe = inner(phase, metadata)
+                    if asyncio.iscoroutine(maybe):
+                        await maybe
+                except Exception:
+                    pass
+
+        return _heartbeat_and_forward
 
     def rewind_to_turn(self, campaign_id: str, target_turn_id: int) -> RewindResult:
         with self._uow_factory() as uow:
@@ -631,6 +680,16 @@ class GameEngine:
                 now=now,
             )
             if not valid:
+                elapsed = (now - context.now).total_seconds() if context.now else -1
+                logger.error(
+                    "_phase_c: claim_invalid for campaign=%s actor=%s "
+                    "(elapsed=%.1fs, lease_ttl=%ds) — the inflight claim "
+                    "expired or was stolen during the LLM call",
+                    turn_input.campaign_id,
+                    turn_input.actor_id,
+                    elapsed,
+                    self._lease_ttl_seconds,
+                )
                 raise StaleClaimError("claim_invalid")
 
             # Lock the campaign row for the duration of this transaction.
