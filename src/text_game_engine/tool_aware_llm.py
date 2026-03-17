@@ -775,6 +775,10 @@ class ToolAwareZorkLLM:
             )
         if not queries:
             return "MEMORY_RECALL: No queries provided."
+        self._zork_log(
+            f"MEMORY_SEARCH campaign={campaign_id}",
+            f"queries={queries!r}  category={category!r}  actor={actor_id}",
+        )
         try:
             source_before_lines = int(payload.get("before_lines", 0))
         except Exception:
@@ -942,6 +946,30 @@ class ToolAwareZorkLLM:
                         "location_key": str(meta.get("location_key") or ""),
                     }
 
+        # Embedding-based turn search via the memory port (supplements keyword hits).
+        if self._emulator is not None and self._emulator._memory_port is not None:
+            for query in queries[:4]:
+                try:
+                    embed_hits = self._emulator._memory_port.search(  # noqa: SLF001
+                        query=query,
+                        campaign_id=campaign_id,
+                        top_k=5,
+                    )
+                    for turn_id, kind, content, score in embed_hits:
+                        tid = int(turn_id)
+                        prior = narrator_hits.get(tid)
+                        if prior is None or float(score) > float(prior.get("score", 0.0)):
+                            narrator_hits[tid] = {
+                                "turn_id": tid,
+                                "score": float(score),
+                                "content": str(content or ""),
+                                "visibility_scope": "public",
+                                "actor_player_slug": "",
+                                "location_key": "",
+                            }
+                except Exception:
+                    pass
+
         ordered_narrator = sorted(
             narrator_hits.values(),
             key=lambda row: (float(row.get("score", 0.0)), int(row.get("turn_id", 0))),
@@ -1072,8 +1100,20 @@ class ToolAwareZorkLLM:
                 }
             )
         if not records:
+            self._zork_log(
+                f"MEMORY_SEARCH RESULT campaign={campaign_id}",
+                "No relevant memories found.",
+            )
             return "MEMORY_RECALL: No relevant memories found."
-        return "MEMORY_RECALL:\n" + self._memory_tool_jsonl(records)
+        result_jsonl = self._memory_tool_jsonl(records)
+        hit_count = sum(1 for r in records if r.get("kind") == "memory_hit")
+        self._zork_log(
+            f"MEMORY_SEARCH RESULT campaign={campaign_id}",
+            f"hits={hit_count}  curated={len(curated_hits)}  "
+            f"narrator={len(ordered_narrator)}  source={len(source_hits_unique)}  "
+            f"roster_hints={len(roster_hints)}",
+        )
+        return "MEMORY_RECALL:\n" + result_jsonl
 
     def _tool_memory_terms(self, campaign_id: str, payload: dict[str, Any]) -> str:
         wildcard_raw = payload.get("wildcard")

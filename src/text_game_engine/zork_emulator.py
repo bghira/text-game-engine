@@ -6861,6 +6861,42 @@ class ZorkEmulator:
                                 )
                             )
 
+                # Fire-and-forget: embed the narrator turn for memory search.
+                if self._memory_port is not None and display_narration:
+                    try:
+                        with self._session_factory() as _embed_session:
+                            last_turns = (
+                                _embed_session.query(Turn)
+                                .filter(Turn.campaign_id == campaign_id)
+                                .filter(Turn.kind == "narrator")
+                                .order_by(Turn.id.desc())
+                                .limit(1)
+                                .all()
+                            )
+                        if last_turns:
+                            _embed_turn = last_turns[0]
+                            _embed_meta = self._safe_turn_meta(_embed_turn)
+                            _embed_visibility = _embed_meta.get("visibility")
+                            self._memory_port.store_turn_embedding(
+                                turn_id=int(_embed_turn.id),
+                                campaign_id=campaign_id,
+                                actor_id=actor_id,
+                                kind="narrator",
+                                content=result.narration or "",
+                                metadata=self._turn_embedding_metadata(
+                                    visibility=_embed_visibility if isinstance(_embed_visibility, dict) else None,
+                                    actor_player_slug=_embed_meta.get("actor_player_slug"),
+                                    location_key=_embed_meta.get("location_key"),
+                                    session_id=session_id,
+                                ),
+                            )
+                    except Exception:
+                        logger.debug(
+                            "Turn embedding skipped for campaign=%s",
+                            campaign_id,
+                            exc_info=True,
+                        )
+
                 return display_narration
             if result.status == "busy":
                 return None
@@ -8178,6 +8214,41 @@ class ZorkEmulator:
                 event_description,
             )
             narration = str(event_description or "Something happens.").strip()
+        # Embed the timed-event narrator turn for memory search.
+        if self._memory_port is not None and narration:
+            try:
+                with self._session_factory() as _embed_session:
+                    last_turns = (
+                        _embed_session.query(Turn)
+                        .filter(Turn.campaign_id == campaign_id)
+                        .filter(Turn.kind == "narrator")
+                        .order_by(Turn.id.desc())
+                        .limit(1)
+                        .all()
+                    )
+                if last_turns:
+                    _embed_turn = last_turns[0]
+                    _embed_meta = self._safe_turn_meta(_embed_turn)
+                    _embed_visibility = _embed_meta.get("visibility")
+                    self._memory_port.store_turn_embedding(
+                        turn_id=int(_embed_turn.id),
+                        campaign_id=campaign_id,
+                        actor_id=active_actor_id,
+                        kind="narrator",
+                        content=narration,
+                        metadata=self._turn_embedding_metadata(
+                            visibility=_embed_visibility if isinstance(_embed_visibility, dict) else None,
+                            actor_player_slug=_embed_meta.get("actor_player_slug"),
+                            location_key=_embed_meta.get("location_key"),
+                            session_id=None,
+                        ),
+                    )
+            except Exception:
+                logger.debug(
+                    "Timed-event turn embedding skipped for campaign=%s",
+                    campaign_id,
+                    exc_info=True,
+                )
         if narration and self._timer_effects_port is not None:
             try:
                 await self._timer_effects_port.emit_timed_event(

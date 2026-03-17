@@ -74,6 +74,17 @@ class MemorySearchPort(Protocol):
     ) -> list[tuple[str, str, float]]:
         ...
 
+    def store_turn_embedding(
+        self,
+        turn_id: int,
+        campaign_id: str,
+        actor_id: str | None,
+        kind: str,
+        content: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        ...
+
 
 class IMDBLookupPort(Protocol):
     def search(self, query: str, max_results: int = 3) -> list[dict]:
