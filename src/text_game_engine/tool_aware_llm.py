@@ -2326,9 +2326,26 @@ class ToolAwareZorkLLM:
         self._zork_log(f"RESEARCH RESPONSE campaign={campaign_id}", first or "(empty)")
         payload = self._parse_model_payload(first)
         if payload is None:
-            logger.warning("_resolve_payload: initial payload parse failed → DeterministicLLM fallback")
+            logger.warning("_resolve_payload: initial payload parse failed → JSON retry")
             self._zork_log(f"PARSE FAILED campaign={campaign_id}", first or "(empty)")
-            return None
+            await _notify_progress(progress, "refining")
+            retry_prompt = (
+                f"{user_prompt}\n\n"
+                "IMPORTANT: Your previous response was not valid JSON.  "
+                "Return ONLY a single JSON object with no markdown fences, "
+                "no commentary, no prose.  Begin with {{ and end with }}."
+            )
+            retry_resp = await self._completion.complete(
+                system_prompt,
+                retry_prompt,
+                temperature=max(0.1, self._temperature - 0.3),
+                max_tokens=self._max_tokens,
+            )
+            self._zork_log(f"PARSE RETRY RESPONSE campaign={campaign_id}", retry_resp or "(empty)")
+            payload = self._parse_model_payload(retry_resp)
+            if payload is None:
+                logger.warning("_resolve_payload: retry parse also failed → DeterministicLLM fallback")
+                return None
 
         tool_history = ""
         used_tool_names: set[str] = set()

@@ -10865,9 +10865,22 @@ class ZorkEmulator:
             result = json.loads(text)
             return result if isinstance(result, dict) else {}
         except json.JSONDecodeError as exc:
+            # Step 1b: apply common syntax repairs then retry.
+            repaired = self._repair_json_lenient_text(text)
+            if repaired != text:
+                try:
+                    result = json.loads(repaired)
+                    if isinstance(result, dict):
+                        return result
+                except json.JSONDecodeError:
+                    pass
             coerced = self._coerce_python_dict(text)
             if coerced is not None:
                 return coerced
+            if repaired != text:
+                coerced = self._coerce_python_dict(repaired)
+                if coerced is not None:
+                    return coerced
             if "Extra data" not in str(exc):
                 raise
             merged: dict[str, Any] = {}
