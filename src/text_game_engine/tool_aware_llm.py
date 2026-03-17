@@ -1042,7 +1042,7 @@ class ToolAwareZorkLLM:
                     "memory_type": "manual",
                     "term": str(term or "").strip(),
                     "relevance": round(float(score or 0.0), 4),
-                    "text": self._memory_tool_text_value(memory or "", max_chars=600),
+                    "text": self._memory_tool_text_value(memory or "", max_chars=2000),
                 }
             )
         for (

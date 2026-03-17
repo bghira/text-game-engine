@@ -9,7 +9,7 @@ import time
 from text_game_engine.core.types import GiveItemInstruction, LLMTurnOutput, TimerInstruction
 from text_game_engine.core.engine import GameEngine
 from text_game_engine.persistence.sqlalchemy.uow import SQLAlchemyUnitOfWork
-from text_game_engine.persistence.sqlalchemy.models import Campaign, Player, Snapshot, Turn
+from text_game_engine.persistence.sqlalchemy.models import Actor, Campaign, Player, Snapshot, Turn
 from text_game_engine.tool_aware_llm import ToolAwareZorkLLM
 from text_game_engine.zork_emulator import ZorkEmulator
 
@@ -261,6 +261,51 @@ class LegacyCtx:
         self.guild = LegacyCtx._Guild(guild_id)
         self.channel = LegacyCtx._Channel(channel_id)
         self.message = LegacyCtx._Message(attachments or [])
+
+
+def test_rename_player_character_updates_state_actor_and_roster(
+    session_factory,
+    uow_factory,
+    seed_campaign_and_actor,
+):
+    llm = StubLLM(LLMTurnOutput(narration="ok"))
+    engine = GameEngine(uow_factory=uow_factory, llm=llm)
+    compat = ZorkEmulator(game_engine=engine, session_factory=session_factory)
+
+    actor_id = seed_campaign_and_actor["actor_id"]
+    campaign_id = seed_campaign_and_actor["campaign_id"]
+    compat.get_or_create_actor(actor_id, display_name="Old Name")
+    player = compat.get_or_create_player(campaign_id, actor_id)
+
+    with session_factory() as session:
+        player_row = session.get(Player, player.id)
+        assert player_row is not None
+        player_row.state_json = compat._dump_json({"character_name": "Old Name"})
+        campaign_row = session.get(Campaign, campaign_id)
+        assert campaign_row is not None
+        campaign_row.characters_json = compat._dump_json(
+            {"old-name": {"name": "Old Name", "location": "harbor"}}
+        )
+        session.commit()
+
+    result = compat.rename_player_character(campaign_id, actor_id, "New Name")
+    assert result["ok"] is True
+    assert result["old_name"] == "Old Name"
+    assert result["name"] == "New Name"
+    assert result["migrated_roster_slug"] == "new-name"
+
+    refreshed = compat.get_or_create_player(campaign_id, actor_id)
+    refreshed_state = compat.get_player_state(refreshed)
+    assert refreshed_state.get("character_name") == "New Name"
+
+    with session_factory() as session:
+        actor_row = session.get(Actor, actor_id)
+        assert actor_row is not None
+        assert actor_row.display_name == "New Name"
+        campaign_row = session.get(Campaign, campaign_id)
+        characters = json.loads(campaign_row.characters_json or "{}")
+        assert "old-name" not in characters
+        assert characters["new-name"]["name"] == "New Name"
 
 
 class FakeHTTPResponse:

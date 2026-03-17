@@ -2018,6 +2018,87 @@ class ZorkEmulator:
         stats["attention_hours"] = round(attention_seconds / 3600.0, 2)
         return stats
 
+    def rename_player_character(
+        self,
+        campaign_id: str,
+        actor_id: str,
+        new_name: str,
+    ) -> dict[str, object]:
+        clean_name = " ".join(str(new_name or "").strip().split())
+        if not clean_name:
+            raise ValueError("Character name is required.")
+        clean_name = clean_name[:128]
+
+        with self._session_factory() as session:
+            campaign = session.get(Campaign, campaign_id)
+            if campaign is None:
+                raise KeyError(f"Unknown campaign: {campaign_id}")
+
+            player = (
+                session.query(Player)
+                .filter(Player.campaign_id == campaign_id)
+                .filter(Player.actor_id == actor_id)
+                .first()
+            )
+            if player is None:
+                raise KeyError(f"Unknown player in campaign: {actor_id}")
+
+            actor = session.get(Actor, actor_id)
+            if actor is None:
+                actor = Actor(id=actor_id, display_name=clean_name, kind="human", metadata_json="{}")
+                session.add(actor)
+
+            player_state = parse_json_dict(player.state_json)
+            old_name = " ".join(
+                str(
+                    player_state.get("character_name")
+                    or getattr(actor, "display_name", None)
+                    or actor_id
+                ).strip().split()
+            )[:128]
+            player_state["character_name"] = clean_name
+            player.state_json = self._dump_json(player_state)
+            player.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
+            player.last_active_at = datetime.now(timezone.utc).replace(tzinfo=None)
+
+            actor.display_name = clean_name
+            actor.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
+
+            migrated_roster_slug = None
+            characters = parse_json_dict(campaign.characters_json)
+            if isinstance(characters, dict) and characters:
+                lookup_name = old_name or clean_name
+                resolved_slug = self._resolve_existing_character_slug(characters, lookup_name)
+                if resolved_slug is not None:
+                    entry = characters.get(resolved_slug)
+                    if isinstance(entry, dict):
+                        updated_entry = dict(entry)
+                        updated_entry["name"] = clean_name
+                        canonical_slug = re.sub(r"[^a-z0-9]+", "-", clean_name.lower()).strip("-")
+                        if canonical_slug and canonical_slug != resolved_slug and canonical_slug not in characters:
+                            characters.pop(resolved_slug, None)
+                            characters[canonical_slug] = updated_entry
+                            migrated_roster_slug = canonical_slug
+                        else:
+                            characters[resolved_slug] = updated_entry
+                            migrated_roster_slug = resolved_slug
+                        campaign.characters_json = self._dump_json(characters)
+                        campaign.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
+
+            session.commit()
+
+        self._zork_log(
+            "PLAYER CHARACTER RENAMED",
+            f"campaign={campaign_id}\nactor_id={actor_id}\nold_name={old_name}\nnew_name={clean_name}",
+        )
+        return {
+            "ok": True,
+            "actor_id": actor_id,
+            "old_name": old_name,
+            "name": clean_name,
+            "migrated_roster_slug": migrated_roster_slug,
+        }
+
     def _normalize_campaign_name(self, name: str) -> str:
         return normalize_campaign_name(name)
 
