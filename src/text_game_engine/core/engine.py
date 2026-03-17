@@ -913,6 +913,14 @@ class GameEngine:
                 narrator_turn_meta["scene_output"] = llm_output.scene_output
                 if narration:
                     narrator_turn_meta["scene_output_rendered"] = narration
+                jsonl = self._scene_output_to_jsonl(
+                    turn_id=None,
+                    game_time=post_turn_game_time,
+                    scene_output=llm_output.scene_output,
+                    turn_visibility=turn_visibility,
+                )
+                if jsonl:
+                    narrator_turn_meta["scene_output_jsonl"] = jsonl
             narrator_turn = uow.turns.add(
                 campaign_id=turn_input.campaign_id,
                 session_id=turn_input.session_id,
@@ -1545,6 +1553,56 @@ class GameEngine:
         except (TypeError, ValueError):
             return default
         return parsed if parsed >= 0 else default
+
+    @staticmethod
+    def _scene_output_to_jsonl(
+        *,
+        turn_id: int | None,
+        game_time: dict[str, int],
+        scene_output: dict[str, Any] | None,
+        turn_visibility: dict[str, Any] | None,
+    ) -> str:
+        """Serialize scene_output beats to JSONL for structured storage."""
+        if not isinstance(scene_output, dict):
+            return ""
+        beats = scene_output.get("beats")
+        if not isinstance(beats, list) or not beats:
+            return ""
+        _int = GameEngine._coerce_non_negative_int
+        gt = game_time if isinstance(game_time, dict) else {}
+        lines: list[str] = []
+        header = {
+            "kind": "turn",
+            "turn_id": turn_id,
+            "day": _int(gt.get("day", 1), default=1),
+            "hour": _int(gt.get("hour", 0), default=0),
+            "minute": _int(gt.get("minute", 0), default=0),
+            "location_key": scene_output.get("location_key"),
+            "context_key": scene_output.get("context_key"),
+            "visibility": str((turn_visibility or {}).get("scope") or "").strip().lower() or "local",
+        }
+        lines.append(json.dumps(header, ensure_ascii=False, separators=(",", ":")))
+        for beat_index, beat in enumerate(beats):
+            if not isinstance(beat, dict):
+                continue
+            line = {
+                "kind": "beat",
+                "turn_id": turn_id,
+                "index": beat_index,
+                "reasoning": str(beat.get("reasoning") or "").strip(),
+                "type": str(beat.get("type") or "narration").strip(),
+                "speaker": str(beat.get("speaker") or "narrator").strip(),
+                "actors": list(beat.get("actors") or []),
+                "listeners": list(beat.get("listeners") or []),
+                "visibility": str(beat.get("visibility") or "local").strip(),
+                "visible_actor_ids": list(beat.get("visible_actor_ids") or beat.get("aware_discord_ids") or []),
+                "aware_npc_slugs": list(beat.get("aware_npc_slugs") or []),
+                "location_key": beat.get("location_key"),
+                "context_key": beat.get("context_key"),
+                "text": str(beat.get("text") or "").strip(),
+            }
+            lines.append(json.dumps(line, ensure_ascii=False, separators=(",", ":")))
+        return "\n".join(lines)
 
     @staticmethod
     def _is_ooc_action_text(action_text: object) -> bool:
