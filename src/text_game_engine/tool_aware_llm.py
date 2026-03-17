@@ -1031,7 +1031,7 @@ class ToolAwareZorkLLM:
                     "actor_player_slug": str(hit.get("actor_player_slug") or "").strip(),
                     "visibility_scope": str(hit.get("visibility_scope") or "public").strip(),
                     "location_key": str(hit.get("location_key") or "").strip(),
-                    "text": self._memory_tool_text_value(hit.get("content") or "", max_chars=800),
+                    "text": self._memory_tool_text_value(hit.get("content") or "", max_chars=3000),
                 }
             )
         for term, memory, score in curated_hits[:5]:
