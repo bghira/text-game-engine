@@ -459,6 +459,12 @@ class ZorkEmulator:
         "No closing cadence: do not end turns with a settlement phrase that resolves scene energy through rhythmic finality. If the scene is still tense, the last line stays tense. "
         "Avoid contrived emotional-summary language or therapist-speak "
         "unless that exact voice is canonically right for the speaking character. "
+        "PLAYER INPUT AUDIBILITY: When PLAYER_ACTION contains quoted dialogue (text in quotation marks), "
+        "that speech is audible to characters in the scene and NPCs may hear and respond to it. "
+        "Unquoted text is stage direction — narrative intent, abstract instructions, or internal thought — "
+        "and is NOT audible to characters. NPCs must never reference, react to, or echo unquoted parenthetical "
+        "or stage-direction text as though they heard it spoken. If the input is entirely unquoted, treat it as "
+        "abstract intent for you to expand into scene-appropriate action and dialogue.\n"
         "ANTI-ECHO: do NOT restate, paraphrase, or mirror the player's just-written wording. "
         "Do not quote the player's lines back to them unless one exact contested phrase is materially necessary. "
         "Default: NPC first line should add new information, a decision, a demand, or a consequence. "
@@ -954,8 +960,9 @@ class ZorkEmulator:
         '{"tool_call": "memory_search", "category": "char:marcus-blackwell", "queries": ["Marcus at the penthouse", "the deal Marcus offered"]}\n'
         "If results are weak or empty, you may immediately call memory_search again with refined queries.\n"
         "\nTOOL USAGE POLICY (HIGH PRIORITY):\n"
-        "- On every normal gameplay turn, call recent_turns BEFORE final narration/state JSON.\n"
-        "- After recent_turns, call memory_search for deeper recall when needed.\n"
+        "- MANDATORY: On every normal gameplay turn you MUST call at least one memory tool (recent_turns or memory_search) "
+        "BEFORE producing final narration. Do not skip this step. Begin your turn with recent_turns, then follow up with "
+        "memory_search if deeper or older recall is needed.\n"
         "- If PLAYER_ACTION involves phone/text/call/off-scene contact, use sms_list/sms_read before narrating; "
         "use sms_write when sending or replying. Use sms_schedule for delayed replies.\n"
         "- Phone/text/SMS turns should normally be private or limited, not local/public, unless the player explicitly shares the content out loud.\n"
@@ -1038,7 +1045,6 @@ class ZorkEmulator:
         "- when the player references past events, locations, objects, or conversations\n"
         "- when describing a revisited location or established NPC\n"
         "- when the player investigates, asks questions, or you are unsure about earlier campaign facts\n"
-        "Do not call memory_search reflexively after every recent_turns. Use it when it will materially improve continuity.\n"
         "When in doubt between guessing and searching, search.\n"
         "IMPORTANT: Memories are stored as narrator event text (e.g. what happened in a scene). "
         "Queries are matched by semantic similarity against these narration snippets.\n"
@@ -1173,6 +1179,7 @@ class ZorkEmulator:
         self._imdb_port = imdb_port
         self._media_port = media_port
         self._notification_port = notification_port
+        self.append_inventory_to_narration = True
         self._logger = logging.getLogger(__name__)
         self._inflight_turns: set[tuple[str, str]] = set()
         self._inflight_turns_lock = threading.Lock()
@@ -6875,13 +6882,14 @@ class ZorkEmulator:
             player_state = self.get_player_state(player) if player is not None else {}
             campaign_state = self.get_campaign_state(campaign) if campaign is not None else {}
             post_turn_game_time = self._extract_game_time_snapshot(campaign_state)
-            inventory_line = self._format_inventory(player_state) or "Inventory: empty"
+            if self.append_inventory_to_narration:
+                inventory_line = self._format_inventory(player_state) or "Inventory: empty"
 
-            if not has_inventory_line:
-                if decorated:
-                    decorated = f"{decorated}\n\n{inventory_line}"
-                else:
-                    decorated = inventory_line
+                if not has_inventory_line:
+                    if decorated:
+                        decorated = f"{decorated}\n\n{inventory_line}"
+                    else:
+                        decorated = inventory_line
 
             sms_notice = self._sms_unread_hourly_notification(
                 campaign_state,
