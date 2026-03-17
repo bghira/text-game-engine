@@ -923,7 +923,7 @@ class ZorkEmulator:
         "- Your narration should hint at urgency narratively (e.g. 'the footsteps grow louder') but NEVER include countdowns, timestamps, emoji clocks, or explicit seconds. The system adds its own countdown display automatically.\n"
         "- No quota: only set a timer when the current scene has a believable, already-grounded clock.\n"
     )
-    MEMORY_LOOKUP_MIN_SUMMARY_CHARS = MAX_SUMMARY_CHARS
+    MEMORY_LOOKUP_MIN_SUMMARY_CHARS = 2000
     MEMORY_TOOL_DISABLED_PROMPT = (
         "\nEARLY-CAMPAIGN MEMORY MODE:\n"
         "- Long-term memory lookup tools are disabled for this turn because WORLD_SUMMARY is still within context budget.\n"
@@ -11258,7 +11258,7 @@ class ZorkEmulator:
             characters=characters,
         )
         memory_lookup_enabled = self._memory_lookup_enabled_for_prompt(
-            summary,
+            campaign.summary or "",
             source_material_available=bool(source_payload.get("available")),
             action_text=action,
         )
