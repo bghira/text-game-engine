@@ -2525,37 +2525,13 @@ class ToolAwareZorkLLM:
             if clock_payload is not None and not emulator._is_tool_call(clock_payload):  # noqa: SLF001
                 payload = clock_payload
 
-        planning_used = bool(
-            {"plot_plan", "chapter_plan", "consequence_log"} & used_tool_names
-        )
-        if not planning_used and self._looks_like_major_narrative_beat(payload):
-            await _notify_progress(progress, "refining")
-            planning_prompt = (
-                f"{user_prompt}\n"
-                f"{tool_history}\n\n"
-                "PLANNING_ENFORCEMENT: A major beat occurred.\n"
-                "Return ONLY one planning tool call JSON now: plot_plan OR consequence_log "
-                "(chapter_plan optional off-rails).\n"
-                "No narration.\n"
-            )
-            self._zork_log(f"PLANNING ENFORCEMENT campaign={campaign_id}", planning_prompt)
-            planning_resp = await self._completion.complete(
-                system_prompt,
-                planning_prompt,
-                temperature=max(0.1, self._temperature - 0.2),
-                max_tokens=700,
-            )
-            self._zork_log(f"PLANNING ENFORCEMENT RESPONSE campaign={campaign_id}", planning_resp or "(empty)")
-            planning_payload = self._parse_model_payload(planning_resp)
-            if planning_payload is not None and emulator._is_tool_call(planning_payload):  # noqa: SLF001
-                planning_name = str(planning_payload.get("tool_call") or "").strip().lower()
-                if planning_name in {"plot_plan", "chapter_plan", "consequence_log"}:
-                    _ = await self._execute_tool_call(
-                        campaign_id,
-                        planning_payload,
-                        actor_id=actor_id,
-                    )
-                    self._bump_auto_fix_counter(campaign_id, "forced_planning_tool")
+        # Planning enforcement disabled: the keyword heuristic in
+        # _looks_like_major_narrative_beat was far too broad (matching
+        # "results", "truth", "escape", any calendar update, any scene
+        # change) and fired an extra LLM round-trip on nearly every
+        # substantive turn.  The LLM already has plot_plan /
+        # consequence_log / chapter_plan tools available during the
+        # normal tool loop and uses them when appropriate.
         return payload
 
     async def complete_turn(self, context, *, progress: ProgressCallback | None = None) -> LLMTurnOutput:
