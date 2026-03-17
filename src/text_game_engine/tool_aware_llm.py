@@ -854,7 +854,6 @@ class ToolAwareZorkLLM:
                 .filter(Turn.campaign_id == campaign_id)
                 .filter(Turn.kind == "narrator")
                 .order_by(Turn.id.desc())
-                .limit(500)
                 .all()
             )
             actor_row = None
@@ -951,6 +950,7 @@ class ToolAwareZorkLLM:
                     }
 
         # Embedding-based turn search via the memory port (supplements keyword hits).
+        embed_only_hits: dict[int, dict[str, Any]] = {}
         if self._emulator is not None and self._emulator._memory_port is not None:
             for query in queries[:4]:
                 try:
@@ -961,24 +961,38 @@ class ToolAwareZorkLLM:
                     )
                     for turn_id, kind, content, score in embed_hits:
                         tid = int(turn_id)
-                        prior = narrator_hits.get(tid)
-                        if prior is None or float(score) > float(prior.get("score", 0.0)):
-                            narrator_hits[tid] = {
-                                "turn_id": tid,
-                                "score": float(score),
-                                "content": str(content or ""),
-                                "visibility_scope": "public",
-                                "actor_player_slug": "",
-                                "location_key": "",
-                            }
+                        if tid in narrator_hits:
+                            # Already found by keyword — boost score if embedding is higher.
+                            prior = narrator_hits[tid]
+                            if float(score) > float(prior.get("score", 0.0)):
+                                prior["score"] = float(score)
+                        else:
+                            prior_embed = embed_only_hits.get(tid)
+                            if prior_embed is None or float(score) > float(prior_embed.get("score", 0.0)):
+                                embed_only_hits[tid] = {
+                                    "turn_id": tid,
+                                    "score": float(score),
+                                    "content": str(content or ""),
+                                    "visibility_scope": "public",
+                                    "actor_player_slug": "",
+                                    "location_key": "",
+                                }
                 except Exception:
                     pass
 
-        ordered_narrator = sorted(
+        # Take top keyword hits, then fill remaining slots with embedding-only hits.
+        ordered_keyword = sorted(
             narrator_hits.values(),
             key=lambda row: (float(row.get("score", 0.0)), int(row.get("turn_id", 0))),
             reverse=True,
         )[:5]
+        keyword_ids = {int(r.get("turn_id", 0)) for r in ordered_keyword}
+        ordered_embed_only = sorted(
+            (v for v in embed_only_hits.values() if int(v.get("turn_id", 0)) not in keyword_ids),
+            key=lambda row: (float(row.get("score", 0.0)), int(row.get("turn_id", 0))),
+            reverse=True,
+        )[:3]
+        ordered_narrator = ordered_keyword + ordered_embed_only
         source_hits_flat: list[tuple[str, str, int, str, float]] = []
         if self._emulator is not None and has_source_material and (
             source_scope or not category_scope

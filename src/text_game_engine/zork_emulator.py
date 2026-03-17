@@ -603,7 +603,7 @@ class ZorkEmulator:
         "- reasoning: string (first key in final turn JSON; concise internal grounding for this turn: what evidence/context you used, which actors are involved, and why the chosen outcome follows)\n"
         "- narration: string (plain-text render of scene_output. Null if scene_output renders itself.)\n"
         "- scene_output: object (Preferred over flat narration when multiple speakers, mixed visibility, or private beats.)\n"
-        "  Keys: location_key, context_key, beats, rendered_text.\n"
+        "  Keys: location_key, context_key, beats.\n"
         "  Each beat MUST begin with reasoning and include: type, speaker, actors, listeners, visibility, "
         "aware_npc_slugs, and text.\n"
         "  speaker=narrator for pure environment/description only; otherwise name the acting character.\n"
@@ -6891,7 +6891,7 @@ class ZorkEmulator:
                                 ),
                             )
                     except Exception:
-                        logger.debug(
+                        self._logger.debug(
                             "Turn embedding skipped for campaign=%s",
                             campaign_id,
                             exc_info=True,
@@ -16178,9 +16178,6 @@ class ZorkEmulator:
     def _scene_output_text_from_raw(self, raw_scene_output: object) -> str:
         if not isinstance(raw_scene_output, dict):
             return ""
-        rendered = str(raw_scene_output.get("rendered_text") or "").strip()
-        if rendered:
-            return self._trim_text(rendered, self.MAX_NARRATION_CHARS)
         raw_beats = raw_scene_output.get("beats")
         if not isinstance(raw_beats, list):
             return ""
@@ -16373,12 +16370,10 @@ class ZorkEmulator:
                 }
             ]
 
-        rendered_text = str(scene_output.get("rendered_text") or "").strip()
-        if not rendered_text:
-            rendered_text = self._trim_text(
-                "\n\n".join(str(beat.get("text") or "").strip() for beat in beats if str(beat.get("text") or "").strip()),
-                self.MAX_NARRATION_CHARS,
-            )
+        rendered_text = self._trim_text(
+            "\n\n".join(str(beat.get("text") or "").strip() for beat in beats if str(beat.get("text") or "").strip()),
+            self.MAX_NARRATION_CHARS,
+        )
 
         normalized = {
             "location_key": (
@@ -16403,9 +16398,6 @@ class ZorkEmulator:
     ) -> str:
         if not isinstance(scene_output, dict):
             return ""
-        rendered = str(scene_output.get("rendered_text") or "").strip()
-        if rendered:
-            return self._trim_text(rendered, self.MAX_NARRATION_CHARS)
         beats = scene_output.get("beats")
         if not isinstance(beats, list):
             return ""
