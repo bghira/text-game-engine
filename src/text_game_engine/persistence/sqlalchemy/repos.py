@@ -25,6 +25,15 @@ class CampaignRepo:
     def get(self, campaign_id: str) -> Campaign | None:
         return self.session.get(Campaign, campaign_id)
 
+    def get_for_update(self, campaign_id: str) -> Campaign | None:
+        """SELECT ... FOR UPDATE — locks the row until transaction commit."""
+        stmt = (
+            select(Campaign)
+            .where(Campaign.id == campaign_id)
+            .with_for_update()
+        )
+        return self.session.execute(stmt).scalar_one_or_none()
+
     def cas_apply_update(
         self,
         campaign_id: str,

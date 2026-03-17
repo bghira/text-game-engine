@@ -601,8 +601,24 @@ class ZorkEmulator:
         "dark humor, and adult situations when appropriate to the story and player actions.\n\n"
         "Return ONLY valid JSON with these keys:\n"
         "- reasoning: string (first key in final turn JSON; concise internal grounding for this turn: what evidence/context you used, which actors are involved, and why the chosen outcome follows)\n"
-        "- narration: string (what the player sees)\n"
-        "- state_update: object (world state patches; set a key to null to remove it when no longer relevant. "
+        "- narration: string (plain-text render of scene_output. Null if scene_output renders itself.)\n"
+        "- scene_output: object (Preferred over flat narration when multiple speakers, mixed visibility, or private beats.)\n"
+        "  Keys: location_key, context_key, beats, rendered_text.\n"
+        "  Each beat MUST begin with reasoning and include: type, speaker, actors, listeners, visibility, "
+        "aware_npc_slugs, and text.\n"
+        "  speaker=narrator for pure environment/description only; otherwise name the acting character.\n"
+        "  actors: who is doing the thing — REQUIRED on every beat even with no spoken speaker.\n"
+        "  listeners: direct in-scene recipients — who is being told, shown, confronted, or directly receiving the beat.\n"
+        "  aware_npc_slugs are REQUIRED on every beat, even if empty array.\n"
+        "  narration should be the plain-text render of the same scene_output when both are present.\n"
+        "<example>\n"
+        '  Dialogue beat: {"reasoning":"Sasha is present and hears this.","type":"npc_dialogue","speaker":"sasha","actors":["sasha"],"listeners":["deshawn-williams"],"visibility":"local","aware_npc_slugs":["sasha"],"text":"\\"Keep moving.\\""}\n'
+        '  Action beat: {"reasoning":"Chris physically moves the jar while Rent watches.","type":"action","speaker":"chris-crawly","actors":["chris-crawly"],"listeners":["rent"],"visibility":"local","aware_npc_slugs":["rent"],"text":"Chris angles the jar toward the pocket."}\n'
+        "</example>\n"
+        "- state_update: REQUIRED every turn. Must include game_time, current_chapter, current_scene. "
+        "Don't tattle — WORLD_STATE is shared across ALL players. Never store intimate details, secrets, or private information in state_update. "
+        "Track private/local context through narration, player_state_update, and character_updates instead. "
+        "Set a key to null to remove it when no longer relevant. "
         "IMPORTANT: WORLD_STATE has a size budget. Actively prune stale WORLD_STATE keys every turn by setting them to null. "
         "This cleanup rule applies to transient world-state only (events, countdowns, one-off flags, scene-local state) — "
         "NOT to WORLD_CHARACTERS roster entries. "
@@ -618,13 +634,16 @@ class ZorkEmulator:
         '  {"marcus": {"mood": "angry", "location": "courtyard"}, "west_gate": {"status": "barred"}}\n'
         "Examples of WRONG structure (never do this):\n"
         '  {"marcus_mood": "angry", "marcus_location": "courtyard", "west_gate_status": "barred"}\n'
-        "- summary_update: string (one or two sentences of lasting changes)\n"
+        "- summary_update: REQUIRED every turn. One sentence. Lasting change or current dramatic state. "
+        "Don't tattle — WORLD_SUMMARY is also shared across all players. Keep it to publicly observable facts only.\n"
         "- xp_awarded: integer (0-10)\n"
         "- player_state_update: object (optional, player state patches)\n"
         "- other_player_state_updates: object (optional; keyed by exact PARTY_SNAPSHOT player_slugs for OTHER CAMPAIGN_PLAYERS only. "
         "Use this only for durable state consequences the scene clearly caused to them: death, injury, capture, relocation, separation, or other status changes. "
         "It does NOT authorize new dialogue, actions, choices, or invented reactions for them.)\n"
         '- co_located_player_slugs: array (optional; exact PARTY_SNAPSHOT player_slugs for OTHER CAMPAIGN_PLAYERS who remain physically with the acting player after this turn. Use only for room/location sync; it does NOT authorize new dialogue, actions, or decisions for them.)\n'
+        '- story_progression: object (optional; Keys: advance (bool), target ("hold"|"next-scene"|"next-chapter"), reason (string). '
+        "Use when a subplot beat should push the outlined story forward without explicit state_update scene change.)\n"
         '- turn_visibility: object (optional; who should get this turn in future prompt context. Keys: "scope" ("public"|"private"|"limited"|"local"), "player_slugs" (array of player slugs from PARTY_SNAPSHOT, typically in `player-<actor_id>` form), "npc_slugs" (array of WORLD_CHARACTERS slugs who overheard/noticed), and optional "reason". This changes prompt visibility only; it does NOT change shared world state.)\n'
         "- scene_image_prompt: string (optional; include whenever the visible scene changes in a meaningful way: entering a room, newly visible characters/objects, reveals, or strong visual shifts)\n"
         "- set_timer_delay: integer (optional; 30-300 seconds, see TIMED EVENTS SYSTEM below)\n"

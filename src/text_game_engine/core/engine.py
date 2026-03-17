@@ -111,7 +111,7 @@ class GameEngine:
 
     def rewind_to_turn(self, campaign_id: str, target_turn_id: int) -> RewindResult:
         with self._uow_factory() as uow:
-            campaign = uow.campaigns.get(campaign_id)
+            campaign = uow.campaigns.get_for_update(campaign_id)
             if campaign is None:
                 return RewindResult(status="error", reason="campaign_not_found")
 
@@ -633,18 +633,17 @@ class GameEngine:
             if not valid:
                 raise StaleClaimError("claim_invalid")
 
-            campaign = uow.campaigns.get(turn_input.campaign_id)
+            # Lock the campaign row for the duration of this transaction.
+            # This prevents concurrent timer events (or other resolve_turn
+            # calls) from bumping row_version between our read and CAS,
+            # which was causing "The world shifts" conflict failures.
+            campaign = uow.campaigns.get_for_update(turn_input.campaign_id)
             player = uow.players.get_by_campaign_actor(turn_input.campaign_id, turn_input.actor_id)
             if campaign is None or player is None:
                 raise StaleClaimError("missing_campaign_or_player")
 
             current_row_version = campaign.row_version
             if current_row_version != context.start_row_version:
-                # Row version changed during LLM call (e.g. timer event or
-                # concurrent background update).  The claim is still valid
-                # and we already re-read current state below, so proceed
-                # with the current row_version rather than discarding the
-                # expensive LLM work.
                 logger.warning(
                     "_phase_c: row_version drift (start=%d current=%d) for campaign=%s — proceeding with current version",
                     context.start_row_version,
