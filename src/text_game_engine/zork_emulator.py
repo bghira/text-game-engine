@@ -8597,6 +8597,21 @@ class ZorkEmulator:
             return text[:idx].rstrip()
         return text
 
+    def _strip_ephemeral_context_lines(self, text: str) -> str:
+        if not text:
+            return ""
+        kept_lines: list[str] = []
+        for line in str(text).splitlines():
+            stripped = line.strip().lower()
+            if any(stripped.startswith(prefix) for prefix in self._INVENTORY_LINE_PREFIXES):
+                continue
+            if any(stripped.startswith(prefix) for prefix in self._UNREAD_SMS_LINE_PREFIXES):
+                continue
+            if stripped.startswith("\u23f0"):
+                continue
+            kept_lines.append(line)
+        return "\n".join(kept_lines).strip()
+
     def _format_inventory(self, player_state: Dict[str, object]) -> Optional[str]:
         if not isinstance(player_state, dict):
             return None
