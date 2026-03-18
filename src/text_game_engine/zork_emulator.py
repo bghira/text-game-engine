@@ -509,12 +509,16 @@ class ZorkEmulator:
         "RECENT_TURNS has already been loaded for the acting player.\n"
         "Do NOT narrate yet unless the system explicitly says to finalize.\n"
         "Your job in this phase is to gather any deeper continuity, canon, SMS, plot, chapter, or consequence context that materially matters for this turn.\n"
-        'When research is sufficient, return ONLY {"tool_call": "ready_to_write"}.\n'
+        'When research is sufficient, return ONLY {"tool_call": "ready_to_write", "speakers": [...], "listeners": [...]}.\n'
     )
     READY_TO_WRITE_TOOL_PROMPT = (
         "\nYou have a ready_to_write tool for ending the research phase.\n"
         "When you have enough context to write the turn, return ONLY:\n"
-        '{"tool_call": "ready_to_write"}\n'
+        '{"tool_call": "ready_to_write", "speakers": ["npc-slug-1"], "listeners": ["npc-slug-2", "player-slug"]}\n'
+        "speakers = only the characters who will actually speak or take a meaningful visible action this turn.\n"
+        "listeners = only the direct recipients or observers whose knowledge should constrain shared context for those beats.\n"
+        "Do NOT include every person present in the room by default. Silent bystanders do not need to be named unless their awareness materially matters.\n"
+        "If a character needs private continuity in order to decide what to say or withhold, include that character in speakers.\n"
         "Do not narrate in the same response as ready_to_write.\n"
         "If the player's communication mode/substance matters before narration, you may first request only the relevant communication rules:\n"
         '{"tool_call": "communication_rules", "keys": ["GM-RULE-COMMUNICATION-SOFTENING", "GM-RULE-SUBSTANCE-EXTRACTION"]}\n'
@@ -8075,7 +8079,7 @@ class ZorkEmulator:
                 ),
                 (
                     'When research is sufficient, return {"tool_call": "ready_to_write", "speakers": [...], "listeners": [...]} '
-                    'with ALL scene participant slugs. Do not narrate yet.'
+                    'with only the characters who will actually speak/act and the listeners who materially constrain shared knowledge. Do not narrate yet.'
                 ),
             )
         return cls._turn_response_style_note(
