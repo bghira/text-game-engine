@@ -11361,6 +11361,10 @@ class ZorkEmulator:
             player.actor_id
         )
         viewer_location_key = self._room_key_from_player_state(player_state).lower()
+        active_pc = self._active_private_context_from_state(player_state)
+        viewer_private_context_key = str(
+            (active_pc or {}).get("context_key") or ""
+        ).strip()
         summary = self._compose_world_summary(
             campaign,
             state,
@@ -11378,10 +11382,6 @@ class ZorkEmulator:
             "a hollow silence answers",
             "the world shifts, but nothing clear emerges",
         )
-        active_pc = self._active_private_context_from_state(player_state)
-        viewer_private_context_key = str(
-            (active_pc or {}).get("context_key") or ""
-        ).strip()
         for turn in turns:
             content = (turn.content or "").strip()
             if not content:
