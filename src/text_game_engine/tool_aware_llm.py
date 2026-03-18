@@ -2577,7 +2577,8 @@ class ToolAwareZorkLLM:
                 _ready_listeners = [_ready_listeners]
             _shared_context_block = ""
             _speaker_continuity_block = ""
-            _clean_final_user_prompt = emulator._strip_recent_turns_prompt_sections(final_user_prompt)  # noqa: SLF001
+            _final_prompt_body, _final_prompt_tail = emulator._split_prompt_tail(final_user_prompt)  # noqa: SLF001
+            _clean_final_user_prompt = emulator._strip_recent_turns_prompt_sections(_final_prompt_body)  # noqa: SLF001
             _clean_tool_history = emulator._strip_recent_turns_prompt_sections(tool_history)  # noqa: SLF001
             with emulator._session_factory() as session:  # noqa: SLF001
                 campaign = session.get(Campaign, str(campaign_id))
@@ -2625,6 +2626,7 @@ class ToolAwareZorkLLM:
                     viewer_actor_id=actor_id,
                     viewer_slug=viewer_slug,
                     viewer_location_key=viewer_location_key,
+                    viewer_private_context_key=viewer_private_context_key,
                     scene_npc_slugs=scene_npc_slugs or None,
                     max_chars=emulator.MAX_SUMMARY_CHARS,  # noqa: SLF001
                 )
@@ -2687,6 +2689,7 @@ class ToolAwareZorkLLM:
                 + _pc_reminder
                 + _shared_context_block
                 + _speaker_continuity_block
+                + (f"\n{_final_prompt_tail}\n" if _final_prompt_tail else "")
                 + emulator.WRITING_CRAFT_PROMPT
             )
             self._zork_log(f"FINALIZATION REQUEST campaign={campaign_id}", f"SYSTEM:\n{final_system_prompt}\n\nUSER:\n{finalize_prompt}")

@@ -8381,6 +8381,7 @@ class ZorkEmulator:
         viewer_actor_id: str | None = None,
         viewer_slug: str = "",
         viewer_location_key: str = "",
+        viewer_private_context_key: str = "",
         scene_npc_slugs: set[str] | None = None,
         max_chars: int = 1600,
     ) -> str:
@@ -8410,11 +8411,12 @@ class ZorkEmulator:
             for turn in turns[-24:]:
                 if not isinstance(turn, Turn) or turn.kind != "narrator":
                     continue
-                if not self._turn_visible_to_viewer(
+                if not self._turn_visible_in_recent_turns_context(
                     turn,
-                    viewer_actor_id,
-                    viewer_slug,
-                    viewer_location_key,
+                    viewer_actor_id=viewer_actor_id,
+                    viewer_slug=viewer_slug,
+                    viewer_location_key=viewer_location_key,
+                    viewer_private_context_key=viewer_private_context_key,
                 ):
                     continue
                 meta = self._safe_turn_meta(turn)
@@ -8481,6 +8483,18 @@ class ZorkEmulator:
                     continue
             kept.append(line)
         return "\n".join(kept).strip()
+
+    @classmethod
+    def _split_prompt_tail(cls, prompt: object) -> tuple[str, str]:
+        value = str(prompt or "")
+        if not value:
+            return "", ""
+        marker_index = value.rfind("\nPLAYER_ACTION ")
+        if marker_index == -1 and value.startswith("PLAYER_ACTION "):
+            marker_index = 0
+        if marker_index == -1:
+            return value.strip(), ""
+        return value[:marker_index].rstrip(), value[marker_index:].strip()
 
     def _fit_state_to_budget(self, state: Dict[str, object], max_chars: int) -> Dict[str, object]:
         text = self._dump_json(state)
@@ -11354,6 +11368,7 @@ class ZorkEmulator:
             viewer_actor_id=player.actor_id,
             viewer_slug=viewer_slug,
             viewer_location_key=viewer_location_key,
+            viewer_private_context_key=viewer_private_context_key,
             max_chars=self.MAX_SUMMARY_CHARS,
         )
 
