@@ -2706,28 +2706,37 @@ class ToolAwareZorkLLM:
 
         if self._is_emptyish_payload(payload):
             await _notify_progress(progress, "refining")
-            self._bump_auto_fix_counter(campaign_id, "empty_response_repair_retry")
-            repair_prompt = (
-                f"{user_prompt}\n"
-                f"{tool_history}\n\n"
-                "OUTPUT_VALIDATION_FAILED: previous response was too empty.\n"
-                "Return ONLY final JSON (no tool_call) with:\n"
-                "- reasoning string grounded in evidence/context used\n"
-                "- narration containing one concrete scene development\n"
-                "- state_update object with game_time advanced\n"
-                "- summary_update with durable consequence when applicable.\n"
-            )
-            self._zork_log(f"EMPTY RESPONSE REPAIR campaign={campaign_id}", repair_prompt)
-            repaired = await self._completion.complete(
-                system_prompt,
-                repair_prompt,
-                temperature=max(0.1, self._temperature - 0.1),
-                max_tokens=self._max_tokens,
-            )
-            self._zork_log(f"EMPTY RESPONSE REPAIR RESPONSE campaign={campaign_id}", repaired or "(empty)")
-            repaired_payload = self._parse_model_payload(repaired)
-            if repaired_payload is not None and not emulator._is_tool_call(repaired_payload):  # noqa: SLF001
-                payload = repaired_payload
+            for attempt in range(2):
+                self._bump_auto_fix_counter(campaign_id, "empty_response_repair_retry")
+                repair_prompt = (
+                    f"{user_prompt}\n"
+                    f"{tool_history}\n\n"
+                    "OUTPUT_VALIDATION_FAILED: previous response was too empty.\n"
+                    "Return ONLY final JSON (no tool_call) with:\n"
+                    "- reasoning string grounded in evidence/context used\n"
+                    "- narration containing one concrete scene development\n"
+                    "- state_update object with game_time advanced\n"
+                    "- summary_update with durable consequence when applicable.\n"
+                )
+                self._zork_log(
+                    f"EMPTY RESPONSE REPAIR campaign={campaign_id} attempt={attempt + 1}",
+                    repair_prompt,
+                )
+                repaired = await self._completion.complete(
+                    system_prompt,
+                    repair_prompt,
+                    temperature=max(0.1, self._temperature - 0.1),
+                    max_tokens=self._max_tokens,
+                )
+                self._zork_log(
+                    f"EMPTY RESPONSE REPAIR RESPONSE campaign={campaign_id} attempt={attempt + 1}",
+                    repaired or "(empty)",
+                )
+                repaired_payload = self._parse_model_payload(repaired)
+                if repaired_payload is not None and not emulator._is_tool_call(repaired_payload):  # noqa: SLF001
+                    payload = repaired_payload
+                    if not self._is_emptyish_payload(payload):
+                        break
 
         narration = str(payload.get("narration") or "")
         if self._narration_has_explicit_clock_time(narration) and not self._action_requests_clock_time(action_text):
