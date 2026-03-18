@@ -8381,6 +8381,7 @@ class ZorkEmulator:
         viewer_actor_id: str | None = None,
         viewer_slug: str = "",
         viewer_location_key: str = "",
+        scene_npc_slugs: set[str] | None = None,
         max_chars: int = 1600,
     ) -> str:
         summary = self._strip_inventory_mentions(campaign.summary or "")
@@ -8417,6 +8418,11 @@ class ZorkEmulator:
                 ):
                     continue
                 meta = self._safe_turn_meta(turn)
+                if scene_npc_slugs and not self._turn_visible_to_all_scene_npcs(
+                    turn,
+                    scene_npc_slugs,
+                ):
+                    continue
                 if bool(meta.get("suppress_context")):
                     continue
                 summary_candidate = meta.get("summary_update")
@@ -8442,6 +8448,39 @@ class ZorkEmulator:
         if story_context:
             return self._trim_text(story_context.splitlines()[0], max_chars)
         return ""
+
+    @classmethod
+    def _strip_recent_turns_prompt_sections(cls, text: object) -> str:
+        value = str(text or "")
+        if not value:
+            return ""
+        lines = value.splitlines()
+        kept: list[str] = []
+        skipping_recent_body = False
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith("RECENT_TURNS_LOADED:"):
+                skipping_recent_body = False
+                continue
+            if stripped.startswith("RECENT_TURNS_NOTE:"):
+                continue
+            if stripped.startswith("RECENT_TURNS_LOCATIONS:"):
+                continue
+            if stripped.startswith("RECENT_TURNS_RECEIVERS:"):
+                continue
+            if stripped == "RECENT_TURNS:":
+                skipping_recent_body = True
+                continue
+            if skipping_recent_body:
+                if (
+                    re.match(r"^[A-Z][A-Z0-9_ ]*:", stripped)
+                    or stripped.startswith("PLAYER_ACTION ")
+                ):
+                    skipping_recent_body = False
+                else:
+                    continue
+            kept.append(line)
+        return "\n".join(kept).strip()
 
     def _fit_state_to_budget(self, state: Dict[str, object], max_chars: int) -> Dict[str, object]:
         text = self._dump_json(state)
@@ -15880,6 +15919,32 @@ class ZorkEmulator:
                 return False
         return True
 
+    def _beat_visible_to_all_scene_npcs(
+        self,
+        beat: Dict[str, object],
+        npc_slugs: set[str],
+    ) -> bool:
+        if not npc_slugs:
+            return True
+        beat_visibility = str(beat.get("visibility") or "").strip().lower()
+        if beat_visibility in {"", "public"}:
+            return True
+        beat_npc_slugs = {
+            self._player_slug_key(entry)
+            for entry in (
+                list(beat.get("actors") or [])
+                + list(beat.get("listeners") or [])
+                + list(beat.get("aware_npc_slugs") or [])
+                + [beat.get("speaker")]
+            )
+            if self._player_slug_key(entry)
+        }
+        return all(
+            self._player_slug_key(npc_slug) in beat_npc_slugs
+            for npc_slug in npc_slugs
+            if self._player_slug_key(npc_slug)
+        )
+
     def _recent_turn_receiver_hints(
         self,
         campaign: Campaign,
@@ -16050,6 +16115,7 @@ class ZorkEmulator:
             if (
                 not visible
                 and (requested_player_slugs or requested_npc_slugs)
+                and not scene_npc_slugs
                 and turn.actor_id == viewer_actor_id
                 and self._turn_relevant_to_scene_receivers(
                     turn,
@@ -16061,6 +16127,7 @@ class ZorkEmulator:
             if (
                 not visible
                 and requested_npc_slugs
+                and not scene_npc_slugs
                 and self._turn_relevant_to_requested_npc_history(
                     turn,
                     requested_npc_slugs=requested_npc_slugs,
@@ -16579,7 +16646,7 @@ class ZorkEmulator:
         visibility = meta.get("visibility")
         if isinstance(visibility, dict):
             header["visibility"] = str(visibility.get("scope") or "").strip().lower() or None
-        lines: List[str] = [json.dumps(header, ensure_ascii=False, separators=(",", ":"))]
+        beat_lines: List[str] = []
         meta_location_key_norm = self._normalize_location_key(meta.get("location_key"))
         fallback_location_key = self._normalize_location_key(
             scene_output.get("location_key")
@@ -16632,7 +16699,7 @@ class ZorkEmulator:
                         and viewer_private_context_key_norm == beat_context_key
                     )
                 )
-            if not beat_visible and requested_npc_slugs:
+            if not beat_visible and requested_npc_slugs and not scene_npc_slugs:
                 beat_npc_slugs = {
                     self._player_slug_key(e)
                     for e in (
@@ -16652,26 +16719,12 @@ class ZorkEmulator:
                     beat_visible = True
             if not beat_visible:
                 continue
-            # LCD beat filter: same-room local beats are included by default
-            # for the current scene. Keep stricter participant checks for
-            # private/limited beats.
-            if scene_npc_slugs and beat_visibility not in {"", "public", "local"}:
-                beat_npc_slugs = {
-                    self._player_slug_key(e)
-                    for e in (
-                        list(beat.get("actors") or [])
-                        + list(beat.get("listeners") or [])
-                        + list(beat.get("aware_npc_slugs") or [])
-                        + [beat.get("speaker")]
-                    )
-                    if self._player_slug_key(e)
-                }
-                if not all(
-                    self._player_slug_key(npc) in beat_npc_slugs
-                    for npc in scene_npc_slugs
-                ):
-                    continue
-            lines.append(
+            if scene_npc_slugs and not self._beat_visible_to_all_scene_npcs(
+                beat,
+                scene_npc_slugs,
+            ):
+                continue
+            beat_lines.append(
                 json.dumps(
                     {
                         "kind": "beat",
@@ -16693,7 +16746,9 @@ class ZorkEmulator:
                     separators=(",", ":"),
                 )
             )
-        return lines
+        if not beat_lines:
+            return []
+        return [json.dumps(header, ensure_ascii=False, separators=(",", ":")), *beat_lines]
 
     def _compute_recent_turns_metadata(
         self,

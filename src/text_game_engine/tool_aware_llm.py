@@ -2569,13 +2569,124 @@ class ToolAwareZorkLLM:
                     "\nPLAYER_CHARACTERS (real humans — do NOT write their dialogue, actions, decisions, "
                     f"emotional reactions, facial expressions, or movement): {', '.join(_pc_names)}\n"
                 )
+            _ready_speakers = payload.get("speakers") or []
+            _ready_listeners = payload.get("listeners") or []
+            if isinstance(_ready_speakers, str):
+                _ready_speakers = [_ready_speakers]
+            if isinstance(_ready_listeners, str):
+                _ready_listeners = [_ready_listeners]
+            _shared_context_block = ""
+            _speaker_continuity_block = ""
+            _clean_final_user_prompt = emulator._strip_recent_turns_prompt_sections(final_user_prompt)  # noqa: SLF001
+            _clean_tool_history = emulator._strip_recent_turns_prompt_sections(tool_history)  # noqa: SLF001
+            with emulator._session_factory() as session:  # noqa: SLF001
+                campaign = session.get(Campaign, str(campaign_id))
+            player = emulator.get_or_create_player(campaign_id, actor_id)
+            if campaign is not None and player is not None:
+                player_state = emulator.get_player_state(player)
+                viewer_location_key = emulator._room_key_from_player_state(player_state).lower()  # noqa: SLF001
+                viewer_private_context = emulator._active_private_context_from_state(player_state)  # noqa: SLF001
+                viewer_private_context_key = str(
+                    (viewer_private_context or {}).get("context_key") or ""
+                ).strip()
+                registry = emulator._campaign_player_registry(campaign_id, emulator._session_factory)  # noqa: SLF001
+                viewer_slug = str(
+                    (registry.get("by_actor_id", {}).get(actor_id) or {}).get("slug")
+                    or emulator._player_visibility_slug(actor_id)  # noqa: SLF001
+                ).strip()
+                player_slugs = {
+                    emulator._player_slug_key(info.get("slug") or info.get("name") or "")  # noqa: SLF001
+                    for info in registry.get("by_actor_id", {}).values()
+                    if isinstance(info, dict)
+                    and emulator._player_slug_key(info.get("slug") or info.get("name") or "")  # noqa: SLF001
+                }
+                speaker_npc_slugs = {
+                    emulator._player_slug_key(raw_slug)  # noqa: SLF001
+                    for raw_slug in list(_ready_speakers)
+                    if emulator._player_slug_key(raw_slug)  # noqa: SLF001
+                }
+                speaker_npc_slugs = {
+                    slug for slug in speaker_npc_slugs if slug and slug not in player_slugs and slug != viewer_slug
+                }
+                listener_npc_slugs = {
+                    emulator._player_slug_key(raw_slug)  # noqa: SLF001
+                    for raw_slug in list(_ready_listeners)
+                    if emulator._player_slug_key(raw_slug)  # noqa: SLF001
+                }
+                listener_npc_slugs = {
+                    slug for slug in listener_npc_slugs if slug and slug not in player_slugs and slug != viewer_slug
+                }
+                scene_npc_slugs = speaker_npc_slugs.union(listener_npc_slugs)
+                turns = emulator.get_recent_turns(campaign_id)
+                shared_summary = emulator._compose_world_summary(  # noqa: SLF001
+                    campaign,
+                    emulator.get_campaign_state(campaign),  # noqa: SLF001
+                    turns=turns,
+                    viewer_actor_id=actor_id,
+                    viewer_slug=viewer_slug,
+                    viewer_location_key=viewer_location_key,
+                    scene_npc_slugs=scene_npc_slugs or None,
+                    max_chars=emulator.MAX_SUMMARY_CHARS,  # noqa: SLF001
+                )
+                shared_recent = emulator._recent_turns_text_for_viewer(  # noqa: SLF001
+                    campaign,
+                    turns,
+                    viewer_actor_id=actor_id,
+                    viewer_slug=viewer_slug,
+                    viewer_location_key=viewer_location_key,
+                    viewer_private_context_key=viewer_private_context_key,
+                    requested_player_slugs=set(),
+                    requested_npc_slugs=scene_npc_slugs,
+                    scene_npc_slugs=scene_npc_slugs or None,
+                )
+                if scene_npc_slugs:
+                    _shared_context_block = (
+                        f"\nSCENE_PARTICIPANTS_LCD: speakers={sorted(_ready_speakers)} listeners={sorted(_ready_listeners)}\n"
+                        "The following WORLD_SUMMARY and RECENT_TURNS are filtered to the LOWEST COMMON DENOMINATOR — "
+                        "only events that ALL named participants would plausibly know about. "
+                        "Use this as the shared pool for common knowledge in the scene.\n"
+                        f"\nWORLD_SUMMARY_LCD: {shared_summary or '(empty)'}\n"
+                        f"\nRECENT_TURNS_LCD:\n{shared_recent}\n"
+                    )
+                elif shared_recent and shared_recent != "None":
+                    _shared_context_block = (
+                        f"\nWORLD_SUMMARY_FINAL: {shared_summary or '(empty)'}\n"
+                        f"\nRECENT_TURNS_FINAL:\n{shared_recent}\n"
+                    )
+                speaker_blocks: list[str] = []
+                for speaker_slug in sorted(speaker_npc_slugs):
+                    speaker_recent = emulator._recent_turns_text_for_viewer(  # noqa: SLF001
+                        campaign,
+                        turns,
+                        viewer_actor_id=actor_id,
+                        viewer_slug=viewer_slug,
+                        viewer_location_key=viewer_location_key,
+                        viewer_private_context_key=viewer_private_context_key,
+                        requested_player_slugs=set(),
+                        requested_npc_slugs={speaker_slug},
+                        scene_npc_slugs=None,
+                    )
+                    if speaker_recent and speaker_recent != "None":
+                        speaker_blocks.append(
+                            f"SPEAKER_CONTINUITY[{speaker_slug}]:\n{speaker_recent}\n"
+                        )
+                if speaker_blocks:
+                    _speaker_continuity_block = (
+                        "\nSPEAKER_CONTINUITY_RULES:\n"
+                        "Each SPEAKER_CONTINUITY block is extra continuity for that named speaker only. "
+                        "That speaker may use it to decide what to reveal, conceal, or emphasize. "
+                        "Do NOT let listeners or silent bystanders act on a speaker's private continuity unless they were independently involved in those same events.\n\n"
+                        + "\n".join(speaker_blocks)
+                    )
             finalize_prompt = (
-                f"{final_user_prompt}\n"
-                f"{tool_history}\n\n"
+                f"{_clean_final_user_prompt}\n"
+                f"{_clean_tool_history}\n\n"
                 "RESEARCH_COMPLETE: Context gathering is complete.\n"
                 "Do NOT call any more tools now. Return final narration/state JSON directly.\n"
                 "REQUIRED fields: reasoning, scene_output, narration, state_update (with game_time), summary_update.\n"
                 + _pc_reminder
+                + _shared_context_block
+                + _speaker_continuity_block
                 + emulator.WRITING_CRAFT_PROMPT
             )
             self._zork_log(f"FINALIZATION REQUEST campaign={campaign_id}", f"SYSTEM:\n{final_system_prompt}\n\nUSER:\n{finalize_prompt}")
