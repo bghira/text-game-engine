@@ -2511,6 +2511,48 @@ class ToolAwareZorkLLM:
             if payload is None:
                 logger.warning("_resolve_payload: post-tool-execution response unparseable (tool=%s)", tool_name)
                 return None
+            if not emulator._is_tool_call(payload):  # noqa: SLF001
+                self._zork_log(
+                    f"RESEARCH PHASE PROTOCOL VIOLATION campaign={campaign_id}",
+                    "Model returned final JSON during research; requesting ready_to_write restage.",
+                )
+                restaged_payload: dict[str, Any] | None = None
+                for attempt in range(2):
+                    restage_prompt = (
+                        f"{user_prompt}\n"
+                        f"{tool_history}\n\n"
+                        "RESEARCH_PHASE_PROTOCOL_VIOLATION: You returned final narration/state JSON during research.\n"
+                        'Do NOT narrate yet. Return ONLY {"tool_call":"ready_to_write","speakers":[...],"listeners":[...]} now.\n'
+                        "speakers = only characters who will actually speak or take meaningful visible action.\n"
+                        "listeners = only the direct recipients/observers whose shared knowledge matters for those beats.\n"
+                    )
+                    self._zork_log(
+                        f"RESEARCH RESTAGE REQUEST campaign={campaign_id} attempt={attempt + 1}",
+                        restage_prompt,
+                    )
+                    restage_response = await self._completion.complete(
+                        system_prompt,
+                        restage_prompt,
+                        temperature=max(0.1, self._temperature - 0.2),
+                        max_tokens=self._max_tokens,
+                    )
+                    self._zork_log(
+                        f"RESEARCH RESTAGE RESPONSE campaign={campaign_id} attempt={attempt + 1}",
+                        restage_response or "(empty)",
+                    )
+                    candidate = self._parse_model_payload(restage_response)
+                    if (
+                        isinstance(candidate, dict)
+                        and emulator._is_tool_call(candidate)  # noqa: SLF001
+                        and str(candidate.get("tool_call") or "").strip().lower()
+                        == "ready_to_write"
+                    ):
+                        restaged_payload = candidate
+                        break
+                if restaged_payload is None:
+                    logger.warning("_resolve_payload: model refused ready_to_write restage after tool=%s", tool_name)
+                    return None
+                payload = restaged_payload
 
         if emulator._is_tool_call(payload) and str(payload.get("tool_call") or "").strip().lower() != "ready_to_write":  # noqa: E501, SLF001
             logger.warning("_resolve_payload: max tool rounds exceeded, still has tool_call=%s", payload.get("tool_call"))
