@@ -968,6 +968,10 @@ class ZorkEmulator:
         "Do NOT use them before recent_turns unless the system explicitly says recent_turns is already loaded.\n"
         "After recent_turns, use memory_search when deeper or older recall materially matters.\n"
         'memory_search syntax: {"tool_call": "memory_search", "queries": ["Marcus at the penthouse", "the deal in the warehouse"]}\n'
+        "memory_search returns compact snippets by default. Start broad, then narrow before requesting full text.\n"
+        'Narrow within the previous turn hits: {"tool_call": "memory_search", "search_within": "last_results", "queries": ["confession", "deal"]}\n'
+        'After narrowing, request expanded turn text only if you still need it: {"tool_call": "memory_search", "search_within": "last_results", "queries": ["exact wording"], "full_text": true}\n'
+        'Use keep_memory_turns to prune stale turn hits from tool context: {"tool_call": "memory_search", "search_within": "last_results", "queries": ["keyword"], "keep_memory_turns": [123, 456]}\n'
         'Optional source scope: {"tool_call": "memory_search", "category": "source", "queries": ["description of the character or event you need"]}\n'
         'Rulebook key browsing: {"tool_call": "source_browse", "document_key": "document-key"}\n'
         'Exact turn retrieval after a hit: {"tool_call": "memory_turn", "turn_id": 1234}\n'
@@ -993,9 +997,13 @@ class ZorkEmulator:
     MEMORY_TOOL_PROMPT = (
         "\nYou have a memory_search tool. To use it, return ONLY:\n"
         '{"tool_call": "memory_search", "queries": ["query1", "query2", ...]}\n'
-        "No other keys alongside tool_call except optional 'category'. You may provide one or more queries.\n"
+        "You may also optionally include category, search_within, full_text, keep_memory_turns, before_lines, and after_lines.\n"
         "Optional category scope example:\n"
         '{"tool_call": "memory_search", "category": "char:marcus-blackwell", "queries": ["Marcus at the penthouse", "the deal Marcus offered"]}\n'
+        "memory_search returns compact snippets by default. Do a broad summary search first, then narrow before asking for more text.\n"
+        'Narrow within the previous turn hits only: {"tool_call": "memory_search", "search_within": "last_results", "queries": ["confession", "deal"]}\n'
+        'After narrowing, request expanded turn text only if you still need it: {"tool_call": "memory_search", "search_within": "last_results", "queries": ["exact wording"], "full_text": true}\n'
+        'Use keep_memory_turns to prune stale turn hits from tool context for later rounds: {"tool_call": "memory_search", "search_within": "last_results", "queries": ["keyword"], "keep_memory_turns": [123, 456]}\n'
         "If results are weak or empty, you may immediately call memory_search again with refined queries.\n"
         "\nTOOL USAGE POLICY (HIGH PRIORITY):\n"
         "- MANDATORY: On every normal gameplay turn you MUST call at least one memory tool (recent_turns or memory_search) "
@@ -1013,6 +1021,7 @@ class ZorkEmulator:
         "If you narrate an NPC texting back but don't sms_write it (either way), the reply is lost permanently.\n"
         "- Only skip tools for trivial immediate physical follow-ups where continuity risk is near zero.\n"
         "- If unsure what to query, describe the situation: combine current location, active NPC names, and what the player is doing into a phrase.\n"
+        "- Prefer this memory flow: recent_turns -> broad memory_search summary -> narrow memory_search with search_within -> full_text only after narrowing.\n"
         "\nYou also have a memory_terms tool for wildcard term/category listing. Use it BEFORE storing memories:\n"
         '{"tool_call": "memory_terms", "wildcard": "marcus*"}\n'
         "This returns existing category/term buckets so you can avoid duplicates.\n"

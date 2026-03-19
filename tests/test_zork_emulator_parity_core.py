@@ -529,6 +529,136 @@ def test_ready_to_write_finalization_uses_final_stage_system_prompt(
     asyncio.run(run_test())
 
 
+def test_memory_search_supports_last_results_full_text_and_context_pruning(
+    session_factory,
+    seed_campaign_and_actor,
+):
+    class MemoryRefineCompletionPort:
+        def __init__(self, keep_turn_id: int):
+            self.keep_turn_id = keep_turn_id
+            self.calls = []
+
+        async def complete(self, system_prompt, prompt, *, temperature=0.8, max_tokens=2048):
+            self.calls.append({"system_prompt": system_prompt, "prompt": prompt})
+            if len(self.calls) == 1:
+                return '{"tool_call":"memory_search","queries":["alpha"]}'
+            if len(self.calls) == 2:
+                return json.dumps(
+                    {
+                        "tool_call": "memory_search",
+                        "search_within": "last_results",
+                        "queries": ["beta"],
+                        "full_text": True,
+                        "keep_memory_turns": [self.keep_turn_id],
+                    }
+                )
+            if len(self.calls) == 3:
+                return '{"tool_call":"ready_to_write","speakers":[],"listeners":[]}'
+            return json.dumps(
+                {
+                    "reasoning": "done",
+                    "scene_output": {
+                        "location_key": "dock-9",
+                        "context_key": "",
+                        "beats": [{"text": "Done."}],
+                    },
+                    "state_update": {
+                        "game_time": {
+                            "day": 1,
+                            "hour": 9,
+                            "minute": 0,
+                            "period": "morning",
+                            "date_label": "Day 1, Morning",
+                        }
+                    },
+                    "summary_update": "done",
+                }
+            )
+
+    async def run_test():
+        compat = _build_compat(session_factory)
+        campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
+        compat.get_or_create_player(campaign.id, seed_campaign_and_actor["actor_id"])
+
+        keep_tail = "KEEP-FULL-TEXT-TAIL"
+        drop_tail = "DROP-FULL-TEXT-TAIL"
+        outside_tail = "OUTSIDE-LAST-RESULTS-TAIL"
+        compat._record_simple_turn_pair(
+            campaign_id=campaign.id,
+            actor_id=seed_campaign_and_actor["actor_id"],
+            session_id=None,
+            action_text="remember alpha",
+            narration=("alpha beta " + ("keep " * 240) + keep_tail),
+        )
+        compat._record_simple_turn_pair(
+            campaign_id=campaign.id,
+            actor_id=seed_campaign_and_actor["actor_id"],
+            session_id=None,
+            action_text="remember alpha again",
+            narration=("alpha only " + ("drop " * 240) + drop_tail),
+        )
+        compat._record_simple_turn_pair(
+            campaign_id=campaign.id,
+            actor_id=seed_campaign_and_actor["actor_id"],
+            session_id=None,
+            action_text="remember beta elsewhere",
+            narration=("beta outside " + ("outside " * 240) + outside_tail),
+        )
+
+        with session_factory() as session:
+            narrator_turns = (
+                session.query(Turn)
+                .filter(Turn.campaign_id == campaign.id)
+                .filter(Turn.kind == "narrator")
+                .order_by(Turn.id.asc())
+                .all()
+            )
+        keep_turn_id = int(narrator_turns[0].id)
+        drop_turn_id = int(narrator_turns[1].id)
+
+        completion = MemoryRefineCompletionPort(keep_turn_id)
+        tool_llm = ToolAwareZorkLLM(
+            session_factory=session_factory,
+            completion_port=completion,
+            temperature=0.8,
+            max_tokens=2048,
+        )
+        tool_llm.bind_emulator(compat)
+
+        payload = await tool_llm._resolve_payload(  # noqa: SLF001
+            campaign.id,
+            seed_campaign_and_actor["actor_id"],
+            "remember alpha",
+            "research system",
+            "PLAYER_ACTION: remember alpha\nmemory_lookup_enabled: true",
+            "final system",
+            "PLAYER_ACTION: remember alpha\nmemory_lookup_enabled: true",
+        )
+
+        assert payload is not None
+        assert payload.get("summary_update") == "done"
+        assert len(completion.calls) == 4
+
+        first_augmented_prompt = completion.calls[1]["prompt"]
+        assert f'"turn_id":{keep_turn_id}' in first_augmented_prompt
+        assert f'"turn_id":{drop_turn_id}' in first_augmented_prompt
+        assert '"full_text":"' not in first_augmented_prompt
+        assert keep_tail not in first_augmented_prompt
+        assert drop_tail not in first_augmented_prompt
+        assert outside_tail not in first_augmented_prompt
+
+        second_augmented_prompt = completion.calls[2]["prompt"]
+        assert f'"turn_id":{keep_turn_id}' in second_augmented_prompt
+        assert f'"turn_id":{drop_turn_id}' not in second_augmented_prompt
+        assert '"kind":"memory_context_retained"' in second_augmented_prompt
+        assert '"full_text":"' in second_augmented_prompt
+        assert keep_tail in second_augmented_prompt
+        assert drop_tail not in second_augmented_prompt
+        assert outside_tail not in second_augmented_prompt
+
+    asyncio.run(run_test())
+
+
 def test_attachment_setup_length_error_for_short_upload(session_factory):
     compat = _build_compat(session_factory)
     short_text = "One short paragraph about a character.\n\nAnother short paragraph."

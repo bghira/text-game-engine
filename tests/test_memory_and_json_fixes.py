@@ -404,6 +404,35 @@ class TestEmbeddingKeywordPools:
 
 
 # ---------------------------------------------------------------------------
+# Memory tool history pruning
+# ---------------------------------------------------------------------------
+
+
+class TestMemoryToolHistoryPruning:
+    def test_pruned_memory_tool_text_keeps_only_requested_turns(self):
+        from text_game_engine.tool_aware_llm import ToolAwareZorkLLM
+
+        raw = (
+            "MEMORY_RECALL:\n"
+            '{"kind":"memory_query_result","queries":["alpha"],"category":"","hit_count":2}\n'
+            '{"kind":"memory_hit","memory_type":"turn","turn_id":12,"text":"keep me"}\n'
+            '{"kind":"memory_hit","memory_type":"turn","turn_id":13,"text":"drop me"}\n'
+            '{"kind":"memory_hit","memory_type":"manual","term":"alpha","text":"manual memory"}'
+        )
+
+        pruned = ToolAwareZorkLLM._pruned_memory_tool_text(
+            "memory_search",
+            raw,
+            {12},
+        )
+
+        assert '"kind":"memory_context_retained"' in pruned
+        assert '"turn_id":12' in pruned
+        assert '"turn_id":13' not in pruned
+        assert "manual memory" not in pruned
+
+
+# ---------------------------------------------------------------------------
 # JSON repair sub-methods
 # ---------------------------------------------------------------------------
 
