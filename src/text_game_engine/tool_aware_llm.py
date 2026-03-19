@@ -550,9 +550,17 @@ class ToolAwareZorkLLM:
         if not isinstance(narration, str):
             narration = ""
 
-        scene_output = payload.get("scene_output")
-        if not isinstance(scene_output, dict):
+        raw_scene_output = payload.get("scene_output")
+        scene_output_text_fallback = ""
+        if isinstance(raw_scene_output, str):
+            scene_output_text_fallback = raw_scene_output.strip()
             scene_output = None
+        elif isinstance(raw_scene_output, dict):
+            scene_output = raw_scene_output
+        else:
+            scene_output = None
+        if not narration and scene_output_text_fallback:
+            narration = scene_output_text_fallback
         if not narration and scene_output is not None:
             try:
                 rendered = emulator._scene_output_rendered_text(scene_output)  # noqa: SLF001
@@ -2727,6 +2735,8 @@ class ToolAwareZorkLLM:
                 "RESEARCH_COMPLETE: Context gathering is complete.\n"
                 "Do NOT call any more tools now. Return final narration/state JSON directly.\n"
                 "REQUIRED fields: reasoning, scene_output, state_update (with game_time), summary_update.\n"
+                "scene_output MUST be an object with keys location_key, context_key, and beats.\n"
+                "beats MUST be an array of 1 to 2 beat objects; scene_output as a plain string is invalid.\n"
                 "narration is optional when scene_output is present; prefer omitting it and let the harness render beat text.\n"
                 + _pc_reminder
                 + _shared_context_block
@@ -2756,7 +2766,8 @@ class ToolAwareZorkLLM:
                     "OUTPUT_VALIDATION_FAILED: previous response was too empty.\n"
                     "Return ONLY final JSON (no tool_call) with:\n"
                     "- reasoning string grounded in evidence/context used\n"
-                    "- scene_output containing one concrete scene development\n"
+                    "- scene_output object containing one concrete scene development\n"
+                    "- scene_output.beats as an array, not a string\n"
                     "- state_update object with game_time advanced\n"
                     "- summary_update with durable consequence when applicable.\n"
                     "narration is optional when scene_output is present.\n"
