@@ -354,7 +354,16 @@ class ToolAwareZorkLLM:
         character_updates = payload.get("character_updates")
         calendar_update = payload.get("calendar_update")
         scene_image_prompt = payload.get("scene_image_prompt")
+        scene_output = payload.get("scene_output")
         xp_awarded = payload.get("xp_awarded", 0)
+        has_scene_output = (
+            isinstance(scene_output, dict)
+            and isinstance(scene_output.get("beats"), list)
+            and any(
+                isinstance(beat, dict) and str(beat.get("text") or "").strip()
+                for beat in scene_output.get("beats")
+            )
+        )
         has_signal = (
             bool(state_update)
             or bool(player_state_update)
@@ -362,6 +371,7 @@ class ToolAwareZorkLLM:
             or bool(character_updates)
             or bool(calendar_update)
         )
+        has_signal = has_signal or has_scene_output
         has_signal = has_signal or bool(str(summary_update or "").strip()) or bool(
             str(scene_image_prompt or "").strip()
         )
@@ -2685,7 +2695,8 @@ class ToolAwareZorkLLM:
                 f"{_clean_tool_history}\n\n"
                 "RESEARCH_COMPLETE: Context gathering is complete.\n"
                 "Do NOT call any more tools now. Return final narration/state JSON directly.\n"
-                "REQUIRED fields: reasoning, scene_output, narration, state_update (with game_time), summary_update.\n"
+                "REQUIRED fields: reasoning, scene_output, state_update (with game_time), summary_update.\n"
+                "narration is optional when scene_output is present; prefer omitting it and let the harness render beat text.\n"
                 + _pc_reminder
                 + _shared_context_block
                 + _speaker_continuity_block
@@ -2714,9 +2725,10 @@ class ToolAwareZorkLLM:
                     "OUTPUT_VALIDATION_FAILED: previous response was too empty.\n"
                     "Return ONLY final JSON (no tool_call) with:\n"
                     "- reasoning string grounded in evidence/context used\n"
-                    "- narration containing one concrete scene development\n"
+                    "- scene_output containing one concrete scene development\n"
                     "- state_update object with game_time advanced\n"
                     "- summary_update with durable consequence when applicable.\n"
+                    "narration is optional when scene_output is present.\n"
                 )
                 self._zork_log(
                     f"EMPTY RESPONSE REPAIR campaign={campaign_id} attempt={attempt + 1}",

@@ -605,8 +605,8 @@ class ZorkEmulator:
         "dark humor, and adult situations when appropriate to the story and player actions.\n\n"
         "Return ONLY valid JSON with these keys:\n"
         "- reasoning: string (first key in final turn JSON; concise internal grounding for this turn: what evidence/context you used, which actors are involved, and why the chosen outcome follows)\n"
-        "- narration: string (plain-text render of scene_output. Null if scene_output renders itself.)\n"
-        "- scene_output: object (Preferred over flat narration when multiple speakers, mixed visibility, or private beats.)\n"
+        "- narration: string (optional. Prefer omitting it or setting it to null/empty when scene_output is present; the harness will synthesize the plain-text render from beats.)\n"
+        "- scene_output: object (Preferred over flat narration when multiple speakers, mixed visibility, or private beats. When you provide scene_output, do NOT waste tokens duplicating it in narration.)\n"
         "  Keys: location_key, context_key, beats.\n"
         "  Each beat MUST begin with reasoning and include: type, speaker, actors, listeners, visibility, "
         "aware_npc_slugs, and text.\n"
@@ -614,7 +614,7 @@ class ZorkEmulator:
         "  actors: who is doing the thing — REQUIRED on every beat even with no spoken speaker.\n"
         "  listeners: direct in-scene recipients — who is being told, shown, confronted, or directly receiving the beat.\n"
         "  aware_npc_slugs are REQUIRED on every beat, even if empty array.\n"
-        "  narration should be the plain-text render of the same scene_output when both are present.\n"
+        "  If narration is omitted, the harness renders it from beat text automatically.\n"
         "<example>\n"
         '  Dialogue beat: {"reasoning":"Sasha is present and hears this.","type":"npc_dialogue","speaker":"sasha","actors":["sasha"],"listeners":["deshawn-williams"],"visibility":"local","aware_npc_slugs":["sasha"],"text":"\\"Keep moving.\\""}\n'
         '  Action beat: {"reasoning":"Chris physically moves the jar while Rent watches.","type":"action","speaker":"chris-crawly","actors":["chris-crawly"],"listeners":["rent"],"visibility":"local","aware_npc_slugs":["rent"],"text":"Chris angles the jar toward the pocket."}\n'
