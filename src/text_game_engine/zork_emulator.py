@@ -448,7 +448,7 @@ class ZorkEmulator:
         "intended_payoff",
     }
     RESPONSE_STYLE_NOTE = (
-        "[SYSTEM NOTE: FOR THIS RESPONSE ONLY: use the current style direction. Narrate in 1 to 6 beats as needed. "
+        "[SYSTEM NOTE: FOR THIS RESPONSE ONLY: use the current style direction. Narrate in 1 to 2 beats as needed. "
         "No recap of unchanged facts. No flowery language unless a character canonically speaks that way. "
         "Do not restage the room with a closing tableau or camera sweep over unchanged props, plates, parked cars, shadows, music, or weather. "
         "If those details did not materially change this turn, leave them implicit. "
@@ -703,7 +703,7 @@ class ZorkEmulator:
         "- Do NOT repeat the narration outside the JSON object.\n"
         "- Keep narration under 1800 characters.\n"
         "- Write in the current style direction.\n"
-        "- Narrate in 1 to 6 beats as needed for the turn.\n"
+        "- Narrate in 1 to 2 beats as needed for the turn.\n"
         "- Avoid flowery language unless a specific character canonically speaks that way. Avoid novel-style interior monologue, melodrama, or comic-book framing.\n"
         "- Vary pacing and sentence rhythm from turn to turn while staying true to the speaking character.\n"
         "- When LITERARY_STYLES is present, it contains named style profiles extracted from real literary works. Each profile describes prose craft: rhythm, register, texture, and avoidances.\n"
