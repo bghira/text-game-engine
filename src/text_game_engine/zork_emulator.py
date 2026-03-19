@@ -6,6 +6,7 @@ import fnmatch
 import json
 import logging
 import os
+import random
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -696,7 +697,10 @@ class ZorkEmulator:
         "Roster removal is only for explicit player/admin cleanup requests, confirmed duplicate merges, death/permanent departure, or true invalid entries. "
         "Prefer updating location/current_status over deleting the character.\n"
         "Set deceased_reason to a string when a character dies. "
-        "WORLD_CHARACTERS in the prompt shows the current NPC roster — use it for continuity.)\n\n"
+        "WORLD_CHARACTERS in the prompt shows the current NPC roster — use it for continuity. "
+        "Actively reuse existing NPCs: bring them back into scenes, let them react to events, have them reach out via SMS, "
+        "or reference them in dialogue. The world feels alive when characters persist with their own agendas "
+        "rather than fading into the background after their introduction.)\n\n"
         "Rules:\n"
         "- Return ONLY the JSON object. No markdown, no code fences, no text before or after the JSON.\n"
         "- In final non-tool responses, include reasoning and put it as the first key.\n"
@@ -11873,6 +11877,14 @@ class ZorkEmulator:
                 action,
             )
         )
+        merged_tail_extra_lines.extend(
+            self._passive_npc_sms_nudge_lines(
+                campaign,
+                state,
+                player,
+                player_state,
+            )
+        )
         turn_prompt_tail = self._build_turn_prompt_tail(
             player_state,
             action,
@@ -15480,6 +15492,108 @@ class ZorkEmulator:
         lines.append(
             "If the player asked for help, respond with specific next-step options or an explicit clue, not generic encouragement."
         )
+        return lines
+
+    # -- Passive NPC reuse / SMS follow-up nudges --
+    # Probability constants for per-turn nudge rolls.
+    NPC_NUDGE_CHANCE = 0.30       # 30% chance to nudge NPC reuse
+    SMS_REPLY_NUDGE_CHANCE = 0.40  # 40% chance to nudge SMS reply when unanswered threads exist
+
+    def _passive_npc_sms_nudge_lines(
+        self,
+        campaign: Campaign,
+        campaign_state: Dict[str, object],
+        player: Player,
+        player_state: Dict[str, object],
+    ) -> list[str]:
+        """Generate prompt nudge lines encouraging passive NPC activity.
+
+        Called on every turn. Uses probability rolls to decide whether to
+        inject a nudge for:
+        - Bringing an off-scene NPC back into the current scene
+        - Having an NPC reply to or initiate an SMS conversation
+        """
+        lines: list[str] = []
+
+        # --- NPC reuse nudge ---
+        if random.random() < self.NPC_NUDGE_CHANCE:
+            characters = parse_json_dict(campaign.characters_json)
+            player_location = str(player_state.get("room_title") or "").strip().lower()
+            # Find NPCs that aren't in the player's current location
+            off_scene: list[str] = []
+            for slug, char in characters.items():
+                if not isinstance(char, dict):
+                    continue
+                if char.get("deceased_reason"):
+                    continue
+                if char.get("remove"):
+                    continue
+                npc_location = str(char.get("current_status") or char.get("location") or "").strip().lower()
+                name = str(char.get("name") or slug).strip()
+                if not name:
+                    continue
+                # Skip NPCs already co-located with the player
+                if player_location and npc_location and player_location in npc_location:
+                    continue
+                off_scene.append(name)
+            if off_scene:
+                picks = random.sample(off_scene, min(2, len(off_scene)))
+                names_str = " or ".join(picks)
+                lines.append(
+                    f"NPC_ACTIVITY_NUDGE: Consider weaving {names_str} into this scene — "
+                    f"they could arrive, be heard from, pass through, send a message, or be mentioned by another character. "
+                    f"Existing NPCs should not fade into the background; the world feels alive when characters "
+                    f"reappear with their own agendas and reactions to recent events."
+                )
+
+        # --- Passive SMS reply nudge ---
+        if random.random() < self.SMS_REPLY_NUDGE_CHANCE:
+            actor_id = str(player.actor_id or "")
+            unread_summary = self._sms_unread_summary_for_player(
+                campaign_state,
+                actor_id=actor_id,
+                player_state=player_state,
+            )
+            unread_threads = self._coerce_non_negative_int(
+                unread_summary.get("threads", 0), default=0
+            )
+            # Also check for threads where the last message was FROM the player (unanswered by NPC)
+            sms_threads = self._sms_threads_from_state(campaign_state)
+            player_aliases = self._sms_player_aliases(actor_id=actor_id, player_state=player_state)
+            unanswered_by_npc: list[str] = []
+            for thread_key, thread_data in sms_threads.items():
+                if not isinstance(thread_data, dict):
+                    continue
+                messages = thread_data.get("messages")
+                if not isinstance(messages, list) or not messages:
+                    continue
+                last_msg = messages[-1] if messages else None
+                if not isinstance(last_msg, dict):
+                    continue
+                from_norm = self._sms_normalize_thread_key(last_msg.get("from"))
+                if from_norm and from_norm in player_aliases:
+                    label = str(thread_data.get("label") or thread_key).strip()[:40]
+                    if label:
+                        unanswered_by_npc.append(label)
+            if unanswered_by_npc:
+                picks = unanswered_by_npc[:2]
+                names_str = " and ".join(picks)
+                lines.append(
+                    f"SMS_REPLY_NUDGE: The player has unanswered outgoing SMS to {names_str}. "
+                    f"Consider having the NPC reply via sms_write during this turn — "
+                    f"people generally respond to texts, and silence without narrative reason feels like a dropped thread. "
+                    f"If the NPC would plausibly delay, narrate a brief reason (busy, thinking, ignoring)."
+                )
+            elif unread_threads > 0:
+                labels = unread_summary.get("labels", [])
+                if labels:
+                    names_str = ", ".join(str(l) for l in labels[:2])
+                    lines.append(
+                        f"SMS_ACTIVITY_NUDGE: There are unread SMS threads from {names_str}. "
+                        f"If narratively appropriate, the character's phone could buzz, "
+                        f"or an NPC could mention they tried to reach the player."
+                    )
+
         return lines
 
     def _increment_auto_fix_counter(
