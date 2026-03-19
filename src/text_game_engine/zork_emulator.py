@@ -608,7 +608,9 @@ class ZorkEmulator:
         "- reasoning: string (first key in final turn JSON; concise internal grounding for this turn: what evidence/context you used, which actors are involved, and why the chosen outcome follows)\n"
         "- narration: string (optional. Prefer omitting it or setting it to null/empty when scene_output is present; the harness will synthesize the plain-text render from beats.)\n"
         "- scene_output: object (Preferred over flat narration when multiple speakers, mixed visibility, or private beats. When you provide scene_output, do NOT waste tokens duplicating it in narration.)\n"
+        "  scene_output MUST be a JSON object, never a string.\n"
         "  Keys: location_key, context_key, beats.\n"
+        "  beats MUST be an array of beat objects, even when there is only one beat.\n"
         "  Each beat MUST begin with reasoning and include: type, speaker, actors, listeners, visibility, "
         "aware_npc_slugs, and text.\n"
         "  speaker=narrator for pure environment/description only; otherwise name the acting character.\n"
@@ -617,6 +619,7 @@ class ZorkEmulator:
         "  aware_npc_slugs are REQUIRED on every beat, even if empty array.\n"
         "  If narration is omitted, the harness renders it from beat text automatically.\n"
         "<example>\n"
+        '  scene_output wrapper: {"location_key":"hotel-lobby","context_key":"hotel-lobby-front-desk","beats":[{"reasoning":"Marin is directly addressing the clerk in a shared public scene.","type":"npc_dialogue","speaker":"marin","actors":["marin"],"listeners":["front-desk-clerk"],"visibility":"local","aware_npc_slugs":["front-desk-clerk"],"text":"Marin slides the room key across the desk. \\"We need the service elevator unlocked.\\""}]}\n'
         '  Dialogue beat: {"reasoning":"Sasha is present and hears this.","type":"npc_dialogue","speaker":"sasha","actors":["sasha"],"listeners":["deshawn-williams"],"visibility":"local","aware_npc_slugs":["sasha"],"text":"\\"Keep moving.\\""}\n'
         '  Action beat: {"reasoning":"Chris physically moves the jar while Rent watches.","type":"action","speaker":"chris-crawly","actors":["chris-crawly"],"listeners":["rent"],"visibility":"local","aware_npc_slugs":["rent"],"text":"Chris angles the jar toward the pocket."}\n'
         "</example>\n"
