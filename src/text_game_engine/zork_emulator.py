@@ -650,6 +650,7 @@ class ZorkEmulator:
         "Use when a subplot beat should push the outlined story forward without explicit state_update scene change.)\n"
         '- turn_visibility: object (optional; who should get this turn in future prompt context. Keys: "scope" ("public"|"private"|"limited"|"local"), "player_slugs" (array of player slugs from PARTY_SNAPSHOT, typically in `player-<actor_id>` form), "npc_slugs" (array of WORLD_CHARACTERS slugs who overheard/noticed), and optional "reason". This changes prompt visibility only; it does NOT change shared world state.)\n'
         "- scene_image_prompt: string (optional; include whenever the visible scene changes in a meaningful way: entering a room, newly visible characters/objects, reveals, or strong visual shifts)\n"
+        '- tool_calls: array (optional; inline side-effect tool invocations supported in final JSON. Only "sms_write" and "sms_schedule" are allowed here. Use this when narration includes an SMS/phone reply or delayed SMS that must persist in the log.)\n'
         "- set_timer_delay: integer (optional; 30-300 seconds, see TIMED EVENTS SYSTEM below)\n"
         "- set_timer_event: string (optional; what happens when the timer expires)\n"
         "- set_timer_interruptible: boolean (optional; default true)\n"
@@ -1091,6 +1092,43 @@ class ZorkEmulator:
         "Returns full expanded chapter with all scene details.\n"
         "Use when you need details about a chapter not fully shown in STORY_CONTEXT.\n"
     )
+    PLOT_PLAN_TOOL_PROMPT = (
+        "\nYou have a plot_plan tool for forward-looking narrative intentions.\n"
+        "Use it to create, update, resolve, or remove multi-turn threads so setups actually pay off.\n"
+        "Return ONLY:\n"
+        '{"tool_call": "plot_plan", "plans": [{"thread": "thread-slug", "setup": "...", "intended_payoff": "...", "target_turns": 12, "dependencies": ["dep-1", "dep-2"]}]}\n'
+        "Resolve or update existing threads by setting status/resolution fields:\n"
+        '{"tool_call": "plot_plan", "plans": [{"thread": "thread-slug", "status": "resolved", "resolution": "What finally happened."}]}\n'
+        "Remove a stale/invalid thread explicitly:\n"
+        '{"tool_call": "plot_plan", "plans": [{"thread": "thread-slug", "remove": true}]}\n'
+        "ACTIVE_PLOT_THREADS are returned in prompt context.\n"
+        "Use ACTIVE_PLOT_THREADS and ACTIVE_HINTS to maintain momentum and prevent mystery-box drift.\n"
+        "Any narrative thread expected to span more than 3 turns SHOULD have a plot plan.\n"
+    )
+    CHAPTER_PLAN_TOOL_PROMPT = (
+        "\nOFF-RAILS CHAPTER MANAGEMENT TOOL:\n"
+        "In off-rails mode, you may create, update, advance, or resolve emergent chapter structure via chapter_plan.\n"
+        "Create or update a chapter:\n"
+        '{"tool_call": "chapter_plan", "action": "create", "chapter": {"slug": "arc-slug", "title": "Arc Title", "summary": "...", "scenes": ["scene-a", "scene-b"], "active": true}}\n'
+        "Advance a chapter scene:\n"
+        '{"tool_call": "chapter_plan", "action": "advance_scene", "chapter": "arc-slug", "to_scene": "scene-b"}\n'
+        "Resolve a chapter:\n"
+        '{"tool_call": "chapter_plan", "action": "resolve", "chapter": "arc-slug", "resolution": "What concluded the arc."}\n'
+        "ACTIVE_CHAPTERS are returned in prompt context.\n"
+        "Use ACTIVE_CHAPTERS to maintain momentum and avoid aimless wandering.\n"
+        "If no chapters are active and the player is directionless, create one from the strongest unresolved thread.\n"
+    )
+    CONSEQUENCE_TOOL_PROMPT = (
+        "\nYou have a consequence_log tool for promised downstream effects.\n"
+        "Use it when narration establishes a future consequence that should persist beyond this turn.\n"
+        "Add a consequence:\n"
+        '{"tool_call": "consequence_log", "add": {"trigger": "...", "consequence": "...", "severity": "moderate", "expires_turns": 20}}\n'
+        "Resolve a consequence:\n"
+        '{"tool_call": "consequence_log", "resolve": {"id": "consequence-id", "resolution": "How it was resolved."}}\n'
+        "Remove a consequence explicitly:\n"
+        '{"tool_call": "consequence_log", "remove": ["consequence-id"]}\n'
+        "ACTIVE_CONSEQUENCES are returned in prompt context. Consult them in relevant scenes.\n"
+    )
     CALENDAR_TOOL_PROMPT = (
         "\nCALENDAR & GAME TIME SYSTEM:\n"
         "The campaign tracks in-game time via CURRENT_GAME_TIME shown in the user prompt.\n"
@@ -1148,6 +1186,18 @@ class ZorkEmulator:
         "distinguishing marks, pose, and art style cues. Keep it 1-3 sentences, "
         "70-150 words, vivid and concrete.\n"
         "Do NOT include image_url in character_updates — the harness manages that field.\n"
+    )
+    FINAL_STAGE_OPERATIONAL_PROMPT = (
+        "\nFINALIZATION OPERATIONAL RULES:\n"
+        "- You are in the final JSON-writing stage. Do NOT return a standalone tool_call object now.\n"
+        '- You MAY include "tool_calls" in the final JSON, but ONLY for sms_write and sms_schedule.\n'
+        "- If narration includes an SMS/phone reply or outgoing SMS that must persist, include a matching sms_write in tool_calls so both sides of the conversation are logged.\n"
+        "- If scheduling a delayed incoming SMS, use tool_calls with sms_schedule and do NOT narrate that delayed message as already received.\n"
+        "- If the current scene has a believable grounded clock and needs forced urgency, you may include set_timer_delay / set_timer_event / set_timer_interruptible / set_timer_interrupt_action / set_timer_interrupt_scope in the final JSON.\n"
+        "- Timers are for real pressure: force a decision, trigger a grounded consequence, move the player, or force an encounter. Do NOT use timers for trivial flavor.\n"
+        "- Timer events must be grounded in established scene facts. Use interrupt_scope=local for hazards anchored to the acting player's immediate situation and global for campaign-wide clocks. Prefer interruptible=false only when the event is already unavoidable.\n"
+        "- calendar_update is allowed in final JSON. Use add for deadlines, appointments, and world events with narrative timing pressure.\n"
+        "- ONLY use calendar_update.remove when the event was resolved by this turn's narration or when you are clearly cleaning up an already-fired/overdue event that is no longer pending. Never remove events just because time passed.\n"
     )
     ON_RAILS_SYSTEM_PROMPT = (
         "\nON-RAILS MODE IS ENABLED.\n"
@@ -11594,12 +11644,16 @@ class ZorkEmulator:
                 system_prompt = f"{system_prompt}{self.TIMER_TOOL_PROMPT}"
             if story_context:
                 system_prompt = f"{system_prompt}{self.STORY_OUTLINE_TOOL_PROMPT}"
+            system_prompt = f"{system_prompt}{self.PLOT_PLAN_TOOL_PROMPT}"
+            if not on_rails:
+                system_prompt = f"{system_prompt}{self.CHAPTER_PLAN_TOOL_PROMPT}"
+            system_prompt = f"{system_prompt}{self.CONSEQUENCE_TOOL_PROMPT}"
             system_prompt = f"{system_prompt}{self.CALENDAR_TOOL_PROMPT}"
             system_prompt = f"{system_prompt}{self.ROSTER_PROMPT}"
             system_prompt = f"{system_prompt}{self.AUTOBIOGRAPHY_TOOL_PROMPT}"
             system_prompt = f"{system_prompt}{self.READY_TO_WRITE_TOOL_PROMPT}"
         else:
-            system_prompt = self.SYSTEM_PROMPT
+            system_prompt = f"{self.SYSTEM_PROMPT}{self.FINAL_STAGE_OPERATIONAL_PROMPT}"
             if guardrails_enabled:
                 system_prompt = f"{system_prompt}{self.GUARDRAILS_SYSTEM_PROMPT}"
             if on_rails:
