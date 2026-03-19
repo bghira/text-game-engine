@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import re
 import threading
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 import requests
 from urllib import error as urllib_error
@@ -6947,6 +6948,18 @@ class ZorkEmulator:
                     pre_slugs=pre_character_slugs,
                     channel_id=portrait_channel_ref,
                 )
+                if result.scene_image_prompt and portrait_channel_ref:
+                    scene_ctx = SimpleNamespace(
+                        author=SimpleNamespace(id=str(actor_id)),
+                        channel=SimpleNamespace(id=str(portrait_channel_ref)),
+                    )
+                    asyncio.create_task(
+                        self._enqueue_scene_image(
+                            scene_ctx,
+                            str(result.scene_image_prompt),
+                            campaign_id=campaign_id,
+                        )
+                    )
                 asyncio.create_task(self._enqueue_new_character_enrichments(
                     campaign_id=campaign_id,
                     pre_slugs=pre_character_slugs,
@@ -8333,6 +8346,18 @@ class ZorkEmulator:
             pre_slugs=pre_character_slugs,
             channel_id=channel_id,
         )
+        if result.scene_image_prompt and channel_id:
+            scene_ctx = SimpleNamespace(
+                author=SimpleNamespace(id=str(active_actor_id)),
+                channel=SimpleNamespace(id=str(channel_id)),
+            )
+            asyncio.create_task(
+                self._enqueue_scene_image(
+                    scene_ctx,
+                    str(result.scene_image_prompt),
+                    campaign_id=campaign_id,
+                )
+            )
         asyncio.create_task(self._enqueue_new_character_enrichments(
             campaign_id=campaign_id,
             pre_slugs=pre_character_slugs,
