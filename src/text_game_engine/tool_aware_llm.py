@@ -498,11 +498,16 @@ class ToolAwareZorkLLM:
         )
         try:
             payload = emulator._parse_json_lenient(json_text or cleaned)  # noqa: SLF001
-        except Exception:
+        except Exception as exc:
             logger.warning(
-                "_parse_model_payload: JSON parse failed; cleaned[:300]=%s json_text[:300]=%s",
-                (cleaned or "")[:300],
-                (json_text or "")[:300],
+                "_parse_model_payload: JSON parse failed: %s\n"
+                "RAW RESPONSE:\n%s\n"
+                "CLEANED RESPONSE:\n%s\n"
+                "EXTRACTED JSON TEXT:\n%s",
+                exc,
+                response or "(empty)",
+                cleaned or "(empty)",
+                json_text or "(empty)",
             )
             self._zork_log(
                 "PARSE CHAIN DETAIL",
@@ -510,8 +515,9 @@ class ToolAwareZorkLLM:
                 f"cleaned_len={len(cleaned or '')}\n"
                 f"json_text_len={len(json_text or '')}\n"
                 f"had_fences={'```' in (response or '')}\n"
-                f"cleaned[:500]={cleaned[:500] if cleaned else '(empty)'}\n"
-                f"json_text[:500]={json_text[:500] if json_text else '(None)'}",
+                f"raw_response=\n{response or '(empty)'}\n"
+                f"cleaned_response=\n{cleaned or '(empty)'}\n"
+                f"json_text=\n{json_text or '(empty)'}",
             )
             return None
         if not isinstance(payload, dict):
