@@ -2010,6 +2010,123 @@ class ZorkEmulator:
                 return parse_json_dict(row.characters_json)
         return parse_json_dict(campaign.characters_json)
 
+    def get_chapter_list(self, campaign: Campaign) -> dict[str, Any]:
+        """Return a structured chapter list for frontend display.
+
+        Works for both on-rails (story_outline.chapters) and off-rails
+        (_chapter_plan) campaigns.
+        """
+        state = self.get_campaign_state(campaign)
+        on_rails = bool(state.get("on_rails", False))
+        current_chapter = state.get("current_chapter", 0)
+        current_scene = state.get("current_scene", 0)
+
+        chapters: list[dict[str, Any]] = []
+
+        if on_rails:
+            outline = state.get("story_outline")
+            if isinstance(outline, dict):
+                raw_chapters = outline.get("chapters")
+                if isinstance(raw_chapters, list):
+                    for idx, ch in enumerate(raw_chapters):
+                        if not isinstance(ch, dict):
+                            continue
+                        scenes = []
+                        raw_scenes = ch.get("scenes")
+                        if isinstance(raw_scenes, list):
+                            for si, sc in enumerate(raw_scenes):
+                                if isinstance(sc, dict):
+                                    scenes.append({
+                                        "title": sc.get("title", "Untitled"),
+                                        "summary": sc.get("summary", ""),
+                                        "is_current": idx == current_chapter and si == current_scene,
+                                    })
+                                else:
+                                    scenes.append({
+                                        "title": str(sc or "Untitled"),
+                                        "summary": "",
+                                        "is_current": idx == current_chapter and si == current_scene,
+                                    })
+                        is_current = idx == current_chapter
+                        status = "completed" if idx < current_chapter else ("active" if is_current else "upcoming")
+                        chapters.append({
+                            "title": ch.get("title", f"Chapter {idx + 1}"),
+                            "summary": ch.get("summary", ""),
+                            "scenes": scenes,
+                            "status": status,
+                            "is_current": is_current,
+                            "index": idx,
+                        })
+        else:
+            plan = self._chapter_plan_from_state(state)
+            current_slug = str(current_chapter) if not isinstance(current_chapter, int) else ""
+            if isinstance(current_chapter, str):
+                current_slug = current_chapter
+            sorted_chapters = sorted(
+                plan.values(),
+                key=lambda row: (
+                    0 if str(row.get("status")) == "active" else 1,
+                    -self._coerce_non_negative_int(row.get("updated_turn", 0), default=0),
+                    str(row.get("slug") or ""),
+                ),
+            )
+            for ch in sorted_chapters:
+                slug = ch.get("slug", "")
+                is_current = slug == current_slug
+                scene_slug = str(current_scene) if isinstance(current_scene, str) else ""
+                scenes = []
+                for sc_slug in (ch.get("scenes") or []):
+                    label = str(sc_slug or "").replace("-", " ").replace("_", " ").strip()
+                    label = " ".join(w.capitalize() for w in label.split()) if label else "Untitled"
+                    scenes.append({
+                        "title": label,
+                        "summary": "",
+                        "is_current": is_current and sc_slug == scene_slug,
+                    })
+                chapters.append({
+                    "title": ch.get("title", slug),
+                    "summary": ch.get("summary", ""),
+                    "scenes": scenes,
+                    "status": ch.get("status", "active"),
+                    "is_current": is_current,
+                    "slug": slug,
+                    "resolution": ch.get("resolution", ""),
+                })
+
+        return {
+            "on_rails": on_rails,
+            "current_chapter": current_chapter,
+            "current_scene": current_scene,
+            "chapters": chapters,
+        }
+
+    @classmethod
+    def format_chapter_outline(cls, story_outline: dict[str, Any]) -> str:
+        """Format a story_outline dict into a human-readable chapter listing."""
+        if not isinstance(story_outline, dict):
+            return ""
+        chapters = story_outline.get("chapters")
+        if not isinstance(chapters, list) or not chapters:
+            return ""
+        lines: list[str] = []
+        for idx, ch in enumerate(chapters):
+            if not isinstance(ch, dict):
+                continue
+            title = ch.get("title", f"Chapter {idx + 1}")
+            summary = str(ch.get("summary", "")).strip()
+            lines.append(f"**{idx + 1}. {title}**")
+            if summary:
+                lines.append(f"   {summary}")
+            scenes = ch.get("scenes")
+            if isinstance(scenes, list):
+                for si, sc in enumerate(scenes):
+                    if isinstance(sc, dict):
+                        sc_title = sc.get("title", f"Scene {si + 1}")
+                    else:
+                        sc_title = str(sc or f"Scene {si + 1}")
+                    lines.append(f"   - {sc_title}")
+        return "\n".join(lines)
+
     def record_player_message(
         self,
         player: Player,
@@ -5498,6 +5615,9 @@ class ZorkEmulator:
             f"Campaign **{raw_name}** is ready! ({rails_label} mode)\n"
             f"Characters: {char_count} | Chapters: {chapter_count}\n\n"
         )
+        chapter_outline_text = self.format_chapter_outline(story_outline)
+        if chapter_outline_text:
+            result_msg += f"__**Chapter Outline**__\n{chapter_outline_text}\n\n"
         if campaign.last_narration:
             result_msg += campaign.last_narration
         self._zork_log(
