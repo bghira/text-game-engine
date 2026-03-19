@@ -6875,6 +6875,7 @@ class ZorkEmulator:
                                 message=sms_message,
                                 game_time=game_time,
                                 turn_id=0,
+                                owner_actor_id=actor_id,
                             )
                             campaign_row.state_json = self._dump_json(campaign_state)
                             campaign_row.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
@@ -9631,6 +9632,7 @@ class ZorkEmulator:
             if not key or not isinstance(raw_value, dict):
                 continue
             label = str(raw_value.get("label") or raw_key).strip()[:80] or key
+            owner_actor_id = str(raw_value.get("owner_actor_id") or "").strip() or None
             raw_messages = raw_value.get("messages")
             if not isinstance(raw_messages, list):
                 raw_messages = []
@@ -9657,11 +9659,72 @@ class ZorkEmulator:
                         ),
                         "turn_id": cls._coerce_non_negative_int(msg.get("turn_id", 0), default=0),
                         "seq": cls._coerce_non_negative_int(msg.get("seq", 0), default=0),
+                        "owner_actor_id": str(
+                            msg.get("owner_actor_id") or owner_actor_id or ""
+                        ).strip()
+                        or None,
                     }
                 )
             if messages:
-                threads[key] = {"label": label, "messages": messages}
+                threads[key] = {
+                    "label": label,
+                    "messages": messages,
+                    "owner_actor_id": owner_actor_id,
+                }
         return threads
+
+    @classmethod
+    def _sms_storage_thread_key(
+        cls,
+        thread: object,
+        *,
+        owner_actor_id: object = None,
+    ) -> str:
+        base_key = cls._sms_normalize_thread_key(thread)
+        if not base_key:
+            base_key = "unknown"
+        owner_text = str(owner_actor_id or "").strip()
+        if not owner_text:
+            return base_key
+        owner_key = cls._sms_normalize_thread_key(f"actor-{owner_text}") or "actor-unknown"
+        return f"{base_key}-{owner_key}"[:80]
+
+    @classmethod
+    def _sms_visible_messages_for_viewer(
+        cls,
+        row: Dict[str, object],
+        *,
+        viewer_actor_id: object = None,
+        player_state: Dict[str, object] | None = None,
+    ) -> List[Dict[str, object]]:
+        raw_messages = row.get("messages")
+        if not isinstance(raw_messages, list):
+            return []
+        if viewer_actor_id is None:
+            return [dict(msg) for msg in raw_messages if isinstance(msg, dict)]
+
+        owner_actor_id = str(row.get("owner_actor_id") or "").strip()
+        viewer_actor_text = str(viewer_actor_id or "").strip()
+        if owner_actor_id:
+            if owner_actor_id != viewer_actor_text:
+                return []
+            return [dict(msg) for msg in raw_messages if isinstance(msg, dict)]
+
+        aliases = cls._sms_player_aliases(
+            actor_id=viewer_actor_id,
+            player_state=player_state,
+        )
+        if not aliases:
+            return []
+        visible: List[Dict[str, object]] = []
+        for raw_msg in raw_messages:
+            if not isinstance(raw_msg, dict):
+                continue
+            from_norm = cls._sms_normalize_thread_key(raw_msg.get("from"))
+            to_norm = cls._sms_normalize_thread_key(raw_msg.get("to"))
+            if (from_norm and from_norm in aliases) or (to_norm and to_norm in aliases):
+                visible.append(dict(raw_msg))
+        return visible
 
     @classmethod
     def _sms_list_threads(
@@ -9669,6 +9732,9 @@ class ZorkEmulator:
         campaign_state: Dict[str, object],
         wildcard: str = "*",
         limit: int = 20,
+        *,
+        viewer_actor_id: object = None,
+        player_state: Dict[str, object] | None = None,
     ) -> list[dict[str, object]]:
         threads = cls._sms_threads_from_state(campaign_state)
         pattern = str(wildcard or "*").strip().lower() or "*"
@@ -9681,9 +9747,11 @@ class ZorkEmulator:
                     label.lower(), pattern
                 ):
                     continue
-            messages = row.get("messages")
-            if not isinstance(messages, list):
-                messages = []
+            messages = cls._sms_visible_messages_for_viewer(
+                row,
+                viewer_actor_id=viewer_actor_id,
+                player_state=player_state,
+            )
             if not messages:
                 continue
             last = messages[-1] if messages else {}
@@ -9692,7 +9760,7 @@ class ZorkEmulator:
                 preview = preview[: cls.SMS_MAX_PREVIEW_CHARS - 1].rstrip() + "…"
             out.append(
                 {
-                    "thread": key,
+                    "thread": cls._sms_normalize_thread_key(label) or key,
                     "label": label,
                     "count": len(messages),
                     "last_from": str(last.get("from") or ""),
@@ -9712,6 +9780,9 @@ class ZorkEmulator:
         campaign_state: Dict[str, object],
         thread: str,
         limit: int = 20,
+        *,
+        viewer_actor_id: object = None,
+        player_state: Dict[str, object] | None = None,
     ) -> tuple[str | None, str | None, list[dict[str, object]]]:
         threads = cls._sms_threads_from_state(campaign_state)
         if not threads:
@@ -9730,6 +9801,13 @@ class ZorkEmulator:
         def _thread_matches(key: str, row: dict) -> bool:
             if not query_key:
                 return False
+            visible_messages = cls._sms_visible_messages_for_viewer(
+                row,
+                viewer_actor_id=viewer_actor_id,
+                player_state=player_state,
+            )
+            if viewer_actor_id is not None and not visible_messages:
+                return False
             key_norm = cls._sms_normalize_thread_key(key)
             label_norm = cls._sms_normalize_thread_key(row.get("label"))
             if query_key and (
@@ -9739,10 +9817,7 @@ class ZorkEmulator:
                 or query_key in label_norm
             ):
                 return True
-            raw_messages = row.get("messages")
-            if not isinstance(raw_messages, list):
-                raw_messages = []
-            for msg in raw_messages:
+            for msg in visible_messages:
                 if not isinstance(msg, dict):
                     continue
                 from_norm = cls._sms_normalize_thread_key(msg.get("from"))
@@ -9765,9 +9840,11 @@ class ZorkEmulator:
         merged_messages: list[dict[str, object]] = []
         for key in matched_keys:
             row = threads.get(key) or {}
-            messages = row.get("messages")
-            if not isinstance(messages, list):
-                messages = []
+            messages = cls._sms_visible_messages_for_viewer(
+                row,
+                viewer_actor_id=viewer_actor_id,
+                player_state=player_state,
+            )
             for msg in messages:
                 if not isinstance(msg, dict):
                     continue
@@ -9792,7 +9869,7 @@ class ZorkEmulator:
             resolved_label = base_label
         else:
             resolved_label = f"{base_label} (+{len(matched_keys) - 1} related thread(s))"
-        return canonical_key, resolved_label, list(capped)
+        return cls._sms_normalize_thread_key(base_label) or canonical_key, resolved_label, list(capped)
 
     @classmethod
     def _sms_actor_key(cls, actor_id: object) -> str:
@@ -10071,16 +10148,26 @@ class ZorkEmulator:
         message: str,
         game_time: Dict[str, int],
         turn_id: int = 0,
+        owner_actor_id: object = None,
     ) -> tuple[str, str, dict[str, object]]:
         threads = cls._sms_threads_from_state(campaign_state)
-        thread_key = cls._sms_normalize_thread_key(thread or recipient or sender or "unknown")
-        if not thread_key:
-            thread_key = "unknown"
+        owner_actor_text = str(owner_actor_id or "").strip() or None
+        thread_key = cls._sms_storage_thread_key(
+            thread or recipient or sender or "unknown",
+            owner_actor_id=owner_actor_text,
+        )
         existing = threads.pop(
             thread_key,
-            {"label": thread or recipient or sender or thread_key, "messages": []},
+            {
+                "label": thread or recipient or sender or thread_key,
+                "messages": [],
+                "owner_actor_id": owner_actor_text,
+            },
         )
         label = str(existing.get("label") or thread or recipient or sender or thread_key).strip()[:80] or thread_key
+        thread_owner_actor_id = (
+            str(existing.get("owner_actor_id") or owner_actor_text or "").strip() or None
+        )
         messages = existing.get("messages")
         if not isinstance(messages, list):
             messages = []
@@ -10093,6 +10180,7 @@ class ZorkEmulator:
             "minute": min(59, max(0, cls._coerce_non_negative_int(game_time.get("minute", 0), default=0))),
             "turn_id": max(0, int(turn_id or 0)),
             "seq": 0,
+            "owner_actor_id": thread_owner_actor_id,
         }
         if messages:
             last = messages[-1]
@@ -10108,7 +10196,11 @@ class ZorkEmulator:
                     and cls._coerce_non_negative_int(last.get("minute", 0), default=0)
                     == cls._coerce_non_negative_int(entry.get("minute", 0), default=0)
                 ):
-                    threads[thread_key] = {"label": label, "messages": messages}
+                    threads[thread_key] = {
+                        "label": label,
+                        "messages": messages,
+                        "owner_actor_id": thread_owner_actor_id,
+                    }
                     campaign_state[cls.SMS_STATE_KEY] = threads
                     return thread_key, label, dict(last)
         next_seq = cls._coerce_non_negative_int(
@@ -10117,7 +10209,11 @@ class ZorkEmulator:
         entry["seq"] = max(1, next_seq)
         messages.append(entry)
         messages = messages[-cls.SMS_MAX_MESSAGES_PER_THREAD :]
-        threads[thread_key] = {"label": label, "messages": messages}
+        threads[thread_key] = {
+            "label": label,
+            "messages": messages,
+            "owner_actor_id": thread_owner_actor_id,
+        }
         while len(threads) > cls.SMS_MAX_THREADS:
             oldest_key = next(iter(threads))
             threads.pop(oldest_key, None)
@@ -10158,6 +10254,7 @@ class ZorkEmulator:
         recipient: str,
         message: str,
         turn_id: int = 0,
+        owner_actor_id: str | None = None,
     ) -> None:
         try:
             await asyncio.sleep(max(0, int(delay_seconds)))
@@ -10187,6 +10284,7 @@ class ZorkEmulator:
                 message=message,
                 game_time=game_time,
                 turn_id=effective_turn_id,
+                owner_actor_id=owner_actor_id,
             )
             campaign.state_json = self._dump_json(campaign_state)
             campaign.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
@@ -10202,6 +10300,7 @@ class ZorkEmulator:
         message: str,
         delay_seconds: int,
         turn_id: int = 0,
+        owner_actor_id: str | None = None,
     ) -> tuple[bool, str, int]:
         thread_clean = str(thread or "").strip()[:80]
         sender_clean = str(sender or "").strip()[:80]
@@ -10223,6 +10322,7 @@ class ZorkEmulator:
                     recipient=recipient_clean,
                     message=message_clean,
                     turn_id=max(0, int(turn_id or 0)),
+                    owner_actor_id=str(owner_actor_id or "").strip() or None,
                 )
             )
         except RuntimeError:
@@ -12267,13 +12367,29 @@ class ZorkEmulator:
         campaign_id: str,
         wildcard: str = "*",
         limit: int = 20,
+        viewer_actor_id: str | None = None,
     ) -> list[dict[str, object]]:
         with self._session_factory() as session:
             campaign = session.get(Campaign, str(campaign_id))
             if campaign is None:
                 return []
             state = self.get_campaign_state(campaign)
-        return self._sms_list_threads(state, wildcard=wildcard, limit=limit)
+            player = None
+            if viewer_actor_id:
+                player = (
+                    session.query(Player)
+                    .filter(Player.campaign_id == str(campaign_id))
+                    .filter(Player.actor_id == str(viewer_actor_id))
+                    .first()
+                )
+            player_state = self.get_player_state(player) if player is not None else {}
+        return self._sms_list_threads(
+            state,
+            wildcard=wildcard,
+            limit=limit,
+            viewer_actor_id=viewer_actor_id,
+            player_state=player_state,
+        )
 
     def read_sms_thread(
         self,
@@ -12287,9 +12403,7 @@ class ZorkEmulator:
             if campaign is None:
                 return None, None, []
             state = self.get_campaign_state(campaign)
-            canonical, label, messages = self._sms_read_thread(
-                state, thread=thread, limit=limit
-            )
+            player = None
             if viewer_actor_id:
                 player = (
                     session.query(Player)
@@ -12298,6 +12412,16 @@ class ZorkEmulator:
                     .first()
                 )
                 player_state = self.get_player_state(player) if player is not None else {}
+            else:
+                player_state = {}
+            canonical, label, messages = self._sms_read_thread(
+                state,
+                thread=thread,
+                limit=limit,
+                viewer_actor_id=viewer_actor_id,
+                player_state=player_state,
+            )
+            if viewer_actor_id:
                 thread_markers: dict[str, int] = {}
                 for msg in messages:
                     if not isinstance(msg, dict):
@@ -12343,6 +12467,7 @@ class ZorkEmulator:
         recipient: str,
         message: str,
         turn_id: int = 0,
+        owner_actor_id: str | None = None,
     ) -> tuple[bool, str]:
         with self._session_factory() as session:
             campaign = session.get(Campaign, str(campaign_id))
@@ -12358,6 +12483,7 @@ class ZorkEmulator:
                 message=message,
                 game_time=game_time,
                 turn_id=turn_id,
+                owner_actor_id=owner_actor_id,
             )
             campaign.state_json = self._dump_json(campaign_state)
             campaign.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)

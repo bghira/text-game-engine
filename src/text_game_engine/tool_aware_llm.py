@@ -1813,7 +1813,13 @@ class ToolAwareZorkLLM:
         self._persist_fallback_memory_state(campaign_id, entries)
         return "MEMORY_STORE_RESULT: stored via fallback memory state"
 
-    def _tool_sms_list(self, campaign_id: str, payload: dict[str, Any]) -> str:
+    def _tool_sms_list(
+        self,
+        campaign_id: str,
+        payload: dict[str, Any],
+        *,
+        actor_id: str | None = None,
+    ) -> str:
         wildcard_raw = payload.get("wildcard")
         wildcard = (
             wildcard_raw.strip()
@@ -1822,7 +1828,12 @@ class ToolAwareZorkLLM:
         )
 
         rows = (
-            self._emulator.list_sms_threads(campaign_id, wildcard=wildcard, limit=20)
+            self._emulator.list_sms_threads(
+                campaign_id,
+                wildcard=wildcard,
+                limit=20,
+                viewer_actor_id=actor_id,
+            )
             if self._emulator
             else []
         )
@@ -1904,7 +1915,13 @@ class ToolAwareZorkLLM:
             lines.append("- (no messages)")
         return "\n".join(lines)
 
-    def _tool_sms_write(self, campaign_id: str, payload: dict[str, Any]) -> str:
+    def _tool_sms_write(
+        self,
+        campaign_id: str,
+        payload: dict[str, Any],
+        *,
+        actor_id: str | None = None,
+    ) -> str:
         thread_raw = payload.get("thread")
         sender_raw = payload.get("from", payload.get("sender"))
         recipient_raw = payload.get("to", payload.get("recipient"))
@@ -1941,10 +1958,17 @@ class ToolAwareZorkLLM:
             recipient=recipient,
             message=message,
             turn_id=turn_id,
+            owner_actor_id=actor_id,
         )
         return f"SMS_WRITE_RESULT: stored={bool(ok)} reason={reason} thread={thread}"
 
-    def _tool_sms_schedule(self, campaign_id: str, payload: dict[str, Any]) -> str:
+    def _tool_sms_schedule(
+        self,
+        campaign_id: str,
+        payload: dict[str, Any],
+        *,
+        actor_id: str | None = None,
+    ) -> str:
         thread_raw = payload.get("thread")
         sender_raw = payload.get("from", payload.get("sender"))
         recipient_raw = payload.get("to", payload.get("recipient"))
@@ -2000,6 +2024,7 @@ class ToolAwareZorkLLM:
             message=message,
             delay_seconds=delay_seconds,
             turn_id=turn_id,
+            owner_actor_id=actor_id,
         )
         return (
             "SMS_SCHEDULE_RESULT: "
@@ -2301,13 +2326,13 @@ class ToolAwareZorkLLM:
         if name == "memory_store":
             return self._tool_memory_store(campaign_id, payload)
         if name == "sms_list":
-            return self._tool_sms_list(campaign_id, payload)
+            return self._tool_sms_list(campaign_id, payload, actor_id=actor_id)
         if name == "sms_read":
             return self._tool_sms_read(campaign_id, payload, actor_id=actor_id)
         if name == "sms_write":
-            return self._tool_sms_write(campaign_id, payload)
+            return self._tool_sms_write(campaign_id, payload, actor_id=actor_id)
         if name == "sms_schedule":
-            return self._tool_sms_schedule(campaign_id, payload)
+            return self._tool_sms_schedule(campaign_id, payload, actor_id=actor_id)
         if name == "story_outline":
             return self._tool_story_outline(campaign_id, payload)
         if name == "plot_plan":
