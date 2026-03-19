@@ -187,6 +187,126 @@ class ToolAwareZorkLLM:
         )
 
     @staticmethod
+    def _memory_tool_bool_value(value: object) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        text = " ".join(str(value or "").strip().lower().split())
+        return text in {"1", "true", "yes", "y", "on"}
+
+    @staticmethod
+    def _memory_tool_turn_id_list(
+        value: object,
+        *,
+        limit: int = 24,
+    ) -> list[int]:
+        if isinstance(value, int):
+            raw_values = [value]
+        elif isinstance(value, (list, tuple, set)):
+            raw_values = list(value)
+        elif isinstance(value, str) and value.strip():
+            raw_values = re.findall(r"\d+", value)
+        else:
+            raw_values = []
+        out: list[int] = []
+        seen: set[int] = set()
+        for raw in raw_values:
+            try:
+                turn_id = int(raw)
+            except Exception:
+                continue
+            if turn_id <= 0 or turn_id in seen:
+                continue
+            seen.add(turn_id)
+            out.append(turn_id)
+            if len(out) >= max(1, int(limit)):
+                break
+        return out
+
+    @classmethod
+    def _memory_tool_records_from_text(cls, text: object) -> list[dict[str, Any]]:
+        records: list[dict[str, Any]] = []
+        for line in str(text or "").splitlines():
+            stripped = line.strip()
+            if not stripped or not stripped.startswith("{"):
+                continue
+            try:
+                row = json.loads(stripped)
+            except Exception:
+                continue
+            if isinstance(row, dict):
+                records.append(row)
+        return records
+
+    @classmethod
+    def _memory_tool_turn_ids_from_text(cls, text: object) -> list[int]:
+        out: list[int] = []
+        seen: set[int] = set()
+        for row in cls._memory_tool_records_from_text(text):
+            row_kind = str(row.get("kind") or "").strip().lower()
+            row_turn_id = 0
+            if row_kind == "memory_turn_result":
+                try:
+                    row_turn_id = int(row.get("turn_id") or 0)
+                except Exception:
+                    row_turn_id = 0
+            elif (
+                row_kind == "memory_hit"
+                and str(row.get("memory_type") or "").strip().lower() == "turn"
+            ):
+                try:
+                    row_turn_id = int(row.get("turn_id") or 0)
+                except Exception:
+                    row_turn_id = 0
+            if row_turn_id <= 0 or row_turn_id in seen:
+                continue
+            seen.add(row_turn_id)
+            out.append(row_turn_id)
+        return out
+
+    @classmethod
+    def _pruned_memory_tool_text(
+        cls,
+        tool_name: str,
+        text: object,
+        keep_turn_ids: set[int],
+    ) -> str:
+        tool_key = str(tool_name or "").strip().lower()
+        if tool_key not in {"memory_search", "memory_turn"}:
+            return str(text or "")
+        if not keep_turn_ids:
+            return ""
+        kept_rows: list[dict[str, Any]] = []
+        for row in cls._memory_tool_records_from_text(text):
+            row_kind = str(row.get("kind") or "").strip().lower()
+            row_turn_id = 0
+            if row_kind == "memory_turn_result":
+                try:
+                    row_turn_id = int(row.get("turn_id") or 0)
+                except Exception:
+                    row_turn_id = 0
+            elif (
+                row_kind == "memory_hit"
+                and str(row.get("memory_type") or "").strip().lower() == "turn"
+            ):
+                try:
+                    row_turn_id = int(row.get("turn_id") or 0)
+                except Exception:
+                    row_turn_id = 0
+            if row_turn_id > 0 and row_turn_id in keep_turn_ids:
+                kept_rows.append(row)
+        if not kept_rows:
+            return ""
+        retained_meta = {
+            "kind": "memory_context_retained",
+            "retained_turn_ids": sorted(keep_turn_ids),
+            "retained_count": len(kept_rows),
+        }
+        prefix = "MEMORY_TURN_RESULT:" if tool_key == "memory_turn" else "MEMORY_RECALL:"
+        return prefix + "\n" + cls._memory_tool_jsonl([retained_meta, *kept_rows])
+
+    @staticmethod
     def _tool_call_signature(payload: dict[str, Any]) -> str:
         if not isinstance(payload, dict):
             return ""
@@ -813,6 +933,13 @@ class ToolAwareZorkLLM:
             source_after_lines = 0
         source_before_lines = max(0, min(50, source_before_lines))
         source_after_lines = max(0, min(50, source_after_lines))
+        full_text = self._memory_tool_bool_value(payload.get("full_text"))
+        search_within_turn_ids = self._memory_tool_turn_id_list(
+            payload.get("search_within_turn_ids")
+            or payload.get("within_turn_ids")
+            or payload.get("turn_ids")
+        )
+        search_within_turn_id_set = set(search_within_turn_ids)
 
         curated_hits: list[tuple[str, str, float]] = []
         source_docs: list[dict[str, Any]] = []
@@ -901,6 +1028,8 @@ class ToolAwareZorkLLM:
             q = query.lower().strip()
             parts = [token for token in re.split(r"\W+", q) if token]
             for turn in turns:
+                if search_within_turn_id_set and int(turn.id or 0) not in search_within_turn_id_set:
+                    continue
                 content = str(turn.content or "")
                 if not content:
                     continue
@@ -985,6 +1114,8 @@ class ToolAwareZorkLLM:
                     )
                     for turn_id, kind, content, score in embed_hits:
                         tid = int(turn_id)
+                        if search_within_turn_id_set and tid not in search_within_turn_id_set:
+                            continue
                         if tid in narrator_hits:
                             # Already found by keyword — boost score if embedding is higher.
                             prior = narrator_hits[tid]
@@ -1046,6 +1177,7 @@ class ToolAwareZorkLLM:
         total_hits = 0
         for hit in ordered_narrator:
             total_hits += 1
+            turn_text = str(hit.get("content") or "")
             records.append(
                 {
                     "kind": "memory_hit",
@@ -1055,7 +1187,17 @@ class ToolAwareZorkLLM:
                     "actor_player_slug": str(hit.get("actor_player_slug") or "").strip(),
                     "visibility_scope": str(hit.get("visibility_scope") or "public").strip(),
                     "location_key": str(hit.get("location_key") or "").strip(),
-                    "text": self._memory_tool_text_value(hit.get("content") or "", max_chars=3000),
+                    "text": self._memory_tool_text_value(turn_text, max_chars=900),
+                    **(
+                        {
+                            "full_text": self._memory_tool_text_value(
+                                turn_text,
+                                max_chars=12000,
+                            )
+                        }
+                        if full_text
+                        else {}
+                    ),
                 }
             )
         for term, memory, score in curated_hits[:5]:
@@ -1066,7 +1208,7 @@ class ToolAwareZorkLLM:
                     "memory_type": "manual",
                     "term": str(term or "").strip(),
                     "relevance": round(float(score or 0.0), 4),
-                    "text": self._memory_tool_text_value(memory or "", max_chars=2000),
+                    "text": self._memory_tool_text_value(memory or "", max_chars=700),
                 }
             )
         for (
@@ -1087,7 +1229,7 @@ class ToolAwareZorkLLM:
                     "document_label": str(source_doc_label or ""),
                     "chunk_index": int(source_chunk_index or 0),
                     "relevance": round(float(source_score or 0.0), 4),
-                    "text": self._memory_tool_text_value(source_chunk_text or "", max_chars=4000),
+                    "text": self._memory_tool_text_value(source_chunk_text or "", max_chars=1600),
                 }
             )
         records.insert(
@@ -1097,6 +1239,8 @@ class ToolAwareZorkLLM:
                 "queries": queries[:4],
                 "category": category or "",
                 "hit_count": total_hits,
+                "full_text": full_text,
+                "search_within_turn_ids": search_within_turn_ids,
             },
         )
         if has_source_material:
@@ -1151,7 +1295,14 @@ class ToolAwareZorkLLM:
             f"narrator={len(ordered_narrator)}  source={len(source_hits_unique)}  "
             f"roster_hints={len(roster_hints)}",
         )
-        return "MEMORY_RECALL:\n" + result_jsonl
+        next_actions = [
+            "MEMORY_RECALL_NEXT_ACTIONS:",
+            '- Narrow within the last turn hits only: {"tool_call":"memory_search","search_within":"last_results","queries":["keyword"]}',
+            '- Request expanded turn text only after narrowing: {"tool_call":"memory_search","search_within":"last_results","queries":["exact wording"],"full_text":true}',
+            '- Prune prior memory-turn context you no longer need: {"tool_call":"memory_search","search_within":"last_results","queries":["keyword"],"keep_memory_turns":[123,456]}',
+            '- Retrieve one exact turn directly: {"tool_call":"memory_turn","turn_id":1234}',
+        ]
+        return "MEMORY_RECALL:\n" + result_jsonl + "\n" + "\n".join(next_actions)
 
     def _tool_memory_terms(self, campaign_id: str, payload: dict[str, Any]) -> str:
         wildcard_raw = payload.get("wildcard")
@@ -2411,13 +2562,72 @@ class ToolAwareZorkLLM:
                 return None
 
         tool_history = ""
+        tool_history_entries: list[dict[str, str]] = []
         used_tool_names: set[str] = set()
         seen_tool_signatures: set[str] = set()
         memory_obligation_met = False
+        last_memory_turn_ids: list[int] = []
         emulator = self._emulator
         if emulator is None:
             logger.warning("_resolve_payload: emulator is None (second check)")
             return None
+
+        def _refresh_tool_history() -> None:
+            nonlocal tool_history
+            tool_history = "".join(
+                f"\n\n{str(entry.get('text') or '').strip()}"
+                for entry in tool_history_entries
+                if str(entry.get("text") or "").strip()
+            )
+
+        def _append_tool_history_entry(tool_name: str, text: str) -> None:
+            nonlocal last_memory_turn_ids
+            tool_key = str(tool_name or "").strip().lower()
+            tool_history_entries.append(
+                {
+                    "tool_name": tool_key,
+                    "text": str(text or "").strip(),
+                }
+            )
+            candidate_turn_ids = self._memory_tool_turn_ids_from_text(text)
+            if tool_key in {"memory_search", "memory_turn"}:
+                last_memory_turn_ids = candidate_turn_ids
+            elif candidate_turn_ids:
+                last_memory_turn_ids = candidate_turn_ids
+            _refresh_tool_history()
+
+        def _apply_keep_memory_turns(keep_turn_ids: list[int]) -> None:
+            nonlocal tool_history_entries, last_memory_turn_ids
+            keep_set = {turn_id for turn_id in keep_turn_ids if turn_id > 0}
+            if not keep_set:
+                return
+            pruned_entries: list[dict[str, str]] = []
+            for entry in tool_history_entries:
+                entry_tool = str(entry.get("tool_name") or "").strip().lower()
+                entry_text = str(entry.get("text") or "")
+                if entry_tool in {"memory_search", "memory_turn"}:
+                    pruned_text = self._pruned_memory_tool_text(
+                        entry_tool,
+                        entry_text,
+                        keep_set,
+                    )
+                    if pruned_text:
+                        pruned_entries.append(
+                            {"tool_name": entry_tool, "text": pruned_text}
+                        )
+                    continue
+                pruned_entries.append(
+                    {
+                        "tool_name": entry_tool,
+                        "text": entry_text.strip(),
+                    }
+                )
+            tool_history_entries = pruned_entries
+            last_memory_turn_ids = [
+                turn_id for turn_id in last_memory_turn_ids if turn_id in keep_set
+            ]
+            _refresh_tool_history()
+
         is_initial_tool_call = emulator._is_tool_call(payload)  # noqa: SLF001
         logger.debug(
             "_resolve_payload: initial parse ok — is_tool_call=%s tool=%s has_narration=%s keys=%s",
@@ -2443,7 +2653,7 @@ class ToolAwareZorkLLM:
                 tool_result = await self._execute_tool_call(
                     campaign_id, tool_payload, actor_id=actor_id
                 )
-                tool_history += f"\n\n{tool_result}"
+                _append_tool_history_entry("memory_search", tool_result)
                 memory_obligation_met = True
                 augmented_prompt = (
                     f"{user_prompt}\n"
@@ -2475,7 +2685,8 @@ class ToolAwareZorkLLM:
             if tool_name == "ready_to_write":
                 break
             if not memory_lookup_enabled and tool_name.startswith("memory_"):
-                tool_history += (
+                _append_tool_history_entry(
+                    "system_note",
                     "\n\nMEMORY_TOOLS_DISABLED: Long-term memory lookup is disabled for this turn "
                     "(early campaign context still fits prompt budget). "
                     "Do NOT call memory_* tools; continue with direct context or non-memory tools."
@@ -2500,7 +2711,8 @@ class ToolAwareZorkLLM:
                 continue
             tool_signature = self._tool_call_signature(payload)
             if tool_signature and tool_signature in seen_tool_signatures:
-                tool_history += (
+                _append_tool_history_entry(
+                    "system_note",
                     "\n\nTOOL_DEDUP_RESULT: duplicate tool_call payload already executed this turn; skipped. "
                     "Do NOT repeat identical tool calls. Use a distinct tool/payload or return final JSON (no tool_call)."
                 )
@@ -2524,6 +2736,16 @@ class ToolAwareZorkLLM:
                 continue
             if tool_signature:
                 seen_tool_signatures.add(tool_signature)
+            if tool_name == "memory_search":
+                search_within = str(payload.get("search_within") or "").strip().lower()
+                if search_within == "last_results" and last_memory_turn_ids:
+                    payload = dict(payload)
+                    payload["search_within_turn_ids"] = list(last_memory_turn_ids)
+                elif search_within == "last_results" and not last_memory_turn_ids:
+                    _append_tool_history_entry(
+                        "system_note",
+                        "MEMORY_SEARCH_WITHIN_RESULT: no previous turn hits are available to narrow within yet; search ran without last_results scoping.",
+                    )
             await _notify_progress(progress, "tool_call", {"tool": tool_name})
             self._zork_log(f"TOOL CALL campaign={campaign_id}", f"tool={tool_name}\npayload={json.dumps(payload, default=str)}")
             tool_result = await self._execute_tool_call(
@@ -2532,13 +2754,19 @@ class ToolAwareZorkLLM:
                 actor_id=actor_id,
             )
             self._zork_log(f"TOOL RESULT campaign={campaign_id}", f"tool={tool_name}\nresult={str(tool_result)}")
-            tool_history += f"\n\n{tool_result}"
+            _append_tool_history_entry(tool_name, tool_result)
+            keep_memory_turns = self._memory_tool_turn_id_list(
+                payload.get("keep_memory_turns")
+            )
+            if keep_memory_turns:
+                _apply_keep_memory_turns(keep_memory_turns)
             if not memory_obligation_met and tool_name in (
                 "recent_turns",
                 "memory_search",
             ):
                 memory_obligation_met = True
-                tool_history += (
+                _append_tool_history_entry(
+                    "system_note",
                     "\n\n[MEMORY OBLIGATION MET — you have satisfied the mandatory memory lookup for this turn. "
                     "Do not call additional memory tools unless you genuinely need specific older information. "
                     "You may now proceed to narration or use non-memory tools.]"
