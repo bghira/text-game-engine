@@ -298,9 +298,17 @@ class ToolAwareZorkLLM:
                 kept_rows.append(row)
         if not kept_rows:
             return ""
+        actual_turn_ids: set[int] = set()
+        for row in kept_rows:
+            try:
+                tid = int(row.get("turn_id") or 0)
+            except Exception:
+                tid = 0
+            if tid > 0:
+                actual_turn_ids.add(tid)
         retained_meta = {
             "kind": "memory_context_retained",
-            "retained_turn_ids": sorted(keep_turn_ids),
+            "retained_turn_ids": sorted(actual_turn_ids),
             "retained_count": len(kept_rows),
         }
         prefix = "MEMORY_TURN_RESULT:" if tool_key == "memory_turn" else "MEMORY_RECALL:"
@@ -934,11 +942,14 @@ class ToolAwareZorkLLM:
         source_before_lines = max(0, min(50, source_before_lines))
         source_after_lines = max(0, min(50, source_after_lines))
         full_text = self._memory_tool_bool_value(payload.get("full_text"))
-        search_within_turn_ids = self._memory_tool_turn_id_list(
-            payload.get("search_within_turn_ids")
-            or payload.get("within_turn_ids")
-            or payload.get("turn_ids")
-        )
+        raw_turn_id_scope = None
+        if "search_within_turn_ids" in payload:
+            raw_turn_id_scope = payload.get("search_within_turn_ids")
+        elif "within_turn_ids" in payload:
+            raw_turn_id_scope = payload.get("within_turn_ids")
+        elif "turn_ids" in payload:
+            raw_turn_id_scope = payload.get("turn_ids")
+        search_within_turn_ids = self._memory_tool_turn_id_list(raw_turn_id_scope)
         search_within_turn_id_set = set(search_within_turn_ids)
 
         curated_hits: list[tuple[str, str, float]] = []
