@@ -829,6 +829,12 @@ class ZorkEmulator:
         "- Do NOT escalate environmental hardship (property damage, theft risk, safety collapse, social pressure) just to coerce acceptance of an optional deal.\n"
         "- Do NOT assert debts, obligations, or contracts unless they were explicitly accepted earlier and grounded in WORLD_STATE/RECENT_TURNS.\n"
         "- NPCs may disagree with the player, but must pursue their own goals through plausible actions, not narrative coercion to force a 'yes'.\n"
+        "- OOC / META RESPECT: when PLAYER_ACTION begins with `[OOC`, it is direct player-to-GM communication, not in-world dialogue.\n"
+        "- You MUST address the OOC substance directly instead of ignoring it and continuing the same scene pressure unchanged.\n"
+        "- If the player asks for a hint, says they are stuck/confused, or says the scene feels railroaded/forced, take that seriously.\n"
+        "- In those cases, give concrete, actionable guidance grounded in visible scene facts, active leads, or current puzzle state, and adapt the scene so the player has real options again.\n"
+        "- Do NOT punish, stonewall, or sidestep OOC feedback by reasserting the blocked premise. Clarify, reopen choices, or relax the bottleneck.\n"
+        "- OOC turns should usually cause little or no in-world advancement unless the player explicitly asks for both meta clarification and an in-world action.\n"
         "- SINCERITY RESPECT: when a player gives a sincere, vulnerable, or emotionally honest answer to an NPC question, "
         "the NPC's next line MUST engage with what was actually said — agree, disagree, be moved, be uncomfortable, push back on the substance — "
         "but must NOT dismiss it as a non-answer, dodge, or deflection and re-ask the same question.\n"
@@ -11737,12 +11743,22 @@ class ZorkEmulator:
                 f"CALENDAR_REMINDERS:\n{calendar_reminders}\n"
                 f"RECENT_TURNS:\n{recent_text}\n"
             )
+        merged_tail_extra_lines = list(tail_extra_lines or [])
+        merged_tail_extra_lines.extend(
+            self._ooc_prompt_extra_lines(
+                campaign,
+                state,
+                player,
+                player_state,
+                action,
+            )
+        )
         turn_prompt_tail = self._build_turn_prompt_tail(
             player_state,
             action,
             response_style_note,
             turn_attachment_context=turn_attachment_context,
-            extra_lines=tail_extra_lines,
+            extra_lines=merged_tail_extra_lines,
         )
         if turn_prompt_tail:
             user_prompt += f"{turn_prompt_tail}\n"
@@ -15255,6 +15271,96 @@ class ZorkEmulator:
 
     def _is_ooc_action_text(self, action_text: object) -> bool:
         return bool(re.match(r"\s*\[OOC\b", str(action_text or ""), re.IGNORECASE))
+
+    @staticmethod
+    def _ooc_help_requested(action_text: object) -> bool:
+        text = " ".join(str(action_text or "").strip().lower().split())
+        if not text:
+            return False
+        markers = (
+            "hint",
+            "stuck",
+            "confused",
+            "unclear",
+            "lost",
+            "what do i do",
+            "what should i do",
+            "where do i go",
+            "railroad",
+            "railroading",
+            "forced",
+            "pushy",
+            "guide me",
+            "nudge",
+            "help me",
+        )
+        return any(marker in text for marker in markers)
+
+    def _ooc_prompt_extra_lines(
+        self,
+        campaign: Campaign,
+        campaign_state: Dict[str, object],
+        player: Player,
+        player_state: Dict[str, object],
+        action_text: str,
+    ) -> list[str]:
+        if not self._is_ooc_action_text(action_text):
+            return []
+
+        lines = [
+            "OOC_DIRECTIVE: PLAYER_ACTION is out-of-character direct player-to-GM communication.",
+            "You MUST address the OOC substance directly in this response instead of continuing the same pressure unchanged.",
+            "Treat OOC hint/stuck/railroading feedback as authoritative signal about player experience.",
+            "Give concrete, actionable guidance or scene adjustment grounded in visible facts. Do not hand-wave, moralize, or repeat the blocked premise.",
+            "Default to little or no in-world advancement on this turn unless the player explicitly requested both OOC clarification and an in-world action.",
+        ]
+        if not self._ooc_help_requested(action_text):
+            return lines
+
+        viewer_slug = self._player_slug_key(player_state.get("character_name"))
+        viewer_location_key = self._room_key_from_player_state(player_state).lower()
+        visible_hints = self._plot_hints_for_viewer(
+            campaign_state,
+            viewer_actor_id=str(player.actor_id or ""),
+            viewer_slug=viewer_slug,
+            viewer_location_key=viewer_location_key,
+            limit=5,
+        )
+        visible_threads = []
+        for row in self._plot_threads_from_state(campaign_state).values():
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("status") or "") != "active":
+                continue
+            if not self._plot_thread_visible_to_viewer(
+                row,
+                viewer_actor_id=str(player.actor_id or ""),
+                viewer_slug=viewer_slug,
+                viewer_location_key=viewer_location_key,
+            ):
+                continue
+            visible_threads.append(row)
+        if visible_hints:
+            lines.append(
+                f"OOC_VISIBLE_HINTS: {self._dump_json(visible_hints[:5])}"
+            )
+        elif visible_threads:
+            fallback_threads = []
+            for row in visible_threads[:5]:
+                fallback_threads.append(
+                    {
+                        "thread": str(row.get('thread') or '').strip(),
+                        "setup": " ".join(str(row.get("setup") or "").split())[:220],
+                        "hint": " ".join(str(row.get("hint") or "").split())[:220],
+                    }
+                )
+            lines.append(
+                f"OOC_ACTIVE_VISIBLE_THREADS: {self._dump_json(fallback_threads)}"
+            )
+        lines.append(
+            "If the player asked for help, respond with specific next-step options or an explicit clue, not generic encouragement."
+        )
+        return lines
 
     def _increment_auto_fix_counter(
         self,
