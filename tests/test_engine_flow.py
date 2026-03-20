@@ -925,6 +925,26 @@ def test_small_model_time_advance_is_clamped_up_to_floor():
     assert game_time.get("minute") == 20
 
 
+def test_game_time_uses_campaign_start_day_of_week():
+    campaign_state = {
+        "game_time": {"day": 3, "hour": 8, "minute": 0},
+        "speed_multiplier": 1.0,
+        "clock_start_day_of_week": "friday",
+    }
+    pre = {"day": 3, "hour": 8, "minute": 0}
+
+    out = GameEngine._ensure_game_time_progress(
+        campaign_state,
+        pre,
+        action_text="[OOC what day is it?]",
+        narration_text="",
+    )
+
+    game_time = out.get("game_time", {})
+    assert game_time.get("day_of_week") == "sunday"
+    assert game_time.get("date_label") == "Sunday, Day 3, Morning"
+
+
 def test_character_updates_null_removes_character(session_factory, uow_factory, seed_campaign_and_actor):
     async def run_test():
         with session_factory() as session:

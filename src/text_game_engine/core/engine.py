@@ -25,6 +25,16 @@ class GameEngine:
     MIN_TURN_ADVANCE_MINUTES = 20
     DEFAULT_TURN_ADVANCE_MINUTES = 20
     MAX_TURN_ADVANCE_MINUTES = 180
+    CLOCK_START_DAY_OF_WEEK_KEY = "clock_start_day_of_week"
+    WEEKDAY_NAMES = (
+        "monday",
+        "tuesday",
+        "wednesday",
+        "thursday",
+        "friday",
+        "saturday",
+        "sunday",
+    )
 
     def __init__(
         self,
@@ -1690,19 +1700,66 @@ class GameEngine:
         return ((max(1, day) - 1) * 24 * 60) + (hour * 60) + minute
 
     @classmethod
-    def _game_time_from_total_minutes(cls, total_minutes: int) -> dict[str, Any]:
+    def _normalize_weekday_name(cls, value: object) -> str:
+        text = " ".join(str(value or "").strip().lower().split())
+        if text in cls.WEEKDAY_NAMES:
+            return text
+        alias_map = {
+            "mon": "monday",
+            "tue": "tuesday",
+            "tues": "tuesday",
+            "wed": "wednesday",
+            "thu": "thursday",
+            "thur": "thursday",
+            "thurs": "thursday",
+            "fri": "friday",
+            "sat": "saturday",
+            "sun": "sunday",
+        }
+        return alias_map.get(text, "monday")
+
+    @classmethod
+    def _campaign_start_day_of_week(cls, campaign_state: dict[str, Any] | None) -> str:
+        if not isinstance(campaign_state, dict):
+            return "monday"
+        return cls._normalize_weekday_name(
+            campaign_state.get(cls.CLOCK_START_DAY_OF_WEEK_KEY, "monday")
+        )
+
+    @classmethod
+    def _weekday_for_day(cls, *, day: int, start_day_of_week: str) -> str:
+        start = cls._normalize_weekday_name(start_day_of_week)
+        try:
+            start_idx = cls.WEEKDAY_NAMES.index(start)
+        except ValueError:
+            start_idx = 0
+        offset = max(1, int(day)) - 1
+        return cls.WEEKDAY_NAMES[(start_idx + offset) % len(cls.WEEKDAY_NAMES)]
+
+    @classmethod
+    def _game_time_from_total_minutes(
+        cls,
+        total_minutes: int,
+        *,
+        start_day_of_week: str = "monday",
+    ) -> dict[str, Any]:
         total = max(0, int(total_minutes))
         day = (total // (24 * 60)) + 1
         within = total % (24 * 60)
         hour = within // 60
         minute = within % 60
         period = cls._game_period_from_hour(hour)
+        day_of_week = cls._weekday_for_day(
+            day=day,
+            start_day_of_week=start_day_of_week,
+        )
         return {
             "day": day,
             "hour": hour,
             "minute": minute,
             "period": period,
-            "date_label": f"Day {day}, {period.title()}",
+            "day_of_week": day_of_week,
+            "date_label": f"{day_of_week.title()}, Day {day}, {period.title()}",
         }
 
     @classmethod
@@ -1791,15 +1848,22 @@ class GameEngine:
         pre_total = cls._game_time_to_total_minutes(pre_snapshot)
         cur_total = cls._game_time_to_total_minutes(cur_snapshot)
         time_skip_request = cls._extract_time_skip_request(action_text)
+        start_day_of_week = cls._campaign_start_day_of_week(campaign_state)
 
         if cur_total > pre_total:
             if time_skip_request is None and not cls._is_ooc_action_text(action_text):
                 min_total = pre_total + cls.MIN_TURN_ADVANCE_MINUTES
                 cur_total = max(cur_total, min_total)
-            campaign_state["game_time"] = cls._game_time_from_total_minutes(cur_total)
+            campaign_state["game_time"] = cls._game_time_from_total_minutes(
+                cur_total,
+                start_day_of_week=start_day_of_week,
+            )
             return campaign_state
         if cls._is_ooc_action_text(action_text):
-            campaign_state["game_time"] = cls._game_time_from_total_minutes(cur_total)
+            campaign_state["game_time"] = cls._game_time_from_total_minutes(
+                cur_total,
+                start_day_of_week=start_day_of_week,
+            )
             return campaign_state
 
         if time_skip_request is not None:
@@ -1816,7 +1880,10 @@ class GameEngine:
         else:
             delta_minutes = min(7 * 24 * 60, delta_minutes)
         new_total = max(pre_total, cur_total) + delta_minutes
-        campaign_state["game_time"] = cls._game_time_from_total_minutes(new_total)
+        campaign_state["game_time"] = cls._game_time_from_total_minutes(
+            new_total,
+            start_day_of_week=start_day_of_week,
+        )
         cls._increment_auto_fix_counter(campaign_state, "game_time_auto_advance")
         return campaign_state
 

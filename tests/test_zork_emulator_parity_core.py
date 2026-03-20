@@ -130,7 +130,7 @@ class ReadyToWriteCompletionPort:
         if len(self.calls) == 1:
             return '{"tool_call":"ready_to_write"}'
         return (
-            '{"reasoning":"finalized","narration":"Final scene.","state_update":{"game_time":{"day":1,"hour":9,"minute":0,"period":"morning","date_label":"Day 1, Morning"}},"summary_update":"done"}'
+            '{"reasoning":"finalized","narration":"Final scene.","state_update":{"game_time":{"day":1,"hour":9,"minute":0,"day_of_week":"monday","period":"morning","date_label":"Monday, Day 1, Morning"}},"summary_update":"done"}'
         )
 
 
@@ -570,8 +570,9 @@ def test_memory_search_supports_last_results_full_text_and_context_pruning(
                             "day": 1,
                             "hour": 9,
                             "minute": 0,
+                            "day_of_week": "monday",
                             "period": "morning",
-                            "date_label": "Day 1, Morning",
+                            "date_label": "Monday, Day 1, Morning",
                         }
                     },
                     "summary_update": "done",
@@ -975,10 +976,35 @@ def test_build_prompt_seeds_default_game_time(session_factory, seed_campaign_and
     assert game_time.get("day") == 1
     assert game_time.get("hour") == 8
     assert game_time.get("minute") == 0
+    assert game_time.get("day_of_week") == "monday"
     assert game_time.get("period") == "morning"
-    assert game_time.get("date_label") == "Day 1, Morning"
+    assert game_time.get("date_label") == "Monday, Day 1, Morning"
     assert '"day": 1' in user_prompt
+    assert "WORLD_CLOCK:" in user_prompt
     assert "CURRENT_GAME_TIME:" in user_prompt
+
+
+def test_build_prompt_includes_weekday_in_world_clock(session_factory, seed_campaign_and_actor):
+    compat = _build_compat(session_factory)
+    campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
+    player = compat.get_or_create_player(seed_campaign_and_actor["campaign_id"], seed_campaign_and_actor["actor_id"])
+    turns = compat.get_recent_turns(seed_campaign_and_actor["campaign_id"])
+
+    with session_factory() as session:
+        campaign_row = session.get(Campaign, campaign.id)
+        campaign_row.state_json = compat._dump_json(
+            {
+                "clock_start_day_of_week": "friday",
+                "game_time": {"day": 3, "hour": 8, "minute": 0},
+            }
+        )
+        session.commit()
+
+    _, user_prompt = compat.build_prompt(campaign, player, "look", turns)
+
+    assert '"day_of_week": "sunday"' in user_prompt
+    assert '"date_label": "Sunday, Day 3, Morning"' in user_prompt
+    assert "WORLD_CLOCK:" in user_prompt
 
 
 def test_story_context_includes_next_three_and_coerces_progress_indices(session_factory, seed_campaign_and_actor):
@@ -1050,7 +1076,7 @@ def test_build_prompt_places_story_context_above_world_summary_and_composes_summ
         campaign_row.summary = "lel without elaboration.\nInventory: stale pretzel\nKevin accepted the drink."
         campaign_row.state_json = compat._dump_json(
             {
-                "game_time": {"day": 1, "hour": 8, "minute": 0, "period": "morning", "date_label": "Day 1, Morning"},
+                "game_time": {"day": 1, "hour": 8, "minute": 0, "day_of_week": "monday", "period": "morning", "date_label": "Monday, Day 1, Morning"},
                 "story_outline": {
                     "chapters": [
                         {
@@ -2532,7 +2558,7 @@ def test_tool_calls_sms_write_executed_in_complete_turn(session_factory, seed_ca
             return json.dumps({
                 "narration": "Saul fires off a quick text.",
                 "state_update": {
-                    "game_time": {"day": 1, "hour": 10, "minute": 0, "period": "morning", "date_label": "Day 1, Morning"},
+                    "game_time": {"day": 1, "hour": 10, "minute": 0, "day_of_week": "monday", "period": "morning", "date_label": "Monday, Day 1, Morning"},
                 },
                 "summary_update": "Saul texted Dale.",
                 "tool_calls": [
