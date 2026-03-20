@@ -353,9 +353,19 @@ class ZorkEmulator:
     MEMORY_SEARCH_ROSTER_HINT_THRESHOLD = 3
     TURN_TIME_INDEX_KEY = "_turn_time_index"
     MAX_TURN_TIME_ENTRIES = 256
-    MIN_TURN_ADVANCE_MINUTES = 1
-    DEFAULT_TURN_ADVANCE_MINUTES = 5
+    MIN_TURN_ADVANCE_MINUTES = 20
+    DEFAULT_TURN_ADVANCE_MINUTES = 20
     MAX_TURN_ADVANCE_MINUTES = 180
+    CLOCK_START_DAY_OF_WEEK_KEY = "clock_start_day_of_week"
+    WEEKDAY_NAMES = (
+        "monday",
+        "tuesday",
+        "wednesday",
+        "thursday",
+        "friday",
+        "saturday",
+        "sunday",
+    )
     LITERARY_STYLES_STATE_KEY = "literary_styles"
     MAX_LITERARY_STYLES_PROMPT_CHARS = 3000
     MAX_LITERARY_STYLE_PROFILE_CHARS = 400
@@ -1161,14 +1171,15 @@ class ZorkEmulator:
         "Every turn, you MUST advance game_time in state_update by a plausible amount "
         "(about 20 minutes for an ordinary turn, longer for travel/rest/time skips, etc.). "
         "Scale the advance by SPEED_MULTIPLIER — at 2x, time passes roughly twice as fast per turn.\n"
+        "The harness derives day_of_week automatically from the campaign's Day 1 weekday. Keep it consistent with the world clock.\n"
         "Default rhythm: advance the world by roughly 20 minutes per turn unless the scene clearly justifies more.\n"
         "Do NOT default to 1-5 minute increments. Use sub-15-minute advances only when immediate shared-scene coherence absolutely requires it.\n"
         "Pace game_time by scene needs: prefer larger jumps (20-90 minutes or to the next meaningful beat) when no immediate deadline is active, "
         "and keep finer-grained time only when needed to preserve shared-scene coherence.\n"
         "Update these fields in state_update:\n"
-        '- "game_time": {"day": int, "hour": int (0-23), "minute": int (0-59), '
+        '- "game_time": {"day": int, "hour": int (0-23), "minute": int (0-59), "day_of_week": string, '
         '"period": "morning"|"afternoon"|"evening"|"night", '
-        '"date_label": "Day N, Period"}\n'
+        '"date_label": "Weekday, Day N, Period"}\n'
         "Advance hour/minute naturally; when hour >= 24, increment day and wrap hour.\n"
         "Set period based on hour: 5-11=morning, 12-16=afternoon, 17-20=evening, 21-4=night.\n\n"
         "You may also return a calendar_update key (object) to manage scheduled events:\n"
@@ -1388,6 +1399,43 @@ class ZorkEmulator:
             "hour": min(23, max(0, hour)),
             "minute": min(59, max(0, minute)),
         }
+
+    @classmethod
+    def _normalize_weekday_name(cls, value: object) -> str:
+        text = " ".join(str(value or "").strip().lower().split())
+        if text in cls.WEEKDAY_NAMES:
+            return text
+        alias_map = {
+            "mon": "monday",
+            "tue": "tuesday",
+            "tues": "tuesday",
+            "wed": "wednesday",
+            "thu": "thursday",
+            "thur": "thursday",
+            "thurs": "thursday",
+            "fri": "friday",
+            "sat": "saturday",
+            "sun": "sunday",
+        }
+        return alias_map.get(text, "monday")
+
+    @classmethod
+    def _campaign_start_day_of_week(cls, campaign_state: Dict[str, object] | None) -> str:
+        if not isinstance(campaign_state, dict):
+            return "monday"
+        return cls._normalize_weekday_name(
+            campaign_state.get(cls.CLOCK_START_DAY_OF_WEEK_KEY, "monday")
+        )
+
+    @classmethod
+    def _weekday_for_day(cls, *, day: int, start_day_of_week: str) -> str:
+        start = cls._normalize_weekday_name(start_day_of_week)
+        try:
+            start_idx = cls.WEEKDAY_NAMES.index(start)
+        except ValueError:
+            start_idx = 0
+        offset = max(1, int(day)) - 1
+        return cls.WEEKDAY_NAMES[(start_idx + offset) % len(cls.WEEKDAY_NAMES)]
 
     @classmethod
     def _turn_context_prefix(cls, turn: Turn) -> str:
@@ -5463,7 +5511,8 @@ class ZorkEmulator:
                 "(Morgan, Chen, Mendoza, Rollins, Nakamura, Kai, River) unless source canon requires them.\n"
                 f"{source_tool_instructions}"
                 "Return ONLY valid JSON with keys: characters, story_outline, summary, "
-                "start_room, landmarks, setting, tone, default_persona, opening_narration.\n"
+                "start_room, landmarks, setting, tone, default_persona, opening_narration, starting_day_of_week.\n"
+                "Choose a starting_day_of_week for Day 1 using a real weekday name.\n"
                 "No markdown, no code fences."
             )
             finalize_user = (
@@ -5521,6 +5570,7 @@ class ZorkEmulator:
                 "tone": "adventurous",
                 "default_persona": setup_data.get("default_persona") or self.DEFAULT_CAMPAIGN_PERSONA,
                 "opening_narration": "The world sharpens around you as the adventure begins.",
+                "starting_day_of_week": "monday",
             }
 
         characters = world.get("characters", {})
@@ -5538,6 +5588,9 @@ class ZorkEmulator:
         default_persona = world.get("default_persona", "")
         summary = world.get("summary", "")
         opening = world.get("opening_narration", "")
+        starting_day_of_week = self._normalize_weekday_name(
+            world.get("starting_day_of_week", state.get(self.CLOCK_START_DAY_OF_WEEK_KEY, "monday"))
+        )
 
         if summary:
             campaign.summary = self._trim_text(str(summary), self.MAX_SUMMARY_CHARS)
@@ -5569,6 +5622,7 @@ class ZorkEmulator:
             state["tone"] = tone
         if default_persona:
             state["default_persona"] = self._trim_text(str(default_persona), self.MAX_PERSONA_PROMPT_CHARS)
+        state[self.CLOCK_START_DAY_OF_WEEK_KEY] = starting_day_of_week
         state["on_rails"] = on_rails
         state["puzzle_mode"] = novel_prefs.get("puzzle_mode", "none")
 
@@ -11793,14 +11847,25 @@ class ZorkEmulator:
         bootstrap_only = bootstrap_only or stage == self.PROMPT_STAGE_BOOTSTRAP
         state = self.get_campaign_state(campaign)
         state = self._scrub_inventory_from_state(state)
+        state_dirty = False
+        if self.CLOCK_START_DAY_OF_WEEK_KEY not in state:
+            state[self.CLOCK_START_DAY_OF_WEEK_KEY] = "monday"
+            state_dirty = True
         if "game_time" not in state:
-            state["game_time"] = {
-                "day": 1,
-                "hour": 8,
-                "minute": 0,
-                "period": "morning",
-                "date_label": "Day 1, Morning",
-            }
+            state["game_time"] = self._game_time_from_total_minutes(
+                ((1 - 1) * 24 * 60) + (8 * 60),
+                start_day_of_week=self._campaign_start_day_of_week(state),
+            )
+            state_dirty = True
+        else:
+            canonical_game_time = self._game_time_from_total_minutes(
+                self._game_time_to_total_minutes(state.get("game_time") or {}),
+                start_day_of_week=self._campaign_start_day_of_week(state),
+            )
+            if state.get("game_time") != canonical_game_time:
+                state["game_time"] = canonical_game_time
+                state_dirty = True
+        if state_dirty:
             campaign.state_json = self._dump_json(state)
         guardrails_enabled = bool(state.get("guardrails_enabled", False))
         model_state = self._build_model_state(state)
@@ -11928,7 +11993,10 @@ class ZorkEmulator:
             party_snapshot,
             characters_for_prompt,
         )
-        game_time = state.get("game_time", {})
+        game_time = self._game_time_from_total_minutes(
+            self._game_time_to_total_minutes(state.get("game_time") or {}),
+            start_day_of_week=self._campaign_start_day_of_week(state),
+        )
         speed_mult = state.get("speed_multiplier", 1.0)
         difficulty = self.normalize_difficulty(state.get("difficulty", "normal"))
         style_direction = self._resolve_style_direction(campaign)
@@ -12011,6 +12079,7 @@ class ZorkEmulator:
                         f"SOURCE_MATERIAL_DIGEST [{digest_key}]:\n{digest_text}\n"
                     )
         user_prompt += (
+            f"WORLD_CLOCK: {self._dump_json(game_time)}\n"
             f"CURRENT_GAME_TIME: {self._dump_json(game_time)}\n"
             f"SPEED_MULTIPLIER: {speed_mult}\n"
             f"DIFFICULTY: {difficulty}\n"
@@ -15504,33 +15573,80 @@ class ZorkEmulator:
         minute = min(59, max(0, self._coerce_non_negative_int(game_time.get("minute", 0), default=0)))
         return ((max(1, day) - 1) * 24 * 60) + (hour * 60) + minute
 
-    def _game_time_from_total_minutes(self, total_minutes: int) -> Dict[str, object]:
+    def _game_time_from_total_minutes(
+        self,
+        total_minutes: int,
+        *,
+        start_day_of_week: str = "monday",
+    ) -> Dict[str, object]:
         total = max(0, int(total_minutes))
         day = (total // (24 * 60)) + 1
         within = total % (24 * 60)
         hour = within // 60
         minute = within % 60
         period = self._game_period_from_hour(hour)
+        day_of_week = self._weekday_for_day(
+            day=day,
+            start_day_of_week=start_day_of_week,
+        )
         return {
             "day": day,
             "hour": hour,
             "minute": minute,
+            "day_of_week": day_of_week,
             "period": period,
-            "date_label": f"Day {day}, {period.title()}",
+            "date_label": f"{day_of_week.title()}, Day {day}, {period.title()}",
         }
 
-    def _format_game_time_label(self, game_time: Dict[str, int]) -> str:
+    def _infer_start_day_of_week_from_game_time(
+        self,
+        game_time: object,
+    ) -> str | None:
+        if not isinstance(game_time, dict):
+            return None
+        weekday = self._normalize_weekday_name(game_time.get("day_of_week"))
+        day = self._coerce_non_negative_int(game_time.get("day", 1), default=1) or 1
+        if weekday not in self.WEEKDAY_NAMES:
+            return None
+        try:
+            weekday_index = self.WEEKDAY_NAMES.index(weekday)
+        except ValueError:
+            return None
+        start_index = (weekday_index - (day - 1)) % len(self.WEEKDAY_NAMES)
+        return self.WEEKDAY_NAMES[start_index]
+
+    def _format_game_time_label(
+        self,
+        game_time: Dict[str, int],
+        *,
+        campaign_state: Optional[Dict[str, object]] = None,
+    ) -> str:
         snapshot = (
             game_time
             if isinstance(game_time, dict)
             else self._extract_game_time_snapshot({"game_time": game_time})
         )
+        start_day_of_week = None
+        if isinstance(campaign_state, dict):
+            start_day_of_week = self._campaign_start_day_of_week(campaign_state)
+        else:
+            start_day_of_week = self._infer_start_day_of_week_from_game_time(snapshot)
+        if not start_day_of_week:
+            existing_label = str(snapshot.get("date_label") or "").strip() if isinstance(snapshot, dict) else ""
+            if existing_label:
+                return existing_label
+            start_day_of_week = "monday"
         canonical = self._game_time_from_total_minutes(
-            self._game_time_to_total_minutes(snapshot)
+            self._game_time_to_total_minutes(snapshot),
+            start_day_of_week=start_day_of_week,
         )
         return str(
             canonical.get("date_label")
-            or f"Day {canonical.get('day', 1)}, {str(canonical.get('period') or 'time').title()}"
+            or (
+                f"{str(canonical.get('day_of_week') or 'monday').title()}, "
+                f"Day {canonical.get('day', 1)}, "
+                f"{str(canonical.get('period') or 'time').title()}"
+            )
         ).strip()
 
     def _speed_multiplier_from_state(self, campaign_state: Dict[str, object]) -> float:
@@ -15858,18 +15974,27 @@ class ZorkEmulator:
         cur_snapshot = self._extract_game_time_snapshot(campaign_state)
         pre_total = self._game_time_to_total_minutes(pre_snapshot)
         cur_total = self._game_time_to_total_minutes(cur_snapshot)
+        start_day_of_week = self._campaign_start_day_of_week(campaign_state)
+        time_skip_request = self._extract_time_skip_request(action_text)
 
         # Keep derived fields canonical when model already advanced time.
         if cur_total > pre_total:
-            campaign_state["game_time"] = self._game_time_from_total_minutes(cur_total)
+            if time_skip_request is None and not self._is_ooc_action_text(action_text):
+                cur_total = max(cur_total, pre_total + self.MIN_TURN_ADVANCE_MINUTES)
+            campaign_state["game_time"] = self._game_time_from_total_minutes(
+                cur_total,
+                start_day_of_week=start_day_of_week,
+            )
             return campaign_state
 
         # Meta/OOC turns do not auto-advance in-game time.
         if self._is_ooc_action_text(action_text):
-            campaign_state["game_time"] = self._game_time_from_total_minutes(cur_total)
+            campaign_state["game_time"] = self._game_time_from_total_minutes(
+                cur_total,
+                start_day_of_week=start_day_of_week,
+            )
             return campaign_state
 
-        time_skip_request = self._extract_time_skip_request(action_text)
         if time_skip_request is not None:
             base_minutes = self._coerce_non_negative_int(
                 time_skip_request.get("minutes", 60), default=60
@@ -15888,7 +16013,10 @@ class ZorkEmulator:
 
         # If model froze or regressed time, force monotonic advance from pre-turn time.
         new_total = max(pre_total, cur_total) + delta_minutes
-        campaign_state["game_time"] = self._game_time_from_total_minutes(new_total)
+        campaign_state["game_time"] = self._game_time_from_total_minutes(
+            new_total,
+            start_day_of_week=start_day_of_week,
+        )
         self._increment_auto_fix_counter(
             campaign_state,
             "game_time_auto_advance",
@@ -15988,10 +16116,21 @@ class ZorkEmulator:
         self,
         player: Player,
         game_time: Dict[str, int],
+        *,
+        campaign_state: Optional[Dict[str, object]] = None,
+        start_day_of_week: str | None = None,
     ) -> None:
         player_state = self.get_player_state(player)
+        resolved_start_day = start_day_of_week
+        if not resolved_start_day and isinstance(campaign_state, dict):
+            resolved_start_day = self._campaign_start_day_of_week(campaign_state)
+        if not resolved_start_day:
+            resolved_start_day = self._infer_start_day_of_week_from_game_time(game_time)
+        if not resolved_start_day:
+            resolved_start_day = "monday"
         player_state["game_time"] = self._game_time_from_total_minutes(
-            self._game_time_to_total_minutes(game_time)
+            self._game_time_to_total_minutes(game_time),
+            start_day_of_week=resolved_start_day,
         )
         with self._session_factory() as session:
             row = session.get(Player, player.id)
@@ -17735,14 +17874,17 @@ class ZorkEmulator:
     ) -> Dict[str, object]:
         out = dict(state_update) if isinstance(state_update, dict) else {}
         current_time = self._extract_game_time_snapshot(campaign_state)
+        start_day_of_week = self._campaign_start_day_of_week(campaign_state)
         provided_time = out.get("game_time")
         if isinstance(provided_time, dict):
             out["game_time"] = self._game_time_from_total_minutes(
-                self._game_time_to_total_minutes(provided_time)
+                self._game_time_to_total_minutes(provided_time),
+                start_day_of_week=start_day_of_week,
             )
         else:
             out["game_time"] = self._game_time_from_total_minutes(
-                self._game_time_to_total_minutes(current_time)
+                self._game_time_to_total_minutes(current_time),
+                start_day_of_week=start_day_of_week,
             )
         if bool(campaign_state.get("on_rails", False)):
             out["current_chapter"] = self._coerce_non_negative_int(
