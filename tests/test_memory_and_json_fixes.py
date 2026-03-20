@@ -117,6 +117,16 @@ class TestCleanResponse:
         parsed = json.loads(result)
         assert parsed["narration"] == "hello"
 
+    def test_truncated_scene_output_object_repaired_without_narration(self, emulator):
+        text = (
+            '{"reasoning":"ok","scene_output":{"location_key":"dock","context_key":"x",'
+            '"beats":[{"text":"Hi"}]},"state_update":{},"summary_update":"done"'
+        )
+        result = emulator._clean_response(text)
+        parsed = json.loads(result)
+        assert parsed["summary_update"] == "done"
+        assert parsed["scene_output"]["beats"][0]["text"] == "Hi"
+
     def test_clean_json_passthrough(self, emulator):
         text = '{"narration": "hello"}'
         result = emulator._clean_response(text)
