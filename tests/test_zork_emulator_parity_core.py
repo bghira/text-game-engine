@@ -792,6 +792,64 @@ def test_sms_read_merges_related_threads_by_participant(session_factory, seed_ca
     assert any(str(row.get("from")) == "Elizabeth" and str(row.get("to")) == "Deshawn" for row in messages)
 
 
+def test_sms_list_and_read_prefer_roster_contact_name_over_legacy_pair_thread(
+    session_factory,
+    seed_campaign_and_actor,
+):
+    compat = _build_compat(session_factory)
+    campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
+    compat.get_or_create_player(campaign.id, seed_campaign_and_actor["actor_id"])
+
+    with session_factory() as session:
+        player = (
+            session.query(Player)
+            .filter(Player.campaign_id == campaign.id)
+            .filter(Player.actor_id == seed_campaign_and_actor["actor_id"])
+            .first()
+        )
+        assert player is not None
+        player_state = json.loads(player.state_json or "{}")
+        player_state["character_name"] = "Chris"
+        player.state_json = compat._dump_json(player_state)
+
+        row = session.get(Campaign, campaign.id)
+        characters = json.loads(row.characters_json or "{}")
+        characters["crawly"] = {"name": "Crawly"}
+        row.characters_json = compat._dump_json(characters)
+        session.commit()
+
+    ok, status = compat.write_sms_thread(
+        campaign.id,
+        thread="chris-crawly",
+        sender="Chris",
+        recipient="Crawly",
+        message="you around?",
+        owner_actor_id=seed_campaign_and_actor["actor_id"],
+    )
+    assert ok is True and status == "stored"
+
+    listed = compat.list_sms_threads(
+        campaign.id,
+        wildcard="*",
+        limit=20,
+        viewer_actor_id=seed_campaign_and_actor["actor_id"],
+    )
+    assert listed
+    assert listed[0]["thread"] == "crawly"
+    assert listed[0]["label"] == "Crawly"
+
+    canonical, label, messages = compat.read_sms_thread(
+        campaign.id,
+        "crawly",
+        limit=20,
+        viewer_actor_id=seed_campaign_and_actor["actor_id"],
+    )
+    assert canonical == "crawly"
+    assert label == "Crawly"
+    assert len(messages) == 1
+    assert str(messages[0]["thread"]).endswith("actor-actor-1")
+
+
 def test_sms_schedule_delivers_later(session_factory, seed_campaign_and_actor):
     compat = _build_compat(session_factory)
     campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])

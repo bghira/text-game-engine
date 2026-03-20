@@ -9889,6 +9889,7 @@ class ZorkEmulator:
         *,
         viewer_actor_id: object = None,
         player_state: Dict[str, object] | None = None,
+        contact_roster: Dict[str, Dict[str, str]] | None = None,
     ) -> list[dict[str, object]]:
         threads = cls._sms_threads_from_state(campaign_state)
         pattern = str(wildcard or "*").strip().lower() or "*"
@@ -9896,11 +9897,6 @@ class ZorkEmulator:
         for key in reversed(list(threads.keys())):
             row = threads.get(key) or {}
             label = str(row.get("label") or key)
-            if pattern != "*":
-                if not fnmatch.fnmatch(key, pattern) and not fnmatch.fnmatch(
-                    label.lower(), pattern
-                ):
-                    continue
             messages = cls._sms_visible_messages_for_viewer(
                 row,
                 viewer_actor_id=viewer_actor_id,
@@ -9908,14 +9904,32 @@ class ZorkEmulator:
             )
             if not messages:
                 continue
+            resolved_contact = cls._sms_resolved_contact(
+                key,
+                row,
+                viewer_actor_id=viewer_actor_id,
+                player_state=player_state,
+                contact_roster=contact_roster,
+                visible_messages=messages,
+            )
+            resolved_thread = str(resolved_contact.get("thread") or key).strip() or key
+            resolved_label = str(resolved_contact.get("label") or label).strip() or label
+            if pattern != "*":
+                if (
+                    not fnmatch.fnmatch(key, pattern)
+                    and not fnmatch.fnmatch(label.lower(), pattern)
+                    and not fnmatch.fnmatch(resolved_thread, pattern)
+                    and not fnmatch.fnmatch(resolved_label.lower(), pattern)
+                ):
+                    continue
             last = messages[-1] if messages else {}
             preview = str(last.get("message") or "").strip()
             if len(preview) > cls.SMS_MAX_PREVIEW_CHARS:
                 preview = preview[: cls.SMS_MAX_PREVIEW_CHARS - 1].rstrip() + "…"
             out.append(
                 {
-                    "thread": cls._sms_normalize_thread_key(label) or key,
-                    "label": label,
+                    "thread": resolved_thread,
+                    "label": resolved_label,
                     "count": len(messages),
                     "last_from": str(last.get("from") or ""),
                     "last_preview": preview,
@@ -9937,6 +9951,7 @@ class ZorkEmulator:
         *,
         viewer_actor_id: object = None,
         player_state: Dict[str, object] | None = None,
+        contact_roster: Dict[str, Dict[str, str]] | None = None,
     ) -> tuple[str | None, str | None, list[dict[str, object]]]:
         threads = cls._sms_threads_from_state(campaign_state)
         if not threads:
@@ -9964,11 +9979,27 @@ class ZorkEmulator:
                 return False
             key_norm = cls._sms_normalize_thread_key(key)
             label_norm = cls._sms_normalize_thread_key(row.get("label"))
+            resolved_contact = cls._sms_resolved_contact(
+                key,
+                row,
+                viewer_actor_id=viewer_actor_id,
+                player_state=player_state,
+                contact_roster=contact_roster,
+                visible_messages=visible_messages,
+            )
+            resolved_thread = cls._sms_normalize_thread_key(
+                resolved_contact.get("thread")
+            )
+            resolved_label = cls._sms_normalize_thread_key(
+                resolved_contact.get("label")
+            )
             if query_key and (
                 query_key == key_norm
                 or query_key in key_norm
                 or query_key == label_norm
                 or query_key in label_norm
+                or (resolved_thread and (query_key == resolved_thread or query_key in resolved_thread))
+                or (resolved_label and (query_key == resolved_label or query_key in resolved_label))
             ):
                 return True
             for msg in visible_messages:
@@ -10018,12 +10049,26 @@ class ZorkEmulator:
 
         canonical_key = selected_key or query_key or matched_keys[0]
         first_row = threads.get(matched_keys[0]) or {}
-        base_label = str(first_row.get("label") or matched_keys[0])
+        resolved_contact = cls._sms_resolved_contact(
+            matched_keys[0],
+            first_row,
+            viewer_actor_id=viewer_actor_id,
+            player_state=player_state,
+            contact_roster=contact_roster,
+        )
+        base_label = str(
+            resolved_contact.get("label") or first_row.get("label") or matched_keys[0]
+        )
         if len(matched_keys) <= 1:
             resolved_label = base_label
         else:
             resolved_label = f"{base_label} (+{len(matched_keys) - 1} related thread(s))"
-        return cls._sms_normalize_thread_key(base_label) or canonical_key, resolved_label, list(capped)
+        canonical_contact = str(resolved_contact.get("thread") or "").strip()
+        return (
+            cls._sms_normalize_thread_key(canonical_contact or base_label) or canonical_key,
+            resolved_label,
+            list(capped),
+        )
 
     @classmethod
     def _sms_actor_key(cls, actor_id: object) -> str:
@@ -10060,6 +10105,88 @@ class ZorkEmulator:
                 if len(token) >= 3:
                     _add(token)
         return aliases
+
+    @classmethod
+    def _sms_resolved_contact(
+        cls,
+        key: str,
+        row: Dict[str, object],
+        *,
+        viewer_actor_id: object = None,
+        player_state: Dict[str, object] | None = None,
+        contact_roster: Dict[str, Dict[str, str]] | None = None,
+        visible_messages: List[Dict[str, object]] | None = None,
+    ) -> dict[str, str]:
+        aliases = cls._sms_player_aliases(
+            actor_id=viewer_actor_id,
+            player_state=player_state,
+        )
+        messages = (
+            list(visible_messages)
+            if isinstance(visible_messages, list)
+            else cls._sms_visible_messages_for_viewer(
+                row,
+                viewer_actor_id=viewer_actor_id,
+                player_state=player_state,
+            )
+        )
+
+        resolved_candidates: list[dict[str, str]] = []
+        resolved_seen: set[str] = set()
+        fallback_candidates: list[dict[str, str]] = []
+        fallback_seen: set[str] = set()
+
+        def _push(raw_value: object) -> None:
+            raw_text = str(raw_value or "").strip()
+            norm = cls._sms_normalize_thread_key(raw_text)
+            if not norm or norm in aliases:
+                return
+            roster_entry = dict((contact_roster or {}).get(norm) or {})
+            if roster_entry:
+                thread_text = cls._sms_normalize_thread_key(
+                    roster_entry.get("thread") or norm
+                )
+                label_text = str(roster_entry.get("label") or raw_text).strip()
+                if thread_text and thread_text not in resolved_seen:
+                    resolved_seen.add(thread_text)
+                    resolved_candidates.append(
+                        {"thread": thread_text, "label": label_text or thread_text}
+                    )
+                return
+            if norm not in fallback_seen:
+                fallback_seen.add(norm)
+                fallback_candidates.append({"thread": norm, "label": raw_text or norm})
+
+        for msg in reversed(messages):
+            if not isinstance(msg, dict):
+                continue
+            _push(msg.get("from"))
+            _push(msg.get("to"))
+
+        if len(resolved_candidates) == 1:
+            return resolved_candidates[0]
+        if len(fallback_candidates) == 1:
+            return fallback_candidates[0]
+
+        for raw in (row.get("label"), key):
+            raw_text = str(raw or "").strip()
+            norm = cls._sms_normalize_thread_key(raw_text)
+            if not norm or norm in aliases:
+                continue
+            roster_entry = dict((contact_roster or {}).get(norm) or {})
+            if roster_entry:
+                thread_text = cls._sms_normalize_thread_key(
+                    roster_entry.get("thread") or norm
+                )
+                label_text = str(roster_entry.get("label") or raw_text).strip()
+                if thread_text:
+                    return {"thread": thread_text, "label": label_text or thread_text}
+
+        label = str(row.get("label") or key).strip()
+        return {
+            "thread": cls._sms_normalize_thread_key(label) or key,
+            "label": label or key,
+        }
 
     @classmethod
     def _sms_read_state_from_campaign_state(
@@ -11374,9 +11501,6 @@ class ZorkEmulator:
         if not response:
             return response
         cleaned = response.strip()
-        json_text = self._extract_json(cleaned)
-        if json_text:
-            return json_text
         # Repair common truncated-object case from the model:
         # starts with '{' but omitted the final closing brace.
         if cleaned.startswith("{") and not cleaned.endswith("}"):
@@ -11388,10 +11512,27 @@ class ZorkEmulator:
                 if isinstance(parsed, dict) and parsed:
                     has_narration = bool(parsed.get("narration"))
                     has_tool_call = bool(parsed.get("tool_call"))
-                    if has_narration or has_tool_call:
+                    scene_output = parsed.get("scene_output")
+                    has_scene_output = (
+                        isinstance(scene_output, dict)
+                        and isinstance(scene_output.get("beats"), list)
+                    )
+                    has_turn_payload = any(
+                        parsed.get(key)
+                        for key in (
+                            "summary_update",
+                            "state_update",
+                            "player_state_update",
+                            "scene_image_prompt",
+                        )
+                    )
+                    if has_narration or has_tool_call or has_scene_output or has_turn_payload:
                         return repaired
             except Exception:
                 pass
+        json_text = self._extract_json(cleaned)
+        if json_text:
+            return json_text
         return cleaned
 
     def _extract_ascii_map(self, text: str) -> str:
@@ -12401,6 +12542,51 @@ class ZorkEmulator:
 
         return stored_count, document_key, {}
 
+    def _sms_contact_roster(
+        self,
+        campaign: Campaign,
+    ) -> dict[str, dict[str, str]]:
+        roster: dict[str, dict[str, str]] = {}
+
+        def _register(alias: object, *, thread: object, label: object) -> None:
+            alias_key = self._sms_normalize_thread_key(alias)
+            thread_key = self._sms_normalize_thread_key(thread)
+            label_text = str(label or "").strip()
+            if not alias_key or not thread_key:
+                return
+            roster[alias_key] = {
+                "thread": thread_key,
+                "label": label_text or thread_key,
+            }
+
+        registry = self._campaign_player_registry(campaign.id, self._session_factory)
+        for entry in registry.get("by_actor_id", {}).values():
+            if not isinstance(entry, dict):
+                continue
+            name = str(entry.get("name") or "").strip()
+            slug = str(entry.get("slug") or "").strip()
+            thread_key = self._sms_normalize_thread_key(name) or self._sms_normalize_thread_key(slug)
+            if not thread_key:
+                continue
+            _register(name, thread=thread_key, label=name or thread_key)
+            _register(slug, thread=thread_key, label=name or thread_key)
+
+        characters = self.get_campaign_characters(campaign)
+        if isinstance(characters, dict):
+            for slug, payload in characters.items():
+                name = (
+                    str(payload.get("name") or slug or "").strip()
+                    if isinstance(payload, dict)
+                    else str(slug or "").strip()
+                )
+                thread_key = self._sms_normalize_thread_key(slug) or self._sms_normalize_thread_key(name)
+                if not thread_key:
+                    continue
+                _register(slug, thread=thread_key, label=name or thread_key)
+                _register(name, thread=thread_key, label=name or thread_key)
+
+        return roster
+
     async def _ingest_story_literary(
         self,
         campaign_id: str,
@@ -12546,6 +12732,7 @@ class ZorkEmulator:
             if campaign is None:
                 return []
             state = self.get_campaign_state(campaign)
+            contact_roster = self._sms_contact_roster(campaign)
             player = None
             if viewer_actor_id:
                 player = (
@@ -12561,6 +12748,7 @@ class ZorkEmulator:
             limit=limit,
             viewer_actor_id=viewer_actor_id,
             player_state=player_state,
+            contact_roster=contact_roster,
         )
 
     def read_sms_thread(
@@ -12575,6 +12763,7 @@ class ZorkEmulator:
             if campaign is None:
                 return None, None, []
             state = self.get_campaign_state(campaign)
+            contact_roster = self._sms_contact_roster(campaign)
             player = None
             if viewer_actor_id:
                 player = (
@@ -12592,6 +12781,7 @@ class ZorkEmulator:
                 limit=limit,
                 viewer_actor_id=viewer_actor_id,
                 player_state=player_state,
+                contact_roster=contact_roster,
             )
             if viewer_actor_id:
                 thread_markers: dict[str, int] = {}
