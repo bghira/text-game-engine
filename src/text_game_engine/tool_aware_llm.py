@@ -627,6 +627,21 @@ class ToolAwareZorkLLM:
         try:
             payload = emulator._parse_json_lenient(json_text or cleaned)  # noqa: SLF001
         except Exception as exc:
+            inferred = self._plaintext_search_intent_to_payload(cleaned or response or "")
+            if inferred is not None:
+                logger.warning(
+                    "_parse_model_payload: recovered plain-text search intent as tool_call=%s queries=%s",
+                    inferred.get("tool_call"),
+                    inferred.get("queries"),
+                )
+                self._zork_log(
+                    "PARSE RECOVERY",
+                    f"mode=plain_text_search_intent\n"
+                    f"raw_response=\n{response or '(empty)'}\n"
+                    f"cleaned_response=\n{cleaned or '(empty)'}\n"
+                    f"inferred_payload=\n{json.dumps(inferred, ensure_ascii=True)}",
+                )
+                return inferred
             logger.warning(
                 "_parse_model_payload: JSON parse failed: %s\n"
                 "RAW RESPONSE:\n%s\n"
@@ -662,6 +677,63 @@ class ToolAwareZorkLLM:
             len(str(payload.get("narration") or "")),
         )
         return payload
+
+    @staticmethod
+    def _plaintext_search_intent_to_payload(text: str | None) -> dict[str, Any] | None:
+        raw = " ".join(str(text or "").strip().split())
+        if not raw or "{" in raw or "}" in raw:
+            return None
+        lower = raw.lower()
+        planning_markers = (
+            "i need to",
+            "we need to",
+            "i should",
+            "let me",
+            "i will",
+            "i'll",
+        )
+        search_markers = (
+            "search",
+            "look up",
+            "find more context",
+            "find context",
+            "check context",
+        )
+        if not any(marker in lower for marker in planning_markers):
+            return None
+        if not any(marker in lower for marker in search_markers):
+            return None
+
+        sentences = [part.strip() for part in re.split(r"(?<=[.!?])\s+", raw) if part.strip()]
+        candidate = ""
+        for sentence in sentences:
+            sentence_lower = sentence.lower()
+            if "context about" in sentence_lower or "context for" in sentence_lower:
+                candidate = sentence
+                break
+            if any(marker in sentence_lower for marker in ("look up", "find more context", "find context")):
+                candidate = sentence
+                break
+        if not candidate and sentences:
+            candidate = sentences[0]
+        query = candidate.strip().rstrip(".!?")
+        query = re.sub(r"(?i)^(?:i|we)\s+(?:need|want|have)\s+to\s+", "", query).strip()
+        query = re.sub(r"(?i)^i\s+should\s+", "", query).strip()
+        query = re.sub(r"(?i)^let\s+me\s+", "", query).strip()
+        query = re.sub(r"(?i)^i\s+will\s+", "", query).strip()
+        query = re.sub(r"(?i)^i['’]ll\s+", "", query).strip()
+        query = re.sub(
+            r"(?i)^(?:find|search|look up|check)(?:\s+for)?\s+(?:more\s+)?context\s+(?:about|for|on)\s+",
+            "",
+            query,
+        ).strip()
+        query = re.sub(r"(?i)^(?:find|search|look up|check)(?:\s+for)?\s+", "", query).strip()
+        query = query.strip(" -:;,")
+        if not query:
+            return None
+        if query.lower() in {"that", "this", "it", "them", "him", "her"}:
+            return None
+        return {"tool_call": "memory_search", "queries": [query[:240]]}
 
     def _payload_to_output(
         self,

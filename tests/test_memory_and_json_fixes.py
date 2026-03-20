@@ -442,6 +442,44 @@ class TestMemoryToolHistoryPruning:
         assert "manual memory" not in pruned
 
 
+class TestPlainTextSearchIntentRecovery:
+    def test_plaintext_search_intent_infers_memory_search_payload(self):
+        from text_game_engine.tool_aware_llm import ToolAwareZorkLLM
+
+        payload = ToolAwareZorkLLM._plaintext_search_intent_to_payload(
+            "I need to find more context about Tits McGee - her actual appearance, "
+            "behavior, and where she is in the bar right now. Let me search for that."
+        )
+
+        assert payload == {
+            "tool_call": "memory_search",
+            "queries": [
+                "Tits McGee - her actual appearance, behavior, and where she is in the bar right now"
+            ],
+        }
+
+    def test_parse_model_payload_recovers_plaintext_search_intent(self):
+        from text_game_engine.tool_aware_llm import ToolAwareZorkLLM
+        from text_game_engine.zork_emulator import ZorkEmulator
+
+        emulator = ZorkEmulator.__new__(ZorkEmulator)
+        llm = ToolAwareZorkLLM.__new__(ToolAwareZorkLLM)
+        llm._emulator = emulator
+        llm._zork_log = lambda *args, **kwargs: None
+
+        payload = llm._parse_model_payload(
+            "I need to find more context about Tits McGee - her actual appearance, "
+            "behavior, and where she is in the bar right now. Let me search for that."
+        )
+
+        assert payload == {
+            "tool_call": "memory_search",
+            "queries": [
+                "Tits McGee - her actual appearance, behavior, and where she is in the bar right now"
+            ],
+        }
+
+
 # ---------------------------------------------------------------------------
 # JSON repair sub-methods
 # ---------------------------------------------------------------------------
