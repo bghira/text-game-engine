@@ -984,6 +984,68 @@ def test_build_prompt_seeds_default_game_time(session_factory, seed_campaign_and
     assert "CURRENT_GAME_TIME:" in user_prompt
 
 
+def test_format_game_time_label_preserves_existing_weekday_without_campaign_state(session_factory, seed_campaign_and_actor):
+    compat = _build_compat(session_factory)
+
+    label = compat._format_game_time_label(
+        {
+            "day": 3,
+            "hour": 8,
+            "minute": 0,
+            "day_of_week": "sunday",
+            "date_label": "Sunday, Day 3, Morning",
+        }
+    )
+
+    assert label == "Sunday, Day 3, Morning"
+
+
+def test_set_player_known_game_time_uses_campaign_clock_weekday(session_factory, seed_campaign_and_actor):
+    compat = _build_compat(session_factory)
+    campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
+    player = compat.get_or_create_player(seed_campaign_and_actor["campaign_id"], seed_campaign_and_actor["actor_id"])
+    campaign_state = compat.get_campaign_state(campaign)
+    campaign_state["clock_start_day_of_week"] = "friday"
+    campaign.state_json = compat._dump_json(campaign_state)
+
+    compat._set_player_known_game_time(
+        player,
+        {"day": 3, "hour": 8, "minute": 0},
+        campaign_state=campaign_state,
+    )
+
+    player_state = compat.get_player_state(player)
+    assert player_state["game_time"]["day_of_week"] == "sunday"
+    assert player_state["game_time"]["date_label"] == "Sunday, Day 3, Morning"
+
+
+def test_build_prompt_persists_default_clock_start_day_when_missing(session_factory, seed_campaign_and_actor):
+    compat = _build_compat(session_factory)
+    campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
+    player = compat.get_or_create_player(seed_campaign_and_actor["campaign_id"], seed_campaign_and_actor["actor_id"])
+    turns = compat.get_recent_turns(seed_campaign_and_actor["campaign_id"])
+
+    with session_factory() as session:
+        campaign_row = session.get(Campaign, campaign.id)
+        campaign_row.state_json = compat._dump_json(
+            {
+                "game_time": {
+                    "day": 1,
+                    "hour": 8,
+                    "minute": 0,
+                    "day_of_week": "monday",
+                    "period": "morning",
+                    "date_label": "Monday, Day 1, Morning",
+                }
+            }
+        )
+        session.commit()
+
+    compat.build_prompt(campaign, player, "look", turns)
+    state = json.loads(campaign.state_json or "{}")
+    assert state.get("clock_start_day_of_week") == "monday"
+
+
 def test_build_prompt_includes_weekday_in_world_clock(session_factory, seed_campaign_and_actor):
     compat = _build_compat(session_factory)
     campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])

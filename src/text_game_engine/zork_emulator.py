@@ -11847,14 +11847,16 @@ class ZorkEmulator:
         bootstrap_only = bootstrap_only or stage == self.PROMPT_STAGE_BOOTSTRAP
         state = self.get_campaign_state(campaign)
         state = self._scrub_inventory_from_state(state)
+        state_dirty = False
         if self.CLOCK_START_DAY_OF_WEEK_KEY not in state:
             state[self.CLOCK_START_DAY_OF_WEEK_KEY] = "monday"
+            state_dirty = True
         if "game_time" not in state:
             state["game_time"] = self._game_time_from_total_minutes(
                 ((1 - 1) * 24 * 60) + (8 * 60),
                 start_day_of_week=self._campaign_start_day_of_week(state),
             )
-            campaign.state_json = self._dump_json(state)
+            state_dirty = True
         else:
             canonical_game_time = self._game_time_from_total_minutes(
                 self._game_time_to_total_minutes(state.get("game_time") or {}),
@@ -11862,7 +11864,9 @@ class ZorkEmulator:
             )
             if state.get("game_time") != canonical_game_time:
                 state["game_time"] = canonical_game_time
-                campaign.state_json = self._dump_json(state)
+                state_dirty = True
+        if state_dirty:
+            campaign.state_json = self._dump_json(state)
         guardrails_enabled = bool(state.get("guardrails_enabled", False))
         model_state = self._build_model_state(state)
         model_state = self._fit_state_to_budget(model_state, self.MAX_STATE_CHARS)
@@ -15594,6 +15598,23 @@ class ZorkEmulator:
             "date_label": f"{day_of_week.title()}, Day {day}, {period.title()}",
         }
 
+    def _infer_start_day_of_week_from_game_time(
+        self,
+        game_time: object,
+    ) -> str | None:
+        if not isinstance(game_time, dict):
+            return None
+        weekday = self._normalize_weekday_name(game_time.get("day_of_week"))
+        day = self._coerce_non_negative_int(game_time.get("day", 1), default=1) or 1
+        if weekday not in self.WEEKDAY_NAMES:
+            return None
+        try:
+            weekday_index = self.WEEKDAY_NAMES.index(weekday)
+        except ValueError:
+            return None
+        start_index = (weekday_index - (day - 1)) % len(self.WEEKDAY_NAMES)
+        return self.WEEKDAY_NAMES[start_index]
+
     def _format_game_time_label(
         self,
         game_time: Dict[str, int],
@@ -15605,9 +15626,19 @@ class ZorkEmulator:
             if isinstance(game_time, dict)
             else self._extract_game_time_snapshot({"game_time": game_time})
         )
+        start_day_of_week = None
+        if isinstance(campaign_state, dict):
+            start_day_of_week = self._campaign_start_day_of_week(campaign_state)
+        else:
+            start_day_of_week = self._infer_start_day_of_week_from_game_time(snapshot)
+        if not start_day_of_week:
+            existing_label = str(snapshot.get("date_label") or "").strip() if isinstance(snapshot, dict) else ""
+            if existing_label:
+                return existing_label
+            start_day_of_week = "monday"
         canonical = self._game_time_from_total_minutes(
             self._game_time_to_total_minutes(snapshot),
-            start_day_of_week=self._campaign_start_day_of_week(campaign_state),
+            start_day_of_week=start_day_of_week,
         )
         return str(
             canonical.get("date_label")
@@ -16085,11 +16116,21 @@ class ZorkEmulator:
         self,
         player: Player,
         game_time: Dict[str, int],
+        *,
+        campaign_state: Optional[Dict[str, object]] = None,
+        start_day_of_week: str | None = None,
     ) -> None:
         player_state = self.get_player_state(player)
+        resolved_start_day = start_day_of_week
+        if not resolved_start_day and isinstance(campaign_state, dict):
+            resolved_start_day = self._campaign_start_day_of_week(campaign_state)
+        if not resolved_start_day:
+            resolved_start_day = self._infer_start_day_of_week_from_game_time(game_time)
+        if not resolved_start_day:
+            resolved_start_day = "monday"
         player_state["game_time"] = self._game_time_from_total_minutes(
             self._game_time_to_total_minutes(game_time),
-            start_day_of_week="monday",
+            start_day_of_week=resolved_start_day,
         )
         with self._session_factory() as session:
             row = session.get(Player, player.id)
