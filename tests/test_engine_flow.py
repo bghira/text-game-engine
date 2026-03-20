@@ -885,6 +885,46 @@ def test_explicit_time_skip_description_bypasses_normal_turn_cap():
     assert game_time.get("minute") == 0
 
 
+def test_default_turn_time_advance_uses_twenty_minute_floor():
+    campaign_state = {
+        "game_time": {"day": 1, "hour": 8, "minute": 0},
+        "speed_multiplier": 1.0,
+    }
+    pre = {"day": 1, "hour": 8, "minute": 0}
+
+    out = GameEngine._ensure_game_time_progress(
+        campaign_state,
+        pre,
+        action_text="talk to the bartender",
+        narration_text="You talk for a while.",
+    )
+
+    game_time = out.get("game_time", {})
+    assert game_time.get("day") == 1
+    assert game_time.get("hour") == 8
+    assert game_time.get("minute") == 20
+
+
+def test_small_model_time_advance_is_clamped_up_to_floor():
+    campaign_state = {
+        "game_time": {"day": 1, "hour": 8, "minute": 1},
+        "speed_multiplier": 1.0,
+    }
+    pre = {"day": 1, "hour": 8, "minute": 0}
+
+    out = GameEngine._ensure_game_time_progress(
+        campaign_state,
+        pre,
+        action_text="look around",
+        narration_text="You look around the room.",
+    )
+
+    game_time = out.get("game_time", {})
+    assert game_time.get("day") == 1
+    assert game_time.get("hour") == 8
+    assert game_time.get("minute") == 20
+
+
 def test_character_updates_null_removes_character(session_factory, uow_factory, seed_campaign_and_actor):
     async def run_test():
         with session_factory() as session:

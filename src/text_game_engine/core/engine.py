@@ -22,8 +22,8 @@ from .types import DiceCheckRequest, DiceCheckResult, ResolveTurnInput, ResolveT
 
 class GameEngine:
     AUTO_FIX_COUNTERS_KEY = "_auto_fix_counters"
-    MIN_TURN_ADVANCE_MINUTES = 1
-    DEFAULT_TURN_ADVANCE_MINUTES = 5
+    MIN_TURN_ADVANCE_MINUTES = 20
+    DEFAULT_TURN_ADVANCE_MINUTES = 20
     MAX_TURN_ADVANCE_MINUTES = 180
 
     def __init__(
@@ -1790,15 +1790,18 @@ class GameEngine:
         cur_snapshot = cls._extract_game_time_snapshot(campaign_state)
         pre_total = cls._game_time_to_total_minutes(pre_snapshot)
         cur_total = cls._game_time_to_total_minutes(cur_snapshot)
+        time_skip_request = cls._extract_time_skip_request(action_text)
 
         if cur_total > pre_total:
+            if time_skip_request is None and not cls._is_ooc_action_text(action_text):
+                min_total = pre_total + cls.MIN_TURN_ADVANCE_MINUTES
+                cur_total = max(cur_total, min_total)
             campaign_state["game_time"] = cls._game_time_from_total_minutes(cur_total)
             return campaign_state
         if cls._is_ooc_action_text(action_text):
             campaign_state["game_time"] = cls._game_time_from_total_minutes(cur_total)
             return campaign_state
 
-        time_skip_request = cls._extract_time_skip_request(action_text)
         if time_skip_request is not None:
             base_minutes = cls._coerce_non_negative_int(
                 time_skip_request.get("minutes", 60), default=60
