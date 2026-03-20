@@ -469,6 +469,7 @@ def test_build_prompt_research_stage_shape(session_factory, seed_campaign_and_ac
     assert '{"tool_call": "sms_list"' in system_prompt
     assert "CALENDAR & GAME TIME SYSTEM:" in system_prompt
     assert "Do NOT output planning prose" in system_prompt
+    assert "roughly 20 minutes per turn" in system_prompt
     assert "RECENT_TURNS_LOADED: true" in user_prompt
     assert "RECENT_TURNS:\n" in user_prompt
     assert "No planning prose or self-talk in research phase" in user_prompt

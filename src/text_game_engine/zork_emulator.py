@@ -1159,9 +1159,11 @@ class ZorkEmulator:
         "\nCALENDAR & GAME TIME SYSTEM:\n"
         "The campaign tracks in-game time via CURRENT_GAME_TIME shown in the user prompt.\n"
         "Every turn, you MUST advance game_time in state_update by a plausible amount "
-        "(minutes for quick actions, hours for travel, etc.). "
+        "(about 20 minutes for an ordinary turn, longer for travel/rest/time skips, etc.). "
         "Scale the advance by SPEED_MULTIPLIER — at 2x, time passes roughly twice as fast per turn.\n"
-        "Pace game_time by scene needs: prefer larger jumps (15-90 minutes or to the next meaningful beat) when no immediate deadline is active, "
+        "Default rhythm: advance the world by roughly 20 minutes per turn unless the scene clearly justifies more.\n"
+        "Do NOT default to 1-5 minute increments. Use sub-15-minute advances only when immediate shared-scene coherence absolutely requires it.\n"
+        "Pace game_time by scene needs: prefer larger jumps (20-90 minutes or to the next meaningful beat) when no immediate deadline is active, "
         "and keep finer-grained time only when needed to preserve shared-scene coherence.\n"
         "Update these fields in state_update:\n"
         '- "game_time": {"day": int, "hour": int (0-23), "minute": int (0-59), '
