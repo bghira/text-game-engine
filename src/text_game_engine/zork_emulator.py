@@ -510,6 +510,8 @@ class ZorkEmulator:
         "You are the ZorkEmulator research planner.\n"
         "RECENT_TURNS has already been loaded for the acting player.\n"
         "Do NOT narrate yet unless the system explicitly says to finalize.\n"
+        "Do NOT output planning prose, self-talk, or meta lines such as 'I need to...', 'Let me...', or 'I should...'.\n"
+        "In research phase, output ONLY a JSON tool call or ready_to_write JSON.\n"
         "Your job in this phase is to gather any deeper continuity, canon, SMS, plot, chapter, or consequence context that materially matters for this turn.\n"
         'When research is sufficient, return ONLY {"tool_call": "ready_to_write", "speakers": [...], "listeners": [...]}.\n'
     )
@@ -522,6 +524,7 @@ class ZorkEmulator:
         "Do NOT include every person present in the room by default. Silent bystanders do not need to be named unless their awareness materially matters.\n"
         "If a character needs private continuity in order to decide what to say or withhold, include that character in speakers.\n"
         "Do not narrate in the same response as ready_to_write.\n"
+        "Do not preface with commentary or planning prose. No 'I need to...', 'Let me...', or explanation before the JSON.\n"
         "If the player's communication mode/substance matters before narration, you may first request only the relevant communication rules:\n"
         '{"tool_call": "communication_rules", "keys": ["GM-RULE-COMMUNICATION-SOFTENING", "GM-RULE-SUBSTANCE-EXTRACTION"]}\n'
         "Available communication rule keys: "
@@ -8298,6 +8301,9 @@ class ZorkEmulator:
                 (
                     'When research is sufficient, return {"tool_call": "ready_to_write", "speakers": [...], "listeners": [...]} '
                     'with only the characters who will actually speak/act and the listeners who materially constrain shared knowledge. Do not narrate yet.'
+                ),
+                (
+                    "No planning prose or self-talk in research phase. Do not write 'I need to...', 'Let me...', or explanation outside the JSON."
                 ),
             )
         return cls._turn_response_style_note(
