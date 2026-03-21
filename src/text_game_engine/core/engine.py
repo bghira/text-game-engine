@@ -22,6 +22,7 @@ from .types import DiceCheckRequest, DiceCheckResult, ResolveTurnInput, ResolveT
 
 class GameEngine:
     AUTO_FIX_COUNTERS_KEY = "_auto_fix_counters"
+    LOCATION_CARDS_STATE_KEY = "_location_cards"
     MIN_TURN_ADVANCE_MINUTES = 20
     DEFAULT_TURN_ADVANCE_MINUTES = 20
     MAX_TURN_ADVANCE_MINUTES = 180
@@ -741,13 +742,28 @@ class GameEngine:
                 resolution_context=resolution_context,
                 campaign_state=campaign_state,
             )
+            campaign_state_update, relocated_character_updates, relocated_location_updates, relocated_entity_keys = (
+                self._relocate_entity_state_updates(
+                    campaign_state_update,
+                    campaign_state=campaign_state,
+                    existing_chars=campaign_characters,
+                    player_state=player_state,
+                    character_updates=getattr(llm_output, "character_updates", {}),
+                    location_updates=getattr(llm_output, "location_updates", {}),
+                )
+            )
             state_null_character_updates = self._character_updates_from_state_nulls(
                 campaign_state_update,
                 campaign_characters,
             )
             merged_character_updates = dict(state_null_character_updates)
-            if isinstance(llm_output.character_updates, dict):
-                merged_character_updates.update(llm_output.character_updates)
+            if isinstance(relocated_character_updates, dict):
+                merged_character_updates.update(relocated_character_updates)
+            merged_location_updates = (
+                dict(relocated_location_updates)
+                if isinstance(relocated_location_updates, dict)
+                else {}
+            )
             if merged_character_updates:
                 merged_character_updates = self._sanitize_character_removals(
                     campaign_characters,
@@ -755,8 +771,22 @@ class GameEngine:
                     resolution_context=resolution_context,
                     campaign_state=campaign_state,
                 )
+            _on_rails = bool(campaign_state.get("on_rails"))
             calendar_update = campaign_state_update.pop("calendar_update", None)
             campaign_state = apply_patch(campaign_state, campaign_state_update)
+            existing_locations = {}
+            raw_locations = campaign_state.get(self.LOCATION_CARDS_STATE_KEY)
+            if isinstance(raw_locations, dict):
+                existing_locations = dict(raw_locations)
+            applied_locations = self._apply_location_updates(
+                existing_locations,
+                merged_location_updates,
+                on_rails=_on_rails,
+            )
+            if applied_locations:
+                campaign_state[self.LOCATION_CARDS_STATE_KEY] = applied_locations
+            else:
+                campaign_state.pop(self.LOCATION_CARDS_STATE_KEY, None)
             campaign_state = self._apply_calendar_update(
                 campaign_state,
                 calendar_update,
@@ -794,8 +824,6 @@ class GameEngine:
                     }
                     campaign_state.pop("_active_minigame", None)
                     campaign_state.pop("_minigame_result", None)
-
-            _on_rails = bool(campaign_state.get("on_rails"))
             campaign_characters = self._apply_character_updates(
                 campaign_characters,
                 merged_character_updates,
@@ -866,9 +894,10 @@ class GameEngine:
             if not narration:
                 narration = self._fallback_narration_from_updates(
                     summary_update=llm_output.summary_update,
-                    state_update=llm_output.state_update,
+                    state_update=campaign_state_update,
                     player_state_update=llm_output.player_state_update,
-                    character_updates=llm_output.character_updates,
+                    character_updates=merged_character_updates,
+                    location_updates=merged_location_updates,
                 ) or "The world shifts, but nothing clear emerges."
             active_char_sync = self._sync_active_player_character_location(
                 campaign_characters,
@@ -903,6 +932,12 @@ class GameEngine:
                     campaign_state,
                     "location_auto_sync_co_located_players",
                     amount=co_located_player_sync,
+                )
+            if relocated_entity_keys:
+                self._increment_auto_fix_counter(
+                    campaign_state,
+                    "entity_state_keys_relocated",
+                    amount=relocated_entity_keys,
                 )
             other_player_state_sync = self._apply_other_player_state_updates(
                 uow,
@@ -1283,6 +1318,7 @@ class GameEngine:
         state_update: object,
         player_state_update: object,
         character_updates: object,
+        location_updates: object,
     ) -> str:
         if isinstance(player_state_update, dict):
             room_summary = str(player_state_update.get("room_summary") or "").strip()
@@ -1296,6 +1332,8 @@ class GameEngine:
             return summary_line.splitlines()[0][:300]
         if isinstance(character_updates, dict) and character_updates:
             return "Character roster updated."
+        if isinstance(location_updates, dict) and location_updates:
+            return "Location records updated."
         if isinstance(state_update, dict) and state_update:
             return "Noted."
         if isinstance(player_state_update, dict) and player_state_update:
@@ -1364,6 +1402,268 @@ class GameEngine:
                 # New character — store everything.
                 merged[slug] = dict(fields)
         return merged
+
+    @classmethod
+    def _resolve_existing_location_slug(
+        cls,
+        existing: dict[str, Any],
+        raw_slug: object,
+    ) -> str | None:
+        slug = str(raw_slug or "").strip()
+        if not slug:
+            return None
+        canonical = re.sub(r"[^a-z0-9]+", "-", slug.lower()).strip("-")
+        if slug in existing:
+            return slug
+        if canonical and canonical in existing:
+            return canonical
+        partial_matches: list[str] = []
+        for existing_slug, existing_fields in existing.items():
+            existing_canonical = re.sub(
+                r"[^a-z0-9]+", "-", str(existing_slug).lower()
+            ).strip("-")
+            if canonical and canonical == existing_canonical:
+                return str(existing_slug)
+            if canonical and (
+                existing_canonical.startswith(canonical)
+                or canonical in existing_canonical
+            ):
+                partial_matches.append(str(existing_slug))
+            if isinstance(existing_fields, dict):
+                name_canonical = re.sub(
+                    r"[^a-z0-9]+", "-",
+                    str(existing_fields.get("name") or "").lower(),
+                ).strip("-")
+                if canonical and canonical == name_canonical:
+                    return str(existing_slug)
+                if canonical and (
+                    name_canonical.startswith(canonical)
+                    or canonical in name_canonical
+                ):
+                    partial_matches.append(str(existing_slug))
+        if canonical:
+            unique_matches = list(dict.fromkeys(partial_matches))
+            if len(unique_matches) == 1:
+                return unique_matches[0]
+        return None
+
+    @classmethod
+    def _apply_location_updates(
+        cls,
+        existing: dict[str, Any],
+        updates: dict[str, Any],
+        on_rails: bool = False,
+    ) -> dict[str, Any]:
+        merged = dict(existing) if isinstance(existing, dict) else {}
+        if not isinstance(updates, dict):
+            return merged
+        for raw_slug, fields in updates.items():
+            slug = str(raw_slug or "").strip()
+            if not slug:
+                continue
+            target_slug = cls._resolve_existing_location_slug(merged, slug)
+            delete_requested = (
+                fields is None
+                or (
+                    isinstance(fields, str)
+                    and fields.strip().lower() in {"delete", "remove", "null"}
+                )
+                or (
+                    isinstance(fields, dict)
+                    and bool(
+                        fields.get("remove")
+                        or fields.get("delete")
+                        or fields.get("_delete")
+                        or fields.get("deleted")
+                    )
+                )
+            )
+            if delete_requested:
+                merged.pop(target_slug or slug, None)
+                continue
+            if not isinstance(fields, dict):
+                continue
+            if target_slug and target_slug in merged and isinstance(merged[target_slug], dict):
+                for key, value in fields.items():
+                    if value is None:
+                        merged[target_slug].pop(key, None)
+                    else:
+                        merged[target_slug][key] = value
+            else:
+                if on_rails:
+                    continue
+                merged[target_slug or slug] = dict(fields)
+        return merged
+
+    @staticmethod
+    def _normalize_entity_field_key(raw_key: object) -> str:
+        text = re.sub(r"[^a-z0-9]+", "_", str(raw_key or "").strip().lower()).strip("_")
+        return re.sub(r"_+", "_", text)
+
+    @classmethod
+    def _match_prefixed_entity_slug(
+        cls,
+        raw_key: object,
+        candidates: list[str],
+    ) -> tuple[str | None, str]:
+        key_text = cls._normalize_entity_field_key(raw_key)
+        if not key_text:
+            return None, ""
+        best_slug = None
+        best_field = ""
+        best_len = -1
+        for slug in candidates:
+            slug_text = cls._normalize_entity_field_key(slug)
+            if not slug_text:
+                continue
+            if key_text == slug_text:
+                if len(slug_text) > best_len:
+                    best_slug = slug
+                    best_field = ""
+                    best_len = len(slug_text)
+                continue
+            prefix = f"{slug_text}_"
+            if key_text.startswith(prefix) and len(slug_text) > best_len:
+                best_slug = slug
+                best_field = key_text[len(prefix):].strip("_")
+                best_len = len(slug_text)
+        return best_slug, best_field
+
+    @classmethod
+    def _known_location_slugs_for_updates(
+        cls,
+        campaign_state: dict[str, Any],
+        existing_chars: dict[str, Any],
+        player_state: dict[str, Any] | None = None,
+    ) -> list[str]:
+        slugs: list[str] = []
+
+        def _add(value: object) -> None:
+            text = re.sub(r"[^a-z0-9]+", "-", str(value or "").strip().lower()).strip("-")
+            if text and text not in slugs:
+                slugs.append(text)
+
+        if isinstance(campaign_state, dict):
+            for slug in (campaign_state.get(cls.LOCATION_CARDS_STATE_KEY) or {}).keys():
+                _add(slug)
+        if isinstance(existing_chars, dict):
+            for row in existing_chars.values():
+                if isinstance(row, dict):
+                    _add(row.get("location"))
+        if isinstance(player_state, dict):
+            _add(player_state.get("location"))
+        return slugs
+
+    @classmethod
+    def _relocate_entity_state_updates(
+        cls,
+        state_update: object,
+        *,
+        campaign_state: dict[str, Any],
+        existing_chars: dict[str, Any],
+        player_state: dict[str, Any] | None = None,
+        character_updates: object = None,
+        location_updates: object = None,
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], int]:
+        if not isinstance(state_update, dict):
+            clean_character_updates = (
+                dict(character_updates) if isinstance(character_updates, dict) else {}
+            )
+            clean_location_updates = (
+                dict(location_updates) if isinstance(location_updates, dict) else {}
+            )
+            return {}, clean_character_updates, clean_location_updates, 0
+
+        out = dict(state_update)
+        merged_character_updates = (
+            dict(character_updates) if isinstance(character_updates, dict) else {}
+        )
+        merged_location_updates = (
+            dict(location_updates) if isinstance(location_updates, dict) else {}
+        )
+        existing_locations = {}
+        if isinstance(campaign_state, dict):
+            raw_locations = campaign_state.get(cls.LOCATION_CARDS_STATE_KEY)
+            if isinstance(raw_locations, dict):
+                existing_locations = dict(raw_locations)
+        known_location_slugs = cls._known_location_slugs_for_updates(
+            campaign_state,
+            existing_chars,
+            player_state,
+        )
+        consumed = 0
+
+        def _merge_overlay(
+            target: dict[str, Any],
+            slug: str,
+            value: object,
+        ) -> bool:
+            if value is None:
+                target[slug] = None
+                return True
+            if isinstance(value, dict):
+                current = target.get(slug)
+                if current is None or not isinstance(current, dict):
+                    current = {}
+                current.update(value)
+                target[slug] = current
+                return True
+            return False
+
+        for raw_key, value in list(out.items()):
+            resolved_char_slug = cls._resolve_existing_character_slug(existing_chars, raw_key)
+            if resolved_char_slug and _merge_overlay(merged_character_updates, resolved_char_slug, value):
+                out.pop(raw_key, None)
+                consumed += 1
+                continue
+            resolved_location_slug = None
+            if known_location_slugs:
+                resolved_location_slug = cls._resolve_existing_location_slug(
+                    {slug: existing_locations.get(slug, {}) for slug in known_location_slugs},
+                    raw_key,
+                )
+            if resolved_location_slug and _merge_overlay(merged_location_updates, resolved_location_slug, value):
+                out.pop(raw_key, None)
+                consumed += 1
+                continue
+
+        character_slugs = sorted(
+            [str(slug) for slug in existing_chars.keys()],
+            key=lambda row: len(cls._normalize_entity_field_key(row)),
+            reverse=True,
+        )
+        location_slugs = sorted(
+            known_location_slugs,
+            key=lambda row: len(cls._normalize_entity_field_key(row)),
+            reverse=True,
+        )
+        for raw_key, value in list(out.items()):
+            if isinstance(value, dict):
+                continue
+            matched_char_slug, char_field = cls._match_prefixed_entity_slug(raw_key, character_slugs)
+            if matched_char_slug and char_field:
+                current = merged_character_updates.get(matched_char_slug)
+                if current is None or not isinstance(current, dict):
+                    current = {}
+                current[char_field] = value
+                merged_character_updates[matched_char_slug] = current
+                out.pop(raw_key, None)
+                consumed += 1
+                continue
+            matched_location_slug, location_field = cls._match_prefixed_entity_slug(
+                raw_key,
+                location_slugs,
+            )
+            if matched_location_slug and location_field:
+                current = merged_location_updates.get(matched_location_slug)
+                if current is None or not isinstance(current, dict):
+                    current = {}
+                current[location_field] = value
+                merged_location_updates[matched_location_slug] = current
+                out.pop(raw_key, None)
+                consumed += 1
+
+        return out, merged_character_updates, merged_location_updates, consumed
 
     @classmethod
     def _sync_npc_locations_from_state_to_roster(

@@ -407,8 +407,16 @@ def test_build_prompt_shape(session_factory, seed_campaign_and_actor):
     assert "RECENT_TURNS_LOADED: true" in user_prompt
     assert "CALENDAR:" in user_prompt
     assert "RECENT_TURNS:\n" in user_prompt
+    assert "SCENE_STATE:" in user_prompt
+    assert "CHARACTER_INDEX:" in user_prompt
+    assert "CHARACTER_CARDS:" in user_prompt
+    assert "LOCATION_INDEX:" in user_prompt
+    assert "LOCATION_CARDS:" in user_prompt
     assert "PLAYER_ACTION" in user_prompt
     assert "other_player_state_updates" in system_prompt
+    assert "SCENE_STATE is the immediate actionable scene" in system_prompt
+    assert "CHARACTER_CARDS are the primary NPC fact store" in system_prompt
+    assert "WORLD_STATE is for world facts" in system_prompt
     assert "not plot-armored" in system_prompt
     assert '{"tool_call": "memory_terms"' not in system_prompt
     assert '{"tool_call": "sms_list"' not in system_prompt
@@ -439,6 +447,11 @@ def test_build_prompt_bootstrap_stage_shape(session_factory, seed_campaign_and_a
     assert "CALENDAR:" not in user_prompt
     assert "STORY_CONTEXT:" not in user_prompt
     assert "RECENT_TURNS:\n" not in user_prompt
+    assert "SCENE_STATE:" in user_prompt
+    assert "CHARACTER_INDEX:" in user_prompt
+    assert "CHARACTER_CARDS:" in user_prompt
+    assert "LOCATION_INDEX:" in user_prompt
+    assert "LOCATION_CARDS:" in user_prompt
     assert "WORLD_CHARACTERS:" in user_prompt
     assert "PLAYER_CARD:" in user_prompt
     assert "PARTY_SNAPSHOT:" in user_prompt
@@ -474,6 +487,156 @@ def test_build_prompt_research_stage_shape(session_factory, seed_campaign_and_ac
     assert "RECENT_TURNS:\n" in user_prompt
     assert "No planning prose or self-talk in research phase" in user_prompt
     assert "WORLD_SUMMARY:" in user_prompt
+    assert "SCENE_STATE:" in user_prompt
+    assert "CHARACTER_INDEX:" in user_prompt
+    assert "CHARACTER_CARDS:" in user_prompt
+    assert "LOCATION_INDEX:" in user_prompt
+    assert "LOCATION_CARDS:" in user_prompt
+
+
+def test_build_prompt_normalizes_persisted_entity_state_into_cards(
+    session_factory,
+    seed_campaign_and_actor,
+):
+    compat = _build_compat(session_factory)
+    campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
+    player = compat.get_or_create_player(seed_campaign_and_actor["campaign_id"], seed_campaign_and_actor["actor_id"])
+    with session_factory() as session:
+        row = session.get(Campaign, seed_campaign_and_actor["campaign_id"])
+        row.characters_json = json.dumps(
+            {
+                "yasmin-devereaux": {
+                    "name": "Yasmin Devereaux",
+                    "location": "hotel-lobby",
+                    "current_status": "Watching the desk.",
+                }
+            }
+        )
+        row.state_json = json.dumps(
+            {
+                "yasmin_devereaux_mood": "guarded",
+                "hotel_lobby_security": "Desk clerk watches arrivals.",
+            }
+        )
+        player_row = (
+            session.query(Player)
+            .filter(Player.campaign_id == seed_campaign_and_actor["campaign_id"])
+            .filter(Player.actor_id == seed_campaign_and_actor["actor_id"])
+            .one()
+        )
+        player_state = json.loads(player_row.state_json or "{}")
+        player_state["location"] = "hotel-lobby"
+        player_state["room_title"] = "Hotel Lobby"
+        player_state["room_summary"] = "Marble lobby and brass desk."
+        player_row.state_json = json.dumps(player_state)
+        session.commit()
+
+    turns = compat.get_recent_turns(seed_campaign_and_actor["campaign_id"])
+    _system_prompt, user_prompt = compat.build_prompt(campaign, player, "look", turns)
+
+    with session_factory() as session:
+        refreshed = session.get(Campaign, seed_campaign_and_actor["campaign_id"])
+        normalized_state = json.loads(refreshed.state_json or "{}")
+        normalized_characters = json.loads(refreshed.characters_json or "{}")
+    assert "yasmin_devereaux_mood" not in normalized_state
+    assert "hotel_lobby_security" not in normalized_state
+    assert normalized_characters["yasmin-devereaux"]["mood"] == "guarded"
+    assert normalized_state[compat.LOCATION_CARDS_STATE_KEY]["hotel-lobby"]["security"] == "Desk clerk watches arrivals."
+    assert '"mood": "guarded"' in user_prompt
+    assert '"slug": "hotel-lobby"' in user_prompt
+
+
+def test_build_prompt_scene_state_derives_active_tensions_from_world_state(
+    session_factory,
+    seed_campaign_and_actor,
+):
+    compat = _build_compat(session_factory)
+    campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
+    player = compat.get_or_create_player(seed_campaign_and_actor["campaign_id"], seed_campaign_and_actor["actor_id"])
+    with session_factory() as session:
+        row = session.get(Campaign, seed_campaign_and_actor["campaign_id"])
+        row.characters_json = json.dumps(
+            {
+                "yasmin-devereaux": {
+                    "name": "Yasmin Devereaux",
+                    "location": "hotel-lobby",
+                    "current_status": "Watching the desk.",
+                    "relationship": "Brittle with Chace.",
+                }
+            }
+        )
+        row.state_json = json.dumps(
+            {
+                "ring-pressure": {
+                    "character_slug": "yasmin-devereaux",
+                    "location_slug": "hotel-lobby",
+                    "status": "The engagement ring has turned the room sharp.",
+                }
+            }
+        )
+        player_row = (
+            session.query(Player)
+            .filter(Player.campaign_id == seed_campaign_and_actor["campaign_id"])
+            .filter(Player.actor_id == seed_campaign_and_actor["actor_id"])
+            .one()
+        )
+        player_state = json.loads(player_row.state_json or "{}")
+        player_state["location"] = "hotel-lobby"
+        player_state["room_title"] = "Hotel Lobby"
+        player_state["room_summary"] = "Marble lobby and brass desk."
+        player_row.state_json = json.dumps(player_state)
+        session.commit()
+
+    turns = compat.get_recent_turns(seed_campaign_and_actor["campaign_id"])
+    _system_prompt, user_prompt = compat.build_prompt(campaign, player, "look", turns)
+
+    assert '"active_tensions"' in user_prompt
+    assert "The engagement ring has turned the room sharp." in user_prompt
+    assert '"source": "world_state:ring-pressure"' in user_prompt
+
+
+def test_build_prompt_keeps_autobiography_out_of_character_cards(
+    session_factory,
+    seed_campaign_and_actor,
+):
+    compat = _build_compat(session_factory)
+    campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
+    player = compat.get_or_create_player(seed_campaign_and_actor["campaign_id"], seed_campaign_and_actor["actor_id"])
+    with session_factory() as session:
+        row = session.get(Campaign, seed_campaign_and_actor["campaign_id"])
+        row.characters_json = json.dumps(
+            {
+                "yasmin-devereaux": {
+                    "name": "Yasmin Devereaux",
+                    "location": "hotel-lobby",
+                    "current_status": "Watching the desk.",
+                    "speech_style": "Controlled and exact.",
+                    "autobiography": "She writes herself as flint wrapped in velvet.",
+                }
+            }
+        )
+        player_row = (
+            session.query(Player)
+            .filter(Player.campaign_id == seed_campaign_and_actor["campaign_id"])
+            .filter(Player.actor_id == seed_campaign_and_actor["actor_id"])
+            .one()
+        )
+        player_state = json.loads(player_row.state_json or "{}")
+        player_state["location"] = "hotel-lobby"
+        player_state["room_title"] = "Hotel Lobby"
+        player_state["room_summary"] = "Marble lobby and brass desk."
+        player_row.state_json = json.dumps(player_state)
+        session.commit()
+
+    turns = compat.get_recent_turns(seed_campaign_and_actor["campaign_id"])
+    _system_prompt, user_prompt = compat.build_prompt(campaign, player, "look", turns)
+
+    cards_match = re.search(r"CHARACTER_CARDS:\s*(.*?)\nLOCATION_INDEX:", user_prompt, re.DOTALL)
+    assert cards_match is not None
+    cards_block = cards_match.group(1)
+    assert '"autobiography"' not in cards_block
+    assert "AUTOBIOGRAPHIES:" in user_prompt
+    assert "She writes herself as flint wrapped in velvet." in user_prompt
 
 
 def test_ready_to_write_finalization_uses_final_stage_system_prompt(
@@ -528,6 +691,114 @@ def test_ready_to_write_finalization_uses_final_stage_system_prompt(
         assert len(completion.calls) == 2
         assert '"tool_call": "ready_to_write"' in completion.calls[0]["system_prompt"]
         assert '"tool_call": "ready_to_write"' not in completion.calls[1]["system_prompt"]
+
+    asyncio.run(run_test())
+
+
+def test_ready_to_write_finalization_reexpands_character_and_location_cards(
+    session_factory,
+    seed_campaign_and_actor,
+):
+    class FocusedReadyToWriteCompletionPort:
+        def __init__(self):
+            self.calls = []
+
+        async def complete(self, system_prompt, prompt, *, temperature=0.8, max_tokens=2048):
+            self.calls.append({"system_prompt": system_prompt, "prompt": prompt})
+            if len(self.calls) == 1:
+                return '{"tool_call":"ready_to_write","speakers":["yasmin-devereaux"],"listeners":["player-actor-1"]}'
+            return (
+                '{"reasoning":"finalized","narration":"Final scene.","state_update":{"game_time":{"day":1,"hour":9,"minute":0,"day_of_week":"monday","period":"morning","date_label":"Monday, Day 1, Morning"}},"summary_update":"done"}'
+            )
+
+    async def run_test():
+        completion = FocusedReadyToWriteCompletionPort()
+        engine = GameEngine(
+            uow_factory=lambda: SQLAlchemyUnitOfWork(session_factory),
+            llm=StubLLM(LLMTurnOutput(narration="unused")),
+        )
+        compat = ZorkEmulator(engine, session_factory, completion_port=completion)
+        tool_llm = ToolAwareZorkLLM(
+            session_factory=session_factory,
+            completion_port=completion,
+            temperature=0.8,
+            max_tokens=2048,
+        )
+        tool_llm.bind_emulator(compat)
+
+        campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
+        player = compat.get_or_create_player(seed_campaign_and_actor["campaign_id"], seed_campaign_and_actor["actor_id"])
+        with session_factory() as session:
+            row = session.get(Campaign, seed_campaign_and_actor["campaign_id"])
+            row.characters_json = json.dumps(
+                {
+                    "yasmin-devereaux": {
+                        "name": "Yasmin Devereaux",
+                        "location": "hotel-lobby",
+                        "current_status": "Watching the desk.",
+                        "speech_style": "Controlled and exact.",
+                        "relationship": "Brittle but engaged.",
+                        "appearance": "Ring catching the lobby light.",
+                    }
+                }
+            )
+            state = json.loads(row.state_json or "{}")
+            state[compat.LOCATION_CARDS_STATE_KEY] = {
+                "hotel-lobby": {
+                    "name": "Hotel Lobby",
+                    "summary": "Marble lobby and brass desk.",
+                    "security": "Clerk watches arrivals.",
+                }
+            }
+            row.state_json = json.dumps(state)
+            player_row = (
+                session.query(Player)
+                .filter(Player.campaign_id == seed_campaign_and_actor["campaign_id"])
+                .filter(Player.actor_id == seed_campaign_and_actor["actor_id"])
+                .one()
+            )
+            player_state = json.loads(player_row.state_json or "{}")
+            player_state.update(
+                {
+                    "location": "hotel-lobby",
+                    "room_title": "Hotel Lobby",
+                    "room_summary": "Marble lobby and brass desk.",
+                }
+            )
+            player_row.state_json = json.dumps(player_state)
+            session.commit()
+        turns = compat.get_recent_turns(seed_campaign_and_actor["campaign_id"])
+        research_system_prompt, research_user_prompt = compat.build_prompt(
+            campaign,
+            player,
+            "look",
+            turns,
+            prompt_stage=compat.PROMPT_STAGE_RESEARCH,
+        )
+        final_system_prompt, final_user_prompt = compat.build_prompt(
+            campaign,
+            player,
+            "look",
+            turns,
+            prompt_stage=compat.PROMPT_STAGE_FINAL,
+        )
+
+        payload = await tool_llm._resolve_payload(  # noqa: SLF001
+            seed_campaign_and_actor["campaign_id"],
+            seed_campaign_and_actor["actor_id"],
+            "look",
+            research_system_prompt,
+            research_user_prompt,
+            final_system_prompt,
+            final_user_prompt,
+        )
+
+        assert payload is not None
+        assert payload.get("narration") == "Final scene."
+        assert "FINAL_CHARACTER_CARDS:" in completion.calls[1]["prompt"]
+        assert "yasmin-devereaux" in completion.calls[1]["prompt"]
+        assert "FINAL_LOCATION_CARDS:" in completion.calls[1]["prompt"]
+        assert "hotel-lobby" in completion.calls[1]["prompt"]
 
     asyncio.run(run_test())
 

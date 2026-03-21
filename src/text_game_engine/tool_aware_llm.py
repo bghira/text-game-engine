@@ -480,6 +480,7 @@ class ToolAwareZorkLLM:
         other_player_state_updates = payload.get("other_player_state_updates")
         summary_update = payload.get("summary_update")
         character_updates = payload.get("character_updates")
+        location_updates = payload.get("location_updates")
         calendar_update = payload.get("calendar_update")
         scene_image_prompt = payload.get("scene_image_prompt")
         scene_output = payload.get("scene_output")
@@ -497,6 +498,7 @@ class ToolAwareZorkLLM:
             or bool(player_state_update)
             or bool(other_player_state_updates)
             or bool(character_updates)
+            or bool(location_updates)
             or bool(calendar_update)
         )
         has_signal = has_signal or has_scene_output
@@ -926,6 +928,9 @@ class ToolAwareZorkLLM:
         character_updates = payload.get("character_updates")
         if not isinstance(character_updates, dict):
             character_updates = {}
+        location_updates = payload.get("location_updates")
+        if not isinstance(location_updates, dict):
+            location_updates = {}
 
         _TOOL_CALLS_ALLOWLIST = frozenset({"sms_write", "sms_schedule"})
         tool_calls_raw = payload.get("tool_calls")
@@ -950,6 +955,7 @@ class ToolAwareZorkLLM:
             scene_image_prompt=scene_image_prompt,
             timer_instruction=timer_instruction,
             character_updates=character_updates,
+            location_updates=location_updates,
             give_item=give_item,
             tool_calls=tool_calls,
         )
@@ -1538,7 +1544,7 @@ class ToolAwareZorkLLM:
             if not applied_rows:
                 return (
                     "AUTOBIOGRAPHY_APPEND_RESULT: nothing stored. "
-                    "Use existing NPC slugs from WORLD_CHARACTERS and include a non-empty a/b/c delta."
+                    "Use existing NPC slugs from CHARACTER_INDEX / WORLD_CHARACTERS and include a non-empty a/b/c delta."
                 )
             campaign.characters_json = json.dumps(characters, ensure_ascii=True)
             campaign.updated_at = datetime.now(UTC).replace(tzinfo=None)
@@ -1566,7 +1572,7 @@ class ToolAwareZorkLLM:
             or ""
         ).strip()
         if not raw_slug:
-            return "AUTOBIOGRAPHY_COMPRESS_RESULT: character not found. Use an existing NPC slug from WORLD_CHARACTERS."
+            return "AUTOBIOGRAPHY_COMPRESS_RESULT: character not found. Use an existing NPC slug from CHARACTER_INDEX / WORLD_CHARACTERS."
 
         # Phase 1: read character data and build the LLM prompt.
         with self._session_factory() as session:
@@ -1577,7 +1583,7 @@ class ToolAwareZorkLLM:
             resolved_slug = emulator._resolve_existing_character_slug(characters, raw_slug) or raw_slug  # noqa: SLF001
             character_row = dict(characters.get(resolved_slug) or {})
             if not character_row:
-                return "AUTOBIOGRAPHY_COMPRESS_RESULT: character not found. Use an existing NPC slug from WORLD_CHARACTERS."
+                return "AUTOBIOGRAPHY_COMPRESS_RESULT: character not found. Use an existing NPC slug from CHARACTER_INDEX / WORLD_CHARACTERS."
             raw_entries = emulator._normalize_autobiography_raw_entries(  # noqa: SLF001
                 character_row.get(emulator.AUTOBIOGRAPHY_RAW_FIELD)  # noqa: SLF001
             )
@@ -2937,6 +2943,8 @@ class ToolAwareZorkLLM:
                 _ready_listeners = [_ready_listeners]
             _shared_context_block = ""
             _speaker_continuity_block = ""
+            _final_character_cards_block = ""
+            _final_location_cards_block = ""
             _final_prompt_body, _final_prompt_tail = emulator._split_prompt_tail(final_user_prompt)  # noqa: SLF001
             _clean_final_user_prompt = emulator._strip_recent_turns_prompt_sections(_final_prompt_body)  # noqa: SLF001
             _clean_tool_history = emulator._strip_recent_turns_prompt_sections(tool_history)  # noqa: SLF001
@@ -2944,6 +2952,8 @@ class ToolAwareZorkLLM:
                 campaign = session.get(Campaign, str(campaign_id))
             player = emulator.get_or_create_player(campaign_id, actor_id)
             if campaign is not None and player is not None:
+                campaign_state = emulator.get_campaign_state(campaign)  # noqa: SLF001
+                campaign_characters = emulator.get_campaign_characters(campaign)  # noqa: SLF001
                 player_state = emulator.get_player_state(player)
                 viewer_location_key = emulator._room_key_from_player_state(player_state).lower()  # noqa: SLF001
                 viewer_private_context = emulator._active_private_context_from_state(player_state)  # noqa: SLF001
@@ -2978,10 +2988,46 @@ class ToolAwareZorkLLM:
                     slug for slug in listener_npc_slugs if slug and slug not in player_slugs and slug != viewer_slug
                 }
                 scene_npc_slugs = speaker_npc_slugs.union(listener_npc_slugs)
+                final_character_entries: list[dict[str, Any]] = []
+                for slug in sorted(scene_npc_slugs):
+                    row = campaign_characters.get(slug) if isinstance(campaign_characters, dict) else None
+                    if not isinstance(row, dict):
+                        continue
+                    prompt_row = dict(row)
+                    prompt_row["_slug"] = slug
+                    final_character_entries.append(prompt_row)
+                if final_character_entries:
+                    final_character_cards = emulator._build_character_cards_for_prompt(  # noqa: SLF001
+                        final_character_entries,
+                        characters=campaign_characters,
+                        player_state=player_state,
+                    )
+                    if final_character_cards:
+                        _final_character_cards_block = (
+                            "\nFINAL_CHARACTER_CARDS: "
+                            f"{emulator._dump_json(final_character_cards)}\n"  # noqa: SLF001
+                        )
+                location_cards_map = emulator._location_cards_from_state(campaign_state, player_state)  # noqa: SLF001
+                final_location_cards = emulator._build_location_cards_for_prompt(  # noqa: SLF001
+                    location_cards_map,
+                    player_state=player_state,
+                )
+                if final_location_cards:
+                    active_location = str(player_state.get("location") or "").strip().lower()
+                    narrowed_location_cards = [
+                        row for row in final_location_cards
+                        if str(row.get("slug") or "").strip().lower() == active_location
+                    ]
+                    if not narrowed_location_cards:
+                        narrowed_location_cards = final_location_cards[:1]
+                    _final_location_cards_block = (
+                        "\nFINAL_LOCATION_CARDS: "
+                        f"{emulator._dump_json(narrowed_location_cards)}\n"  # noqa: SLF001
+                    )
                 turns = emulator.get_recent_turns(campaign_id)
                 shared_summary = emulator._compose_world_summary(  # noqa: SLF001
                     campaign,
-                    emulator.get_campaign_state(campaign),  # noqa: SLF001
+                    campaign_state,
                     turns=turns,
                     viewer_actor_id=actor_id,
                     viewer_slug=viewer_slug,
@@ -3052,6 +3098,8 @@ class ToolAwareZorkLLM:
                 + _pc_reminder
                 + _shared_context_block
                 + _speaker_continuity_block
+                + _final_character_cards_block
+                + _final_location_cards_block
                 + (f"\n{_final_prompt_tail}\n" if _final_prompt_tail else "")
                 + emulator.WRITING_CRAFT_PROMPT
             )

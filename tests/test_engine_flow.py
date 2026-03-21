@@ -269,6 +269,112 @@ def test_recent_turns_visibility_filters_private_and_limited(
     asyncio.run(run_test())
 
 
+def test_phase_c_relocates_flat_entity_state_keys_into_character_and_location_storage(
+    session_factory,
+    uow_factory,
+    seed_campaign_and_actor,
+):
+    async def run_test():
+        with session_factory() as session:
+            campaign = session.get(Campaign, seed_campaign_and_actor["campaign_id"])
+            campaign.characters_json = json.dumps(
+                {
+                    "yasmin-devereaux": {
+                        "name": "Yasmin Devereaux",
+                        "location": "hotel-lobby",
+                        "current_status": "Waiting near the desk.",
+                    }
+                }
+            )
+            session.commit()
+
+        llm = StubLLM(
+            LLMTurnOutput(
+                narration="The lobby holds its breath.",
+                state_update={
+                    "yasmin_devereaux_mood": "guarded",
+                    "hotel_lobby_security": "Desk clerk now recognizes Rigby.",
+                },
+            )
+        )
+        engine = GameEngine(uow_factory=uow_factory, llm=llm)
+
+        result = await engine.resolve_turn(
+            ResolveTurnInput(
+                campaign_id=seed_campaign_and_actor["campaign_id"],
+                actor_id=seed_campaign_and_actor["actor_id"],
+                action="look",
+            )
+        )
+        assert result.status == "ok"
+
+        with session_factory() as session:
+            campaign = session.get(Campaign, seed_campaign_and_actor["campaign_id"])
+            state = json.loads(campaign.state_json or "{}")
+            characters = json.loads(campaign.characters_json or "{}")
+            assert "yasmin_devereaux_mood" not in state
+            assert "hotel_lobby_security" not in state
+            assert characters["yasmin-devereaux"]["mood"] == "guarded"
+            assert state[engine.LOCATION_CARDS_STATE_KEY]["hotel-lobby"]["security"] == "Desk clerk now recognizes Rigby."
+
+    asyncio.run(run_test())
+
+
+def test_phase_c_relocates_exact_entity_overlays_out_of_state_update(
+    session_factory,
+    uow_factory,
+    seed_campaign_and_actor,
+):
+    async def run_test():
+        with session_factory() as session:
+            campaign = session.get(Campaign, seed_campaign_and_actor["campaign_id"])
+            campaign.characters_json = json.dumps(
+                {
+                    "yasmin-devereaux": {
+                        "name": "Yasmin Devereaux",
+                        "location": "hotel-lobby",
+                        "current_status": "Waiting near the desk.",
+                    }
+                }
+            )
+            session.commit()
+
+        llm = StubLLM(
+            LLMTurnOutput(
+                narration="Everything sharpens.",
+                state_update={
+                    "yasmin-devereaux": {
+                        "current_status": "Ring visible, studying Rigby.",
+                    },
+                    "hotel-lobby": {
+                        "security": "Desk clerk is watching the entrance.",
+                    },
+                },
+            )
+        )
+        engine = GameEngine(uow_factory=uow_factory, llm=llm)
+
+        result = await engine.resolve_turn(
+            ResolveTurnInput(
+                campaign_id=seed_campaign_and_actor["campaign_id"],
+                actor_id=seed_campaign_and_actor["actor_id"],
+                action="look",
+            )
+        )
+        assert result.status == "ok"
+
+        with session_factory() as session:
+            campaign = session.get(Campaign, seed_campaign_and_actor["campaign_id"])
+            state = json.loads(campaign.state_json or "{}")
+            characters = json.loads(campaign.characters_json or "{}")
+            assert "yasmin-devereaux" not in state
+            assert "hotel-lobby" not in state
+            assert characters["yasmin-devereaux"]["current_status"] == "Ring visible, studying Rigby."
+            assert state[engine.LOCATION_CARDS_STATE_KEY]["hotel-lobby"]["security"] == "Desk clerk is watching the entrance."
+
+    asyncio.run(run_test())
+
+
 def test_summary_update_only_persists_for_public_turns(
     session_factory,
     uow_factory,
@@ -713,6 +819,91 @@ def test_engine_fallback_narration_uses_state_updates(session_factory, uow_facto
         )
         assert result.status == "ok"
         assert result.narration == "Hotel room with ocean view."
+
+    asyncio.run(run_test())
+
+
+def test_engine_fallback_narration_uses_relocated_character_updates(
+    session_factory,
+    uow_factory,
+    seed_campaign_and_actor,
+):
+    async def run_test():
+        with session_factory() as session:
+            campaign = session.get(Campaign, seed_campaign_and_actor["campaign_id"])
+            campaign.characters_json = json.dumps(
+                {
+                    "yasmin-devereaux": {
+                        "name": "Yasmin Devereaux",
+                        "location": "hotel-lobby",
+                    }
+                }
+            )
+            session.commit()
+
+        llm = StubLLM(
+            LLMTurnOutput(
+                narration="",
+                state_update={"yasmin_devereaux_mood": "guarded"},
+            )
+        )
+        engine = GameEngine(uow_factory=uow_factory, llm=llm)
+
+        result = await engine.resolve_turn(
+            ResolveTurnInput(
+                campaign_id=seed_campaign_and_actor["campaign_id"],
+                actor_id=seed_campaign_and_actor["actor_id"],
+                action="look",
+            )
+        )
+        assert result.status == "ok"
+        assert result.narration == "Character roster updated."
+
+        with session_factory() as session:
+            campaign = session.get(Campaign, seed_campaign_and_actor["campaign_id"])
+            characters = json.loads(campaign.characters_json or "{}")
+            assert characters["yasmin-devereaux"]["mood"] == "guarded"
+
+    asyncio.run(run_test())
+
+
+def test_on_rails_location_updates_do_not_create_new_location_cards(
+    session_factory,
+    uow_factory,
+    seed_campaign_and_actor,
+):
+    async def run_test():
+        with session_factory() as session:
+            campaign = session.get(Campaign, seed_campaign_and_actor["campaign_id"])
+            campaign.state_json = json.dumps({"on_rails": True})
+            session.commit()
+
+        llm = StubLLM(
+            LLMTurnOutput(
+                narration="The corridor tightens.",
+                location_updates={
+                    "secret-basement": {
+                        "security": "Cameras cover the stairwell.",
+                    }
+                },
+            )
+        )
+        engine = GameEngine(uow_factory=uow_factory, llm=llm)
+
+        result = await engine.resolve_turn(
+            ResolveTurnInput(
+                campaign_id=seed_campaign_and_actor["campaign_id"],
+                actor_id=seed_campaign_and_actor["actor_id"],
+                action="continue",
+            )
+        )
+        assert result.status == "ok"
+
+        with session_factory() as session:
+            campaign = session.get(Campaign, seed_campaign_and_actor["campaign_id"])
+            state = json.loads(campaign.state_json or "{}")
+            locations = state.get(engine.LOCATION_CARDS_STATE_KEY) or {}
+            assert "secret-basement" not in locations
 
     asyncio.run(run_test())
 
