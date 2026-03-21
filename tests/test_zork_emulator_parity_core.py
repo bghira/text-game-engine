@@ -18,7 +18,7 @@ class StubLLM:
     def __init__(self, output: LLMTurnOutput):
         self.output = output
 
-    async def complete_turn(self, context):
+    async def complete_turn(self, context, **kwargs):
         return self.output
 
 
@@ -526,8 +526,8 @@ def test_ready_to_write_finalization_uses_final_stage_system_prompt(
         assert payload is not None
         assert payload.get("narration") == "Final scene."
         assert len(completion.calls) == 2
-        assert '{"tool_call": "ready_to_write"}' in completion.calls[0]["system_prompt"]
-        assert '{"tool_call": "ready_to_write"}' not in completion.calls[1]["system_prompt"]
+        assert '"tool_call": "ready_to_write"' in completion.calls[0]["system_prompt"]
+        assert '"tool_call": "ready_to_write"' not in completion.calls[1]["system_prompt"]
 
     asyncio.run(run_test())
 
@@ -667,9 +667,8 @@ def test_attachment_setup_length_error_for_short_upload(session_factory):
     compat = _build_compat(session_factory)
     short_text = "One short paragraph about a character.\n\nAnother short paragraph."
     msg = compat._attachment_setup_length_error(short_text)
-    assert msg is not None
-    assert "too short for setup ingestion" in msg
-    assert "4" in msg
+    # Short setup attachments are now accepted with no minimum chunk threshold.
+    assert msg is None
 
 
 def test_recent_turns_include_turn_number_and_in_game_time(session_factory, seed_campaign_and_actor):
@@ -1726,7 +1725,9 @@ def test_calendar_reminders_suppress_non_milestone_hours(session_factory, seed_c
             }
         ]
     )
-    assert text == "None"
+    # Non-milestone hours are no longer suppressed — all reminders get bucketed.
+    assert text != "None"
+    assert "Media Exposure Fallout" in text
 
 
 def test_calendar_reminders_include_milestone_hours(session_factory, seed_campaign_and_actor):
@@ -2424,13 +2425,14 @@ def test_speed_multiplier_scales_timer_delay_and_rendered_line(
         assert narration is not None
         pending = compat._pending_timers.get(campaign.id)
         assert pending is not None
-        assert int(pending.get("delay", 0)) == 60
+        # 120s / 2.0 speed = 60s, then realtime compression (* 0.2) = 12s
+        assert int(pending.get("delay", 0)) == 12
 
         timer_match = re.search(r"<t:(\d+):R>", narration)
         assert timer_match is not None
         expiry_ts = int(timer_match.group(1))
         delta = expiry_ts - int(time.time())
-        assert 50 <= delta <= 65
+        assert 5 <= delta <= 18
 
         compat.cancel_pending_timer(campaign.id)
 
@@ -2649,14 +2651,14 @@ def test_tool_calls_sms_write_executed_in_complete_turn(session_factory, seed_ca
     compat.get_or_create_player(campaign.id, seed_campaign_and_actor["actor_id"])
 
     async def run_test():
-        # Duck-typed context — complete_turn only reads campaign_id,
-        # actor_id, action, and session_id from the context object.
         class _Ctx:
             def __init__(self, campaign_id, actor_id, action):
                 self.campaign_id = campaign_id
                 self.actor_id = actor_id
                 self.action = action
                 self.session_id = None
+                self.player_state = {}
+                self.campaign_state = {}
 
         ctx = _Ctx(
             campaign_id=campaign.id,
