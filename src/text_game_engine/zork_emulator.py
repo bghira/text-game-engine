@@ -385,6 +385,7 @@ class ZorkEmulator:
         "default_persona",
         "start_room",
         "story_outline",
+        "chapters",
         "current_chapter",
         "current_scene",
         "setup_phase",
@@ -8869,58 +8870,27 @@ class ZorkEmulator:
 
     def _build_story_context(self, campaign_state: Dict[str, object]) -> Optional[str]:
         if not bool(campaign_state.get("on_rails", False)):
-            chapters = campaign_state.get("chapters")
-            if isinstance(chapters, list) and chapters:
-                active_rows = [
-                    row
-                    for row in chapters
-                    if isinstance(row, dict)
-                    and str(row.get("status") or "active").strip().lower() == "active"
-                ]
-                rows = active_rows[:4] if active_rows else [row for row in chapters if isinstance(row, dict)][:4]
-                if rows:
-                    def _chapter_scene_label(value: object) -> str:
-                        text = str(value or "").strip()
-                        if not text:
-                            return "Untitled"
-                        text = text.replace("_", "-")
-                        parts = [part for part in text.split("-") if part]
-                        if not parts:
-                            return "Untitled"
-                        return " ".join(part.capitalize() for part in parts)[:120]
-
-                    current = rows[0]
-                    lines: List[str] = []
-                    lines.append(f"CURRENT CHAPTER: {current.get('title', 'Untitled')}")
-                    lines.append(f"  Summary: {current.get('summary', '')}")
-                    scenes = current.get("scenes") or []
-                    current_scene_slug = str(current.get("current_scene") or "").strip()
-                    if isinstance(scenes, list):
-                        for i, scene in enumerate(scenes):
-                            scene_slug = str(scene or "").strip()
-                            marker = " >>> CURRENT SCENE <<<" if scene_slug and scene_slug == current_scene_slug else ""
-                            lines.append(f"  Scene {i + 1}: {_chapter_scene_label(scene_slug)}{marker}")
-                    if len(rows) > 1:
-                        lines.append("")
-                        for idx, row in enumerate(rows[1:4], start=1):
-                            label = "NEXT CHAPTER" if idx == 1 else f"UPCOMING CHAPTER {idx}"
-                            lines.append(f"{label}: {row.get('title', 'Untitled')}")
-                            summary = str(row.get("summary") or "").strip()
-                            if summary:
-                                lines.append(f"  Preview: {summary[:320]}")
-                            row_scenes = row.get("scenes") or []
-                            if isinstance(row_scenes, list) and row_scenes:
-                                preview_titles = [
-                                    _chapter_scene_label(scene)
-                                    for scene in row_scenes[:3]
-                                    if str(scene or "").strip()
-                                ]
-                                if preview_titles:
-                                    lines.append(f"  Early scenes: {', '.join(preview_titles)}")
-                            lines.append("")
-                    while lines and not lines[-1]:
-                        lines.pop()
-                    return "\n".join(lines) if lines else None
+            threads = self._plot_threads_for_prompt(campaign_state, limit=6)
+            active_threads = [
+                row for row in threads
+                if isinstance(row, dict) and str(row.get("status") or "").strip().lower() == "active"
+            ]
+            if active_threads:
+                lines: List[str] = ["ACTIVE SUBPLOTS:"]
+                for row in active_threads[:6]:
+                    thread = str(row.get("thread") or "untitled-thread").strip()
+                    setup = str(row.get("setup") or "").strip()
+                    payoff = str(row.get("intended_payoff") or "").strip()
+                    hint = str(row.get("hint") or "").strip()
+                    lines.append(f"- {thread}")
+                    if setup:
+                        lines.append(f"  Setup: {setup[:240]}")
+                    if payoff:
+                        lines.append(f"  Payoff: {payoff[:240]}")
+                    if hint:
+                        lines.append(f"  Hint: {hint[:220]}")
+                return "\n".join(lines)
+            return None
 
         outline = campaign_state.get("story_outline")
         if not isinstance(outline, dict):
@@ -12469,6 +12439,18 @@ class ZorkEmulator:
         recent_text = "\n".join(recent_lines) if recent_lines else "None"
 
         rails_context = self._build_rails_context(player_state, party_snapshot)
+        active_plot_threads = self._plot_threads_for_prompt(state, limit=8)
+        active_plot_threads = [
+            row for row in active_plot_threads
+            if isinstance(row, dict) and str(row.get("status") or "").strip().lower() == "active"
+        ]
+        active_plot_hints = self._plot_hints_for_viewer(
+            state,
+            viewer_actor_id=player.actor_id,
+            viewer_slug=viewer_slug,
+            viewer_location_key=viewer_location_key,
+            limit=6,
+        )
         character_index_source = self._build_characters_for_prompt(
             characters,
             player_state,
@@ -12640,6 +12622,8 @@ class ZorkEmulator:
             user_prompt += (
                 f"WORLD_SUMMARY: {summary}\n"
                 f"WORLD_STATE: {self._dump_json(model_state)}\n"
+                f"ACTIVE_PLOT_THREADS: {self._dump_json(active_plot_threads)}\n"
+                f"ACTIVE_HINTS: {self._dump_json(active_plot_hints)}\n"
                 f"CALENDAR: {self._dump_json(calendar_for_prompt)}\n"
                 f"CALENDAR_REMINDERS:\n{calendar_reminders}\n"
                 f"RECENT_TURNS:\n{recent_text}\n"
@@ -12695,8 +12679,6 @@ class ZorkEmulator:
             if story_context:
                 system_prompt = f"{system_prompt}{self.STORY_OUTLINE_TOOL_PROMPT}"
             system_prompt = f"{system_prompt}{self.PLOT_PLAN_TOOL_PROMPT}"
-            if not on_rails:
-                system_prompt = f"{system_prompt}{self.CHAPTER_PLAN_TOOL_PROMPT}"
             system_prompt = f"{system_prompt}{self.CONSEQUENCE_TOOL_PROMPT}"
             system_prompt = f"{system_prompt}{self.CALENDAR_TOOL_PROMPT}"
             system_prompt = f"{system_prompt}{self.ROSTER_PROMPT}"

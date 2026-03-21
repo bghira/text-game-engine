@@ -483,10 +483,13 @@ def test_build_prompt_research_stage_shape(session_factory, seed_campaign_and_ac
     assert "CALENDAR & GAME TIME SYSTEM:" in system_prompt
     assert "Do NOT output planning prose" in system_prompt
     assert "roughly 20 minutes per turn" in system_prompt
+    assert "OFF-RAILS CHAPTER MANAGEMENT TOOL" not in system_prompt
     assert "RECENT_TURNS_LOADED: true" in user_prompt
     assert "RECENT_TURNS:\n" in user_prompt
     assert "No planning prose or self-talk in research phase" in user_prompt
     assert "WORLD_SUMMARY:" in user_prompt
+    assert "ACTIVE_PLOT_THREADS:" in user_prompt
+    assert "ACTIVE_HINTS:" in user_prompt
     assert "SCENE_STATE:" in user_prompt
     assert "CHARACTER_INDEX:" in user_prompt
     assert "CHARACTER_CARDS:" in user_prompt
@@ -593,6 +596,54 @@ def test_build_prompt_scene_state_derives_active_tensions_from_world_state(
     assert '"active_tensions"' in user_prompt
     assert "The engagement ring has turned the room sharp." in user_prompt
     assert '"source": "world_state:ring-pressure"' in user_prompt
+
+
+def test_build_prompt_offrails_ignores_legacy_chapters_and_uses_plot_threads(
+    session_factory,
+    seed_campaign_and_actor,
+):
+    compat = _build_compat(session_factory)
+    campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
+    player = compat.get_or_create_player(seed_campaign_and_actor["campaign_id"], seed_campaign_and_actor["actor_id"])
+    with session_factory() as session:
+        row = session.get(Campaign, seed_campaign_and_actor["campaign_id"])
+        row.state_json = json.dumps(
+            {
+                "on_rails": False,
+                "chapters": [
+                    {
+                        "title": "Legacy Chapter Leak",
+                        "summary": "This should not appear in off-rails prompt context.",
+                        "status": "active",
+                    }
+                ],
+                "_plot_threads": {
+                    "ring-pressure": {
+                        "thread": "ring-pressure",
+                        "setup": "Yasmin is cornered by the engagement fallout.",
+                        "intended_payoff": "The ring pressure forces a direct conversation.",
+                        "hint": "The ring keeps catching the light whenever she moves.",
+                        "status": "active",
+                        "updated_turn": 10,
+                    }
+                },
+            }
+        )
+        session.commit()
+
+    turns = compat.get_recent_turns(seed_campaign_and_actor["campaign_id"])
+    system_prompt, user_prompt = compat.build_prompt(
+        campaign,
+        player,
+        "look",
+        turns,
+        prompt_stage=compat.PROMPT_STAGE_RESEARCH,
+    )
+
+    assert "Legacy Chapter Leak" not in user_prompt
+    assert "ACTIVE SUBPLOTS:" in user_prompt
+    assert "ring-pressure" in user_prompt
+    assert "OFF-RAILS CHAPTER MANAGEMENT TOOL" not in system_prompt
 
 
 def test_ready_to_write_finalization_uses_final_stage_system_prompt(
