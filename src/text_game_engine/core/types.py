@@ -79,6 +79,7 @@ class LLMTurnOutput:
     scene_image_prompt: Optional[str] = None
     timer_instruction: Optional[TimerInstruction] = None
     character_updates: dict[str, Any] = field(default_factory=dict)
+    location_updates: dict[str, Any] = field(default_factory=dict)
     give_item: Optional[GiveItemInstruction] = None
     dice_check: Optional[DiceCheckRequest] = None
     puzzle_trigger: Optional[PuzzleTrigger] = None

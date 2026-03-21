@@ -81,6 +81,8 @@ class ZorkEmulator:
     MAX_SCENE_REFERENCE_IMAGES = 10
     MAX_INVENTORY_CHANGES_PER_TURN = 10
     MAX_CHARACTERS_CHARS = 8000
+    MAX_CHARACTER_INDEX_CHARS = 5000
+    MAX_LOCATION_INDEX_CHARS = 4000
     MAX_CHARACTERS_IN_PROMPT = 20
     AUTOBIOGRAPHY_FIELD = "autobiography"
     AUTOBIOGRAPHY_RAW_FIELD = "autobiography_raw"
@@ -357,6 +359,7 @@ class ZorkEmulator:
     DEFAULT_TURN_ADVANCE_MINUTES = 20
     MAX_TURN_ADVANCE_MINUTES = 180
     CLOCK_START_DAY_OF_WEEK_KEY = "clock_start_day_of_week"
+    LOCATION_CARDS_STATE_KEY = GameEngine.LOCATION_CARDS_STATE_KEY
     WEEKDAY_NAMES = (
         "monday",
         "tuesday",
@@ -398,6 +401,7 @@ class ZorkEmulator:
         SMS_MESSAGE_SEQ_KEY,
         TURN_TIME_INDEX_KEY,
         LITERARY_STYLES_STATE_KEY,
+        LOCATION_CARDS_STATE_KEY,
         "_active_puzzle",
         "_puzzle_result",
         "_active_minigame",
@@ -513,7 +517,7 @@ class ZorkEmulator:
         "You are the ZorkEmulator continuity bootstrapper.\n"
         "Do NOT narrate yet. Do NOT resolve the turn yet.\n"
         "Your job in this phase is only to decide what immediate privacy-gated scene continuity is needed.\n"
-        "Use the acting player's location, PARTY_SNAPSHOT, WORLD_CHARACTERS, and PLAYER_ACTION to choose recent_turns receivers.\n"
+        "Use the acting player's location, PARTY_SNAPSHOT, SCENE_STATE, CHARACTER_INDEX / CHARACTER_CARDS, and PLAYER_ACTION to choose recent_turns receivers.\n"
         "Return only a tool call in this phase.\n"
     )
     RESEARCH_SYSTEM_PROMPT = (
@@ -640,6 +644,7 @@ class ZorkEmulator:
         "- state_update: REQUIRED every turn. Must include game_time, current_chapter, current_scene. "
         "Don't tattle — WORLD_STATE is shared across ALL players. Never store intimate details, secrets, or private information in state_update. "
         "Track private/local context through narration, player_state_update, and character_updates instead. "
+        "WORLD_STATE is for world facts, event threads, investigations, and cross-entity facts — not as a dumping ground for character cards or location cards. "
         "Set a key to null to remove it when no longer relevant. "
         "IMPORTANT: WORLD_STATE has a size budget. Actively prune stale WORLD_STATE keys every turn by setting them to null. "
         "This cleanup rule applies to transient world-state only (events, countdowns, one-off flags, scene-local state) — "
@@ -666,7 +671,7 @@ class ZorkEmulator:
         '- co_located_player_slugs: array (optional; exact PARTY_SNAPSHOT player_slugs for OTHER CAMPAIGN_PLAYERS who remain physically with the acting player after this turn. Use only for room/location sync; it does NOT authorize new dialogue, actions, or decisions for them.)\n'
         '- story_progression: object (optional; Keys: advance (bool), target ("hold"|"next-scene"|"next-chapter"), reason (string). '
         "Use when a subplot beat should push the outlined story forward without explicit state_update scene change.)\n"
-        '- turn_visibility: object (optional; who should get this turn in future prompt context. Keys: "scope" ("public"|"private"|"limited"|"local"), "player_slugs" (array of player slugs from PARTY_SNAPSHOT, typically in `player-<actor_id>` form), "npc_slugs" (array of WORLD_CHARACTERS slugs who overheard/noticed), and optional "reason". This changes prompt visibility only; it does NOT change shared world state.)\n'
+        '- turn_visibility: object (optional; who should get this turn in future prompt context. Keys: "scope" ("public"|"private"|"limited"|"local"), "player_slugs" (array of player slugs from PARTY_SNAPSHOT, typically in `player-<actor_id>` form), "npc_slugs" (array of CHARACTER_INDEX / WORLD_CHARACTERS slugs who overheard/noticed), and optional "reason". This changes prompt visibility only; it does NOT change shared world state.)\n'
         "- scene_image_prompt: string (optional; include whenever the visible scene changes in a meaningful way: entering a room, newly visible characters/objects, reveals, or strong visual shifts)\n"
         '- tool_calls: array (optional; inline side-effect tool invocations supported in final JSON. Only "sms_write" and "sms_schedule" are allowed here. Use this when narration includes an SMS/phone reply or delayed SMS that must persist in the log.)\n'
         "- set_timer_delay: integer (optional; 30-300 seconds, see TIMED EVENTS SYSTEM below)\n"
@@ -712,8 +717,14 @@ class ZorkEmulator:
         "Do NOT remove characters just because they are off-scene, quiet, or not recently mentioned. "
         "Roster removal is only for explicit player/admin cleanup requests, confirmed duplicate merges, death/permanent departure, or true invalid entries. "
         "Prefer updating location/current_status over deleting the character.\n"
+        "- location_updates: object (optional; keyed by stable location slugs like 'hotel-lobby' or 'washington-ranch-kitchen'. "
+        "Use this for durable place facts: layout, security, atmosphere, notable_objects, current_activity, social_rules, recent_change, and other location-specific continuity. "
+        "Do NOT store location facts in WORLD_STATE when they belong to one place. "
+        "Example: {\"location_updates\": {\"hotel-lobby\": {\"security\": \"Desk clerk now recognizes Rigby.\", \"current_activity\": \"Quiet afternoon check-ins.\"}}}\n"
+        "If you accidentally put character/location facts into state_update, the harness may relocate them, but do NOT rely on that. Prefer character_updates/location_updates directly.\n"
         "Set deceased_reason to a string when a character dies. "
-        "WORLD_CHARACTERS in the prompt shows the current NPC roster — use it for continuity. "
+        "CHARACTER_INDEX / CHARACTER_CARDS are the primary NPC continuity blocks. LOCATION_INDEX / LOCATION_CARDS are the primary place continuity blocks. "
+        "WORLD_CHARACTERS remains as a compatibility roster alias. "
         "Actively reuse existing NPCs: bring them back into scenes, let them react to events, have them reach out via SMS, "
         "or reference them in dialogue. The world feels alive when characters persist with their own agendas "
         "rather than fading into the background after their introduction.)\n\n"
@@ -746,6 +757,11 @@ class ZorkEmulator:
         "- RECENT_TURNS includes turn/time tags like [TURN #N | Day D HH:MM]. Use them to track pacing and chronology.\n"
         "- RECENT_TURNS is already filtered to what the acting player plausibly knows. Hidden/private turns from other players are omitted.\n"
         "- TURN_VISIBILITY_DEFAULT tells you whether this turn should default to public, local, or private context.\n"
+        "- SCENE_STATE is the immediate actionable scene: who is present, what is visible, and what tensions are active right now. Use it first for immediate staging.\n"
+        "- CHARACTER_INDEX lists NPC slugs and available_keys. CHARACTER_CARDS are the primary NPC fact store: compact facts for all shown NPCs, expanded facts for scene-relevant NPCs.\n"
+        "- LOCATION_INDEX lists known place slugs and available_keys. LOCATION_CARDS are the primary place fact store: compact facts broadly, expanded facts for current/scene-relevant locations.\n"
+        "- WORLD_STATE is for world facts, investigations, event threads, and cross-entity facts. Do not treat it as a backup character sheet or location encyclopedia.\n"
+        "- WORLD_CHARACTERS is kept as a compatibility alias only. Prefer CHARACTER_INDEX and CHARACTER_CARDS when reasoning about NPC continuity.\n"
         "- When SOURCE_MATERIAL_DOCS is present, treat it as canon. On normal turns, source lookup should be part of your research plan before asserting key plot facts, but only query the relevant subset for this turn.\n"
         "- Use source payload to bias queries: rulebook docs are key-snippet indexes (browse with source_browse first), story docs are narrative scenes, generic docs are mixed/loose notes.\n"
         "- If WORLD_SUMMARY is empty, invent a strong starting room and seed the world.\n"
@@ -962,7 +978,9 @@ class ZorkEmulator:
         "- Source-material memory search should only be enabled when the current player action explicitly asks for canon recall/details.\n"
         "- Do NOT call memory_search, memory_terms, memory_turn, or memory_store.\n"
         "- You may still call recent_turns for immediate visible continuity.\n"
-        "- Use WORLD_SUMMARY, WORLD_STATE, WORLD_CHARACTERS, PARTY_SNAPSHOT, and recent_turns when needed.\n"
+        "- Use WORLD_SUMMARY, WORLD_STATE, SCENE_STATE, CHARACTER_INDEX, CHARACTER_CARDS, LOCATION_INDEX, LOCATION_CARDS, PARTY_SNAPSHOT, and recent_turns when needed.\n"
+        "- SCENE_STATE is the immediate actionable scene. CHARACTER_CARDS / LOCATION_CARDS are the primary entity fact stores.\n"
+        "- WORLD_CHARACTERS remains as a compatibility alias; prefer CHARACTER_INDEX and CHARACTER_CARDS.\n"
     )
     RECENT_TURNS_TOOL_PROMPT = (
         "\nYou have a recent_turns tool for immediate visible continuity.\n"
@@ -1189,7 +1207,7 @@ class ZorkEmulator:
         "HARNESS BEHAVIOR:\n"
         "- The harness converts add entries into absolute due dates and stores fire_day + fire_hour (the exact in-game deadline).\n"
         "- known_by is optional. If provided, reminders are only injected when at least one known character is in the active scene.\n"
-        "- Keep known_by to character names from PARTY_SNAPSHOT / WORLD_CHARACTERS. Omit known_by for globally-known events.\n"
+        "- Keep known_by to character names from PARTY_SNAPSHOT / CHARACTER_INDEX. Omit known_by for globally-known events.\n"
         "- target_player / target_players are optional player-specific targets. These may be a Discord ID, a Discord mention, a player slug, or a PARTY_SNAPSHOT-style string such as '<@123> (Rigby)'.\n"
         "- If no target_player(s) are provided, the event is treated as global.\n"
         "- Do NOT decrement counters manually by re-adding events each turn. The harness computes remaining days automatically.\n"
@@ -1218,7 +1236,7 @@ class ZorkEmulator:
     )
     ROSTER_PROMPT = (
         "\nCHARACTER ROSTER & PORTRAITS:\n"
-        "The harness maintains a character roster (WORLD_CHARACTERS). "
+        "The harness maintains a character roster (CHARACTER_INDEX / CHARACTER_CARDS, with WORLD_CHARACTERS kept as a compatibility alias). "
         "When you create or update a character via character_updates, the 'appearance' field "
         "is used by the harness to auto-generate a portrait image. Write 'appearance' as a "
         "detailed visual description suitable for image generation: physical features, clothing, "
@@ -1240,7 +1258,7 @@ class ZorkEmulator:
     )
     ON_RAILS_SYSTEM_PROMPT = (
         "\nON-RAILS MODE IS ENABLED.\n"
-        "- You CANNOT create new characters not in WORLD_CHARACTERS. New character slugs will be rejected.\n"
+        "- You CANNOT create new characters not in CHARACTER_INDEX / WORLD_CHARACTERS. New character slugs will be rejected.\n"
         "- You CANNOT introduce locations/landmarks not in story_outline or landmarks list.\n"
         "- You CANNOT add new chapters or scenes beyond STORY_CONTEXT.\n"
         "- You MUST advance along the current chapter/scene trajectory.\n"
@@ -11275,6 +11293,8 @@ class ZorkEmulator:
         characters: Dict[str, dict],
         player_state: Dict[str, object],
         recent_text: str,
+        *,
+        limit: int | None = None,
     ) -> list:
         if not characters:
             return []
@@ -11325,7 +11345,9 @@ class ZorkEmulator:
                 distant.append(entry)
 
         result = nearby + mentioned + distant
-        return result[: self.MAX_CHARACTERS_IN_PROMPT]
+        if limit is None:
+            return result
+        return result[: limit]
 
     def _fit_characters_to_budget(self, characters_list: list, max_chars: int) -> list:
         while characters_list:
@@ -11334,6 +11356,457 @@ class ZorkEmulator:
                 return characters_list
             characters_list = characters_list[:-1]
         return []
+
+    def _fit_json_list_to_budget(self, rows: list[dict[str, object]], max_chars: int) -> list[dict[str, object]]:
+        trimmed = list(rows or [])
+        while trimmed:
+            text = json.dumps(trimmed, ensure_ascii=True)
+            if len(text) <= max_chars:
+                return trimmed
+            trimmed = trimmed[:-1]
+        return []
+
+    @staticmethod
+    def _compact_prompt_fact_value(value: object, *, max_chars: int = 140) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            text = " ".join(value.strip().split())
+        else:
+            try:
+                text = json.dumps(value, ensure_ascii=True, sort_keys=True)
+            except Exception:
+                text = str(value)
+            text = " ".join(text.strip().split())
+        if len(text) > max_chars:
+            text = text[: max_chars - 3].rstrip() + "..."
+        return text
+
+    def _character_field_priority(self, field_name: str) -> str:
+        key = str(field_name or "").strip().lower()
+        if key in {"name", "location", "current_status", "speech_style", "relationship", "relationships", "allegiance"}:
+            return "critical"
+        if key in {"appearance", "personality", "background", "autobiography", "literary_style"}:
+            return "scene"
+        return "low"
+
+    def _location_field_priority(self, field_name: str) -> str:
+        key = str(field_name or "").strip().lower()
+        if key in {"name", "summary", "security", "current_activity"}:
+            return "critical"
+        if key in {"layout", "notable_objects", "recent_change", "social_rules", "atmosphere", "exits"}:
+            return "scene"
+        return "low"
+
+    def _build_character_index_for_prompt(
+        self,
+        characters_for_prompt: list[dict[str, object]],
+        *,
+        characters: Dict[str, dict] | None = None,
+    ) -> list[dict[str, object]]:
+        rows: list[dict[str, object]] = []
+        characters = characters or {}
+        hidden_keys = {
+            self.AUTOBIOGRAPHY_RAW_FIELD,
+            self.AUTOBIOGRAPHY_LAST_COMPRESSED_TURN_FIELD,
+            "evolving_personality",
+        }
+        for entry in characters_for_prompt or []:
+            if not isinstance(entry, dict):
+                continue
+            slug = str(entry.get("_slug") or "").strip()
+            if not slug:
+                continue
+            source = characters.get(slug) if isinstance(characters.get(slug), dict) else entry
+            available_keys = sorted(
+                key
+                for key in (source or {}).keys()
+                if key not in hidden_keys and not str(key).startswith("_")
+            )
+            rows.append(
+                {
+                    "slug": slug,
+                    "name": str(entry.get("name") or slug).strip(),
+                    "location": source.get("location"),
+                    "current_status": source.get("current_status"),
+                    "available_keys": available_keys,
+                    "hook": self._compact_prompt_fact_value(
+                        source.get("relationship") or source.get("allegiance") or source.get("current_status"),
+                        max_chars=90,
+                    ),
+                }
+            )
+        return rows
+
+    def _build_character_cards_for_prompt(
+        self,
+        characters_for_prompt: list[dict[str, object]],
+        *,
+        characters: Dict[str, dict] | None = None,
+        player_state: Dict[str, object] | None = None,
+    ) -> list[dict[str, object]]:
+        rows: list[dict[str, object]] = []
+        characters = characters or {}
+        player_location = str((player_state or {}).get("location") or "").strip().lower()
+        hidden_keys = {
+            self.AUTOBIOGRAPHY_RAW_FIELD,
+            self.AUTOBIOGRAPHY_LAST_COMPRESSED_TURN_FIELD,
+            "evolving_personality",
+        }
+        for entry in characters_for_prompt or []:
+            if not isinstance(entry, dict):
+                continue
+            slug = str(entry.get("_slug") or "").strip()
+            if not slug:
+                continue
+            source = characters.get(slug)
+            if not isinstance(source, dict):
+                source = dict(entry)
+            available_keys = [
+                key
+                for key in source.keys()
+                if key not in hidden_keys and not str(key).startswith("_")
+            ]
+            priorities = {
+                key: self._character_field_priority(key)
+                for key in available_keys
+            }
+            compact = {
+                key: self._compact_prompt_fact_value(source.get(key))
+                for key in available_keys
+                if self._compact_prompt_fact_value(source.get(key))
+            }
+            char_location = str(source.get("location") or "").strip().lower()
+            expand_scene_fields = bool(player_location and char_location and char_location == player_location)
+            expanded: dict[str, object] = {}
+            for key in available_keys:
+                priority = priorities.get(key, "low")
+                if priority == "critical" or (priority == "scene" and expand_scene_fields):
+                    value = source.get(key)
+                    if value in (None, "", [], {}):
+                        continue
+                    expanded[key] = value
+            rows.append(
+                {
+                    "slug": slug,
+                    "name": str(source.get("name") or entry.get("name") or slug).strip(),
+                    "available_keys": sorted(available_keys),
+                    "compact": compact,
+                    "expanded": expanded,
+                    "priority": priorities,
+                }
+            )
+        return rows
+
+    def _location_cards_from_state(
+        self,
+        campaign_state: Dict[str, object],
+        player_state: Dict[str, object] | None = None,
+    ) -> Dict[str, dict]:
+        out: Dict[str, dict] = {}
+        if isinstance(campaign_state.get(self.LOCATION_CARDS_STATE_KEY), dict):
+            for slug, payload in (campaign_state.get(self.LOCATION_CARDS_STATE_KEY) or {}).items():
+                if isinstance(payload, dict):
+                    out[str(slug)] = dict(payload)
+        player_state = player_state or {}
+        player_location = str(player_state.get("location") or "").strip()
+        if player_location:
+            row = dict(out.get(player_location) or {})
+            row.setdefault("name", str(player_state.get("room_title") or player_location).strip())
+            row.setdefault("summary", str(player_state.get("room_summary") or "").strip())
+            if str(player_state.get("room_description") or "").strip():
+                row.setdefault("description", str(player_state.get("room_description") or "").strip())
+            if isinstance(player_state.get("exits"), list) and player_state.get("exits"):
+                row.setdefault("exits", list(player_state.get("exits") or []))
+            out[player_location] = row
+        return out
+
+    def _build_location_index_for_prompt(
+        self,
+        location_cards: Dict[str, dict],
+    ) -> list[dict[str, object]]:
+        rows: list[dict[str, object]] = []
+        for slug, payload in sorted(location_cards.items()):
+            if not isinstance(payload, dict):
+                continue
+            available_keys = sorted(
+                key for key in payload.keys() if not str(key).startswith("_")
+            )
+            rows.append(
+                {
+                    "slug": slug,
+                    "name": str(payload.get("name") or slug).strip(),
+                    "summary": self._compact_prompt_fact_value(
+                        payload.get("summary") or payload.get("description"),
+                        max_chars=120,
+                    ),
+                    "available_keys": available_keys,
+                }
+            )
+        return rows
+
+    def _build_location_cards_for_prompt(
+        self,
+        location_cards: Dict[str, dict],
+        *,
+        player_state: Dict[str, object] | None = None,
+    ) -> list[dict[str, object]]:
+        rows: list[dict[str, object]] = []
+        active_location = str((player_state or {}).get("location") or "").strip().lower()
+        for slug, payload in sorted(location_cards.items()):
+            if not isinstance(payload, dict):
+                continue
+            available_keys = [key for key in payload.keys() if not str(key).startswith("_")]
+            priorities = {
+                key: self._location_field_priority(key)
+                for key in available_keys
+            }
+            compact = {
+                key: self._compact_prompt_fact_value(payload.get(key))
+                for key in available_keys
+                if self._compact_prompt_fact_value(payload.get(key))
+            }
+            expanded: dict[str, object] = {}
+            for key in available_keys:
+                priority = priorities.get(key, "low")
+                if priority == "critical" or (
+                    priority == "scene" and slug.lower() == active_location
+                ):
+                    value = payload.get(key)
+                    if value in (None, "", [], {}):
+                        continue
+                    expanded[key] = value
+            rows.append(
+                {
+                    "slug": slug,
+                    "name": str(payload.get("name") or slug).strip(),
+                    "available_keys": sorted(available_keys),
+                    "compact": compact,
+                    "expanded": expanded,
+                    "priority": priorities,
+                }
+            )
+        return rows
+
+    def _derive_scene_active_tensions(
+        self,
+        present_characters: list[dict[str, object]],
+        *,
+        campaign_state: Dict[str, object] | None = None,
+        location_key: str = "",
+    ) -> list[dict[str, str]]:
+        tensions: list[dict[str, str]] = []
+        seen_keys: set[str] = set()
+
+        def _add(slug: str, tension_text: object, source: str) -> None:
+            tension = self._compact_prompt_fact_value(tension_text, max_chars=120)
+            clean_slug = str(slug or "").strip()
+            if not clean_slug or not tension:
+                return
+            dedupe_key = f"{clean_slug}|{tension}"
+            if dedupe_key in seen_keys:
+                return
+            seen_keys.add(dedupe_key)
+            tensions.append(
+                {
+                    "slug": clean_slug,
+                    "tension": tension,
+                    "source": source,
+                }
+            )
+
+        for row in present_characters:
+            if not isinstance(row, dict):
+                continue
+            slug = str(row.get("slug") or "").strip()
+            if not slug:
+                continue
+            source = str(row.get("relationship") or row.get("current_status") or "").strip()
+            if not source:
+                continue
+            _add(slug, source, "character")
+        if isinstance(campaign_state, dict) and present_characters:
+            present_slugs = {
+                str(row.get("slug") or "").strip().lower()
+                for row in present_characters
+                if isinstance(row, dict) and str(row.get("slug") or "").strip()
+            }
+            location_norm = str(location_key or "").strip().lower()
+            excluded = set(self.MODEL_STATE_EXCLUDE_KEYS) | {self.LOCATION_CARDS_STATE_KEY}
+            for state_key, payload in campaign_state.items():
+                if state_key in excluded or not isinstance(payload, dict):
+                    continue
+                raw_refs: list[str] = []
+                for ref_key in (
+                    "character_slug",
+                    "npc_slug",
+                    "target_slug",
+                    "source_slug",
+                    "location_slug",
+                ):
+                    value = payload.get(ref_key)
+                    if isinstance(value, str) and value.strip():
+                        raw_refs.append(value.strip().lower())
+                for ref_key in ("characters", "participants", "known_by", "npc_slugs"):
+                    value = payload.get(ref_key)
+                    if isinstance(value, list):
+                        for item in value:
+                            text = str(item or "").strip().lower()
+                            if text:
+                                raw_refs.append(text)
+                if not any(ref in present_slugs for ref in raw_refs) and (
+                    not location_norm or location_norm not in raw_refs
+                ):
+                    continue
+                detail = (
+                    payload.get("tension")
+                    or payload.get("dynamic")
+                    or payload.get("status")
+                    or payload.get("summary")
+                    or payload.get("description")
+                    or payload.get("reason")
+                    or payload.get("fact")
+                )
+                if not detail:
+                    detail = payload
+                matched_slug = next((ref for ref in raw_refs if ref in present_slugs), "")
+                if matched_slug:
+                    _add(matched_slug, detail, f"world_state:{state_key}")
+        return tensions[:6]
+
+    def _build_scene_state_for_prompt(
+        self,
+        *,
+        campaign_state: Dict[str, object],
+        player_state: Dict[str, object],
+        party_snapshot: list[dict[str, object]],
+        characters: Dict[str, dict],
+        location_cards: Dict[str, dict],
+    ) -> dict[str, object]:
+        location_key = str(player_state.get("location") or "").strip()
+        present_characters: list[dict[str, object]] = []
+        for slug, payload in (characters or {}).items():
+            if not isinstance(payload, dict):
+                continue
+            if str(payload.get("location") or "").strip().lower() != location_key.lower():
+                continue
+            if payload.get("deceased_reason"):
+                continue
+            present_characters.append(
+                {
+                    "slug": str(slug),
+                    "name": str(payload.get("name") or slug).strip(),
+                    "current_status": payload.get("current_status"),
+                    "relationship": payload.get("relationship"),
+                }
+            )
+        present_players: list[dict[str, object]] = []
+        for row in party_snapshot or []:
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("location") or "").strip().lower() != location_key.lower():
+                continue
+            present_players.append(
+                {
+                    "slug": str(row.get("slug") or row.get("player_slug") or "").strip(),
+                    "name": str(row.get("character_name") or row.get("name") or "").strip(),
+                }
+            )
+        location_row = location_cards.get(location_key) if isinstance(location_cards, dict) else {}
+        scene_location_facts = {}
+        if isinstance(location_row, dict):
+            for key in ("summary", "security", "current_activity", "atmosphere"):
+                value = location_row.get(key)
+                if value not in (None, "", [], {}):
+                    scene_location_facts[key] = value
+        atmosphere = (
+            str(location_row.get("atmosphere") or "").strip()
+            if isinstance(location_row, dict)
+            else ""
+        ) or str(player_state.get("room_summary") or "").strip()
+        return {
+            "location_key": location_key,
+            "context_key": str((self._active_private_context_from_state(player_state) or {}).get("context_key") or "").strip(),
+            "atmosphere": atmosphere,
+            "present_characters": present_characters,
+            "present_players": present_players,
+            "visible_objects": [],
+            "active_tensions": self._derive_scene_active_tensions(
+                present_characters,
+                campaign_state=campaign_state,
+                location_key=location_key,
+            ),
+            "scene_location_facts": scene_location_facts,
+        }
+
+    def _normalize_persisted_entity_state(
+        self,
+        campaign: Campaign,
+        campaign_state: Dict[str, object],
+        characters: Dict[str, dict],
+        player_state: Dict[str, object],
+    ) -> tuple[Dict[str, object], Dict[str, dict], int]:
+        normalized_state, character_updates, location_updates, consumed = (
+            self._engine._relocate_entity_state_updates(
+                campaign_state,
+                campaign_state=campaign_state,
+                existing_chars=characters,
+                player_state=player_state,
+            )
+        )
+        if not consumed:
+            return campaign_state, characters, 0
+        normalized_characters = self._engine._apply_character_updates(
+            characters,
+            character_updates,
+            on_rails=bool(campaign_state.get("on_rails")),
+        )
+        existing_locations = {}
+        raw_locations = normalized_state.get(self.LOCATION_CARDS_STATE_KEY)
+        if isinstance(raw_locations, dict):
+            existing_locations = dict(raw_locations)
+        normalized_locations = self._engine._apply_location_updates(
+            existing_locations,
+            location_updates,
+        )
+        if normalized_locations:
+            normalized_state[self.LOCATION_CARDS_STATE_KEY] = normalized_locations
+        else:
+            normalized_state.pop(self.LOCATION_CARDS_STATE_KEY, None)
+        self._persist_campaign_prompt_state(
+            campaign.id,
+            state=normalized_state,
+            characters=normalized_characters,
+            campaign=campaign,
+        )
+        self._zork_log(
+            "PERSISTED ENTITY STATE NORMALIZED",
+            f"Relocated {consumed} character/location world-state key(s) before prompt build.",
+        )
+        return normalized_state, normalized_characters, consumed
+
+    def _persist_campaign_prompt_state(
+        self,
+        campaign_id: str,
+        *,
+        state: Dict[str, object] | None = None,
+        characters: Dict[str, dict] | None = None,
+        campaign: Campaign | None = None,
+    ) -> None:
+        if campaign is not None:
+            if state is not None:
+                campaign.state_json = self._dump_json(state)
+            if characters is not None:
+                campaign.characters_json = self._dump_json(characters)
+        with self._session_factory() as session:
+            row = session.get(Campaign, str(campaign_id))
+            if row is None:
+                return
+            if state is not None:
+                row.state_json = self._dump_json(state)
+            if characters is not None:
+                row.characters_json = self._dump_json(characters)
+            session.commit()
 
     def _literary_styles_for_prompt(
         self,
@@ -11866,12 +12339,25 @@ class ZorkEmulator:
                 state["game_time"] = canonical_game_time
                 state_dirty = True
         if state_dirty:
-            campaign.state_json = self._dump_json(state)
+            self._persist_campaign_prompt_state(
+                campaign.id,
+                state=state,
+                campaign=campaign,
+            )
         guardrails_enabled = bool(state.get("guardrails_enabled", False))
-        model_state = self._build_model_state(state)
-        model_state = self._fit_state_to_budget(model_state, self.MAX_STATE_CHARS)
         attributes = self.get_player_attributes(player)
         player_state = self.get_player_state(player)
+        characters = self.get_campaign_characters(campaign)
+        state, characters, normalized_entity_keys = self._normalize_persisted_entity_state(
+            campaign,
+            state,
+            characters,
+            player_state,
+        )
+        if normalized_entity_keys:
+            state_dirty = True
+        model_state = self._build_model_state(state)
+        model_state = self._fit_state_to_budget(model_state, self.MAX_STATE_CHARS)
         if party_snapshot is None:
             party_snapshot = self._build_party_snapshot_for_prompt(campaign, player, player_state)
 
@@ -11983,9 +12469,49 @@ class ZorkEmulator:
         recent_text = "\n".join(recent_lines) if recent_lines else "None"
 
         rails_context = self._build_rails_context(player_state, party_snapshot)
-        characters = self.get_campaign_characters(campaign)
-        characters_for_prompt = self._build_characters_for_prompt(characters, player_state, recent_text)
+        character_index_source = self._build_characters_for_prompt(
+            characters,
+            player_state,
+            recent_text,
+            limit=None,
+        )
+        character_index_source = self._fit_json_list_to_budget(
+            character_index_source,
+            self.MAX_CHARACTER_INDEX_CHARS,
+        )
+        characters_for_prompt = self._build_characters_for_prompt(
+            characters,
+            player_state,
+            recent_text,
+            limit=self.MAX_CHARACTERS_IN_PROMPT,
+        )
         characters_for_prompt = self._fit_characters_to_budget(characters_for_prompt, self.MAX_CHARACTERS_CHARS)
+        character_index = self._build_character_index_for_prompt(
+            character_index_source,
+            characters=characters,
+        )
+        character_cards = self._build_character_cards_for_prompt(
+            characters_for_prompt,
+            characters=characters,
+            player_state=player_state,
+        )
+        location_cards_map = self._location_cards_from_state(state, player_state)
+        location_index = self._build_location_index_for_prompt(location_cards_map)
+        location_index = self._fit_json_list_to_budget(
+            location_index,
+            self.MAX_LOCATION_INDEX_CHARS,
+        )
+        location_cards = self._build_location_cards_for_prompt(
+            location_cards_map,
+            player_state=player_state,
+        )
+        scene_state = self._build_scene_state_for_prompt(
+            campaign_state=state,
+            player_state=player_state,
+            party_snapshot=party_snapshot,
+            characters=characters,
+            location_cards=location_cards_map,
+        )
         story_context = self._build_story_context(state)
         on_rails = bool(state.get("on_rails", False))
         active_scene_names = self._active_scene_character_names(
@@ -12031,7 +12557,11 @@ class ZorkEmulator:
             calendar_reminder_state_after != calendar_reminder_state_before
             or calendar_state_after != calendar_state_before
         ):
-            campaign.state_json = self._dump_json(state)
+            self._persist_campaign_prompt_state(
+                campaign.id,
+                state=state,
+                campaign=campaign,
+            )
         source_payload = self._source_material_prompt_payload(campaign.id)
         literary_styles_text = self._literary_styles_for_prompt(
             state,
@@ -12088,6 +12618,11 @@ class ZorkEmulator:
             f"RECENT_TURNS_LOADED: {str(not bootstrap_only).lower()}\n"
         )
         user_prompt += (
+            f"SCENE_STATE: {self._dump_json(scene_state)}\n"
+            f"CHARACTER_INDEX: {self._dump_json(character_index)}\n"
+            f"CHARACTER_CARDS: {self._dump_json(character_cards)}\n"
+            f"LOCATION_INDEX: {self._dump_json(location_index)}\n"
+            f"LOCATION_CARDS: {self._dump_json(location_cards)}\n"
             f"WORLD_CHARACTERS: {self._dump_json(characters_for_prompt)}\n"
             f"PLAYER_CARD: {self._dump_json(player_card)}\n"
             f"PARTY_SNAPSHOT: {self._dump_json(party_snapshot)}\n"
@@ -16584,6 +17119,7 @@ class ZorkEmulator:
         xp_awarded: object,
         scene_image_prompt: object,
         character_updates: Dict[str, object],
+        location_updates: Dict[str, object] | None = None,
         calendar_update: object,
     ) -> bool:
         text = " ".join(str(narration or "").strip().lower().split())
@@ -16594,7 +17130,7 @@ class ZorkEmulator:
             "a hollow silence answers.",
         }
         short_narration = len(text) < 24
-        has_world = bool(state_update) or bool(character_updates) or bool(calendar_update)
+        has_world = bool(state_update) or bool(character_updates) or bool(location_updates) or bool(calendar_update)
         has_player = bool(player_state_update)
         has_summary = bool(str(summary_update or "").strip())
         has_image = bool(str(scene_image_prompt or "").strip())
