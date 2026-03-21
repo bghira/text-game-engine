@@ -14,7 +14,7 @@ class StubLLM:
     def __init__(self, output: LLMTurnOutput):
         self.output = output
 
-    async def complete_turn(self, context):
+    async def complete_turn(self, context, **kwargs):
         return self.output
 
 

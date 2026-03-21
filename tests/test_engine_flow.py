@@ -15,7 +15,7 @@ class StubLLM:
     def __init__(self, output: LLMTurnOutput):
         self.output = output
 
-    async def complete_turn(self, context):
+    async def complete_turn(self, context, **kwargs):
         return self.output
 
 
@@ -24,18 +24,20 @@ class QueueLLM:
         self.outputs = list(outputs)
         self.contexts = []
 
-    async def complete_turn(self, context):
+    async def complete_turn(self, context, **kwargs):
         self.contexts.append(context)
         if not self.outputs:
             raise AssertionError("No queued LLM outputs left.")
         return self.outputs.pop(0)
 
 
-def test_phase_c_cas_conflict_rolls_back_all_writes(
+def test_phase_c_row_version_drift_proceeds_with_current_version(
     session_factory,
     uow_factory,
     seed_campaign_and_actor,
 ):
+    """Row-version drift (e.g. from async timer bumps) should NOT cause a
+    conflict — the engine adopts the current version and proceeds."""
     async def run_test():
         llm = StubLLM(
             LLMTurnOutput(
@@ -62,22 +64,24 @@ def test_phase_c_cas_conflict_rolls_back_all_writes(
             ),
             before_phase_c=bump_version,
         )
-        assert result.status == "conflict"
+        assert result.status == "ok"
 
         with session_factory() as session:
-            assert session.execute(select(Turn)).scalars().all() == []
-            assert session.execute(select(Snapshot)).scalars().all() == []
-            assert session.execute(select(Timer)).scalars().all() == []
-            assert session.execute(select(OutboxEvent)).scalars().all() == []
+            turns = session.execute(select(Turn)).scalars().all()
+            assert len(turns) >= 1
+            snapshots = session.execute(select(Snapshot)).scalars().all()
+            assert len(snapshots) >= 1
 
     asyncio.run(run_test())
 
 
-def test_single_auto_retry_then_conflict_response(
+def test_row_version_drift_does_not_trigger_retry(
     session_factory,
     uow_factory,
     seed_campaign_and_actor,
 ):
+    """Row-version drift should succeed on the first attempt without
+    triggering conflict retries — the engine adopts the drifted version."""
     async def run_test():
         llm = StubLLM(LLMTurnOutput(narration="retry me"))
         engine = GameEngine(uow_factory=uow_factory, llm=llm, max_conflict_retries=1)
@@ -99,8 +103,8 @@ def test_single_auto_retry_then_conflict_response(
             ),
             before_phase_c=always_bump,
         )
-        assert calls["n"] == 2
-        assert result.status == "conflict"
+        assert calls["n"] == 1
+        assert result.status == "ok"
 
     asyncio.run(run_test())
 
