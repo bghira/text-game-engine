@@ -11407,6 +11407,7 @@ class ZorkEmulator:
         rows: list[dict[str, object]] = []
         characters = characters or {}
         hidden_keys = {
+            self.AUTOBIOGRAPHY_FIELD,
             self.AUTOBIOGRAPHY_RAW_FIELD,
             self.AUTOBIOGRAPHY_LAST_COMPRESSED_TURN_FIELD,
             "evolving_personality",
@@ -11449,6 +11450,7 @@ class ZorkEmulator:
         characters = characters or {}
         player_location = str((player_state or {}).get("location") or "").strip().lower()
         hidden_keys = {
+            self.AUTOBIOGRAPHY_FIELD,
             self.AUTOBIOGRAPHY_RAW_FIELD,
             self.AUTOBIOGRAPHY_LAST_COMPRESSED_TURN_FIELD,
             "evolving_personality",
@@ -11471,11 +11473,11 @@ class ZorkEmulator:
                 key: self._character_field_priority(key)
                 for key in available_keys
             }
-            compact = {
-                key: self._compact_prompt_fact_value(source.get(key))
-                for key in available_keys
-                if self._compact_prompt_fact_value(source.get(key))
-            }
+            compact: dict[str, object] = {}
+            for key in available_keys:
+                compact_value = self._compact_prompt_fact_value(source.get(key))
+                if compact_value:
+                    compact[key] = compact_value
             char_location = str(source.get("location") or "").strip().lower()
             expand_scene_fields = bool(player_location and char_location and char_location == player_location)
             expanded: dict[str, object] = {}
@@ -11561,11 +11563,11 @@ class ZorkEmulator:
                 key: self._location_field_priority(key)
                 for key in available_keys
             }
-            compact = {
-                key: self._compact_prompt_fact_value(payload.get(key))
-                for key in available_keys
-                if self._compact_prompt_fact_value(payload.get(key))
-            }
+            compact: dict[str, object] = {}
+            for key in available_keys:
+                compact_value = self._compact_prompt_fact_value(payload.get(key))
+                if compact_value:
+                    compact[key] = compact_value
             expanded: dict[str, object] = {}
             for key in available_keys:
                 priority = priorities.get(key, "low")
@@ -11768,6 +11770,7 @@ class ZorkEmulator:
         normalized_locations = self._engine._apply_location_updates(
             existing_locations,
             location_updates,
+            on_rails=bool(campaign_state.get("on_rails")),
         )
         if normalized_locations:
             normalized_state[self.LOCATION_CARDS_STATE_KEY] = normalized_locations
@@ -12354,8 +12357,6 @@ class ZorkEmulator:
             characters,
             player_state,
         )
-        if normalized_entity_keys:
-            state_dirty = True
         model_state = self._build_model_state(state)
         model_state = self._fit_state_to_budget(model_state, self.MAX_STATE_CHARS)
         if party_snapshot is None:
@@ -18657,6 +18658,7 @@ class ZorkEmulator:
         state_update: Dict[str, object],
         player_state_update: Dict[str, object],
         character_updates: Dict[str, object],
+        location_updates: Dict[str, object] | None = None,
         calendar_update: object,
     ) -> bool:
         if not bool(campaign_state.get("on_rails", False)):
@@ -18700,6 +18702,7 @@ class ZorkEmulator:
             xp_awarded=0,
             scene_image_prompt=None,
             character_updates=character_updates if isinstance(character_updates, dict) else {},
+            location_updates=location_updates if isinstance(location_updates, dict) else {},
             calendar_update=calendar_update,
         ):
             return False

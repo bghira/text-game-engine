@@ -595,6 +595,50 @@ def test_build_prompt_scene_state_derives_active_tensions_from_world_state(
     assert '"source": "world_state:ring-pressure"' in user_prompt
 
 
+def test_build_prompt_keeps_autobiography_out_of_character_cards(
+    session_factory,
+    seed_campaign_and_actor,
+):
+    compat = _build_compat(session_factory)
+    campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
+    player = compat.get_or_create_player(seed_campaign_and_actor["campaign_id"], seed_campaign_and_actor["actor_id"])
+    with session_factory() as session:
+        row = session.get(Campaign, seed_campaign_and_actor["campaign_id"])
+        row.characters_json = json.dumps(
+            {
+                "yasmin-devereaux": {
+                    "name": "Yasmin Devereaux",
+                    "location": "hotel-lobby",
+                    "current_status": "Watching the desk.",
+                    "speech_style": "Controlled and exact.",
+                    "autobiography": "She writes herself as flint wrapped in velvet.",
+                }
+            }
+        )
+        player_row = (
+            session.query(Player)
+            .filter(Player.campaign_id == seed_campaign_and_actor["campaign_id"])
+            .filter(Player.actor_id == seed_campaign_and_actor["actor_id"])
+            .one()
+        )
+        player_state = json.loads(player_row.state_json or "{}")
+        player_state["location"] = "hotel-lobby"
+        player_state["room_title"] = "Hotel Lobby"
+        player_state["room_summary"] = "Marble lobby and brass desk."
+        player_row.state_json = json.dumps(player_state)
+        session.commit()
+
+    turns = compat.get_recent_turns(seed_campaign_and_actor["campaign_id"])
+    _system_prompt, user_prompt = compat.build_prompt(campaign, player, "look", turns)
+
+    cards_match = re.search(r"CHARACTER_CARDS:\s*(.*?)\nLOCATION_INDEX:", user_prompt, re.DOTALL)
+    assert cards_match is not None
+    cards_block = cards_match.group(1)
+    assert '"autobiography"' not in cards_block
+    assert "AUTOBIOGRAPHIES:" in user_prompt
+    assert "She writes herself as flint wrapped in velvet." in user_prompt
+
+
 def test_ready_to_write_finalization_uses_final_stage_system_prompt(
     session_factory,
     seed_campaign_and_actor,
