@@ -771,6 +771,7 @@ class GameEngine:
                     resolution_context=resolution_context,
                     campaign_state=campaign_state,
                 )
+            _on_rails = bool(campaign_state.get("on_rails"))
             calendar_update = campaign_state_update.pop("calendar_update", None)
             campaign_state = apply_patch(campaign_state, campaign_state_update)
             existing_locations = {}
@@ -780,6 +781,7 @@ class GameEngine:
             applied_locations = self._apply_location_updates(
                 existing_locations,
                 merged_location_updates,
+                on_rails=_on_rails,
             )
             if applied_locations:
                 campaign_state[self.LOCATION_CARDS_STATE_KEY] = applied_locations
@@ -822,8 +824,6 @@ class GameEngine:
                     }
                     campaign_state.pop("_active_minigame", None)
                     campaign_state.pop("_minigame_result", None)
-
-            _on_rails = bool(campaign_state.get("on_rails"))
             campaign_characters = self._apply_character_updates(
                 campaign_characters,
                 merged_character_updates,
@@ -894,10 +894,10 @@ class GameEngine:
             if not narration:
                 narration = self._fallback_narration_from_updates(
                     summary_update=llm_output.summary_update,
-                    state_update=llm_output.state_update,
+                    state_update=campaign_state_update,
                     player_state_update=llm_output.player_state_update,
-                    character_updates=llm_output.character_updates,
-                    location_updates=getattr(llm_output, "location_updates", {}),
+                    character_updates=merged_character_updates,
+                    location_updates=merged_location_updates,
                 ) or "The world shifts, but nothing clear emerges."
             active_char_sync = self._sync_active_player_character_location(
                 campaign_characters,
@@ -1452,6 +1452,7 @@ class GameEngine:
         cls,
         existing: dict[str, Any],
         updates: dict[str, Any],
+        on_rails: bool = False,
     ) -> dict[str, Any]:
         merged = dict(existing) if isinstance(existing, dict) else {}
         if not isinstance(updates, dict):
@@ -1489,6 +1490,8 @@ class GameEngine:
                     else:
                         merged[target_slug][key] = value
             else:
+                if on_rails:
+                    continue
                 merged[target_slug or slug] = dict(fields)
         return merged
 
