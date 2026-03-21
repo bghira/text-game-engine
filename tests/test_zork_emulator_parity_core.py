@@ -483,10 +483,13 @@ def test_build_prompt_research_stage_shape(session_factory, seed_campaign_and_ac
     assert "CALENDAR & GAME TIME SYSTEM:" in system_prompt
     assert "Do NOT output planning prose" in system_prompt
     assert "roughly 20 minutes per turn" in system_prompt
+    assert "OFF-RAILS CHAPTER MANAGEMENT TOOL" not in system_prompt
     assert "RECENT_TURNS_LOADED: true" in user_prompt
     assert "RECENT_TURNS:\n" in user_prompt
     assert "No planning prose or self-talk in research phase" in user_prompt
     assert "WORLD_SUMMARY:" in user_prompt
+    assert "ACTIVE_PLOT_THREADS:" in user_prompt
+    assert "ACTIVE_HINTS:" in user_prompt
     assert "SCENE_STATE:" in user_prompt
     assert "CHARACTER_INDEX:" in user_prompt
     assert "CHARACTER_CARDS:" in user_prompt
@@ -595,6 +598,54 @@ def test_build_prompt_scene_state_derives_active_tensions_from_world_state(
     assert '"source": "world_state:ring-pressure"' in user_prompt
 
 
+def test_build_prompt_offrails_ignores_legacy_chapters_and_uses_plot_threads(
+    session_factory,
+    seed_campaign_and_actor,
+):
+    compat = _build_compat(session_factory)
+    campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
+    player = compat.get_or_create_player(seed_campaign_and_actor["campaign_id"], seed_campaign_and_actor["actor_id"])
+    with session_factory() as session:
+        row = session.get(Campaign, seed_campaign_and_actor["campaign_id"])
+        row.state_json = json.dumps(
+            {
+                "on_rails": False,
+                "chapters": [
+                    {
+                        "title": "Legacy Chapter Leak",
+                        "summary": "This should not appear in off-rails prompt context.",
+                        "status": "active",
+                    }
+                ],
+                "_plot_threads": {
+                    "ring-pressure": {
+                        "thread": "ring-pressure",
+                        "setup": "Yasmin is cornered by the engagement fallout.",
+                        "intended_payoff": "The ring pressure forces a direct conversation.",
+                        "hint": "The ring keeps catching the light whenever she moves.",
+                        "status": "active",
+                        "updated_turn": 10,
+                    }
+                },
+            }
+        )
+        session.commit()
+
+    turns = compat.get_recent_turns(seed_campaign_and_actor["campaign_id"])
+    system_prompt, user_prompt = compat.build_prompt(
+        campaign,
+        player,
+        "look",
+        turns,
+        prompt_stage=compat.PROMPT_STAGE_RESEARCH,
+    )
+
+    assert "Legacy Chapter Leak" not in user_prompt
+    assert "ACTIVE SUBPLOTS:" in user_prompt
+    assert "ring-pressure" in user_prompt
+    assert "OFF-RAILS CHAPTER MANAGEMENT TOOL" not in system_prompt
+
+
 def test_build_prompt_keeps_autobiography_out_of_character_cards(
     session_factory,
     seed_campaign_and_actor,
@@ -631,12 +682,86 @@ def test_build_prompt_keeps_autobiography_out_of_character_cards(
     turns = compat.get_recent_turns(seed_campaign_and_actor["campaign_id"])
     _system_prompt, user_prompt = compat.build_prompt(campaign, player, "look", turns)
 
-    cards_match = re.search(r"CHARACTER_CARDS:\s*(.*?)\nLOCATION_INDEX:", user_prompt, re.DOTALL)
+    cards_match = re.search(r"CHARACTER_CARDS:\s*(\[.*?\])\nLOCATION_INDEX:", user_prompt, re.DOTALL)
     assert cards_match is not None
     cards_block = cards_match.group(1)
     assert '"autobiography"' not in cards_block
     assert "AUTOBIOGRAPHIES:" in user_prompt
     assert "She writes herself as flint wrapped in velvet." in user_prompt
+
+
+def test_build_prompt_cards_use_top_level_scan_fields_without_compact_duplication(
+    session_factory,
+    seed_campaign_and_actor,
+):
+    compat = _build_compat(session_factory)
+    campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
+    player = compat.get_or_create_player(seed_campaign_and_actor["campaign_id"], seed_campaign_and_actor["actor_id"])
+    with session_factory() as session:
+        row = session.get(Campaign, seed_campaign_and_actor["campaign_id"])
+        row.characters_json = json.dumps(
+            {
+                "gwen": {
+                    "name": "Gwen",
+                    "location": "washington-ranch-basement-media-room",
+                    "current_status": "Watching without blinking.",
+                    "personality": "Domestic and dangerous at once.",
+                    "speech_style": "Low, exact, and unhurried.",
+                }
+            }
+        )
+        state = json.loads(row.state_json or "{}")
+        state[compat.LOCATION_CARDS_STATE_KEY] = {
+            "washington-ranch-basement-media-room": {
+                "name": "Basement Media Room",
+                "summary": "Low lamps, leather couch, humming projector.",
+                "security": "The ranch staff does not come down here uninvited.",
+                "layout": "Screen wall opposite the bar cart.",
+            }
+        }
+        row.state_json = json.dumps(state)
+        player_row = (
+            session.query(Player)
+            .filter(Player.campaign_id == seed_campaign_and_actor["campaign_id"])
+            .filter(Player.actor_id == seed_campaign_and_actor["actor_id"])
+            .one()
+        )
+        player_state = json.loads(player_row.state_json or "{}")
+        player_state["location"] = "washington-ranch-basement-media-room"
+        player_state["room_title"] = "Basement Media Room"
+        player_state["room_summary"] = "Low lamps, leather couch, humming projector."
+        player_row.state_json = json.dumps(player_state)
+        session.commit()
+
+    turns = compat.get_recent_turns(seed_campaign_and_actor["campaign_id"])
+    _system_prompt, user_prompt = compat.build_prompt(campaign, player, "look", turns)
+
+    character_match = re.search(r"CHARACTER_CARDS:\s*(\[.*?\])\nLOCATION_INDEX:", user_prompt, re.DOTALL)
+    assert character_match is not None
+    character_cards = json.loads(character_match.group(1))
+    gwen_card = next(row for row in character_cards if row.get("slug") == "gwen")
+    assert gwen_card["name"] == "Gwen"
+    assert gwen_card["location"] == "washington-ranch-basement-media-room"
+    assert gwen_card["current_status"] == "Watching without blinking."
+    assert "name" not in gwen_card["compact"]
+    assert "location" not in gwen_card["compact"]
+    assert "current_status" not in gwen_card["compact"]
+    assert "name" not in gwen_card["expanded"]
+    assert "location" not in gwen_card["expanded"]
+    assert "current_status" not in gwen_card["expanded"]
+
+    location_match = re.search(r"LOCATION_CARDS:\s*(\[.*?\])\nWORLD_CHARACTERS:", user_prompt, re.DOTALL)
+    assert location_match is not None
+    location_cards = json.loads(location_match.group(1))
+    room_card = next(
+        row for row in location_cards if row.get("slug") == "washington-ranch-basement-media-room"
+    )
+    assert room_card["name"] == "Basement Media Room"
+    assert room_card["summary"] == "Low lamps, leather couch, humming projector."
+    assert "name" not in room_card["compact"]
+    assert "summary" not in room_card["compact"]
+    assert "name" not in room_card["expanded"]
+    assert "summary" not in room_card["expanded"]
 
 
 def test_ready_to_write_finalization_uses_final_stage_system_prompt(
@@ -1343,6 +1468,7 @@ def test_story_context_includes_next_three_and_coerces_progress_indices(session_
     compat = _build_compat(session_factory)
 
     campaign_state = {
+        "on_rails": True,
         "current_chapter": "1",
         "current_scene": "2",
         "story_outline": {
@@ -1370,31 +1496,83 @@ def test_story_context_uses_offrails_active_chapters(session_factory, seed_campa
 
     campaign_state = {
         "on_rails": False,
-        "chapters": [
-            {
-                "slug": "friday-night-after",
-                "title": "Friday Night, After",
-                "summary": "Everything is different and nothing shows.",
-                "current_scene": "boundary-test",
-                "scenes": ["boundary-test", "the-cat-knows", "closing-approaches"],
+        "_plot_threads": {
+            "friday-night-after": {
+                "thread": "friday-night-after",
+                "setup": "Everything is different and nothing shows.",
+                "intended_payoff": "The cat forces the boundary into the open.",
+                "hint": "The cat knows before the people do.",
                 "status": "active",
+                "updated_turn": 12,
             },
-            {
-                "slug": "health-tax",
-                "title": "The Health Tax",
-                "summary": "Monet cuts him off because she noticed.",
-                "current_scene": "the-cutoff",
-                "scenes": ["the-cutoff", "what-follows"],
+            "health-tax": {
+                "thread": "health-tax",
+                "setup": "Monet cuts him off because she noticed.",
+                "intended_payoff": "The cutoff becomes impossible to dodge.",
+                "hint": "The cutoff keeps following him room to room.",
                 "status": "active",
+                "updated_turn": 10,
             },
-        ],
+        },
     }
 
     story_context = compat._build_story_context(campaign_state)
     assert story_context is not None
-    assert "CURRENT CHAPTER: Friday Night, After" in story_context
-    assert "Scene 1: Boundary Test >>> CURRENT SCENE <<<" in story_context
-    assert "NEXT CHAPTER: The Health Tax" in story_context
+    assert "ACTIVE SUBPLOTS:" in story_context
+    assert "- friday-night-after" in story_context
+    assert "Setup: Everything is different and nothing shows." in story_context
+    assert "- health-tax" in story_context
+
+
+def test_build_prompt_offrails_filters_private_plot_threads_by_viewer(
+    session_factory,
+    seed_campaign_and_actor,
+):
+    compat = _build_compat(session_factory)
+    campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
+    player = compat.get_or_create_player(seed_campaign_and_actor["campaign_id"], seed_campaign_and_actor["actor_id"])
+    with session_factory() as session:
+        row = session.get(Campaign, seed_campaign_and_actor["campaign_id"])
+        row.state_json = json.dumps(
+            {
+                "on_rails": False,
+                "_plot_threads": {
+                    "public-thread": {
+                        "thread": "public-thread",
+                        "setup": "Everyone can feel the weather changing.",
+                        "hint": "Rain is coming.",
+                        "status": "active",
+                        "updated_turn": 12,
+                        "visibility": "public",
+                    },
+                    "private-thread": {
+                        "thread": "private-thread",
+                        "setup": "Only the second player should know this.",
+                        "hint": "Keep it close.",
+                        "status": "active",
+                        "updated_turn": 11,
+                        "visibility": "private",
+                        "visible_actor_ids": ["actor-2"],
+                    },
+                },
+            }
+        )
+        session.commit()
+
+    turns = compat.get_recent_turns(seed_campaign_and_actor["campaign_id"])
+    system_prompt, user_prompt = compat.build_prompt(
+        campaign,
+        player,
+        "look",
+        turns,
+        prompt_stage=compat.PROMPT_STAGE_RESEARCH,
+    )
+
+    assert "public-thread" in user_prompt
+    assert "private-thread" not in user_prompt
+    assert "Only the second player should know this." not in user_prompt
+    assert "OFF-RAILS CHAPTER MANAGEMENT TOOL" not in system_prompt
+    assert "story_outline" not in system_prompt.lower()
 
 
 def test_build_prompt_places_story_context_above_world_summary_and_composes_summary(session_factory, seed_campaign_and_actor):
