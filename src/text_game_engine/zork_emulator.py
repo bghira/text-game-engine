@@ -8868,13 +8868,67 @@ class ZorkEmulator:
             model_state[key] = value
         return self._prune_stale_state(model_state)
 
-    def _build_story_context(self, campaign_state: Dict[str, object]) -> Optional[str]:
+    def _active_plot_threads_for_viewer(
+        self,
+        campaign_state: Dict[str, object],
+        *,
+        viewer_actor_id: str | None = None,
+        viewer_slug: str | None = None,
+        viewer_location_key: str | None = None,
+        limit: int = 8,
+    ) -> list[dict[str, object]]:
+        ranked_threads: list[dict[str, object]] = []
+        for thread in self._plot_threads_from_state(campaign_state).values():
+            if not isinstance(thread, dict):
+                continue
+            if str(thread.get("status") or "").strip().lower() != "active":
+                continue
+            if not self._plot_thread_visible_to_viewer(
+                thread,
+                viewer_actor_id=viewer_actor_id,
+                viewer_slug=viewer_slug,
+                viewer_location_key=viewer_location_key,
+            ):
+                continue
+            ranked_threads.append(thread)
+        ranked_threads.sort(
+            key=lambda row: (
+                -self._coerce_non_negative_int(row.get("updated_turn", 0), default=0),
+                str(row.get("thread") or ""),
+            )
+        )
+        out: list[dict[str, object]] = []
+        for thread in ranked_threads[: max(1, int(limit or 8))]:
+            out.append(
+                {
+                    "thread": thread.get("thread"),
+                    "setup": thread.get("setup"),
+                    "intended_payoff": thread.get("intended_payoff"),
+                    "target_turns": thread.get("target_turns"),
+                    "dependencies": list(thread.get("dependencies") or []),
+                    "hint": thread.get("hint"),
+                    "status": thread.get("status"),
+                    "resolution": thread.get("resolution"),
+                }
+            )
+        return out
+
+    def _build_story_context(
+        self,
+        campaign_state: Dict[str, object],
+        *,
+        viewer_actor_id: str | None = None,
+        viewer_slug: str | None = None,
+        viewer_location_key: str | None = None,
+    ) -> Optional[str]:
         if not bool(campaign_state.get("on_rails", False)):
-            threads = self._plot_threads_for_prompt(campaign_state, limit=6)
-            active_threads = [
-                row for row in threads
-                if isinstance(row, dict) and str(row.get("status") or "").strip().lower() == "active"
-            ]
+            active_threads = self._active_plot_threads_for_viewer(
+                campaign_state,
+                viewer_actor_id=viewer_actor_id,
+                viewer_slug=viewer_slug,
+                viewer_location_key=viewer_location_key,
+                limit=6,
+            )
             if active_threads:
                 lines: List[str] = ["ACTIVE SUBPLOTS:"]
                 for row in active_threads[:6]:
@@ -11377,6 +11431,7 @@ class ZorkEmulator:
         rows: list[dict[str, object]] = []
         characters = characters or {}
         hidden_keys = {
+            self.AUTOBIOGRAPHY_FIELD,
             self.AUTOBIOGRAPHY_RAW_FIELD,
             self.AUTOBIOGRAPHY_LAST_COMPRESSED_TURN_FIELD,
             "evolving_personality",
@@ -11419,10 +11474,12 @@ class ZorkEmulator:
         characters = characters or {}
         player_location = str((player_state or {}).get("location") or "").strip().lower()
         hidden_keys = {
+            self.AUTOBIOGRAPHY_FIELD,
             self.AUTOBIOGRAPHY_RAW_FIELD,
             self.AUTOBIOGRAPHY_LAST_COMPRESSED_TURN_FIELD,
             "evolving_personality",
         }
+        top_level_keys = {"name", "location", "current_status"}
         for entry in characters_for_prompt or []:
             if not isinstance(entry, dict):
                 continue
@@ -11441,15 +11498,19 @@ class ZorkEmulator:
                 key: self._character_field_priority(key)
                 for key in available_keys
             }
-            compact = {
-                key: self._compact_prompt_fact_value(source.get(key))
-                for key in available_keys
-                if self._compact_prompt_fact_value(source.get(key))
-            }
+            compact: dict[str, object] = {}
+            for key in available_keys:
+                if key in top_level_keys:
+                    continue
+                compact_value = self._compact_prompt_fact_value(source.get(key))
+                if compact_value:
+                    compact[key] = compact_value
             char_location = str(source.get("location") or "").strip().lower()
             expand_scene_fields = bool(player_location and char_location and char_location == player_location)
             expanded: dict[str, object] = {}
             for key in available_keys:
+                if key in top_level_keys:
+                    continue
                 priority = priorities.get(key, "low")
                 if priority == "critical" or (priority == "scene" and expand_scene_fields):
                     value = source.get(key)
@@ -11460,6 +11521,8 @@ class ZorkEmulator:
                 {
                     "slug": slug,
                     "name": str(source.get("name") or entry.get("name") or slug).strip(),
+                    "location": source.get("location"),
+                    "current_status": source.get("current_status"),
                     "available_keys": sorted(available_keys),
                     "compact": compact,
                     "expanded": expanded,
@@ -11523,6 +11586,7 @@ class ZorkEmulator:
     ) -> list[dict[str, object]]:
         rows: list[dict[str, object]] = []
         active_location = str((player_state or {}).get("location") or "").strip().lower()
+        top_level_keys = {"name", "summary"}
         for slug, payload in sorted(location_cards.items()):
             if not isinstance(payload, dict):
                 continue
@@ -11531,13 +11595,17 @@ class ZorkEmulator:
                 key: self._location_field_priority(key)
                 for key in available_keys
             }
-            compact = {
-                key: self._compact_prompt_fact_value(payload.get(key))
-                for key in available_keys
-                if self._compact_prompt_fact_value(payload.get(key))
-            }
+            compact: dict[str, object] = {}
+            for key in available_keys:
+                if key in top_level_keys:
+                    continue
+                compact_value = self._compact_prompt_fact_value(payload.get(key))
+                if compact_value:
+                    compact[key] = compact_value
             expanded: dict[str, object] = {}
             for key in available_keys:
+                if key in top_level_keys:
+                    continue
                 priority = priorities.get(key, "low")
                 if priority == "critical" or (
                     priority == "scene" and slug.lower() == active_location
@@ -11550,6 +11618,10 @@ class ZorkEmulator:
                 {
                     "slug": slug,
                     "name": str(payload.get("name") or slug).strip(),
+                    "summary": self._compact_prompt_fact_value(
+                        payload.get("summary") or payload.get("description"),
+                        max_chars=120,
+                    ),
                     "available_keys": sorted(available_keys),
                     "compact": compact,
                     "expanded": expanded,
@@ -12439,11 +12511,13 @@ class ZorkEmulator:
         recent_text = "\n".join(recent_lines) if recent_lines else "None"
 
         rails_context = self._build_rails_context(player_state, party_snapshot)
-        active_plot_threads = self._plot_threads_for_prompt(state, limit=8)
-        active_plot_threads = [
-            row for row in active_plot_threads
-            if isinstance(row, dict) and str(row.get("status") or "").strip().lower() == "active"
-        ]
+        active_plot_threads = self._active_plot_threads_for_viewer(
+            state,
+            viewer_actor_id=player.actor_id,
+            viewer_slug=viewer_slug,
+            viewer_location_key=viewer_location_key,
+            limit=8,
+        )
         active_plot_hints = self._plot_hints_for_viewer(
             state,
             viewer_actor_id=player.actor_id,
@@ -12494,8 +12568,13 @@ class ZorkEmulator:
             characters=characters,
             location_cards=location_cards_map,
         )
-        story_context = self._build_story_context(state)
         on_rails = bool(state.get("on_rails", False))
+        story_context = self._build_story_context(
+            state,
+            viewer_actor_id=player.actor_id,
+            viewer_slug=viewer_slug,
+            viewer_location_key=viewer_location_key,
+        )
         active_scene_names = self._active_scene_character_names(
             player_state,
             party_snapshot,
@@ -12676,7 +12755,7 @@ class ZorkEmulator:
             system_prompt = f"{system_prompt}{self.SMS_TOOL_PROMPT}"
             if state.get("timed_events_enabled", True):
                 system_prompt = f"{system_prompt}{self.TIMER_TOOL_PROMPT}"
-            if story_context:
+            if on_rails and story_context:
                 system_prompt = f"{system_prompt}{self.STORY_OUTLINE_TOOL_PROMPT}"
             system_prompt = f"{system_prompt}{self.PLOT_PLAN_TOOL_PROMPT}"
             system_prompt = f"{system_prompt}{self.CONSEQUENCE_TOOL_PROMPT}"
