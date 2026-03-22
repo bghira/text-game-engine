@@ -1613,6 +1613,40 @@ def test_build_prompt_places_story_context_above_world_summary_and_composes_summ
     assert user_prompt.index("STORY_CONTEXT:") < user_prompt.index("WORLD_SUMMARY:")
 
 
+def test_build_rails_context_normalizes_inventory_origin_fragments(session_factory, seed_campaign_and_actor):
+    compat = _build_compat(session_factory)
+
+    rails_context = compat._build_rails_context(
+        {
+            "room_title": "Alien Craft Interior",
+            "room_summary": "Walls pulse with nameless luminescence.",
+            "location": "alien-craft-interior",
+            "exits": ["Christmas Town Center"],
+            "inventory": [
+                {"name": "projection booth key", "origin": "Found in locker"},
+                {
+                    "name": "sticky notes",
+                    "origin": "The sticky notes come off in one pass.",
+                },
+                {
+                    "name": "navy blazer (brass buttons)",
+                    "origin": "The men's section surrenders a navy blazer with brass buttons, two white dress shirts still stiff with starch from some",
+                },
+            ],
+        },
+        [],
+    )
+
+    inventory = rails_context.get("inventory") or []
+    key_row = next(row for row in inventory if row.get("name") == "projection booth key")
+    sticky_row = next(row for row in inventory if row.get("name") == "sticky notes")
+    blazer_row = next(row for row in inventory if row.get("name") == "navy blazer (brass buttons)")
+
+    assert key_row.get("origin") == "Found in locker"
+    assert sticky_row.get("origin") == "Acquired earlier in-scene."
+    assert blazer_row.get("origin") == "Acquired earlier in-scene."
+
+
 def test_generate_map_prompt_uses_authoritative_location_keys(session_factory, seed_campaign_and_actor):
     async def run_test():
         map_port = CaptureMapCompletionPort()
