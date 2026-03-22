@@ -239,7 +239,7 @@ class ZorkEmulator:
     DEFAULT_SCENE_IMAGE_MODEL = "black-forest-labs/FLUX.2-klein-4b"
     DEFAULT_AVATAR_IMAGE_MODEL = "black-forest-labs/FLUX.2-klein-4b"
     SCENE_IMAGE_PRESERVE_PREFIX = (
-        "preserving all scene image details from scene in image x"
+        "preserving all scene image details from scene in image 1"
     )
     TIMER_REALTIME_SCALE = 0.2
     TIMER_REALTIME_MIN_SECONDS = 5
@@ -510,6 +510,8 @@ class ZorkEmulator:
         "- Never narrate 'a beat' (e.g. 'a beat of silence', 'there is a beat before...'). Show the pause through action, description, or pacing instead.\n"
         "- Structure matters: vary sentence length and rhythm. A short sentence after a long one lands harder.\n"
         "- Style is the differentiator. Don't just describe what happens — make how you describe it unmistakable.\n"
+        "- BAN: THERAPEUTIC RESOLUTION FRAMING. Do not force scenes, entities, or events into emotional-growth arcs, redemptive learning, spiritual lessons, consent metaphors, or 'finally asking / learning to stay / learning to feel' beats unless the source material and immediate scene explicitly earn it.\n"
+        "- Things may be practical, random, transactional, grotesque, funny, unresolved, or simply strange. Not every event means something deeper. Sometimes things just happen.\n"
         "- Vary your landing gear. Turns can end mid-exchange, on a practical detail, on a half-finished gesture, abruptly after dialogue. Not every turn needs a final settling sentence that signals 'scene complete' — most shouldn't.\n"
     )
     DEFAULT_STYLE_DIRECTION = "Mulberry Award-winning literature"
@@ -752,6 +754,7 @@ class ZorkEmulator:
         "- REGISTER SUSTAIN: when a scene reaches genuine emotional resolution — warmth lands, a character opens up, a moment of real connection occurs — stay in that register for the rest of the turn. Do not pivot to tactical options, next-step choices, or plot logistics after an emotional beat lands. Let the moment breathe. End the turn there if needed. The player will move the scene forward when they are ready; the GM's job in that moment is to hold the space the emotion created, not to fill it with forward momentum. Exception: an NPC's own personal needs, anxieties, or agenda can break the register if that is what the character would genuinely do — a person who needs to say something urgent does not wait for the emotional moment to finish. The interruption should feel human, not mechanical.\n"
         "- Do not let every emotional beat collapse into the same stock therapeutic or pseudo-profound language.\n"
         "- Avoid contrived emotional shorthand or therapist-speak; examples include phrases like 'be present', 'show up', or 'hold space', unless a specific character would genuinely talk that way.\n"
+        "- BAN: THERAPEUTIC RESOLUTION FRAMING. Do not automatically turn encounters into healing arcs, redemptive lessons, consent metaphors, or 'finally asking / learning to stay / learning to feel' revelations. Alien things can stay alien. People can want simple practical answers. Some events are just events.\n"
         "- DELTA MODE: each turn should add NEW developments only. Do not recap unchanged context from WORLD_SUMMARY or RECENT_TURNS.\n"
         "- Do not re-state the player's action in paraphrase unless needed for immediate clarity.\n"
         "- Avoid repetitive recap loops: at most one brief callback sentence to prior events, then move the scene forward.\n"
@@ -6104,20 +6107,22 @@ class ZorkEmulator:
         if not prompt:
             return ""
         directives: List[str] = []
-        image_index = 1
-        if has_room_reference:
-            directives.append(
-                f"Use the environment from image {image_index} as the persistent room layout and lighting anchor."
-            )
-            image_index += 1
+        image_index = 2 if has_room_reference else 1
         for ref in avatar_refs:
-            name = str(ref.get("name") or "character").strip()
+            name = self._scene_image_reference_name(ref.get("name"))
             directives.append(f"Render {name} to match the person in image {image_index}.")
             image_index += 1
         if directives:
             prompt = f"{' '.join(directives)} {prompt}"
         prompt = re.sub(r"\s+", " ", prompt).strip()
         return prompt
+
+    @staticmethod
+    def _scene_image_reference_name(value: object) -> str:
+        words = [part for part in re.split(r"\s+", str(value or "").strip()) if part]
+        if not words:
+            return "character"
+        return " ".join(words[:2])
 
     def _compose_empty_room_scene_prompt(
         self,
@@ -6309,7 +6314,7 @@ class ZorkEmulator:
                             has_room_reference=has_room_reference,
                             avatar_refs=avatar_refs[: max(self.MAX_SCENE_REFERENCE_IMAGES - 1, 0)],
                         )
-        prefix = self.SCENE_IMAGE_PRESERVE_PREFIX.strip()
+        prefix = self.SCENE_IMAGE_PRESERVE_PREFIX.strip() if has_room_reference else ""
         if prefix and not prompt_for_generation.lower().startswith(prefix.lower()):
             prompt_for_generation = f"{prefix}. {prompt_for_generation}".strip()
 
@@ -7321,6 +7326,7 @@ class ZorkEmulator:
                 actor_id=actor_id,
                 player_state=player_state,
                 game_time=post_turn_game_time,
+                contact_roster=self._sms_contact_roster(campaign) if campaign is not None else None,
             )
             if sms_notice:
                 decorated = f"{decorated}\n\n{sms_notice}"
@@ -10356,15 +10362,38 @@ class ZorkEmulator:
     @classmethod
     def _sms_unread_thread_display_label(
         cls,
+        key: str,
         row: Dict[str, object],
         *,
         actor_id: object,
         player_state: Dict[str, object] | None,
+        contact_roster: Dict[str, Dict[str, str]] | None = None,
     ) -> str:
         viewer = cls._sms_viewer_display_label(
             actor_id=actor_id,
             player_state=player_state,
         )
+        viewer_aliases = cls._sms_player_aliases(
+            actor_id=actor_id,
+            player_state=player_state,
+        )
+        resolved = cls._sms_resolved_contact(
+            key,
+            row,
+            viewer_actor_id=actor_id,
+            player_state=player_state,
+            contact_roster=contact_roster,
+        )
+        resolved_counterpart = cls._sms_normalize_thread_key(
+            resolved.get("label") or resolved.get("thread")
+        )
+        if (
+            viewer
+            and resolved_counterpart
+            and resolved_counterpart not in viewer_aliases
+            and resolved_counterpart != viewer
+        ):
+            return f"{viewer}<->{resolved_counterpart}"
         counterpart = cls._sms_counterpart_display_label(
             row,
             actor_id=actor_id,
@@ -10533,6 +10562,7 @@ class ZorkEmulator:
         *,
         actor_id: object,
         player_state: Dict[str, object] | None,
+        contact_roster: Dict[str, Dict[str, str]] | None = None,
     ) -> Dict[str, object]:
         aliases = cls._sms_player_aliases(actor_id=actor_id, player_state=player_state)
         if not aliases:
@@ -10571,9 +10601,11 @@ class ZorkEmulator:
             unread_messages += thread_unread
             unread_threads += 1
             label = cls._sms_unread_thread_display_label(
+                thread_key,
                 row,
                 actor_id=actor_id,
                 player_state=player_state,
+                contact_roster=contact_roster,
             )
             if label:
                 labels.append(label[:40])
@@ -10605,6 +10637,7 @@ class ZorkEmulator:
         actor_id: object,
         player_state: Dict[str, object] | None,
         game_time: Dict[str, int] | None,
+        contact_roster: Dict[str, Dict[str, str]] | None = None,
     ) -> str | None:
         if not isinstance(campaign_state, dict):
             return None
@@ -10612,6 +10645,7 @@ class ZorkEmulator:
             campaign_state,
             actor_id=actor_id,
             player_state=player_state,
+            contact_roster=contact_roster,
         )
         unread_messages = cls._coerce_non_negative_int(summary.get("messages", 0), default=0)
         unread_threads = cls._coerce_non_negative_int(summary.get("threads", 0), default=0)

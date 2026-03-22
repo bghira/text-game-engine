@@ -395,6 +395,13 @@ def test_json_parsing_helpers(session_factory, seed_campaign_and_actor):
     assert parsed_extra.get("tool_call") == "memory_search"
     assert parsed_extra.get("queries") == ["query one", "query two", "query three"]
 
+    extra_object_closer = (
+        '{"tool_call":"memory_search","queries":["query one","query two","query three"]}}'
+    )
+    parsed_extra_object = compat._parse_json_lenient(extra_object_closer)
+    assert parsed_extra_object.get("tool_call") == "memory_search"
+    assert parsed_extra_object.get("queries") == ["query one", "query two", "query three"]
+
 
 def test_build_prompt_shape(session_factory, seed_campaign_and_actor):
     compat = _build_compat(session_factory)
@@ -1253,6 +1260,7 @@ def test_ready_to_write_finalization_reexpands_character_and_location_cards(
         assert '"relationship": "Brittle but engaged."' in completion.calls[1]["prompt"]
         assert "FINAL_LOCATION_CARDS:" in completion.calls[1]["prompt"]
         assert "hotel-lobby" in completion.calls[1]["prompt"]
+        assert "BAN: THERAPEUTIC RESOLUTION FRAMING." in completion.calls[1]["prompt"]
         final_location_match = re.search(r"FINAL_LOCATION_CARDS:\s*(\[.*?\])\n", completion.calls[1]["prompt"], re.DOTALL)
         assert final_location_match is not None
         assert '"expanded":' not in final_location_match.group(1)
@@ -3646,6 +3654,25 @@ def test_sms_list_excludes_threads_with_zero_messages(session_factory):
     assert "saul" in thread_keys, "Thread with messages should appear in sms_list"
     assert listed[0]["count"] == 1
     assert "Dock 9" in listed[0]["last_preview"]
+
+
+def test_scene_image_reference_prompt_uses_image_1_preserve_prefix_and_short_names(session_factory):
+    compat = _build_compat(session_factory)
+
+    prompt = compat._compose_scene_prompt_with_references(
+        "Inside the amber resonance chamber.",
+        has_room_reference=True,
+        avatar_refs=[
+            {
+                "name": "Dawn Preston the androgynous sibling of Chace Preston",
+            }
+        ],
+    )
+
+    assert compat.SCENE_IMAGE_PRESERVE_PREFIX == "preserving all scene image details from scene in image 1"
+    assert "persistent room layout and lighting anchor" not in prompt
+    assert "Render Dawn Preston to match the person in image 2." in prompt
+    assert "Dawn Preston the androgynous sibling of Chace Preston" not in prompt
 
 
 def test_sms_unread_notification_uses_bilateral_thread_label(session_factory):
