@@ -1058,19 +1058,27 @@ class ToolAwareZorkLLM:
             elif category_scope.startswith("source:"):
                 source_scope = True
                 source_scope_key = category_scope.split(":", 1)[1].strip() or None
+            include_turn_hits = not source_scope
+            include_manual_hits = not source_scope
+            include_source_hits = source_scope or not category_scope
             curated_seen: set[tuple[str, str]] = set()
-            for query in queries[:4]:
-                for hit in self._emulator.search_curated_memories(
-                    query=query,
-                    campaign_id=campaign_id,
-                    category=category,
-                    top_k=5,
-                ):
-                    dedup_key = (str(hit[0] or "").strip(), str(hit[1] or "").strip())
-                    if dedup_key in curated_seen:
-                        continue
-                    curated_seen.add(dedup_key)
-                    curated_hits.append(hit)
+            if include_manual_hits:
+                for query in queries[:4]:
+                    for hit in self._emulator.search_curated_memories(
+                        query=query,
+                        campaign_id=campaign_id,
+                        category=category,
+                        top_k=5,
+                    ):
+                        dedup_key = (str(hit[0] or "").strip(), str(hit[1] or "").strip())
+                        if dedup_key in curated_seen:
+                            continue
+                        curated_seen.add(dedup_key)
+                        curated_hits.append(hit)
+        else:
+            include_turn_hits = True
+            include_manual_hits = True
+            include_source_hits = not category_scope
 
         roster_hints: list[dict[str, Any]] = []
         if self._emulator is not None and hasattr(
@@ -1088,112 +1096,116 @@ class ToolAwareZorkLLM:
                 roster_hints = []
 
         narrator_hits: dict[int, dict[str, Any]] = {}
-        with self._session_factory() as session:
-            turns = (
-                session.query(Turn)
-                .filter(Turn.campaign_id == campaign_id)
-                .filter(Turn.kind == "narrator")
-                .order_by(Turn.id.desc())
-                .all()
-            )
-            actor_row = None
-            if actor_id:
-                actor_row = (
-                    session.query(Player)
-                    .filter(Player.campaign_id == campaign_id)
-                    .filter(Player.actor_id == actor_id)
-                    .first()
+        if include_turn_hits:
+            with self._session_factory() as session:
+                turns = (
+                    session.query(Turn)
+                    .filter(Turn.campaign_id == campaign_id)
+                    .filter(Turn.kind == "narrator")
+                    .order_by(Turn.id.desc())
+                    .all()
                 )
-        actor_slug = None
-        actor_location_key = ""
-        if actor_row is not None and self._emulator is not None:
-            actor_state = self._parse_json(actor_row.state_json, {})
-            actor_slug = self._emulator._player_visibility_slug(actor_id)  # noqa: SLF001
-            actor_location_key = self._emulator._room_key_from_player_state(  # noqa: SLF001
-                actor_state
-            )
-
-        for query in queries[:4]:
-            q = query.lower().strip()
-            parts = [token for token in re.split(r"\W+", q) if token]
-            for turn in turns:
-                if search_within_turn_id_set and int(turn.id or 0) not in search_within_turn_id_set:
-                    continue
-                content = str(turn.content or "")
-                if not content:
-                    continue
-                meta = self._parse_json(turn.meta_json, {})
-                visibility = meta.get("visibility") if isinstance(meta, dict) else None
-                if actor_id and self._emulator is not None:
-                    if not self._emulator._turn_visible_to_viewer(  # noqa: SLF001
-                        turn, actor_id, actor_slug or "", actor_location_key.lower()
-                    ):
+                actor_row = None
+                if actor_id:
+                    actor_row = (
+                        session.query(Player)
+                        .filter(Player.campaign_id == campaign_id)
+                        .filter(Player.actor_id == actor_id)
+                        .first()
+                    )
+            actor_slug = None
+            actor_location_key = ""
+            if actor_row is not None and self._emulator is not None:
+                actor_state = self._parse_json(actor_row.state_json, {})
+                actor_slug = self._emulator._player_visibility_slug(actor_id)  # noqa: SLF001
+                actor_location_key = self._emulator._room_key_from_player_state(  # noqa: SLF001
+                    actor_state
+                )
+            for query in queries[:4]:
+                q = query.lower().strip()
+                parts = [token for token in re.split(r"\W+", q) if token]
+                for turn in turns:
+                    if search_within_turn_id_set and int(turn.id or 0) not in search_within_turn_id_set:
                         continue
-                if structured_turn_scope:
-                    actor_player_slug = str(meta.get("actor_player_slug") or "").strip()
-                    if interaction_participant_slug:
-                        visible_player_slugs = (
-                            visibility.get("visible_player_slugs")
-                            if isinstance(visibility, dict)
-                            else []
-                        )
-                        visible_slug_set = {
-                            self._emulator._player_slug_key(item)  # noqa: SLF001
-                            for item in (
-                                visible_player_slugs
-                                if isinstance(visible_player_slugs, list)
-                                else []
-                            )
-                            if self._emulator is not None
-                        }
-                        if (
-                            actor_player_slug != interaction_participant_slug
-                            and interaction_participant_slug not in visible_slug_set
+                    content = str(turn.content or "")
+                    if not content:
+                        continue
+                    meta = self._parse_json(turn.meta_json, {})
+                    visibility = meta.get("visibility") if isinstance(meta, dict) else None
+                    if actor_id and self._emulator is not None:
+                        if not self._emulator._turn_visible_to_viewer(  # noqa: SLF001
+                            turn, actor_id, actor_slug or "", actor_location_key.lower()
                         ):
                             continue
-                    if awareness_npc_slug:
-                        aware_npc_slugs = (
-                            visibility.get("aware_npc_slugs")
-                            if isinstance(visibility, dict)
-                            else []
-                        )
-                        if awareness_npc_slug not in {
-                            str(item or "").strip()
-                            for item in (
-                                aware_npc_slugs
-                                if isinstance(aware_npc_slugs, list)
+                    if structured_turn_scope:
+                        actor_player_slug = str(meta.get("actor_player_slug") or "").strip()
+                        if interaction_participant_slug:
+                            visible_player_slugs = (
+                                visibility.get("visible_player_slugs")
+                                if isinstance(visibility, dict)
                                 else []
                             )
-                        }:
-                            continue
-                    if visibility_scope_filter in {"public", "private", "limited", "local"}:
-                        row_scope = str((visibility or {}).get("scope") or "public").strip().lower()
-                        if row_scope != visibility_scope_filter:
-                            continue
-                hay = content.lower()
-                score = 0.0
-                if q and q in hay:
-                    score = 1.0
-                elif parts:
-                    score = sum(1 for token in parts if token in hay) / len(parts)
-                if score <= 0.0:
-                    continue
-                prior = narrator_hits.get(int(turn.id))
-                if prior is None or score > float(prior.get("score", 0.0)):
-                    narrator_hits[int(turn.id)] = {
-                        "turn_id": int(turn.id),
-                        "score": score,
-                        "content": content,
-                        "visibility_scope": str(
-                            (visibility or {}).get("scope") or "public"
-                        ),
-                        "actor_player_slug": str(meta.get("actor_player_slug") or ""),
-                        "location_key": str(meta.get("location_key") or ""),
-                    }
+                            visible_slug_set = {
+                                self._emulator._player_slug_key(item)  # noqa: SLF001
+                                for item in (
+                                    visible_player_slugs
+                                    if isinstance(visible_player_slugs, list)
+                                    else []
+                                )
+                                if self._emulator is not None
+                            }
+                            if (
+                                actor_player_slug != interaction_participant_slug
+                                and interaction_participant_slug not in visible_slug_set
+                            ):
+                                continue
+                        if awareness_npc_slug:
+                            aware_npc_slugs = (
+                                visibility.get("aware_npc_slugs")
+                                if isinstance(visibility, dict)
+                                else []
+                            )
+                            if awareness_npc_slug not in {
+                                str(item or "").strip()
+                                for item in (
+                                    aware_npc_slugs
+                                    if isinstance(aware_npc_slugs, list)
+                                    else []
+                                )
+                            }:
+                                continue
+                        if visibility_scope_filter in {"public", "private", "limited", "local"}:
+                            row_scope = str((visibility or {}).get("scope") or "public").strip().lower()
+                            if row_scope != visibility_scope_filter:
+                                continue
+                    hay = content.lower()
+                    score = 0.0
+                    if q and q in hay:
+                        score = 1.0
+                    elif parts:
+                        score = sum(1 for token in parts if token in hay) / len(parts)
+                    if score <= 0.0:
+                        continue
+                    prior = narrator_hits.get(int(turn.id))
+                    if prior is None or score > float(prior.get("score", 0.0)):
+                        narrator_hits[int(turn.id)] = {
+                            "turn_id": int(turn.id),
+                            "score": score,
+                            "content": content,
+                            "visibility_scope": str(
+                                (visibility or {}).get("scope") or "public"
+                            ),
+                            "actor_player_slug": str(meta.get("actor_player_slug") or ""),
+                            "location_key": str(meta.get("location_key") or ""),
+                        }
 
         # Embedding-based turn search via the memory port (supplements keyword hits).
         embed_only_hits: dict[int, dict[str, Any]] = {}
-        if self._emulator is not None and self._emulator._memory_port is not None:
+        if (
+            include_turn_hits
+            and self._emulator is not None
+            and self._emulator._memory_port is not None
+        ):
             for query in queries[:4]:
                 try:
                     embed_hits = self._emulator._memory_port.search(  # noqa: SLF001
@@ -1238,9 +1250,7 @@ class ToolAwareZorkLLM:
         )[:3]
         ordered_narrator = ordered_keyword + ordered_embed_only
         source_hits_flat: list[tuple[str, str, int, str, float]] = []
-        if self._emulator is not None and has_source_material and (
-            source_scope or not category_scope
-        ):
+        if self._emulator is not None and has_source_material and include_source_hits:
             for query in queries[:4]:
                 source_hits_flat.extend(
                     self._emulator.search_source_material(
@@ -1264,42 +1274,44 @@ class ToolAwareZorkLLM:
 
         records: list[dict[str, Any]] = []
         total_hits = 0
-        for hit in ordered_narrator:
-            total_hits += 1
-            turn_text = str(hit.get("content") or "")
-            records.append(
-                {
-                    "kind": "memory_hit",
-                    "memory_type": "turn",
-                    "turn_id": int(hit.get("turn_id", 0) or 0),
-                    "relevance": round(float(hit.get("score", 0.0) or 0.0), 4),
-                    "actor_player_slug": str(hit.get("actor_player_slug") or "").strip(),
-                    "visibility_scope": str(hit.get("visibility_scope") or "public").strip(),
-                    "location_key": str(hit.get("location_key") or "").strip(),
-                    "text": self._memory_tool_text_value(turn_text, max_chars=900),
-                    **(
-                        {
-                            "full_text": self._memory_tool_text_value(
-                                turn_text,
-                                max_chars=12000,
-                            )
-                        }
-                        if full_text
-                        else {}
-                    ),
-                }
-            )
-        for term, memory, score in curated_hits[:5]:
-            total_hits += 1
-            records.append(
-                {
-                    "kind": "memory_hit",
-                    "memory_type": "manual",
-                    "term": str(term or "").strip(),
-                    "relevance": round(float(score or 0.0), 4),
-                    "text": self._memory_tool_text_value(memory or "", max_chars=700),
-                }
-            )
+        if include_turn_hits:
+            for hit in ordered_narrator:
+                total_hits += 1
+                turn_text = str(hit.get("content") or "")
+                records.append(
+                    {
+                        "kind": "memory_hit",
+                        "memory_type": "turn",
+                        "turn_id": int(hit.get("turn_id", 0) or 0),
+                        "relevance": round(float(hit.get("score", 0.0) or 0.0), 4),
+                        "actor_player_slug": str(hit.get("actor_player_slug") or "").strip(),
+                        "visibility_scope": str(hit.get("visibility_scope") or "public").strip(),
+                        "location_key": str(hit.get("location_key") or "").strip(),
+                        "text": self._memory_tool_text_value(turn_text, max_chars=900),
+                        **(
+                            {
+                                "full_text": self._memory_tool_text_value(
+                                    turn_text,
+                                    max_chars=12000,
+                                )
+                            }
+                            if full_text
+                            else {}
+                        ),
+                    }
+                )
+        if include_manual_hits:
+            for term, memory, score in curated_hits[:5]:
+                total_hits += 1
+                records.append(
+                    {
+                        "kind": "memory_hit",
+                        "memory_type": "manual",
+                        "term": str(term or "").strip(),
+                        "relevance": round(float(score or 0.0), 4),
+                        "text": self._memory_tool_text_value(memory or "", max_chars=700),
+                    }
+                )
         for (
             source_doc_key,
             source_doc_label,
