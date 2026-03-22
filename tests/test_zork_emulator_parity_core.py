@@ -3646,3 +3646,38 @@ def test_sms_list_excludes_threads_with_zero_messages(session_factory):
     assert "saul" in thread_keys, "Thread with messages should appear in sms_list"
     assert listed[0]["count"] == 1
     assert "Dock 9" in listed[0]["last_preview"]
+
+
+def test_sms_unread_notification_uses_bilateral_thread_label(session_factory):
+    compat = _build_compat(session_factory)
+    campaign_state = {
+        compat.SMS_STATE_KEY: {
+            "chace-actor-1": {
+                "label": "chace",
+                "owner_actor_id": "1",
+                "messages": [
+                    {
+                        "from": "Gwen",
+                        "to": "Chace Preston",
+                        "message": "Where are you?",
+                        "day": 138,
+                        "hour": 18,
+                        "minute": 48,
+                        "turn_id": 22097,
+                        "seq": 1,
+                    }
+                ],
+            }
+        }
+    }
+
+    notice = compat._sms_unread_hourly_notification(
+        campaign_state,
+        actor_id="1",
+        player_state={"character_name": "Chace Preston"},
+        game_time={"day": 138, "hour": 18, "minute": 48},
+    )
+
+    assert notice is not None
+    assert "Unread SMS: 1 message(s) in 1 thread(s)" in notice
+    assert "(chace-preston<->gwen)" in notice

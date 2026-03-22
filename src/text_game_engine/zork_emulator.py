@@ -10297,6 +10297,84 @@ class ZorkEmulator:
         return aliases
 
     @classmethod
+    def _sms_viewer_display_label(
+        cls,
+        *,
+        actor_id: object,
+        player_state: Dict[str, object] | None,
+    ) -> str:
+        if isinstance(player_state, dict):
+            char_name = cls._sms_normalize_thread_key(player_state.get("character_name"))
+            if char_name:
+                return char_name
+        actor_key = cls._sms_actor_key(actor_id)
+        return actor_key or "player"
+
+    @classmethod
+    def _sms_counterpart_display_label(
+        cls,
+        row: Dict[str, object],
+        *,
+        actor_id: object,
+        player_state: Dict[str, object] | None,
+    ) -> str:
+        aliases = cls._sms_player_aliases(
+            actor_id=actor_id,
+            player_state=player_state,
+        )
+        messages = cls._sms_visible_messages_for_viewer(
+            row,
+            viewer_actor_id=actor_id,
+            player_state=player_state,
+        )
+        seen: set[str] = set()
+        candidates: list[str] = []
+
+        def _push(raw_value: object) -> None:
+            norm = cls._sms_normalize_thread_key(raw_value)
+            if not norm or norm in aliases or norm in seen:
+                return
+            seen.add(norm)
+            candidates.append(norm)
+
+        for msg in reversed(messages):
+            if not isinstance(msg, dict):
+                continue
+            _push(msg.get("from"))
+            _push(msg.get("to"))
+            if len(candidates) > 1:
+                break
+        if len(candidates) == 1:
+            return candidates[0]
+
+        for raw_value in (row.get("label"), row.get("thread"), row.get("key")):
+            norm = cls._sms_normalize_thread_key(raw_value)
+            if norm and norm not in aliases:
+                return norm
+        return ""
+
+    @classmethod
+    def _sms_unread_thread_display_label(
+        cls,
+        row: Dict[str, object],
+        *,
+        actor_id: object,
+        player_state: Dict[str, object] | None,
+    ) -> str:
+        viewer = cls._sms_viewer_display_label(
+            actor_id=actor_id,
+            player_state=player_state,
+        )
+        counterpart = cls._sms_counterpart_display_label(
+            row,
+            actor_id=actor_id,
+            player_state=player_state,
+        )
+        if viewer and counterpart:
+            return f"{viewer}<->{counterpart}"
+        return counterpart or viewer
+
+    @classmethod
     def _sms_resolved_contact(
         cls,
         key: str,
@@ -10492,7 +10570,11 @@ class ZorkEmulator:
                 continue
             unread_messages += thread_unread
             unread_threads += 1
-            label = str(row.get("label") or thread_key).strip()
+            label = cls._sms_unread_thread_display_label(
+                row,
+                actor_id=actor_id,
+                player_state=player_state,
+            )
             if label:
                 labels.append(label[:40])
         deduped_labels: list[str] = []
