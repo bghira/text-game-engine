@@ -479,6 +479,24 @@ class TestPlainTextSearchIntentRecovery:
             ],
         }
 
+    def test_parse_model_payload_recovers_memory_search_with_extra_closer(self):
+        from text_game_engine.tool_aware_llm import ToolAwareZorkLLM
+        from text_game_engine.zork_emulator import ZorkEmulator
+
+        emulator = ZorkEmulator.__new__(ZorkEmulator)
+        llm = ToolAwareZorkLLM.__new__(ToolAwareZorkLLM)
+        llm._emulator = emulator
+        llm._zork_log = lambda *args, **kwargs: None
+
+        payload = llm._parse_model_payload(
+            '{"tool_call": "memory_search", "queries": ["query one", "query two", "query three"]]}'
+        )
+
+        assert payload == {
+            "tool_call": "memory_search",
+            "queries": ["query one", "query two", "query three"],
+        }
+
 
 class TestMemorySearchCategoryFiltering:
     def test_source_category_returns_only_source_hits(self):

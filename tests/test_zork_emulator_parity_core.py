@@ -388,6 +388,13 @@ def test_json_parsing_helpers(session_factory, seed_campaign_and_actor):
     assert parsed.get("tool_call") == "memory_search"
     assert parsed.get("queries") == ["Elizabeth"]
 
+    extra_closer = (
+        '{"tool_call":"memory_search","queries":["query one","query two","query three"]]}'
+    )
+    parsed_extra = compat._parse_json_lenient(extra_closer)
+    assert parsed_extra.get("tool_call") == "memory_search"
+    assert parsed_extra.get("queries") == ["query one", "query two", "query three"]
+
 
 def test_build_prompt_shape(session_factory, seed_campaign_and_actor):
     compat = _build_compat(session_factory)
