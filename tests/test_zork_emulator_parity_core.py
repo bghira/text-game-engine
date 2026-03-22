@@ -750,6 +750,24 @@ def test_build_prompt_character_index_carries_roster_criticals_while_cards_stay_
     assert yasmin_index["critical"]["relationship"] == "Engaged."
     assert yasmin_index["critical"]["speech_style"] == "Sharp and quick."
 
+    world_characters_match = re.search(r"WORLD_CHARACTERS:\s*(\[.*?\])\nPLAYER_CARD:", user_prompt, re.DOTALL)
+    assert world_characters_match is not None
+    world_characters = json.loads(world_characters_match.group(1))
+    gwen_world = next(row for row in world_characters if row.get("slug") == "gwen")
+    yasmin_world = next(row for row in world_characters if row.get("slug") == "yasmin-devereaux")
+    assert gwen_world == {
+        "slug": "gwen",
+        "name": "Gwen",
+        "location": "hotel-lobby",
+        "current_status": "Watching the desk.",
+    }
+    assert yasmin_world == {
+        "slug": "yasmin-devereaux",
+        "name": "Yasmin Devereaux",
+        "location": "rosedale-apartment-4c",
+        "current_status": "Off-scene.",
+    }
+
     cards_match = re.search(r"CHARACTER_CARDS:\s*(\[.*?\])\nLOCATION_INDEX:", user_prompt, re.DOTALL)
     assert cards_match is not None
     character_cards = json.loads(cards_match.group(1))
@@ -836,6 +854,26 @@ def test_build_prompt_cards_use_top_level_scan_fields_without_compact_duplicatio
     assert "location" not in gwen_card["expanded"]
     assert "current_status" not in gwen_card["expanded"]
     assert "priority" not in gwen_card
+
+    location_index_match = re.search(r"LOCATION_INDEX:\s*(\[.*?\])\nLOCATION_CARDS:", user_prompt, re.DOTALL)
+    assert location_index_match is not None
+    location_index = json.loads(location_index_match.group(1))
+    active_location_index = next(
+        row for row in location_index if row.get("slug") == "washington-ranch-basement-media-room"
+    )
+    projection_booth_index = next(
+        row for row in location_index if row.get("slug") == "oakhaven-projection-booth"
+    )
+    assert active_location_index["name"] == "Basement Media Room"
+    assert active_location_index.get("summary") is None
+    assert active_location_index.get("available_keys") is None
+    assert projection_booth_index["summary"] == "Dust in the booth light."
+    assert projection_booth_index["available_keys"] == [
+        "channel_seven",
+        "monitoring_station",
+        "name",
+        "summary",
+    ]
 
     location_match = re.search(r"LOCATION_CARDS:\s*(\[.*?\])\nWORLD_CHARACTERS:", user_prompt, re.DOTALL)
     assert location_match is not None
@@ -1286,8 +1324,52 @@ def test_recent_turns_include_turn_number_and_in_game_time(session_factory, seed
     turns = compat.get_recent_turns(seed_campaign_and_actor["campaign_id"])
     _, user_prompt = compat.build_prompt(campaign, player, "look", turns)
 
-    assert "[TURN #" in user_prompt
-    assert "Day 2 14:30" in user_prompt
+    assert '"kind":"turn"' in user_prompt
+    assert '"turn_id":' in user_prompt
+    assert '"day":2' in user_prompt
+    assert '"hour":14' in user_prompt
+    assert '"minute":30' in user_prompt
+
+
+def test_recent_turns_prompt_uses_structured_fallback_not_legacy_player_lines(
+    session_factory,
+    seed_campaign_and_actor,
+):
+    compat = _build_compat(session_factory)
+    campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
+    player = compat.get_or_create_player(seed_campaign_and_actor["campaign_id"], seed_campaign_and_actor["actor_id"])
+    with session_factory() as session:
+        session.add(
+            Turn(
+                campaign_id=campaign.id,
+                session_id=None,
+                actor_id=player.actor_id,
+                kind="player",
+                content='"what is yield"',
+                meta_json=json.dumps(
+                    {
+                        "game_time": {"day": 138, "hour": 16, "minute": 28},
+                        "visibility": {
+                            "scope": "local",
+                            "actor_player_slug": "chace-preston",
+                            "location_key": "alien-craft-interior",
+                        },
+                        "location_key": "alien-craft-interior",
+                    }
+                ),
+            )
+        )
+        session.commit()
+
+    turns = compat.get_recent_turns(seed_campaign_and_actor["campaign_id"])
+    _system_prompt, user_prompt = compat.build_prompt(campaign, player, "look", turns)
+
+    assert '[TURN #' not in user_prompt
+    assert 'PLAYER (CHACE PRESTON):' not in user_prompt
+    assert '"kind":"beat"' in user_prompt
+    assert '"type":"player_action"' in user_prompt
+    assert '"speaker":"chace-preston"' in user_prompt
+    assert '\\"what is yield\\"' in user_prompt
 
 
 def test_sms_thread_roundtrip(session_factory, seed_campaign_and_actor):
@@ -1572,7 +1654,6 @@ def test_build_prompt_seeds_default_game_time(session_factory, seed_campaign_and
     assert game_time.get("period") == "morning"
     assert game_time.get("date_label") == "Monday, Day 1, Morning"
     assert '"day": 1' in user_prompt
-    assert "WORLD_CLOCK:" in user_prompt
     assert "CURRENT_GAME_TIME:" in user_prompt
 
 
@@ -1638,7 +1719,7 @@ def test_build_prompt_persists_default_clock_start_day_when_missing(session_fact
     assert state.get("clock_start_day_of_week") == "monday"
 
 
-def test_build_prompt_includes_weekday_in_world_clock(session_factory, seed_campaign_and_actor):
+def test_build_prompt_includes_weekday_in_current_game_time(session_factory, seed_campaign_and_actor):
     compat = _build_compat(session_factory)
     campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
     player = compat.get_or_create_player(seed_campaign_and_actor["campaign_id"], seed_campaign_and_actor["actor_id"])
@@ -1658,7 +1739,7 @@ def test_build_prompt_includes_weekday_in_world_clock(session_factory, seed_camp
 
     assert '"day_of_week": "sunday"' in user_prompt
     assert '"date_label": "Sunday, Day 3, Morning"' in user_prompt
-    assert "WORLD_CLOCK:" in user_prompt
+    assert "CURRENT_GAME_TIME:" in user_prompt
 
 
 def test_story_context_includes_next_three_and_coerces_progress_indices(session_factory, seed_campaign_and_actor):
