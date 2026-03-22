@@ -6027,9 +6027,6 @@ class ZorkEmulator:
                     persona = " ".join(persona.split()[:18])
                 attributes = self.get_player_attributes(entry)
                 attribute_cues = self._build_attribute_cues(attributes)
-                visible_items = []
-                if entry.actor_id == actor.actor_id:
-                    visible_items = self._normalize_inventory_items(state.get("inventory"))[:3]
                 out.append(
                     {
                         "actor_id": entry.actor_id,
@@ -6042,7 +6039,6 @@ class ZorkEmulator:
                         "attribute_cues": attribute_cues,
                         "location": state.get("location"),
                         "room_title": state.get("room_title"),
-                        "visible_items": visible_items,
                     }
                 )
                 if len(out) >= self.MAX_PARTY_CONTEXT_PLAYERS:
@@ -6189,9 +6185,6 @@ class ZorkEmulator:
                 cues = entry.get("attribute_cues") or []
                 if cues:
                     tags.append(" / ".join([str(cue) for cue in cues[:2]]))
-                items = entry.get("visible_items") or []
-                if items:
-                    tags.append("carrying " + ", ".join([str(item) for item in items[:2]]))
                 cast_fragments.append(f"{name} ({'; '.join(tags)})" if tags else name)
             if cast_fragments:
                 pending_prefixes.append(f"Characters: {'; '.join(cast_fragments)}.")
