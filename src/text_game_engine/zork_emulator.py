@@ -11640,6 +11640,30 @@ class ZorkEmulator:
             )
         return rows
 
+    def _build_world_characters_for_prompt(
+        self,
+        characters_for_prompt: list[dict[str, object]],
+        *,
+        characters: Dict[str, dict] | None = None,
+    ) -> list[dict[str, object]]:
+        rows: list[dict[str, object]] = []
+        characters = characters or {}
+        for entry in characters_for_prompt or []:
+            if not isinstance(entry, dict):
+                continue
+            slug = str(entry.get("_slug") or "").strip()
+            if not slug:
+                continue
+            source = characters.get(slug) if isinstance(characters.get(slug), dict) else entry
+            row = {
+                "slug": slug,
+                "name": str((source or {}).get("name") or entry.get("name") or slug).strip(),
+                "location": (source or {}).get("location"),
+                "current_status": (source or {}).get("current_status"),
+            }
+            rows.append(row)
+        return rows
+
     def _build_character_cards_for_prompt(
         self,
         characters_for_prompt: list[dict[str, object]],
@@ -11779,27 +11803,31 @@ class ZorkEmulator:
     def _build_location_index_for_prompt(
         self,
         location_cards: Dict[str, dict],
+        *,
+        player_state: Dict[str, object] | None = None,
     ) -> list[dict[str, object]]:
         rows: list[dict[str, object]] = []
+        active_location = str((player_state or {}).get("location") or "").strip().lower()
         for slug, payload in sorted(location_cards.items()):
             if not isinstance(payload, dict):
                 continue
+            is_active_location = slug.lower() == active_location
             available_keys = sorted(
                 key
                 for key in payload.keys()
                 if key != self.LOCATION_FACT_PRIORITIES_KEY and not str(key).startswith("_")
             )
-            rows.append(
-                {
-                    "slug": slug,
-                    "name": str(payload.get("name") or slug).strip(),
-                    "summary": self._compact_prompt_fact_value(
-                        payload.get("summary") or payload.get("description"),
-                        max_chars=120,
-                    ),
-                    "available_keys": available_keys,
-                }
-            )
+            row = {
+                "slug": slug,
+                "name": str(payload.get("name") or slug).strip(),
+            }
+            if not is_active_location:
+                row["summary"] = self._compact_prompt_fact_value(
+                    payload.get("summary") or payload.get("description"),
+                    max_chars=120,
+                )
+                row["available_keys"] = available_keys
+            rows.append(row)
         return rows
 
     def _build_location_cards_for_prompt(
@@ -12691,38 +12719,40 @@ class ZorkEmulator:
                 viewer_location_key,
             ):
                 continue
-            turn_prefix = self._turn_context_prefix(turn)
+            meta = self._safe_turn_meta(turn)
+            scene_output = meta.get("scene_output")
+            if isinstance(scene_output, dict) and scene_output.get("beats"):
+                jsonl_lines = self._scene_output_recent_lines(
+                    turn,
+                    state,
+                    scene_output,
+                    viewer_actor_id=player.actor_id,
+                    viewer_slug=viewer_slug,
+                    viewer_location_key=viewer_location_key,
+                    viewer_private_context_key=viewer_private_context_key,
+                )
+                if jsonl_lines and turn.kind == "narrator":
+                    recent_lines.extend(jsonl_lines)
+                    continue
+
             if turn.kind == "player":
                 if ooc_re.match(content):
                     continue
-                clipped = content
-                clipped = self._strip_inventory_mentions(clipped)
+                clipped = self._strip_inventory_mentions(content)
+                if not clipped:
+                    continue
                 name = player_names.get(turn.actor_id or "")
-                if name:
-                    label = f"PLAYER ({name.upper()})"
-                else:
-                    label = "PLAYER"
-                recent_lines.append(f"{turn_prefix} {label}: {clipped}")
+                recent_lines.extend(
+                    self._recent_turn_fallback_lines(
+                        turn,
+                        state,
+                        content_text=clipped,
+                        player_name=name,
+                    )
+                )
             elif turn.kind == "narrator":
                 if content.lower() in error_phrases:
                     continue
-                # Prefer structured JSONL beats when the turn has scene_output.
-                meta = self._safe_turn_meta(turn)
-                scene_output = meta.get("scene_output")
-                if isinstance(scene_output, dict) and scene_output.get("beats"):
-                    jsonl_lines = self._scene_output_recent_lines(
-                        turn,
-                        state,
-                        scene_output,
-                        viewer_actor_id=player.actor_id,
-                        viewer_slug=viewer_slug,
-                        viewer_location_key=viewer_location_key,
-                        viewer_private_context_key=viewer_private_context_key,
-                    )
-                    if jsonl_lines:
-                        recent_lines.extend(jsonl_lines)
-                        continue
-                # Fallback: plain text for legacy turns without scene_output.
                 clipped_lines = []
                 for line in content.splitlines():
                     stripped = line.strip()
@@ -12734,7 +12764,13 @@ class ZorkEmulator:
                 clipped = "\n".join(clipped_lines).strip()
                 if not clipped:
                     continue
-                recent_lines.append(f"{turn_prefix} NARRATOR: {clipped}")
+                recent_lines.extend(
+                    self._recent_turn_fallback_lines(
+                        turn,
+                        state,
+                        content_text=clipped,
+                    )
+                )
         recent_text = "\n".join(recent_lines) if recent_lines else "None"
 
         rails_context = self._build_rails_context(player_state, party_snapshot)
@@ -12776,6 +12812,10 @@ class ZorkEmulator:
             characters=characters,
             campaign_state=state,
         )
+        world_characters = self._build_world_characters_for_prompt(
+            character_index_source,
+            characters=characters,
+        )
         character_cards = self._build_character_cards_for_prompt(
             scene_characters_for_prompt,
             characters=characters,
@@ -12784,7 +12824,10 @@ class ZorkEmulator:
             include_critical_fields=False,
         )
         location_cards_map = self._location_cards_from_state(state, player_state)
-        location_index = self._build_location_index_for_prompt(location_cards_map)
+        location_index = self._build_location_index_for_prompt(
+            location_cards_map,
+            player_state=player_state,
+        )
         location_index = self._fit_json_list_to_budget(
             location_index,
             self.MAX_LOCATION_INDEX_CHARS,
@@ -12892,7 +12935,6 @@ class ZorkEmulator:
             user_prompt += (
                 f"SOURCE_MATERIAL_DOCS: {self._dump_json(source_payload.get('docs') or [])}\n"
                 f"SOURCE_MATERIAL_KEYS: {self._dump_json(source_payload.get('keys') or [])}\n"
-                f"SOURCE_MATERIAL_SNIPPET_COUNT: {source_payload.get('chunk_count')}\n"
                 f"SOURCE_MATERIAL_CHUNK_COUNT: {source_payload.get('chunk_count')}\n"
             )
             source_digests = source_payload.get("digests") or {}
@@ -12902,7 +12944,6 @@ class ZorkEmulator:
                         f"SOURCE_MATERIAL_DIGEST [{digest_key}]:\n{digest_text}\n"
                     )
         user_prompt += (
-            f"WORLD_CLOCK: {self._dump_json(game_time)}\n"
             f"CURRENT_GAME_TIME: {self._dump_json(game_time)}\n"
             f"SPEED_MULTIPLIER: {speed_mult}\n"
             f"DIFFICULTY: {difficulty}\n"
@@ -12916,7 +12957,7 @@ class ZorkEmulator:
             f"CHARACTER_CARDS: {self._dump_json(character_cards)}\n"
             f"LOCATION_INDEX: {self._dump_json(location_index)}\n"
             f"LOCATION_CARDS: {self._dump_json(location_cards)}\n"
-            f"WORLD_CHARACTERS: {self._dump_json(character_index_source)}\n"
+            f"WORLD_CHARACTERS: {self._dump_json(world_characters)}\n"
             f"PLAYER_CARD: {self._dump_json(player_card)}\n"
             f"PARTY_SNAPSHOT: {self._dump_json(party_snapshot)}\n"
         )
@@ -18145,19 +18186,20 @@ class ZorkEmulator:
             "context_key": context_key,
             "visibility": scope,
         }
-        if isinstance(entry, dict):
+        time_source = entry if isinstance(entry, dict) else meta.get("game_time")
+        if isinstance(time_source, dict):
             header["day"] = (
-                self._coerce_non_negative_int(entry.get("day", 1), default=1) or 1
+                self._coerce_non_negative_int(time_source.get("day", 1), default=1) or 1
             )
             header["hour"] = min(
                 23,
-                max(0, self._coerce_non_negative_int(entry.get("hour", 0), default=0)),
+                max(0, self._coerce_non_negative_int(time_source.get("hour", 0), default=0)),
             )
             header["minute"] = min(
                 59,
                 max(
                     0,
-                    self._coerce_non_negative_int(entry.get("minute", 0), default=0),
+                    self._coerce_non_negative_int(time_source.get("minute", 0), default=0),
                 ),
             )
         beat_type = "player_action" if turn.kind == "player" else "narration"
@@ -18499,11 +18541,12 @@ class ZorkEmulator:
             "location_key": scene_output.get("location_key"),
             "context_key": scene_output.get("context_key"),
         }
-        if isinstance(entry, dict):
-            header["day"] = self._coerce_non_negative_int(entry.get("day", 1), default=1) or 1
-            header["hour"] = min(23, max(0, self._coerce_non_negative_int(entry.get("hour", 0), default=0)))
-            header["minute"] = min(59, max(0, self._coerce_non_negative_int(entry.get("minute", 0), default=0)))
         meta = self._safe_turn_meta(turn)
+        time_source = entry if isinstance(entry, dict) else meta.get("game_time")
+        if isinstance(time_source, dict):
+            header["day"] = self._coerce_non_negative_int(time_source.get("day", 1), default=1) or 1
+            header["hour"] = min(23, max(0, self._coerce_non_negative_int(time_source.get("hour", 0), default=0)))
+            header["minute"] = min(59, max(0, self._coerce_non_negative_int(time_source.get("minute", 0), default=0)))
         visibility = meta.get("visibility")
         if isinstance(visibility, dict):
             header["visibility"] = str(visibility.get("scope") or "").strip().lower() or None
