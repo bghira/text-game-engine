@@ -406,7 +406,6 @@ def test_build_prompt_shape(session_factory, seed_campaign_and_actor):
     assert "You are the ZorkEmulator" in system_prompt
     assert "STRUCTURE REQUIREMENT:" in system_prompt
     assert "CALENDAR_REMINDERS" in user_prompt
-    assert "ACTIVE_PLAYER_LOCATION:" in user_prompt
     assert "CAMPAIGN:" in user_prompt
     assert "CURRENT_GAME_TIME:" in user_prompt
     assert "SPEED_MULTIPLIER:" in user_prompt
@@ -463,7 +462,6 @@ def test_build_prompt_bootstrap_stage_shape(session_factory, seed_campaign_and_a
     assert "PLAYER_CARD:" in user_prompt
     assert "PARTY_SNAPSHOT:" in user_prompt
     assert '"visible_items"' not in user_prompt
-    assert "ACTIVE_PLAYER_LOCATION:" in user_prompt
     assert "PLAYER_ACTION" in user_prompt
 
 
@@ -712,6 +710,7 @@ def test_build_prompt_character_index_carries_roster_criticals_while_cards_stay_
                 "gwen": {
                     "name": "Gwen",
                     "age": "34",
+                    "gender": "cis-female",
                     "location": "hotel-lobby",
                     "current_status": "Watching the desk.",
                     "speech_style": "Short sentences.",
@@ -721,6 +720,7 @@ def test_build_prompt_character_index_carries_roster_criticals_while_cards_stay_
                 "yasmin-devereaux": {
                     "name": "Yasmin Devereaux",
                     "age": "29",
+                    "gender": "cis-female",
                     "location": "rosedale-apartment-4c",
                     "current_status": "Off-scene.",
                     "relationship": "Engaged.",
@@ -754,8 +754,10 @@ def test_build_prompt_character_index_carries_roster_criticals_while_cards_stay_
     assert gwen_index["critical"]["speech_style"] == "Short sentences."
     assert gwen_index["critical"]["allegiance"] == "The configuration."
     assert gwen_index["critical"]["age"] == "34"
+    assert gwen_index["critical"]["gender"] == "cis-female"
     assert yasmin_index["critical"]["relationship"] == "Engaged."
     assert yasmin_index["critical"]["speech_style"] == "Sharp and quick."
+    assert yasmin_index["critical"]["gender"] == "cis-female"
 
     world_characters_match = re.search(r"WORLD_CHARACTERS:\s*(\[.*?\])\nPLAYER_CARD:", user_prompt, re.DOTALL)
     assert world_characters_match is not None
@@ -3338,6 +3340,8 @@ def test_apply_character_updates_immutable_fields_preserved(session_factory):
     existing = {
         "saul": {
             "name": "Saul Goodman",
+            "age": "42",
+            "gender": "cis-male",
             "personality": "Charming, fast-talking",
             "background": "Former lawyer",
             "appearance": "Slicked-back hair, flashy suit",
@@ -3350,6 +3354,8 @@ def test_apply_character_updates_immutable_fields_preserved(session_factory):
     updates = {
         "saul": {
             "name": "James McGill",  # immutable — should be ignored
+            "age": "44",  # immutable — should be ignored
+            "gender": "synthetic",  # immutable — should be ignored
             "personality": "Reformed",  # immutable — should be ignored
             "background": "New backstory",  # immutable — should be ignored
             "appearance": "Casual clothes",  # immutable — should be ignored
@@ -3364,6 +3370,8 @@ def test_apply_character_updates_immutable_fields_preserved(session_factory):
 
     # Immutable fields unchanged
     assert result["saul"]["name"] == "Saul Goodman"
+    assert result["saul"]["age"] == "42"
+    assert result["saul"]["gender"] == "cis-male"
     assert result["saul"]["personality"] == "Charming, fast-talking"
     assert result["saul"]["background"] == "Former lawyer"
     assert result["saul"]["appearance"] == "Slicked-back hair, flashy suit"
@@ -3383,6 +3391,8 @@ def test_apply_character_updates_new_char_gets_all_fields(session_factory):
     updates = {
         "mira": {
             "name": "Mira",
+            "age": "31",
+            "gender": "trans-female",
             "personality": "Quiet observer",
             "background": "Unknown origins",
             "appearance": "Dark cloak",
@@ -3394,6 +3404,8 @@ def test_apply_character_updates_new_char_gets_all_fields(session_factory):
     result = compat._apply_character_updates(existing, updates)
 
     assert result["mira"]["name"] == "Mira"
+    assert result["mira"]["age"] == "31"
+    assert result["mira"]["gender"] == "trans-female"
     assert result["mira"]["personality"] == "Quiet observer"
     assert result["mira"]["background"] == "Unknown origins"
     assert result["mira"]["appearance"] == "Dark cloak"
