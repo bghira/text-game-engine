@@ -1626,11 +1626,11 @@ def test_build_rails_context_normalizes_inventory_origin_fragments(session_facto
                 {"name": "projection booth key", "origin": "Found in locker"},
                 {
                     "name": "sticky notes",
-                    "origin": "The sticky notes come off in one pass.",
+                    "origin": "The sticky notes come off in one pass. (received Day 10, 15:28)",
                 },
                 {
                     "name": "navy blazer (brass buttons)",
-                    "origin": "The men's section surrenders a navy blazer with brass buttons, two white dress shirts still stiff with starch from some",
+                    "origin": "The men's section surrenders a navy blazer with brass buttons, two white dress shirts still stiff with starch from some (received Day 10, 15:28)",
                 },
             ],
         },
@@ -1643,8 +1643,8 @@ def test_build_rails_context_normalizes_inventory_origin_fragments(session_facto
     blazer_row = next(row for row in inventory if row.get("name") == "navy blazer (brass buttons)")
 
     assert key_row.get("origin") == "Found in locker"
-    assert sticky_row.get("origin") == "Acquired earlier in-scene."
-    assert blazer_row.get("origin") == "Acquired earlier in-scene."
+    assert sticky_row.get("origin") == "Acquired earlier in-scene. (received Day 10, 15:28)"
+    assert blazer_row.get("origin") == "Acquired earlier in-scene. (received Day 10, 15:28)"
 
 
 def test_generate_map_prompt_uses_authoritative_location_keys(session_factory, seed_campaign_and_actor):
@@ -1876,6 +1876,7 @@ def test_inventory_delta_sanitization(session_factory, seed_campaign_and_actor):
     previous = {
         "location": "dock",
         "inventory": [{"name": "Rusty Key", "origin": "Found in locker"}],
+        "game_time": {"day": 3, "hour": 9, "minute": 5},
         "room_title": "Dock 9",
         "room_description": "Rain hisses on steel.",
     }
@@ -1885,12 +1886,40 @@ def test_inventory_delta_sanitization(session_factory, seed_campaign_and_actor):
         "location": "warehouse",
     }
     cleaned = compat._sanitize_player_state_update(previous, update, action_text="enter warehouse")
-    names = [item["name"] for item in cleaned["inventory"]]
+    items = {item["name"]: item for item in cleaned["inventory"]}
+    names = list(items)
     assert "Lantern" in names
     assert "Rusty Key" not in names
+    assert items["Lantern"]["origin"] == "Received Day 3, 09:05"
     assert cleaned["room_description"] is None
     assert cleaned["room_title"] is None
     assert cleaned["room_summary"] is None
+
+
+def test_inventory_add_object_preserves_explicit_origin(session_factory, seed_campaign_and_actor):
+    compat = _build_compat(session_factory)
+    previous = {
+        "location": "dock",
+        "inventory": [{"name": "Rusty Key", "origin": "Found in locker"}],
+        "game_time": {"day": 3, "hour": 9, "minute": 5},
+    }
+    update = {
+        "inventory_add": [
+            {
+                "name": "projection booth key",
+                "origin": "Taken from the booth drawer",
+            }
+        ],
+    }
+    cleaned = compat._sanitize_player_state_update(
+        previous,
+        update,
+        action_text="check the booth",
+        narration_text="You pull a key from the booth drawer.",
+    )
+    items = {row["name"]: row for row in cleaned["inventory"]}
+    assert items["projection booth key"]["origin"] == "Taken from the booth drawer (received Day 3, 09:05)"
+    assert items["Rusty Key"]["origin"] == "Found in locker"
 
 
 def test_media_enqueue_hooks(session_factory, seed_campaign_and_actor):
