@@ -788,6 +788,97 @@ def test_build_prompt_character_index_carries_roster_criticals_while_cards_stay_
     assert gwen_card["expanded"].get("speech_style") is None
 
 
+def test_build_prompt_excludes_real_player_characters_from_npc_prompt_blocks(
+    session_factory,
+    seed_campaign_and_actor,
+):
+    compat = _build_compat(session_factory)
+    campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
+    player = compat.get_or_create_player(seed_campaign_and_actor["campaign_id"], seed_campaign_and_actor["actor_id"])
+    other_player = compat.get_or_create_player(seed_campaign_and_actor["campaign_id"], "actor-2")
+
+    with session_factory() as session:
+        row = session.get(Campaign, seed_campaign_and_actor["campaign_id"])
+        row.characters_json = json.dumps(
+            {
+                "gwen": {
+                    "name": "Gwen",
+                    "location": "alien-craft-resonance-chamber",
+                    "current_status": "Holding on.",
+                    "relationship": "Watching Chace.",
+                    "speech_style": "Short sentences.",
+                    "personality": "Professional, observant, wry.",
+                },
+                "chace-preston": {
+                    "name": "Chace Preston",
+                    "location": "alien-craft-resonance-chamber",
+                    "current_status": "Present in the chamber.",
+                    "relationship": "Player character duplicate.",
+                },
+                "dawn-preston-the-androgynous-sibling-of-chace-preston": {
+                    "name": "Dawn Preston the androgynous sibling of Chace Preston",
+                    "location": "alien-craft-resonance-chamber",
+                    "current_status": "Also present in the chamber.",
+                    "relationship": "Player character duplicate.",
+                },
+            }
+        )
+        primary_player_row = (
+            session.query(Player)
+            .filter(Player.campaign_id == seed_campaign_and_actor["campaign_id"])
+            .filter(Player.actor_id == seed_campaign_and_actor["actor_id"])
+            .one()
+        )
+        primary_state = json.loads(primary_player_row.state_json or "{}")
+        primary_state["character_name"] = "Chace Preston"
+        primary_state["location"] = "alien-craft-resonance-chamber"
+        primary_state["room_title"] = "Resonance Chamber"
+        primary_state["room_summary"] = "You remain in control of the next move."
+        primary_player_row.state_json = json.dumps(primary_state)
+
+        other_player_row = (
+            session.query(Player)
+            .filter(Player.campaign_id == seed_campaign_and_actor["campaign_id"])
+            .filter(Player.actor_id == "actor-2")
+            .one()
+        )
+        other_state = json.loads(other_player_row.state_json or "{}")
+        other_state["character_name"] = "Dawn Preston the androgynous sibling of Chace Preston"
+        other_state["location"] = "alien-craft-resonance-chamber"
+        other_state["room_title"] = "Resonance Chamber"
+        other_state["room_summary"] = "You remain in control of the next move."
+        other_player_row.state_json = json.dumps(other_state)
+        session.commit()
+
+    assert other_player.actor_id == "actor-2"
+    turns = compat.get_recent_turns(seed_campaign_and_actor["campaign_id"])
+    _system_prompt, user_prompt = compat.build_prompt(campaign, player, "look", turns)
+
+    scene_match = re.search(r"SCENE_STATE:\s*(\{.*?\})\nCHARACTER_INDEX:", user_prompt, re.DOTALL)
+    assert scene_match is not None
+    scene_state = json.loads(scene_match.group(1))
+    assert {row.get("slug") for row in scene_state["present_players"]} == {
+        f"player-{seed_campaign_and_actor['actor_id']}",
+        "player-actor-2",
+    }
+    assert {row.get("slug") for row in scene_state["present_characters"]} == {"gwen"}
+
+    character_index_match = re.search(r"CHARACTER_INDEX:\s*(\[.*?\])\nCHARACTER_CARDS:", user_prompt, re.DOTALL)
+    assert character_index_match is not None
+    character_index = json.loads(character_index_match.group(1))
+    assert {row.get("slug") for row in character_index} == {"gwen"}
+
+    cards_match = re.search(r"CHARACTER_CARDS:\s*(\[.*?\])\nLOCATION_INDEX:", user_prompt, re.DOTALL)
+    assert cards_match is not None
+    character_cards = json.loads(cards_match.group(1))
+    assert {row.get("slug") for row in character_cards} == {"gwen"}
+
+    world_match = re.search(r"WORLD_CHARACTERS:\s*(\[.*?\])\nPLAYER_CARD:", user_prompt, re.DOTALL)
+    assert world_match is not None
+    world_characters = json.loads(world_match.group(1))
+    assert {row.get("slug") for row in world_characters} == {"gwen"}
+
+
 def test_build_prompt_cards_use_top_level_scan_fields_without_compact_duplication(
     session_factory,
     seed_campaign_and_actor,
