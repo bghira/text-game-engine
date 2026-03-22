@@ -7331,18 +7331,6 @@ class ZorkEmulator:
             if sms_notice:
                 decorated = f"{decorated}\n\n{sms_notice}"
                 self._increment_auto_fix_counter(campaign_state, "sms_unread_notice")
-                # Also send as a DM so the player sees it even if they
-                # aren't watching the game channel.
-                if self._notification_port is not None:
-                    try:
-                        asyncio.create_task(
-                            self._notification_port.send_dm(
-                                actor_id=str(actor_id),
-                                message=sms_notice,
-                            )
-                        )
-                    except Exception:
-                        pass
 
             if timer_instruction is not None and not has_timer_line:
                 delay_seconds = (
