@@ -983,26 +983,20 @@ def test_build_prompt_cards_use_top_level_scan_fields_without_compact_duplicatio
     )
     assert room_card["name"] == "Basement Media Room"
     assert room_card["summary"] == "Low lamps, leather couch, humming projector."
-    assert "name" not in room_card["compact"]
-    assert "summary" not in room_card["compact"]
-    assert "exits" not in room_card["compact"]
-    assert "name" not in room_card["expanded"]
-    assert "summary" not in room_card["expanded"]
-    assert "exits" not in room_card["expanded"]
+    assert room_card.get("compact") is None
     assert "priority" not in room_card
-    assert room_card["expanded"]["layout"] == "Screen wall opposite the bar cart."
+    assert room_card["layout"] == "Screen wall opposite the bar cart."
 
     projection_booth = next(
         row for row in location_cards if row.get("slug") == "oakhaven-projection-booth"
     )
     assert "priority" not in projection_booth
-    assert projection_booth["expanded"]["monitoring_station"] == "recording"
-    assert projection_booth["expanded"].get("channel_seven") is None
-    assert projection_booth["compact"]["monitoring_station"] == "recording"
-    assert projection_booth["compact"].get("channel_seven") is None
+    assert projection_booth["monitoring_station"] == "recording"
+    assert projection_booth.get("channel_seven") is None
+    assert projection_booth.get("compact") is None
     assert compat.LOCATION_FACT_PRIORITIES_KEY not in projection_booth["available_keys"]
     assert '"compact": {}' not in location_match.group(1)
-    assert '"expanded": {}' not in location_match.group(1)
+    assert '"expanded":' not in location_match.group(1)
 
 
 def test_location_update_priority_wrapper_persists_hidden_fact_priority_metadata():
@@ -1259,6 +1253,9 @@ def test_ready_to_write_finalization_reexpands_character_and_location_cards(
         assert '"relationship": "Brittle but engaged."' in completion.calls[1]["prompt"]
         assert "FINAL_LOCATION_CARDS:" in completion.calls[1]["prompt"]
         assert "hotel-lobby" in completion.calls[1]["prompt"]
+        final_location_match = re.search(r"FINAL_LOCATION_CARDS:\s*(\[.*?\])\n", completion.calls[1]["prompt"], re.DOTALL)
+        assert final_location_match is not None
+        assert '"expanded":' not in final_location_match.group(1)
 
     asyncio.run(run_test())
 

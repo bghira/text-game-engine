@@ -11934,10 +11934,12 @@ class ZorkEmulator:
                 ),
                 "available_keys": sorted(available_keys),
             }
+            for key in list(expanded.keys()):
+                compact.pop(key, None)
+            for key, value in expanded.items():
+                row[key] = value
             if compact:
                 row["compact"] = compact
-            if expanded:
-                row["expanded"] = expanded
             rows.append(row)
         return rows
 
