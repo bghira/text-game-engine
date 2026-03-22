@@ -16019,25 +16019,101 @@ class ZorkEmulator:
         }
 
     @classmethod
+    def _inventory_origin_for_prompt(cls, value: object) -> str:
+        text = " ".join(str(value or "").strip().split())
+        if not text:
+            return ""
+        lower = text.lower()
+        strong_prefixes = (
+            "found ",
+            "received ",
+            "bought ",
+            "stole ",
+            "taken ",
+            "took ",
+            "picked up",
+            "retrieved ",
+            "gift ",
+            "won ",
+            "from ",
+            "looted ",
+            "borrowed ",
+            "taken from ",
+            "received from ",
+        )
+        if any(lower.startswith(prefix) for prefix in strong_prefixes):
+            return text[:120]
+        if len(text.split()) <= 4 and not any(ch in text for ch in ".!?"):
+            if lower.startswith(("from ", "in ", "at ")):
+                return text[:120]
+            return f"From {text[:112]}".strip()
+        return "Acquired earlier in-scene."
+
+    @classmethod
     def _get_inventory_rich(cls, player_state: dict[str, object]) -> list[dict[str, object]]:
         raw = player_state.get("inventory") if isinstance(player_state, dict) else None
         if isinstance(raw, list):
             out = []
+            seen: set[str] = set()
             for item in raw[:50]:
                 if isinstance(item, dict):
-                    out.append(item)
+                    name = str(
+                        item.get("name") or item.get("item") or item.get("title") or ""
+                    ).strip()
+                    if not name:
+                        continue
+                    name_key = name.lower()
+                    if name_key in seen:
+                        continue
+                    seen.add(name_key)
+                    out.append(
+                        {
+                            "name": name,
+                            "origin": cls._inventory_origin_for_prompt(item.get("origin")),
+                        }
+                    )
                 elif isinstance(item, str) and item.strip():
-                    out.append({"name": item.strip()})
+                    name = item.strip()
+                    name_key = name.lower()
+                    if name_key in seen:
+                        continue
+                    seen.add(name_key)
+                    out.append({"name": name, "origin": ""})
             return out
         if isinstance(raw, dict):
             out = []
+            seen: set[str] = set()
             for key, value in raw.items():
                 if isinstance(value, dict):
-                    entry = dict(value)
-                    entry.setdefault("name", str(key).strip())
-                    out.append(entry)
+                    name = str(
+                        value.get("name") or value.get("item") or value.get("title") or key
+                    ).strip()
+                    if not name:
+                        continue
+                    name_key = name.lower()
+                    if name_key in seen:
+                        continue
+                    seen.add(name_key)
+                    out.append(
+                        {
+                            "name": name,
+                            "origin": cls._inventory_origin_for_prompt(value.get("origin")),
+                        }
+                    )
                 else:
-                    out.append({"name": str(key).strip(), "detail": value})
+                    name = str(key).strip()
+                    if not name:
+                        continue
+                    name_key = name.lower()
+                    if name_key in seen:
+                        continue
+                    seen.add(name_key)
+                    out.append(
+                        {
+                            "name": name,
+                            "origin": cls._inventory_origin_for_prompt(value),
+                        }
+                    )
             return out[:50]
         return []
 
