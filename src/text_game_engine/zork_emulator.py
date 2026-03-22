@@ -369,6 +369,7 @@ class ZorkEmulator:
         "saturday",
         "sunday",
     )
+    DAYS_PER_GAME_YEAR = 365
     LITERARY_STYLES_STATE_KEY = "literary_styles"
     MAX_LITERARY_STYLES_PROMPT_CHARS = 3000
     MAX_LITERARY_STYLE_PROFILE_CHARS = 400
@@ -11495,7 +11496,7 @@ class ZorkEmulator:
 
     def _character_birthday_hint_for_prompt(
         self,
-        campaign_state: Dict[str, object] | None,
+        current_day: int,
         character_row: object,
     ) -> str | None:
         if not isinstance(character_row, dict):
@@ -11506,12 +11507,10 @@ class ZorkEmulator:
         created_day = self._coerce_non_negative_int(created.get("day"), default=0)
         if created_day <= 0:
             return None
-        current_snapshot = self._extract_game_time_snapshot(campaign_state or {})
-        current_day = self._coerce_non_negative_int(current_snapshot.get("day"), default=0)
         if current_day < created_day:
             return None
         days_in_game = current_day - created_day
-        if days_in_game % 365 != 0:
+        if days_in_game % self.DAYS_PER_GAME_YEAR != 0:
             return None
         return "It is this character's birthday today."
 
@@ -11553,6 +11552,7 @@ class ZorkEmulator:
             self.AUTOBIOGRAPHY_RAW_FIELD,
             self.AUTOBIOGRAPHY_LAST_COMPRESSED_TURN_FIELD,
             "evolving_personality",
+            "created",
         }
         for entry in characters_for_prompt or []:
             if not isinstance(entry, dict):
@@ -11597,8 +11597,13 @@ class ZorkEmulator:
             self.AUTOBIOGRAPHY_RAW_FIELD,
             self.AUTOBIOGRAPHY_LAST_COMPRESSED_TURN_FIELD,
             "evolving_personality",
+            "created",
         }
         top_level_keys = {"name", "location", "current_status"}
+        current_day = self._coerce_non_negative_int(
+            self._extract_game_time_snapshot(campaign_state or {}).get("day"),
+            default=0,
+        )
         for entry in characters_for_prompt or []:
             if not isinstance(entry, dict):
                 continue
@@ -11609,7 +11614,7 @@ class ZorkEmulator:
             if not isinstance(source, dict):
                 source = dict(entry)
             birthday_hint = self._character_birthday_hint_for_prompt(
-                campaign_state,
+                current_day,
                 source,
             )
             if birthday_hint:

@@ -822,9 +822,18 @@ def test_build_prompt_character_cards_add_birthday_hint_only_on_matching_day(
     assert gwen_card["expanded"]["birthday_hint"] == "It is this character's birthday today."
     assert gwen_card["compact"]["birthday_hint"] == "It is this character's birthday today."
     assert "birthday_hint" in gwen_card["available_keys"]
+    assert "created" not in gwen_card["available_keys"]
+    assert gwen_card["expanded"].get("created") is None
+    assert gwen_card["compact"].get("created") is None
     assert yasmin_card["expanded"].get("birthday_hint") is None
     assert yasmin_card["compact"].get("birthday_hint") is None
     assert "birthday_hint" not in yasmin_card["available_keys"]
+    assert "created" not in yasmin_card["available_keys"]
+    character_index_match = re.search(r"CHARACTER_INDEX:\s*(\[.*?\])\nCHARACTER_CARDS:", user_prompt, re.DOTALL)
+    assert character_index_match is not None
+    character_index = json.loads(character_index_match.group(1))
+    gwen_index = next(row for row in character_index if row.get("slug") == "gwen")
+    assert "created" not in gwen_index["available_keys"]
     assert '"birthday_hint"' not in re.search(r"WORLD_CHARACTERS:\s*(\[.*?\])\nPLAYER_CARD:", user_prompt, re.DOTALL).group(1)
 
 
