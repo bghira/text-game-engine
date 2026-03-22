@@ -2139,11 +2139,18 @@ def test_setup_flow_with_attachment_and_confirm(session_factory, seed_campaign_a
         )
         assert "I recognize" in msg
 
-        genre_msg = await compat.handle_setup_message(
+        structure_msg = await compat.handle_setup_message(
             campaign_id=campaign.id,
             actor_id=seed_campaign_and_actor["actor_id"],
             message_text="yes",
             attachments=[StubAttachment("lore.txt", b"Neo wakes up in a false city.\n\nAgents hunt him.")],
+        )
+        assert "campaign structure" in structure_msg.lower()
+
+        genre_msg = await compat.handle_setup_message(
+            campaign_id=campaign.id,
+            actor_id=seed_campaign_and_actor["actor_id"],
+            message_text="character-centric",
         )
         assert "genre direction" in genre_msg.lower()
 
@@ -2192,13 +2199,20 @@ def test_classify_confirm_negative_with_novel_guidance_skips_reclassify(
         assert "Is this correct?" in msg
         assert probe.initial_classify_calls == 1
 
-        genre_msg = await compat.handle_setup_message(
+        structure_msg = await compat.handle_setup_message(
             campaign_id=campaign.id,
             actor_id=seed_campaign_and_actor["actor_id"],
             message_text="no, i'd rather do a novel thing where the moon is a prison colony",
         )
-        assert "genre direction" in genre_msg.lower()
+        assert "campaign structure" in structure_msg.lower()
         assert probe.reclassify_calls == 0
+
+        genre_msg = await compat.handle_setup_message(
+            campaign_id=campaign.id,
+            actor_id=seed_campaign_and_actor["actor_id"],
+            message_text="character-centric",
+        )
+        assert "genre direction" in genre_msg.lower()
 
         variants_msg = await compat.handle_setup_message(
             campaign_id=campaign.id,
@@ -2238,10 +2252,17 @@ def test_setup_variant_rendering_formats_structured_people_and_chapters(
         )
         assert "I recognize" in msg
 
-        genre_msg = await compat.handle_setup_message(
+        structure_msg = await compat.handle_setup_message(
             campaign_id=campaign.id,
             actor_id=seed_campaign_and_actor["actor_id"],
             message_text="yes",
+        )
+        assert "campaign structure" in structure_msg.lower()
+
+        genre_msg = await compat.handle_setup_message(
+            campaign_id=campaign.id,
+            actor_id=seed_campaign_and_actor["actor_id"],
+            message_text="character-centric",
         )
         assert "genre direction" in genre_msg.lower()
 
@@ -2263,6 +2284,70 @@ def test_setup_variant_rendering_formats_structured_people_and_chapters(
             main_character = setup_variants[0].get("main_character")
             assert isinstance(main_character, dict)
             assert main_character.get("name") == "Lison Farrand"
+
+    asyncio.run(run_test())
+
+
+def test_setup_shared_world_does_not_auto_assign_player_identity(
+    session_factory, seed_campaign_and_actor
+):
+    async def run_test():
+        compat = _build_compat(
+            session_factory,
+            completion_port=StubCompletionPort(),
+            imdb_port=StubIMDB(),
+        )
+        campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
+
+        msg = await compat.start_campaign_setup(
+            campaign_id=campaign.id,
+            actor_id=seed_campaign_and_actor["actor_id"],
+            raw_name="Matrix",
+            on_rails=True,
+        )
+        assert "I recognize" in msg
+
+        structure_msg = await compat.handle_setup_message(
+            campaign_id=campaign.id,
+            actor_id=seed_campaign_and_actor["actor_id"],
+            message_text="yes",
+        )
+        assert "shared-world" in structure_msg.lower()
+
+        genre_msg = await compat.handle_setup_message(
+            campaign_id=campaign.id,
+            actor_id=seed_campaign_and_actor["actor_id"],
+            message_text="shared-world",
+        )
+        assert "genre direction" in genre_msg.lower()
+
+        variants_msg = await compat.handle_setup_message(
+            campaign_id=campaign.id,
+            actor_id=seed_campaign_and_actor["actor_id"],
+            message_text="noir",
+        )
+        assert "Choose a storyline variant" in variants_msg
+
+        done_msg = await compat.handle_setup_message(
+            campaign_id=campaign.id,
+            actor_id=seed_campaign_and_actor["actor_id"],
+            message_text="1",
+        )
+        assert "is ready" in done_msg
+
+        with session_factory() as session:
+            row = session.get(Campaign, campaign.id)
+            state = json.loads(row.state_json or "{}")
+            assert state.get("world_structure") == "shared-world"
+            player = (
+                session.query(Player)
+                .filter(Player.campaign_id == campaign.id)
+                .filter(Player.actor_id == seed_campaign_and_actor["actor_id"])
+                .first()
+            )
+            assert player is not None
+            player_state = json.loads(player.state_json or "{}")
+            assert not player_state.get("character_name")
 
     asyncio.run(run_test())
 
@@ -2947,9 +3032,17 @@ def test_legacy_setup_signatures(session_factory, seed_campaign_and_actor):
         )
         assert "I recognize" in msg
 
-        genre_msg = await compat.handle_setup_message(
+        structure_msg = await compat.handle_setup_message(
             ctx,
             "yes",
+            campaign,
+            command_prefix="!",
+        )
+        assert "campaign structure" in structure_msg.lower()
+
+        genre_msg = await compat.handle_setup_message(
+            ctx,
+            "character-centric",
             campaign,
             command_prefix="!",
         )

@@ -3751,6 +3751,13 @@ class ZorkEmulator:
                     clean_text,
                     attachments=attachments,
                 )
+            elif phase == "world_structure_pick":
+                result = await self._setup_handle_world_structure_pick(
+                    campaign,
+                    state,
+                    setup_data,
+                    clean_text,
+                )
             elif phase == "genre_pick":
                 result = await self._setup_handle_genre_pick(
                     campaign,
@@ -4187,6 +4194,22 @@ class ZorkEmulator:
         if self._completion_port is None:
             return 0, ""
         attachment_summary = str(setup_data.get("attachment_summary") or "").strip()
+        world_structure = str(
+            setup_data.get("world_structure") or "character-centric"
+        ).strip().lower()
+        if world_structure == "shared-world":
+            structure_context = (
+                "\nCampaign structure: shared-world.\n"
+                "Build variants around a world many players can inhabit, not a single chosen protagonist.\n"
+                "Do not make the campaign depend on one singular lead character.\n"
+                "The `main_character` field should name a suggested entry point, first viewpoint, or social anchor, "
+                "not the only person the campaign matters to.\n"
+            )
+        else:
+            structure_context = (
+                "\nCampaign structure: character-centric.\n"
+                "Build variants around a strong central player-facing lead or main viewpoint character.\n"
+            )
         source_payload = self._source_material_prompt_payload(str(campaign.id))
         source_index_hint = self._auto_rulebook_source_index_hint(source_payload)
         source_tool_instructions = ""
@@ -4871,6 +4894,22 @@ class ZorkEmulator:
         if not isinstance(imdb_results, list):
             imdb_results = []
         attachment_summary = str(setup_data.get("attachment_summary") or "").strip()
+        world_structure = str(
+            setup_data.get("world_structure") or "character-centric"
+        ).strip().lower()
+        if world_structure == "shared-world":
+            structure_context = (
+                "\nCampaign structure: shared-world.\n"
+                "Build variants around a world many players can inhabit, not a single chosen protagonist.\n"
+                "Do not make the campaign depend on one singular lead character.\n"
+                "The `main_character` field should name a suggested entry point, first viewpoint, or social anchor, "
+                "not the only person the campaign matters to.\n"
+            )
+        else:
+            structure_context = (
+                "\nCampaign structure: character-centric.\n"
+                "Build variants around a strong central player-facing lead or main viewpoint character.\n"
+            )
 
         # Build source material index hint if docs are available.
         source_payload = self._source_material_prompt_payload(str(campaign.id))
@@ -5017,6 +5056,7 @@ class ZorkEmulator:
                     f"{imdb_context}"
                     f"{attachment_context}"
                     f"{source_index_hint}"
+                    f"{structure_context}"
                     f"{genre_context}"
                     f"{guidance_context}"
                     "Use actual characters, locations, and plot points from the source work."
@@ -5027,6 +5067,7 @@ class ZorkEmulator:
                     f"called '{raw_name}'.\n"
                     f"{attachment_context}"
                     f"{source_index_hint}"
+                    f"{structure_context}"
                     f"{genre_context}"
                     f"{guidance_context}"
                     "Each variant should have a different tone, central conflict, or protagonist archetype. "
@@ -5336,6 +5377,53 @@ class ZorkEmulator:
 
         return {"kind": "custom", "value": raw[:200]}, None
 
+    @classmethod
+    def _setup_world_structure_prompt(cls) -> str:
+        return (
+            "What kind of campaign structure do you want?\n\n"
+            "1. **character-centric** — a main player character / lead viewpoint anchors the campaign.\n"
+            "2. **shared-world** — the world matters more than one singular protagonist; multiple players can inhabit it.\n\n"
+            "Reply with **character-centric** or **shared-world**.\n"
+            "Short aliases also work: **main-player** / **ensemble**."
+        )
+
+    @classmethod
+    def _parse_setup_world_structure_choice(
+        cls,
+        content: str,
+    ) -> tuple[str | None, str | None]:
+        raw = str(content or "").strip().lower()
+        if not raw:
+            return None, "Please choose a campaign structure."
+
+        normalized = raw.replace("_", "-").replace(" ", "-")
+        normalized = re.sub(r"-{2,}", "-", normalized).strip("-")
+        protagonist_tokens = {
+            "1",
+            "character-centric",
+            "charactercentric",
+            "main-player",
+            "main-character",
+            "protagonist",
+            "lead",
+            "solo",
+        }
+        shared_tokens = {
+            "2",
+            "shared-world",
+            "sharedworld",
+            "ensemble",
+            "world-centric",
+            "sandbox",
+            "multi-player",
+            "multiplayer",
+        }
+        if normalized in protagonist_tokens:
+            return "character-centric", None
+        if normalized in shared_tokens:
+            return "shared-world", None
+        return None, "Reply with `character-centric` or `shared-world`."
+
     async def _setup_handle_classify_confirm(
         self,
         campaign: Campaign,
@@ -5537,6 +5625,21 @@ class ZorkEmulator:
 
         if user_guidance:
             setup_data["variant_user_guidance"] = user_guidance
+        state["setup_phase"] = "world_structure_pick"
+        state["setup_data"] = setup_data
+        return self._setup_world_structure_prompt()
+
+    async def _setup_handle_world_structure_pick(
+        self,
+        campaign: Campaign,
+        state: dict[str, Any],
+        setup_data: dict[str, Any],
+        message_text: str,
+    ) -> str:
+        world_structure, error = self._parse_setup_world_structure_choice(message_text)
+        if error:
+            return f"{error}\n\n{self._setup_world_structure_prompt()}"
+        setup_data["world_structure"] = world_structure
         state["setup_phase"] = "genre_pick"
         state["setup_data"] = setup_data
         return self._setup_genre_prompt()
@@ -5600,6 +5703,9 @@ class ZorkEmulator:
         if not isinstance(novel_prefs, dict):
             novel_prefs = {}
         on_rails = True if is_known else bool(novel_prefs.get("on_rails", False))
+        world_structure = str(
+            setup_data.get("world_structure") or "character-centric"
+        ).strip().lower()
 
         # Build source material index hint if docs are available.
         source_payload = self._source_material_prompt_payload(str(campaign.id))
@@ -5677,6 +5783,18 @@ class ZorkEmulator:
                 genre_value = str(genre_pref.get("value") or "").strip()
                 if genre_value:
                     genre_context = f"\nGenre direction: {genre_value}\n"
+            if world_structure == "shared-world":
+                structure_context = (
+                    "\nCampaign structure: shared-world.\n"
+                    "Build a setting that supports multiple player characters, factions, and entry points.\n"
+                    "Do not center the world on one singular destined protagonist.\n"
+                    "If you name a `main_character`, treat that as a suggested entry point or initial viewpoint only.\n"
+                )
+            else:
+                structure_context = (
+                    "\nCampaign structure: character-centric.\n"
+                    "It is acceptable to build the world around a central player-facing lead or main viewpoint.\n"
+                )
             finalize_system = (
                 "You are a world-builder for interactive text-adventure campaigns.\n"
                 "For non-canonical/original characters, choose distinctive specific names; avoid generic defaults "
@@ -5694,6 +5812,7 @@ class ZorkEmulator:
                 f"{imdb_context}"
                 f"{attachment_context}"
                 f"{source_index_hint}"
+                f"{structure_context}"
                 f"{genre_context}"
                 f"Chosen storyline:\n{self._dump_json(chosen)}\n\n"
                 "Expand chapter outline into full chapters with 2-4 scenes each."
@@ -5707,6 +5826,7 @@ class ZorkEmulator:
                             f"{imdb_context}"
                             f"{attachment_context}"
                             f"{source_index_hint}"
+                            f"{structure_context}"
                             f"{genre_context}"
                             "Source-material summary (if present) is authoritative; keep names, locations, and plot faithful to it.\n"
                             f"Chosen storyline:\n{self._dump_json(chosen)}"
@@ -5797,6 +5917,7 @@ class ZorkEmulator:
         state[self.CLOCK_START_DAY_OF_WEEK_KEY] = starting_day_of_week
         state["on_rails"] = on_rails
         state["puzzle_mode"] = novel_prefs.get("puzzle_mode", "none")
+        state["world_structure"] = world_structure
 
         if opening:
             room_title = start_room.get("room_title", "") if isinstance(start_room, dict) else ""
@@ -5838,7 +5959,11 @@ class ZorkEmulator:
                 main_char = chosen.get("main_character", "")
                 if isinstance(main_char, dict):
                     main_char = str(main_char.get("name") or "").strip()
-                if main_char and not player_state.get("character_name"):
+                if (
+                    world_structure != "shared-world"
+                    and main_char
+                    and not player_state.get("character_name")
+                ):
                     player_state["character_name"] = main_char
                 if default_persona and not player_state.get("persona"):
                     player_state["persona"] = self._trim_text(str(default_persona), self.MAX_PERSONA_PROMPT_CHARS)
