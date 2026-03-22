@@ -13214,6 +13214,8 @@ class ZorkEmulator:
                 system_prompt = f"{system_prompt}{self.GUARDRAILS_SYSTEM_PROMPT}"
             if on_rails:
                 system_prompt = f"{system_prompt}{self.ON_RAILS_SYSTEM_PROMPT}"
+            if state.get("timed_events_enabled", True):
+                system_prompt = f"{system_prompt}{self.TIMER_TOOL_PROMPT}"
         return system_prompt, user_prompt
 
     async def generate_map(self, campaign_or_ctx, actor_id: str | None = None, command_prefix: str = "!") -> str:
