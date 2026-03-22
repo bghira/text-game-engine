@@ -484,22 +484,9 @@ class TestMemorySearchCategoryFiltering:
     def test_source_category_returns_only_source_hits(self):
         from text_game_engine.tool_aware_llm import ToolAwareZorkLLM
 
-        class _FakeQuery:
-            def filter(self, *args, **kwargs):
-                return self
-
-            def order_by(self, *args, **kwargs):
-                return self
-
-            def all(self):
-                return []
-
-            def first(self):
-                return None
-
         class _FakeSession:
             def query(self, *args, **kwargs):
-                return _FakeQuery()
+                raise AssertionError("source-only memory search should not query turn/player tables")
 
         class _FakeSessionFactory:
             def __call__(self):

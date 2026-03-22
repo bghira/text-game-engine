@@ -1096,32 +1096,31 @@ class ToolAwareZorkLLM:
                 roster_hints = []
 
         narrator_hits: dict[int, dict[str, Any]] = {}
-        with self._session_factory() as session:
-            turns = (
-                session.query(Turn)
-                .filter(Turn.campaign_id == campaign_id)
-                .filter(Turn.kind == "narrator")
-                .order_by(Turn.id.desc())
-                .all()
-            )
-            actor_row = None
-            if actor_id:
-                actor_row = (
-                    session.query(Player)
-                    .filter(Player.campaign_id == campaign_id)
-                    .filter(Player.actor_id == actor_id)
-                    .first()
-                )
-        actor_slug = None
-        actor_location_key = ""
-        if actor_row is not None and self._emulator is not None:
-            actor_state = self._parse_json(actor_row.state_json, {})
-            actor_slug = self._emulator._player_visibility_slug(actor_id)  # noqa: SLF001
-            actor_location_key = self._emulator._room_key_from_player_state(  # noqa: SLF001
-                actor_state
-            )
-
         if include_turn_hits:
+            with self._session_factory() as session:
+                turns = (
+                    session.query(Turn)
+                    .filter(Turn.campaign_id == campaign_id)
+                    .filter(Turn.kind == "narrator")
+                    .order_by(Turn.id.desc())
+                    .all()
+                )
+                actor_row = None
+                if actor_id:
+                    actor_row = (
+                        session.query(Player)
+                        .filter(Player.campaign_id == campaign_id)
+                        .filter(Player.actor_id == actor_id)
+                        .first()
+                    )
+            actor_slug = None
+            actor_location_key = ""
+            if actor_row is not None and self._emulator is not None:
+                actor_state = self._parse_json(actor_row.state_json, {})
+                actor_slug = self._emulator._player_visibility_slug(actor_id)  # noqa: SLF001
+                actor_location_key = self._emulator._room_key_from_player_state(  # noqa: SLF001
+                    actor_state
+                )
             for query in queries[:4]:
                 q = query.lower().strip()
                 parts = [token for token in re.split(r"\W+", q) if token]
