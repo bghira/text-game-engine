@@ -11587,6 +11587,7 @@ class ZorkEmulator:
         rows: list[dict[str, object]] = []
         active_location = str((player_state or {}).get("location") or "").strip().lower()
         top_level_keys = {"name", "summary"}
+        suppressed_card_keys = {"exits"}
         for slug, payload in sorted(location_cards.items()):
             if not isinstance(payload, dict):
                 continue
@@ -11597,14 +11598,14 @@ class ZorkEmulator:
             }
             compact: dict[str, object] = {}
             for key in available_keys:
-                if key in top_level_keys:
+                if key in top_level_keys or key in suppressed_card_keys:
                     continue
                 compact_value = self._compact_prompt_fact_value(payload.get(key))
                 if compact_value:
                     compact[key] = compact_value
             expanded: dict[str, object] = {}
             for key in available_keys:
-                if key in top_level_keys:
+                if key in top_level_keys or key in suppressed_card_keys:
                     continue
                 priority = priorities.get(key, "low")
                 if priority == "critical" or (

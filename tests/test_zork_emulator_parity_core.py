@@ -730,6 +730,7 @@ def test_build_prompt_cards_use_top_level_scan_fields_without_compact_duplicatio
         player_state["location"] = "washington-ranch-basement-media-room"
         player_state["room_title"] = "Basement Media Room"
         player_state["room_summary"] = "Low lamps, leather couch, humming projector."
+        player_state["exits"] = ["Hallway", "Stairwell"]
         player_row.state_json = json.dumps(player_state)
         session.commit()
 
@@ -760,8 +761,10 @@ def test_build_prompt_cards_use_top_level_scan_fields_without_compact_duplicatio
     assert room_card["summary"] == "Low lamps, leather couch, humming projector."
     assert "name" not in room_card["compact"]
     assert "summary" not in room_card["compact"]
+    assert "exits" not in room_card["compact"]
     assert "name" not in room_card["expanded"]
     assert "summary" not in room_card["expanded"]
+    assert "exits" not in room_card["expanded"]
 
 
 def test_ready_to_write_finalization_uses_final_stage_system_prompt(
