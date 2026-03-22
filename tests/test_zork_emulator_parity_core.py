@@ -455,6 +455,7 @@ def test_build_prompt_bootstrap_stage_shape(session_factory, seed_campaign_and_a
     assert "WORLD_CHARACTERS:" in user_prompt
     assert "PLAYER_CARD:" in user_prompt
     assert "PARTY_SNAPSHOT:" in user_prompt
+    assert '"visible_items"' not in user_prompt
     assert "ACTIVE_PLAYER_LOCATION:" in user_prompt
     assert "PLAYER_ACTION" in user_prompt
 
