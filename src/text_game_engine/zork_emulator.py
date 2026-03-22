@@ -7518,6 +7518,9 @@ class ZorkEmulator:
             return
 
         with self._session_factory() as session:
+            campaign = session.get(Campaign, campaign_id)
+            campaign_state = parse_json_dict(campaign.state_json) if campaign is not None else {}
+            game_time_snapshot = self._extract_game_time_snapshot(campaign_state)
             source_player = (
                 session.query(Player)
                 .filter(Player.campaign_id == campaign_id)
@@ -7609,6 +7612,7 @@ class ZorkEmulator:
                     [],
                     [gi_item_name],
                     origin_hint="",
+                    game_time=game_time_snapshot,
                 )
                 source_player.state_json = self._dump_json(source_state)
 
@@ -7619,6 +7623,7 @@ class ZorkEmulator:
                 [gi_item_name],
                 [],
                 origin_hint=f"Received from <@{actor_id}>",
+                game_time=game_time_snapshot,
             )
             target_player.state_json = self._dump_json(target_state)
             target_player.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
@@ -16120,6 +16125,10 @@ class ZorkEmulator:
         if receipt_match:
             receipt_text = receipt_match.group(1)
             receipt_suffix = f" (received {receipt_text})"
+        base_text = text
+        if receipt_match:
+            start, end = receipt_match.span()
+            base_text = f"{text[:start]}{text[end:]}".strip(" ,.;")
         lower = text.lower()
         strong_prefixes = (
             "found ",
@@ -16138,12 +16147,26 @@ class ZorkEmulator:
             "taken from ",
             "received from ",
         )
+        def _truncate_preserving_receipt(raw: str, *, max_chars: int = 120) -> str:
+            clean = " ".join(str(raw or "").strip().split())
+            if not receipt_suffix:
+                return clean[:max_chars]
+            room = max_chars - len(receipt_suffix)
+            if room <= 0:
+                return receipt_suffix.strip()
+            if len(clean) <= room:
+                return f"{clean}{receipt_suffix}"
+            if room <= 3:
+                clipped = clean[:room]
+            else:
+                clipped = clean[: room - 3].rstrip() + "..."
+            return f"{clipped}{receipt_suffix}"
         if any(lower.startswith(prefix) for prefix in strong_prefixes):
-            return (text[:120] if len(text) > 120 else text)
+            return _truncate_preserving_receipt(base_text)
         if len(text.split()) <= 4 and not any(ch in text for ch in ".!?"):
             if lower.startswith(("from ", "in ", "at ")):
-                return text[:120]
-            return f"From {text[:112]}".strip()
+                return _truncate_preserving_receipt(base_text)
+            return _truncate_preserving_receipt(f"From {base_text[:112]}".strip())
         if receipt_suffix:
             return f"Acquired earlier in-scene.{receipt_suffix}"
         return "Acquired earlier in-scene."

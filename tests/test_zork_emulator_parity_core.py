@@ -1647,6 +1647,18 @@ def test_build_rails_context_normalizes_inventory_origin_fragments(session_facto
     assert blazer_row.get("origin") == "Acquired earlier in-scene. (received Day 10, 15:28)"
 
 
+def test_inventory_origin_for_prompt_preserves_receipt_suffix_when_truncating(session_factory, seed_campaign_and_actor):
+    compat = _build_compat(session_factory)
+    raw_origin = (
+        "Received from <@1> after the impossible communion at the edge of the desert, "
+        "with too many details to fit cleanly into a short prompt field "
+        "(received Day 10, 15:28)"
+    )
+    normalized = compat._inventory_origin_for_prompt(raw_origin)
+    assert "(received Day 10, 15:28)" in normalized
+    assert normalized.startswith("Received from <@1>")
+
+
 def test_generate_map_prompt_uses_authoritative_location_keys(session_factory, seed_campaign_and_actor):
     async def run_test():
         map_port = CaptureMapCompletionPort()
@@ -2762,6 +2774,17 @@ def test_give_item_fallback_infers_transfer_from_narration(
         source = compat.get_or_create_player(campaign.id, "1")
         compat.get_or_create_player(campaign.id, "2")
         with session_factory() as session:
+            campaign_row = session.get(Campaign, campaign.id)
+            campaign_state = json.loads(campaign_row.state_json or "{}")
+            campaign_state["game_time"] = {
+                "day": 7,
+                "hour": 14,
+                "minute": 42,
+                "day_of_week": "sunday",
+                "period": "afternoon",
+                "date_label": "Sunday, Day 7, Afternoon",
+            }
+            campaign_row.state_json = json.dumps(campaign_state)
             source_row = session.get(Player, source.id)
             source_row.state_json = compat._dump_json(
                 {"inventory": [{"name": "Rusty Key", "origin": "Found in locker"}]}
@@ -2784,6 +2807,7 @@ def test_give_item_fallback_infers_transfer_from_narration(
         assert "Rusty Key" in dst_names
         key_row = next(entry for entry in dst_items if entry["name"] == "Rusty Key")
         assert "Received from <@1>" in key_row.get("origin", "")
+        assert re.search(r"received Day 7, \d{2}:\d{2}", key_row.get("origin", ""))
 
     asyncio.run(run_test())
 
