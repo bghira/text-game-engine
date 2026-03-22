@@ -480,6 +480,82 @@ class TestPlainTextSearchIntentRecovery:
         }
 
 
+class TestMemorySearchCategoryFiltering:
+    def test_source_category_returns_only_source_hits(self):
+        from text_game_engine.tool_aware_llm import ToolAwareZorkLLM
+
+        class _FakeQuery:
+            def filter(self, *args, **kwargs):
+                return self
+
+            def order_by(self, *args, **kwargs):
+                return self
+
+            def all(self):
+                return []
+
+            def first(self):
+                return None
+
+        class _FakeSession:
+            def query(self, *args, **kwargs):
+                return _FakeQuery()
+
+        class _FakeSessionFactory:
+            def __call__(self):
+                return self
+
+            def __enter__(self):
+                return _FakeSession()
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        emulator = MagicMock()
+        emulator.list_source_material_documents.return_value = [
+            {
+                "document_key": "alien-ship-notes",
+                "document_label": "Alien Ship Notes",
+                "chunk_count": 3,
+                "format": "story",
+                "sample_chunk": "Rigby boards the alien craft.",
+            }
+        ]
+        emulator.search_source_material.return_value = [
+            (
+                "alien-ship-notes",
+                "Alien Ship Notes",
+                2,
+                "The five-heartbeat configuration interface unfolds from the wall.",
+                0.91,
+            )
+        ]
+        emulator.search_curated_memories.return_value = [
+            ("char:rigby", "Rigby was at the church parking lot.", 0.99)
+        ]
+        emulator._memory_port = None
+
+        llm = ToolAwareZorkLLM.__new__(ToolAwareZorkLLM)
+        llm._emulator = emulator
+        llm._session_factory = _FakeSessionFactory()
+        llm._zork_log = lambda *args, **kwargs: None
+
+        result = llm._tool_memory_search(
+            "campaign-1",
+            {
+                "queries": ["Rigby on the alien craft inside the ship"],
+                "category": "source",
+            },
+            actor_id="actor-1",
+        )
+
+        assert '"memory_type":"source"' in result
+        assert '"document_key":"alien-ship-notes"' in result
+        assert '"memory_type":"turn"' not in result
+        assert '"memory_type":"manual"' not in result
+        emulator.search_curated_memories.assert_not_called()
+
+
 # ---------------------------------------------------------------------------
 # JSON repair sub-methods
 # ---------------------------------------------------------------------------
