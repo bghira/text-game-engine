@@ -22,6 +22,19 @@ If you change source-material ingestion, format detection, `source_browse`,
 `memory_search` source behavior, or attachment authoring expectations, update
 `docs/source-material.md` in the same change.
 
+## Change Discipline
+
+- When you change a method signature, helper contract, or data shape, update all
+  call sites in the repo, not just the ones in the code path you are actively
+  editing.
+- Prefer repo-wide searches before finishing a refactor: find every caller,
+  serializer, normalizer, prompt builder, and test that depends on the old
+  contract.
+- If a helper is used both from model-facing flows and internal maintenance
+  flows, verify both paths still receive the new required inputs.
+- When truncating or normalizing structured text, preserve critical suffixes or
+  metadata fields instead of assuming the important part is always at the front.
+
 ## Repo Focus
 
 - `src/text_game_engine/zork_emulator.py`: main runtime surface
