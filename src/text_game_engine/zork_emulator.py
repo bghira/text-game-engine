@@ -11493,9 +11493,40 @@ class ZorkEmulator:
             text = text[: max_chars - 3].rstrip() + "..."
         return text
 
+    def _character_birthday_hint_for_prompt(
+        self,
+        campaign_state: Dict[str, object] | None,
+        character_row: object,
+    ) -> str | None:
+        if not isinstance(character_row, dict):
+            return None
+        created = character_row.get("created")
+        if not isinstance(created, dict):
+            return None
+        created_day = self._coerce_non_negative_int(created.get("day"), default=0)
+        if created_day <= 0:
+            return None
+        current_snapshot = self._extract_game_time_snapshot(campaign_state or {})
+        current_day = self._coerce_non_negative_int(current_snapshot.get("day"), default=0)
+        if current_day < created_day:
+            return None
+        days_in_game = current_day - created_day
+        if days_in_game % 365 != 0:
+            return None
+        return "It is this character's birthday today."
+
     def _character_field_priority(self, field_name: str) -> str:
         key = str(field_name or "").strip().lower()
-        if key in {"name", "location", "current_status", "speech_style", "relationship", "relationships", "allegiance"}:
+        if key in {
+            "name",
+            "location",
+            "current_status",
+            "speech_style",
+            "relationship",
+            "relationships",
+            "allegiance",
+            "birthday_hint",
+        }:
             return "critical"
         if key in {"appearance", "personality", "background", "autobiography", "literary_style"}:
             return "scene"
@@ -11555,6 +11586,7 @@ class ZorkEmulator:
         characters_for_prompt: list[dict[str, object]],
         *,
         characters: Dict[str, dict] | None = None,
+        campaign_state: Dict[str, object] | None = None,
         player_state: Dict[str, object] | None = None,
     ) -> list[dict[str, object]]:
         rows: list[dict[str, object]] = []
@@ -11576,6 +11608,13 @@ class ZorkEmulator:
             source = characters.get(slug)
             if not isinstance(source, dict):
                 source = dict(entry)
+            birthday_hint = self._character_birthday_hint_for_prompt(
+                campaign_state,
+                source,
+            )
+            if birthday_hint:
+                source = dict(source)
+                source["birthday_hint"] = birthday_hint
             available_keys = [
                 key
                 for key in source.keys()
@@ -12636,6 +12675,7 @@ class ZorkEmulator:
         character_cards = self._build_character_cards_for_prompt(
             characters_for_prompt,
             characters=characters,
+            campaign_state=state,
             player_state=player_state,
         )
         location_cards_map = self._location_cards_from_state(state, player_state)

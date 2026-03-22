@@ -3012,6 +3012,7 @@ class ToolAwareZorkLLM:
                     final_character_cards = emulator._build_character_cards_for_prompt(  # noqa: SLF001
                         final_character_entries,
                         characters=campaign_characters,
+                        campaign_state=campaign_state,
                         player_state=player_state,
                     )
                     if final_character_cards:

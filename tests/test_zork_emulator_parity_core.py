@@ -767,6 +767,67 @@ def test_build_prompt_cards_use_top_level_scan_fields_without_compact_duplicatio
     assert "exits" not in room_card["expanded"]
 
 
+def test_build_prompt_character_cards_add_birthday_hint_only_on_matching_day(
+    session_factory,
+    seed_campaign_and_actor,
+):
+    compat = _build_compat(session_factory)
+    campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
+    player = compat.get_or_create_player(seed_campaign_and_actor["campaign_id"], seed_campaign_and_actor["actor_id"])
+    with session_factory() as session:
+        row = session.get(Campaign, seed_campaign_and_actor["campaign_id"])
+        row.characters_json = json.dumps(
+            {
+                "gwen": {
+                    "name": "Gwen",
+                    "location": "hotel-lobby",
+                    "current_status": "Watching.",
+                    "speech_style": "Short sentences.",
+                    "created": {"day": 1, "hour": 8, "loc": "hotel-lobby", "source": "scene"},
+                },
+                "yasmin-devereaux": {
+                    "name": "Yasmin Devereaux",
+                    "location": "hotel-lobby",
+                    "current_status": "Still here.",
+                    "speech_style": "Sharp and quick.",
+                    "created": {"day": 2, "hour": 8, "loc": "hotel-lobby", "source": "scene"},
+                },
+            }
+        )
+        state = json.loads(row.state_json or "{}")
+        state["game_time"] = {"day": 366, "hour": 14, "minute": 15}
+        row.state_json = json.dumps(state)
+        player_row = (
+            session.query(Player)
+            .filter(Player.campaign_id == seed_campaign_and_actor["campaign_id"])
+            .filter(Player.actor_id == seed_campaign_and_actor["actor_id"])
+            .one()
+        )
+        player_state = json.loads(player_row.state_json or "{}")
+        player_state["location"] = "hotel-lobby"
+        player_state["room_title"] = "Hotel Lobby"
+        player_state["room_summary"] = "Marble lobby and brass desk."
+        player_row.state_json = json.dumps(player_state)
+        session.commit()
+
+    turns = compat.get_recent_turns(seed_campaign_and_actor["campaign_id"])
+    _system_prompt, user_prompt = compat.build_prompt(campaign, player, "look", turns)
+
+    character_match = re.search(r"CHARACTER_CARDS:\s*(\[.*?\])\nLOCATION_INDEX:", user_prompt, re.DOTALL)
+    assert character_match is not None
+    character_cards = json.loads(character_match.group(1))
+    gwen_card = next(row for row in character_cards if row.get("slug") == "gwen")
+    yasmin_card = next(row for row in character_cards if row.get("slug") == "yasmin-devereaux")
+
+    assert gwen_card["expanded"]["birthday_hint"] == "It is this character's birthday today."
+    assert gwen_card["compact"]["birthday_hint"] == "It is this character's birthday today."
+    assert "birthday_hint" in gwen_card["available_keys"]
+    assert yasmin_card["expanded"].get("birthday_hint") is None
+    assert yasmin_card["compact"].get("birthday_hint") is None
+    assert "birthday_hint" not in yasmin_card["available_keys"]
+    assert '"birthday_hint"' not in re.search(r"WORLD_CHARACTERS:\s*(\[.*?\])\nPLAYER_CARD:", user_prompt, re.DOTALL).group(1)
+
+
 def test_ready_to_write_finalization_uses_final_stage_system_prompt(
     session_factory,
     seed_campaign_and_actor,
