@@ -1934,14 +1934,15 @@ class ZorkEmulator:
                 .first()
             )
             if row is None:
+                default_campaign = self.get_or_create_campaign(guild, "main", created_by_actor_id="system")
                 row = GameSession(
-                    campaign_id=self.get_or_create_campaign(guild, "main", created_by_actor_id="system").id,
+                    campaign_id=default_campaign.id,
                     surface="discord_channel",
                     surface_key=key,
                     surface_guild_id=guild,
                     surface_channel_id=channel,
                     enabled=False,
-                    metadata_json=self._dump_json({"active_campaign_id": None}),
+                    metadata_json=self._dump_json({"active_campaign_id": default_campaign.id}),
                 )
                 session.add(row)
                 session.commit()
@@ -1968,6 +1969,7 @@ class ZorkEmulator:
                 campaign = self.get_or_create_campaign(guild, "main", actor_id)
                 active_campaign_id = campaign.id
             meta["active_campaign_id"] = active_campaign_id
+            channel_row.campaign_id = active_campaign_id
             channel_row.enabled = True
             self._store_session_metadata(channel_row, meta)
             channel_row.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
@@ -2012,6 +2014,7 @@ class ZorkEmulator:
                     return None, False, f"{active_count} other player(s) active in last hour"
             campaign = self.get_or_create_campaign(str(guild_id), normalized, actor_id)
             meta["active_campaign_id"] = campaign.id
+            channel_row.campaign_id = campaign.id
             self._store_session_metadata(channel_row, meta)
             channel_row.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
             session.commit()
