@@ -258,13 +258,13 @@ class ZorkEmulator:
     PLAYER_STATS_LAST_MESSAGE_AT_KEY = "last_message_at"
     _MENTION_RE = re.compile(r"<@!?(\d+)>")
     DEFAULT_CAMPAIGN_PERSONA = (
-        "A cooperative, curious adventurer: observant, resourceful, and willing to "
-        "engage with absurd situations in-character."
+        "Average build, mid-20s, practical clothes, well-worn boots, alert eyes, "
+        "a satchel slung across one shoulder."
     )
     PRESET_DEFAULT_PERSONAS = {
         "alice": (
-            "A curious and polite wanderer with dry wit, dream-logic intuition, and "
-            "quiet courage in whimsical danger."
+            "Young girl, bright blue eyes, long blonde hair with a black headband, "
+            "pale blue knee-length dress, white pinafore, striped stockings."
         ),
     }
     PRESET_ALIASES = {
@@ -369,6 +369,7 @@ class ZorkEmulator:
         "saturday",
         "sunday",
     )
+    DAYS_PER_GAME_YEAR = 365
     LITERARY_STYLES_STATE_KEY = "literary_styles"
     MAX_LITERARY_STYLES_PROMPT_CHARS = 3000
     MAX_LITERARY_STYLE_PROFILE_CHARS = 400
@@ -2401,11 +2402,11 @@ class ZorkEmulator:
             return self.DEFAULT_CAMPAIGN_PERSONA
         prompt = (
             f"The campaign is titled: '{campaign_name}'.\n"
-            "If this references a known movie, book, show, or story, describe the MAIN CHARACTER as a person — "
-            "age, vibe, background, and what makes them tick. Not how they speak or narrate.\n"
+            "If this references a known movie, book, show, or story, describe the MAIN CHARACTER's physical appearance — "
+            "age, build, hair, clothing, distinguishing features. Not personality or writing style.\n"
             "If it's an original setting, describe a fitting protagonist the same way.\n"
-            "Write it like a casting brief: '28-year-old ambitious junior associate at a top law firm, "
-            "smart but naive about office politics' — not a voice direction or writing style.\n"
+            "Write it like a casting sheet: 'Late 20s, lean, dark curly hair, rumpled suit, ink-stained fingers, "
+            "furrowed brow' — visual details an artist could draw from, not behavior or voice.\n"
             "Return ONLY the persona (1-2 sentences, max 140 chars). No quotes or explanation."
         )
         try:
@@ -6216,7 +6217,7 @@ class ZorkEmulator:
             "centered composition",
         ]
         if persona:
-            prompt_parts.insert(1, f"Persona/style notes: {persona}.")
+            prompt_parts.insert(1, f"Appearance: {persona}.")
         composed = " ".join([part for part in prompt_parts if part])
         composed = re.sub(r"\s+", " ", composed).strip()
         return self._trim_text(composed, 900)
@@ -11493,9 +11494,38 @@ class ZorkEmulator:
             text = text[: max_chars - 3].rstrip() + "..."
         return text
 
+    def _character_birthday_hint_for_prompt(
+        self,
+        current_day: int,
+        character_row: object,
+    ) -> str | None:
+        if not isinstance(character_row, dict):
+            return None
+        created = character_row.get("created")
+        if not isinstance(created, dict):
+            return None
+        created_day = self._coerce_non_negative_int(created.get("day"), default=0)
+        if created_day <= 0:
+            return None
+        if current_day < created_day:
+            return None
+        days_in_game = current_day - created_day
+        if days_in_game % self.DAYS_PER_GAME_YEAR != 0:
+            return None
+        return "It is this character's birthday today."
+
     def _character_field_priority(self, field_name: str) -> str:
         key = str(field_name or "").strip().lower()
-        if key in {"name", "location", "current_status", "speech_style", "relationship", "relationships", "allegiance"}:
+        if key in {
+            "name",
+            "location",
+            "current_status",
+            "speech_style",
+            "relationship",
+            "relationships",
+            "allegiance",
+            "birthday_hint",
+        }:
             return "critical"
         if key in {"appearance", "personality", "background", "autobiography", "literary_style"}:
             return "scene"
@@ -11522,6 +11552,7 @@ class ZorkEmulator:
             self.AUTOBIOGRAPHY_RAW_FIELD,
             self.AUTOBIOGRAPHY_LAST_COMPRESSED_TURN_FIELD,
             "evolving_personality",
+            "created",
         }
         for entry in characters_for_prompt or []:
             if not isinstance(entry, dict):
@@ -11555,6 +11586,7 @@ class ZorkEmulator:
         characters_for_prompt: list[dict[str, object]],
         *,
         characters: Dict[str, dict] | None = None,
+        campaign_state: Dict[str, object] | None = None,
         player_state: Dict[str, object] | None = None,
     ) -> list[dict[str, object]]:
         rows: list[dict[str, object]] = []
@@ -11565,8 +11597,13 @@ class ZorkEmulator:
             self.AUTOBIOGRAPHY_RAW_FIELD,
             self.AUTOBIOGRAPHY_LAST_COMPRESSED_TURN_FIELD,
             "evolving_personality",
+            "created",
         }
         top_level_keys = {"name", "location", "current_status"}
+        current_day = self._coerce_non_negative_int(
+            self._extract_game_time_snapshot(campaign_state or {}).get("day"),
+            default=0,
+        )
         for entry in characters_for_prompt or []:
             if not isinstance(entry, dict):
                 continue
@@ -11576,6 +11613,13 @@ class ZorkEmulator:
             source = characters.get(slug)
             if not isinstance(source, dict):
                 source = dict(entry)
+            birthday_hint = self._character_birthday_hint_for_prompt(
+                current_day,
+                source,
+            )
+            if birthday_hint:
+                source = dict(source)
+                source["birthday_hint"] = birthday_hint
             available_keys = [
                 key
                 for key in source.keys()
@@ -12636,6 +12680,7 @@ class ZorkEmulator:
         character_cards = self._build_character_cards_for_prompt(
             characters_for_prompt,
             characters=characters,
+            campaign_state=state,
             player_state=player_state,
         )
         location_cards_map = self._location_cards_from_state(state, player_state)
