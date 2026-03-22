@@ -784,6 +784,8 @@ class ZorkEmulator:
         "- Use player_state_update for inventory, hp, conditions, deceased_reason, and other durable player-state consequences.\n"
         "- Treat each player's inventory as private and never copy items from other players.\n"
         "- For inventory changes, ONLY use player_state_update.inventory_add and player_state_update.inventory_remove arrays.\n"
+        "- inventory_add entries may be plain item names or objects like {\"name\":\"projection booth key\",\"origin\":\"Found in the booth drawer\"}. Prefer the object form when adding a new item so you deliberately record where it came from.\n"
+        "- inventory_remove entries should stay as plain item names.\n"
         "- Do not return player_state_update.inventory full lists.\n"
         "- Each inventory item in RAILS_CONTEXT has a 'name' and 'origin' (how/where it was acquired). "
         "Respect item origins — never contradict or reinvent an item's backstory.\n"
@@ -7516,6 +7518,9 @@ class ZorkEmulator:
             return
 
         with self._session_factory() as session:
+            campaign = session.get(Campaign, campaign_id)
+            campaign_state = parse_json_dict(campaign.state_json) if campaign is not None else {}
+            game_time_snapshot = self._extract_game_time_snapshot(campaign_state)
             source_player = (
                 session.query(Player)
                 .filter(Player.campaign_id == campaign_id)
@@ -7607,6 +7612,7 @@ class ZorkEmulator:
                     [],
                     [gi_item_name],
                     origin_hint="",
+                    game_time=game_time_snapshot,
                 )
                 source_player.state_json = self._dump_json(source_state)
 
@@ -7617,6 +7623,7 @@ class ZorkEmulator:
                 [gi_item_name],
                 [],
                 origin_hint=f"Received from <@{actor_id}>",
+                game_time=game_time_snapshot,
             )
             target_player.state_json = self._dump_json(target_state)
             target_player.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
@@ -9123,6 +9130,29 @@ class ZorkEmulator:
             cleaned.append(item_text)
         return cleaned
 
+    def _normalize_inventory_entries(self, value) -> List[Dict[str, str]]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            value = [part.strip() for part in value.split(",")]
+        if not isinstance(value, list):
+            return []
+        cleaned: List[Dict[str, str]] = []
+        seen: set[str] = set()
+        for item in value:
+            name = self._item_to_text(item)
+            if not name:
+                continue
+            normalized = name.lower()
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            origin = ""
+            if isinstance(item, dict):
+                origin = " ".join(str(item.get("origin") or "").strip().split())[:160]
+            cleaned.append({"name": name, "origin": origin})
+        return cleaned
+
     def _get_inventory_rich(self, player_state: Dict[str, object]) -> List[Dict[str, str]]:
         raw = player_state.get("inventory") if isinstance(player_state, dict) else None
         if not raw or not isinstance(raw, list):
@@ -9148,9 +9178,10 @@ class ZorkEmulator:
     def _apply_inventory_delta(
         self,
         current: List[Dict[str, str]],
-        adds: List[str],
+        adds: List[Dict[str, str] | str],
         removes: List[str],
         origin_hint: str = "",
+        game_time: Dict[str, object] | None = None,
     ) -> List[Dict[str, str]]:
         remove_norm = {item.lower() for item in removes}
         out: List[Dict[str, str]] = []
@@ -9160,18 +9191,60 @@ class ZorkEmulator:
             out.append(entry)
         out_norm = {entry["name"].lower() for entry in out}
         for item in adds:
-            if item.lower() in out_norm:
+            if isinstance(item, dict):
+                item_name = str(item.get("name") or "").strip()
+                explicit_origin = str(item.get("origin") or "").strip()
+            else:
+                item_name = str(item or "").strip()
+                explicit_origin = ""
+            if not item_name:
                 continue
-            out.append({"name": item, "origin": origin_hint})
-            out_norm.add(item.lower())
+            if item_name.lower() in out_norm:
+                continue
+            out.append(
+                {
+                    "name": item_name,
+                    "origin": self._inventory_origin_with_receipt(
+                        explicit_origin or origin_hint,
+                        game_time,
+                    ),
+                }
+            )
+            out_norm.add(item_name.lower())
         return out
 
-    def _build_origin_hint(self, narration_text: str, action_text: str) -> str:
-        source = (narration_text or action_text or "").strip()
-        if not source:
+    def _inventory_receipt_stamp(self, game_time: object) -> str:
+        if not isinstance(game_time, dict) or not game_time:
             return ""
-        first_sentence = re.split(r"(?<=[.!?])\s", source, maxsplit=1)[0]
-        return first_sentence[:120]
+        snapshot = self._extract_game_time_snapshot({"game_time": game_time})
+        try:
+            day = max(1, int(snapshot.get("day", 1) or 1))
+            hour = min(23, max(0, int(snapshot.get("hour", 0) or 0)))
+            minute = min(59, max(0, int(snapshot.get("minute", 0) or 0)))
+        except (TypeError, ValueError):
+            return ""
+        return f"Day {day}, {hour:02d}:{minute:02d}"
+
+    def _inventory_origin_with_receipt(
+        self,
+        origin_text: object,
+        game_time: object,
+    ) -> str:
+        base = " ".join(str(origin_text or "").strip().split())
+        receipt = self._inventory_receipt_stamp(game_time)
+        if not receipt:
+            return base
+        if not base:
+            return f"Received {receipt}"
+        if re.search(r"\breceived\s+day\s+\d+\s*,\s*\d{2}:\d{2}\b", base, re.IGNORECASE):
+            return base
+        return f"{base} (received {receipt})"
+
+    def _build_origin_hint(self, narration_text: str, action_text: str) -> str:
+        # Default fallback provenance should be the in-world receipt timestamp,
+        # not a raw fragment of action/narration text. Deliberate origins come
+        # from explicit inventory_add objects or system-authored transfer hints.
+        return ""
 
     def _item_mentioned(self, item_name: str, text_lower: str) -> bool:
         item_l = item_name.lower()
@@ -9198,20 +9271,30 @@ class ZorkEmulator:
         cleaned = dict(update)
         previous_inventory_rich = self._get_inventory_rich(previous_state)
 
-        inventory_add = self._normalize_inventory_items(cleaned.pop("inventory_add", []))
+        inventory_add = self._normalize_inventory_entries(cleaned.pop("inventory_add", []))
         inventory_remove = self._normalize_inventory_items(cleaned.pop("inventory_remove", []))
 
         if "inventory" in cleaned:
-            model_inventory = self._normalize_inventory_items(cleaned.pop("inventory", []))
-            model_set = {name.lower() for name in model_inventory}
+            model_inventory = self._normalize_inventory_entries(cleaned.pop("inventory", []))
+            model_set = {entry["name"].lower() for entry in model_inventory}
             current_names = [entry["name"] for entry in previous_inventory_rich]
             current_set = {name.lower() for name in current_names}
             for name in current_names:
                 if name.lower() not in model_set and name.lower() not in {r.lower() for r in inventory_remove}:
                     inventory_remove.append(name)
-            for name in model_inventory:
-                if name.lower() not in current_set and name.lower() not in {a.lower() for a in inventory_add}:
-                    inventory_add.append(name)
+            existing_add_names = {
+                (
+                    str(entry.get("name") or "").strip().lower()
+                    if isinstance(entry, dict)
+                    else str(entry or "").strip().lower()
+                )
+                for entry in inventory_add
+            }
+            for entry in model_inventory:
+                name = entry["name"]
+                if name.lower() not in current_set and name.lower() not in existing_add_names:
+                    inventory_add.append(entry)
+                    existing_add_names.add(name.lower())
 
         current_norm = {entry["name"].lower() for entry in previous_inventory_rich}
         inventory_remove = [item for item in inventory_remove if item.lower() in current_norm]
@@ -9222,12 +9305,16 @@ class ZorkEmulator:
             inventory_remove = inventory_remove[: self.MAX_INVENTORY_CHANGES_PER_TURN]
 
         origin_hint = self._build_origin_hint(narration_text, action_text)
+        effective_game_time = cleaned.get("game_time")
+        if not isinstance(effective_game_time, dict) or not effective_game_time:
+            effective_game_time = previous_state.get("game_time")
         if inventory_add or inventory_remove:
             cleaned["inventory"] = self._apply_inventory_delta(
                 previous_inventory_rich,
                 inventory_add,
                 inventory_remove,
                 origin_hint=origin_hint,
+                game_time=effective_game_time if isinstance(effective_game_time, dict) else None,
             )
         else:
             cleaned["inventory"] = previous_inventory_rich
@@ -16023,6 +16110,25 @@ class ZorkEmulator:
         text = " ".join(str(value or "").strip().split())
         if not text:
             return ""
+        receipt_match = re.search(
+            r"\(received\s+(Day\s+\d+\s*,\s*\d{2}:\d{2})\)",
+            text,
+            re.IGNORECASE,
+        )
+        if not receipt_match:
+            receipt_match = re.search(
+                r"\breceived\s+(Day\s+\d+\s*,\s*\d{2}:\d{2})\b",
+                text,
+                re.IGNORECASE,
+            )
+        receipt_suffix = ""
+        if receipt_match:
+            receipt_text = receipt_match.group(1)
+            receipt_suffix = f" (received {receipt_text})"
+        base_text = text
+        if receipt_match:
+            start, end = receipt_match.span()
+            base_text = f"{text[:start]}{text[end:]}".strip(" ,.;")
         lower = text.lower()
         strong_prefixes = (
             "found ",
@@ -16041,12 +16147,28 @@ class ZorkEmulator:
             "taken from ",
             "received from ",
         )
+        def _truncate_preserving_receipt(raw: str, *, max_chars: int = 120) -> str:
+            clean = " ".join(str(raw or "").strip().split())
+            if not receipt_suffix:
+                return clean[:max_chars]
+            room = max_chars - len(receipt_suffix)
+            if room <= 0:
+                return receipt_suffix.strip()
+            if len(clean) <= room:
+                return f"{clean}{receipt_suffix}"
+            if room <= 3:
+                clipped = clean[:room]
+            else:
+                clipped = clean[: room - 3].rstrip() + "..."
+            return f"{clipped}{receipt_suffix}"
         if any(lower.startswith(prefix) for prefix in strong_prefixes):
-            return text[:120]
+            return _truncate_preserving_receipt(base_text)
         if len(text.split()) <= 4 and not any(ch in text for ch in ".!?"):
             if lower.startswith(("from ", "in ", "at ")):
-                return text[:120]
-            return f"From {text[:112]}".strip()
+                return _truncate_preserving_receipt(base_text)
+            return _truncate_preserving_receipt(f"From {base_text[:112]}".strip())
+        if receipt_suffix:
+            return f"Acquired earlier in-scene.{receipt_suffix}"
         return "Acquired earlier in-scene."
 
     @classmethod
