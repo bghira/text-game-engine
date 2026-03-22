@@ -2405,7 +2405,7 @@ class ZorkEmulator:
             "age, build, hair, clothing, distinguishing features. Not personality or writing style.\n"
             "If it's an original setting, describe a fitting protagonist the same way.\n"
             "Write it like a casting sheet: 'Late 20s, lean, dark curly hair, rumpled suit, ink-stained fingers, "
-            "nervous energy' — visual details an artist could draw from, not behavior or voice.\n"
+            "furrowed brow' — visual details an artist could draw from, not behavior or voice.\n"
             "Return ONLY the persona (1-2 sentences, max 140 chars). No quotes or explanation."
         )
         try:
