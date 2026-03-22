@@ -415,7 +415,7 @@ def test_build_prompt_shape(session_factory, seed_campaign_and_actor):
     assert "PLAYER_ACTION" in user_prompt
     assert "other_player_state_updates" in system_prompt
     assert "SCENE_STATE is the immediate actionable scene" in system_prompt
-    assert "CHARACTER_CARDS are the primary NPC fact store" in system_prompt
+    assert "CHARACTER_INDEX is the roster-wide NPC continuity block" in system_prompt
     assert "WORLD_STATE is for world facts" in system_prompt
     assert "not plot-armored" in system_prompt
     assert '{"tool_call": "memory_terms"' not in system_prompt
@@ -691,6 +691,76 @@ def test_build_prompt_keeps_autobiography_out_of_character_cards(
     assert "She writes herself as flint wrapped in velvet." in user_prompt
 
 
+def test_build_prompt_character_index_carries_roster_criticals_while_cards_stay_scene_local(
+    session_factory,
+    seed_campaign_and_actor,
+):
+    compat = _build_compat(session_factory)
+    campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
+    player = compat.get_or_create_player(seed_campaign_and_actor["campaign_id"], seed_campaign_and_actor["actor_id"])
+    with session_factory() as session:
+        row = session.get(Campaign, seed_campaign_and_actor["campaign_id"])
+        row.characters_json = json.dumps(
+            {
+                "gwen": {
+                    "name": "Gwen",
+                    "age": "34",
+                    "location": "hotel-lobby",
+                    "current_status": "Watching the desk.",
+                    "speech_style": "Short sentences.",
+                    "allegiance": "The configuration.",
+                    "personality": "Professional, observant, wry.",
+                },
+                "yasmin-devereaux": {
+                    "name": "Yasmin Devereaux",
+                    "age": "29",
+                    "location": "rosedale-apartment-4c",
+                    "current_status": "Off-scene.",
+                    "relationship": "Engaged.",
+                    "speech_style": "Sharp and quick.",
+                    "personality": "Rebellious and thrill-seeking.",
+                },
+            }
+        )
+        player_row = (
+            session.query(Player)
+            .filter(Player.campaign_id == seed_campaign_and_actor["campaign_id"])
+            .filter(Player.actor_id == seed_campaign_and_actor["actor_id"])
+            .one()
+        )
+        player_state = json.loads(player_row.state_json or "{}")
+        player_state["location"] = "hotel-lobby"
+        player_state["room_title"] = "Hotel Lobby"
+        player_state["room_summary"] = "Marble lobby and brass desk."
+        player_row.state_json = json.dumps(player_state)
+        session.commit()
+
+    turns = compat.get_recent_turns(seed_campaign_and_actor["campaign_id"])
+    _system_prompt, user_prompt = compat.build_prompt(campaign, player, "look", turns)
+
+    character_index_match = re.search(r"CHARACTER_INDEX:\s*(\[.*?\])\nCHARACTER_CARDS:", user_prompt, re.DOTALL)
+    assert character_index_match is not None
+    character_index = json.loads(character_index_match.group(1))
+    gwen_index = next(row for row in character_index if row.get("slug") == "gwen")
+    yasmin_index = next(row for row in character_index if row.get("slug") == "yasmin-devereaux")
+
+    assert gwen_index["critical"]["speech_style"] == "Short sentences."
+    assert gwen_index["critical"]["allegiance"] == "The configuration."
+    assert gwen_index["critical"]["age"] == "34"
+    assert yasmin_index["critical"]["relationship"] == "Engaged."
+    assert yasmin_index["critical"]["speech_style"] == "Sharp and quick."
+
+    cards_match = re.search(r"CHARACTER_CARDS:\s*(\[.*?\])\nLOCATION_INDEX:", user_prompt, re.DOTALL)
+    assert cards_match is not None
+    character_cards = json.loads(cards_match.group(1))
+    assert {row.get("slug") for row in character_cards} == {"gwen"}
+    gwen_card = character_cards[0]
+    assert "priority" not in gwen_card
+    assert gwen_card["expanded"]["personality"] == "Professional, observant, wry."
+    assert gwen_card["compact"].get("speech_style") is None
+    assert gwen_card["expanded"].get("speech_style") is None
+
+
 def test_build_prompt_cards_use_top_level_scan_fields_without_compact_duplication(
     session_factory,
     seed_campaign_and_actor,
@@ -765,6 +835,7 @@ def test_build_prompt_cards_use_top_level_scan_fields_without_compact_duplicatio
     assert "name" not in gwen_card["expanded"]
     assert "location" not in gwen_card["expanded"]
     assert "current_status" not in gwen_card["expanded"]
+    assert "priority" not in gwen_card
 
     location_match = re.search(r"LOCATION_CARDS:\s*(\[.*?\])\nWORLD_CHARACTERS:", user_prompt, re.DOTALL)
     assert location_match is not None
@@ -792,6 +863,8 @@ def test_build_prompt_cards_use_top_level_scan_fields_without_compact_duplicatio
     assert projection_booth["compact"]["monitoring_station"] == "recording"
     assert projection_booth["compact"].get("channel_seven") is None
     assert compat.LOCATION_FACT_PRIORITIES_KEY not in projection_booth["available_keys"]
+    assert '"compact": {}' not in location_match.group(1)
+    assert '"expanded": {}' not in location_match.group(1)
 
 
 def test_location_update_priority_wrapper_persists_hidden_fact_priority_metadata():
@@ -867,8 +940,8 @@ def test_build_prompt_character_cards_add_birthday_hint_only_on_matching_day(
     gwen_card = next(row for row in character_cards if row.get("slug") == "gwen")
     yasmin_card = next(row for row in character_cards if row.get("slug") == "yasmin-devereaux")
 
-    assert gwen_card["expanded"]["birthday_hint"] == "It is this character's birthday today."
-    assert gwen_card["compact"]["birthday_hint"] == "It is this character's birthday today."
+    assert gwen_card["expanded"].get("birthday_hint") is None
+    assert gwen_card["compact"].get("birthday_hint") is None
     assert "birthday_hint" in gwen_card["available_keys"]
     assert "created" not in gwen_card["available_keys"]
     assert gwen_card["expanded"].get("created") is None
@@ -881,6 +954,7 @@ def test_build_prompt_character_cards_add_birthday_hint_only_on_matching_day(
     assert character_index_match is not None
     character_index = json.loads(character_index_match.group(1))
     gwen_index = next(row for row in character_index if row.get("slug") == "gwen")
+    assert gwen_index["critical"]["birthday_hint"] == "It is this character's birthday today."
     assert "created" not in gwen_index["available_keys"]
     assert '"birthday_hint"' not in re.search(r"WORLD_CHARACTERS:\s*(\[.*?\])\nPLAYER_CARD:", user_prompt, re.DOTALL).group(1)
 
@@ -1043,6 +1117,8 @@ def test_ready_to_write_finalization_reexpands_character_and_location_cards(
         assert payload.get("narration") == "Final scene."
         assert "FINAL_CHARACTER_CARDS:" in completion.calls[1]["prompt"]
         assert "yasmin-devereaux" in completion.calls[1]["prompt"]
+        assert '"speech_style": "Controlled and exact."' in completion.calls[1]["prompt"]
+        assert '"relationship": "Brittle but engaged."' in completion.calls[1]["prompt"]
         assert "FINAL_LOCATION_CARDS:" in completion.calls[1]["prompt"]
         assert "hotel-lobby" in completion.calls[1]["prompt"]
 

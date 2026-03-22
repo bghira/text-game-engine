@@ -3014,6 +3014,7 @@ class ToolAwareZorkLLM:
                         characters=campaign_characters,
                         campaign_state=campaign_state,
                         player_state=player_state,
+                        include_critical_fields=True,
                     )
                     if final_character_cards:
                         _final_character_cards_block = (

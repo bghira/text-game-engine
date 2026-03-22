@@ -763,7 +763,8 @@ class ZorkEmulator:
         "- RECENT_TURNS is already filtered to what the acting player plausibly knows. Hidden/private turns from other players are omitted.\n"
         "- TURN_VISIBILITY_DEFAULT tells you whether this turn should default to public, local, or private context.\n"
         "- SCENE_STATE is the immediate actionable scene: who is present, what is visible, and what tensions are active right now. Use it first for immediate staging.\n"
-        "- CHARACTER_INDEX lists NPC slugs and available_keys. CHARACTER_CARDS are the primary NPC fact store: compact facts for all shown NPCs, expanded facts for scene-relevant NPCs.\n"
+        "- CHARACTER_INDEX is the roster-wide NPC continuity block: name/location/current_status plus other critical fields for all known NPCs.\n"
+        "- CHARACTER_CARDS are the deeper scene NPC cards: use them for local-scene depth, voice, appearance, and other non-critical texture.\n"
         "- LOCATION_INDEX lists known place slugs and available_keys. LOCATION_CARDS are the primary place fact store: critical location facts persist across scenes; non-critical location facts surface when that location is active.\n"
         "- WORLD_STATE is for world facts, investigations, event threads, and cross-entity facts. Do not treat it as a backup character sheet or location encyclopedia.\n"
         "- WORLD_CHARACTERS is kept as a compatibility alias only. Prefer CHARACTER_INDEX and CHARACTER_CARDS when reasoning about NPC continuity.\n"
@@ -11514,6 +11515,7 @@ class ZorkEmulator:
         key = str(field_name or "").strip().lower()
         if key in {
             "name",
+            "age",
             "location",
             "current_status",
             "speech_style",
@@ -11521,11 +11523,31 @@ class ZorkEmulator:
             "relationships",
             "allegiance",
             "birthday_hint",
+            "deceased_reason",
         }:
             return "critical"
         if key in {"appearance", "personality", "background", "autobiography", "literary_style"}:
             return "scene"
         return "low"
+
+    def _character_scene_relevance(
+        self,
+        character_row: Dict[str, object] | None,
+        *,
+        player_state: Dict[str, object] | None = None,
+    ) -> bool:
+        if not isinstance(character_row, dict):
+            return False
+        if character_row.get("deceased_reason"):
+            return False
+        player_state = player_state or {}
+        char_state = {
+            "location": character_row.get("location"),
+            "room_title": character_row.get("room_title"),
+            "room_summary": character_row.get("room_summary"),
+            "room_id": character_row.get("room_id"),
+        }
+        return self._same_scene(player_state, char_state)
 
     def _location_field_priority(self, field_name: str) -> str:
         key = str(field_name or "").strip().lower()
@@ -11562,6 +11584,7 @@ class ZorkEmulator:
         characters_for_prompt: list[dict[str, object]],
         *,
         characters: Dict[str, dict] | None = None,
+        campaign_state: Dict[str, object] | None = None,
     ) -> list[dict[str, object]]:
         rows: list[dict[str, object]] = []
         characters = characters or {}
@@ -11572,6 +11595,10 @@ class ZorkEmulator:
             "evolving_personality",
             "created",
         }
+        current_day = self._coerce_non_negative_int(
+            self._extract_game_time_snapshot(campaign_state or {}).get("day"),
+            default=0,
+        )
         for entry in characters_for_prompt or []:
             if not isinstance(entry, dict):
                 continue
@@ -11579,11 +11606,28 @@ class ZorkEmulator:
             if not slug:
                 continue
             source = characters.get(slug) if isinstance(characters.get(slug), dict) else entry
+            birthday_hint = self._character_birthday_hint_for_prompt(
+                current_day,
+                source,
+            )
+            if birthday_hint:
+                source = dict(source)
+                source["birthday_hint"] = birthday_hint
             available_keys = sorted(
                 key
                 for key in (source or {}).keys()
                 if key not in hidden_keys and not str(key).startswith("_")
             )
+            critical: dict[str, object] = {}
+            for key in available_keys:
+                if key in {"name", "location", "current_status"}:
+                    continue
+                if self._character_field_priority(key) != "critical":
+                    continue
+                value = source.get(key)
+                if value in (None, "", [], {}):
+                    continue
+                critical[key] = value
             rows.append(
                 {
                     "slug": slug,
@@ -11591,10 +11635,7 @@ class ZorkEmulator:
                     "location": source.get("location"),
                     "current_status": source.get("current_status"),
                     "available_keys": available_keys,
-                    "hook": self._compact_prompt_fact_value(
-                        source.get("relationship") or source.get("allegiance") or source.get("current_status"),
-                        max_chars=90,
-                    ),
+                    "critical": critical,
                 }
             )
         return rows
@@ -11606,6 +11647,7 @@ class ZorkEmulator:
         characters: Dict[str, dict] | None = None,
         campaign_state: Dict[str, object] | None = None,
         player_state: Dict[str, object] | None = None,
+        include_critical_fields: bool = False,
     ) -> list[dict[str, object]]:
         rows: list[dict[str, object]] = []
         characters = characters or {}
@@ -11651,6 +11693,9 @@ class ZorkEmulator:
             for key in available_keys:
                 if key in top_level_keys:
                     continue
+                priority = priorities.get(key, "low")
+                if priority == "critical" and not include_critical_fields:
+                    continue
                 compact_value = self._compact_prompt_fact_value(source.get(key))
                 if compact_value:
                     compact[key] = compact_value
@@ -11661,7 +11706,10 @@ class ZorkEmulator:
                 if key in top_level_keys:
                     continue
                 priority = priorities.get(key, "low")
-                if priority == "critical" or (priority == "scene" and expand_scene_fields):
+                if (
+                    (include_critical_fields and priority == "critical")
+                    or (priority == "scene" and expand_scene_fields)
+                ):
                     value = source.get(key)
                     if value in (None, "", [], {}):
                         continue
@@ -11675,9 +11723,34 @@ class ZorkEmulator:
                     "available_keys": sorted(available_keys),
                     "compact": compact,
                     "expanded": expanded,
-                    "priority": priorities,
                 }
             )
+        return rows
+
+    def _build_scene_characters_for_prompt(
+        self,
+        characters: Dict[str, dict],
+        player_state: Dict[str, object],
+    ) -> list[dict[str, object]]:
+        rows: list[dict[str, object]] = []
+        hidden_prompt_keys = {
+            self.AUTOBIOGRAPHY_FIELD,
+            self.AUTOBIOGRAPHY_RAW_FIELD,
+            self.AUTOBIOGRAPHY_LAST_COMPRESSED_TURN_FIELD,
+            "evolving_personality",
+        }
+        for slug, char in characters.items():
+            if not isinstance(char, dict):
+                continue
+            if not self._character_scene_relevance(char, player_state=player_state):
+                continue
+            entry = {
+                key: value
+                for key, value in dict(char).items()
+                if key not in hidden_prompt_keys
+            }
+            entry["_slug"] = slug
+            rows.append(entry)
         return rows
 
     def _location_cards_from_state(
@@ -11769,19 +11842,20 @@ class ZorkEmulator:
                 if value in (None, "", [], {}):
                     continue
                 expanded[key] = value
-            rows.append(
-                {
-                    "slug": slug,
-                    "name": str(payload.get("name") or slug).strip(),
-                    "summary": self._compact_prompt_fact_value(
-                        payload.get("summary") or payload.get("description"),
-                        max_chars=120,
-                    ),
-                    "available_keys": sorted(available_keys),
-                    "compact": compact,
-                    "expanded": expanded,
-                }
-            )
+            row = {
+                "slug": slug,
+                "name": str(payload.get("name") or slug).strip(),
+                "summary": self._compact_prompt_fact_value(
+                    payload.get("summary") or payload.get("description"),
+                    max_chars=120,
+                ),
+                "available_keys": sorted(available_keys),
+            }
+            if compact:
+                row["compact"] = compact
+            if expanded:
+                row["expanded"] = expanded
+            rows.append(row)
         return rows
 
     def _derive_scene_active_tensions(
@@ -12688,22 +12762,26 @@ class ZorkEmulator:
             character_index_source,
             self.MAX_CHARACTER_INDEX_CHARS,
         )
-        characters_for_prompt = self._build_characters_for_prompt(
+        scene_characters_for_prompt = self._build_scene_characters_for_prompt(
             characters,
             player_state,
-            recent_text,
-            limit=self.MAX_CHARACTERS_IN_PROMPT,
         )
-        characters_for_prompt = self._fit_characters_to_budget(characters_for_prompt, self.MAX_CHARACTERS_CHARS)
+        scene_characters_for_prompt = scene_characters_for_prompt[: self.MAX_CHARACTERS_IN_PROMPT]
+        scene_characters_for_prompt = self._fit_characters_to_budget(
+            scene_characters_for_prompt,
+            self.MAX_CHARACTERS_CHARS,
+        )
         character_index = self._build_character_index_for_prompt(
             character_index_source,
             characters=characters,
+            campaign_state=state,
         )
         character_cards = self._build_character_cards_for_prompt(
-            characters_for_prompt,
+            scene_characters_for_prompt,
             characters=characters,
             campaign_state=state,
             player_state=player_state,
+            include_critical_fields=False,
         )
         location_cards_map = self._location_cards_from_state(state, player_state)
         location_index = self._build_location_index_for_prompt(location_cards_map)
@@ -12732,7 +12810,7 @@ class ZorkEmulator:
         active_scene_names = self._active_scene_character_names(
             player_state,
             party_snapshot,
-            characters_for_prompt,
+            scene_characters_for_prompt,
         )
         game_time = self._game_time_from_total_minutes(
             self._game_time_to_total_minutes(state.get("game_time") or {}),
@@ -12780,10 +12858,10 @@ class ZorkEmulator:
         source_payload = self._source_material_prompt_payload(campaign.id)
         literary_styles_text = self._literary_styles_for_prompt(
             state,
-            characters_for_prompt,
+            scene_characters_for_prompt,
         )
         autobiographies_text = self._autobiographies_for_prompt(
-            characters_for_prompt,
+            scene_characters_for_prompt,
             characters=characters,
         )
         memory_lookup_enabled = self._memory_lookup_enabled_for_prompt(
@@ -12838,7 +12916,7 @@ class ZorkEmulator:
             f"CHARACTER_CARDS: {self._dump_json(character_cards)}\n"
             f"LOCATION_INDEX: {self._dump_json(location_index)}\n"
             f"LOCATION_CARDS: {self._dump_json(location_cards)}\n"
-            f"WORLD_CHARACTERS: {self._dump_json(characters_for_prompt)}\n"
+            f"WORLD_CHARACTERS: {self._dump_json(character_index_source)}\n"
             f"PLAYER_CARD: {self._dump_json(player_card)}\n"
             f"PARTY_SNAPSHOT: {self._dump_json(party_snapshot)}\n"
         )
