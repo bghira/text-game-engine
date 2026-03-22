@@ -2057,6 +2057,13 @@ class ZorkEmulator:
             if campaign is not None:
                 return str(active_campaign_id), None
 
+        channel_campaign_id = getattr(channel, "campaign_id", None)
+        if channel_campaign_id:
+            with self._session_factory() as session:
+                campaign = session.get(Campaign, str(channel_campaign_id))
+            if campaign is not None:
+                return str(channel_campaign_id), None
+
         _, campaign = self.enable_channel(guild_id, channel_id, actor_id)
         return campaign.id, None
 
