@@ -96,7 +96,7 @@ class ZorkEmulator:
     XP_PER_LEVEL = 50
     ATTENTION_WINDOW_SECONDS = 600
     IMMUTABLE_CHARACTER_FIELDS: set = frozenset({
-        "name", "personality", "background", "appearance", "speech_style",
+        "name", "age", "gender", "personality", "background", "appearance", "speech_style",
     })
     ATTACHMENT_MAX_BYTES = 500_000
     ATTACHMENT_CHUNK_TOKENS = 50_000
@@ -692,13 +692,14 @@ class ZorkEmulator:
         "- character_updates: object (optional; keyed by stable slug IDs like 'marcus-blackwell'. "
         "Use this to create or update NPCs in the world character tracker. "
         "Slug IDs must be lowercase-hyphenated, derived from the character name, and stable across turns. "
-        "On first appearance provide all fields: name, personality, background, appearance, speech_style, location, "
+        "On first appearance provide all fields: name, age, gender, personality, background, appearance, speech_style, location, "
         "current_status, allegiance, relationship. "
+        "gender should be a short stable identity label such as cis-male, cis-female, trans-male, trans-female, nonbinary, synthetic, or another precise diegetic category if the setting calls for it. "
         "speech_style should be 2-3 sentences on how the character talks: sentence length, vocabulary, verbal tics, and what they avoid saying. "
         "On subsequent turns only mutable fields are accepted: "
         "location, current_status, allegiance, relationship, relationships, literary_style, deceased_reason, and any other dynamic key. "
         "literary_style should be a string referencing a key from LITERARY_STYLES (if available). "
-        "Foundational fields (name, personality, background, appearance, speech_style) are set at creation and not overwritten by state updates. "
+        "Foundational fields (name, age, gender, personality, background, appearance, speech_style) are set at creation and not overwritten by state updates. "
         "allegiance: Update this as loyalties actually shift — don't leave it frozen at the creation-time value. "
         "Example progression: \"Herself\" → \"Herself, and increasingly Chace, though she hasn't filed that yet.\" "
         "Character card writing rule: describe what the character DOES, not what they don't. "
@@ -709,7 +710,7 @@ class ZorkEmulator:
         "{\"deshawn\": {\"status\": \"partner\", \"knows_about\": [\"pregnancy\"], \"doesnt_know\": [\"blood-test-result\"], \"dynamic\": \"protective-but-autonomous\"}}. "
         "Use it to track disclosures, secrets, and dynamic shifts.\n"
         "Examples:\n"
-        "  Create NPC: {\"character_updates\": {\"wren\": {\"name\": \"Wren\", \"personality\": \"Guarded, observant, dry.\", \"background\": \"Former hotel manager pulled into the expedition.\", \"appearance\": \"Lean woman in a weather-stained blazer, dark braid, sharp eyes, practical shoes, realistic style.\", \"speech_style\": \"Short sentences. Dry humor. Avoids sentiment.\", \"location\": \"jekyll-castle-east-annex-laboratory\", \"current_status\": \"Watching the doorway.\", \"allegiance\": \"self\", \"relationship\": \"wary ally\"}}}\n"
+        "  Create NPC: {\"character_updates\": {\"wren\": {\"name\": \"Wren\", \"age\": \"34\", \"gender\": \"cis-female\", \"personality\": \"Guarded, observant, dry.\", \"background\": \"Former hotel manager pulled into the expedition.\", \"appearance\": \"Lean woman in a weather-stained blazer, dark braid, sharp eyes, practical shoes, realistic style.\", \"speech_style\": \"Short sentences. Dry humor. Avoids sentiment.\", \"location\": \"jekyll-castle-east-annex-laboratory\", \"current_status\": \"Watching the doorway.\", \"allegiance\": \"self\", \"relationship\": \"wary ally\"}}}\n"
         "  Update NPC location/status: {\"character_updates\": {\"wren\": {\"location\": \"jekyll-castle-east-annex-laboratory\", \"current_status\": \"Processing that the castle trip was unnecessary.\", \"allegiance\": \"The expedition, reluctantly.\"}}}\n"
         "  Remove NPC from roster: {\"character_updates\": {\"wren\": null}}\n"
         "To remove a character from the roster, use character_updates ONLY: set that character slug to null "
@@ -783,7 +784,7 @@ class ZorkEmulator:
         "- CRITICAL — ROOM STATE COHERENCE: whenever the player's physical location changes (movement, teleport, time-skip, "
         "reuniting with party, being picked up, waking in a new place, etc.) you MUST update ALL of: "
         "location, room_title, room_summary, room_description, and exits in player_state_update. "
-        "ACTIVE_PLAYER_LOCATION reflects the CURRENT stored state — if it is stale/wrong, your response MUST correct it. "
+        "RAILS_CONTEXT and SCENE_STATE reflect the CURRENT stored scene state — if they are stale/wrong because the player moved, your response MUST correct that through player_state_update. "
         "Narration alone does NOT move the player; only player_state_update changes their actual location.\n"
         "- Use player_state_update.exits as a short list of exits if applicable.\n"
         "- Use player_state_update for inventory, hp, conditions, deceased_reason, and other durable player-state consequences.\n"
@@ -961,7 +962,7 @@ class ZorkEmulator:
         "If the player does NOT act in time, the system auto-fires the event.\n"
         "PURPOSE: Timed events should FORCE THE PLAYER TO MAKE A DECISION or DRAG THEM WHERE THEY NEED TO BE.\n"
         "- Use timers to push the story forward when the player is stalling, idle, or refusing to engage.\n"
-        "- Use ACTIVE_PLAYER_LOCATION and PARTY_SNAPSHOT to decide scope and narrative impact.\n"
+        "- Use SCENE_STATE, RAILS_CONTEXT, and PARTY_SNAPSHOT to decide scope and narrative impact.\n"
         "- NPCs should grab, escort, or coerce the player. Environments should shift and force movement.\n"
         "- The event should advance the plot: move the player to the next location, "
         "force an encounter, have an NPC intervene, or change the scene decisively.\n"
@@ -11403,10 +11404,16 @@ class ZorkEmulator:
         player_state: Dict[str, object],
         recent_text: str,
         *,
+        excluded_character_keys: set[str] | None = None,
         limit: int | None = None,
     ) -> list:
         if not characters:
             return []
+        excluded_character_keys = {
+            self._player_slug_key(value)
+            for value in list(excluded_character_keys or set())
+            if self._player_slug_key(value)
+        }
         player_location = str(player_state.get("location") or "").strip().lower()
         recent_lower = recent_text.lower() if recent_text else ""
         hidden_prompt_keys = {
@@ -11420,9 +11427,15 @@ class ZorkEmulator:
         mentioned = []
         distant = []
         for slug, char in characters.items():
+            slug_key = self._player_slug_key(slug)
             char_location = str(char.get("location") or "").strip().lower()
             char_name = str(char.get("name") or slug).strip().lower()
+            char_name_key = self._player_slug_key(char.get("name") or slug)
             is_deceased = bool(char.get("deceased_reason"))
+            if excluded_character_keys and (
+                slug_key in excluded_character_keys or char_name_key in excluded_character_keys
+            ):
+                continue
 
             if not is_deceased and player_location and char_location == player_location:
                 entry = {
@@ -11516,6 +11529,7 @@ class ZorkEmulator:
         if key in {
             "name",
             "age",
+            "gender",
             "location",
             "current_status",
             "speech_style",
@@ -11751,12 +11765,47 @@ class ZorkEmulator:
             )
         return rows
 
+    def _player_character_prompt_keys(
+        self,
+        party_snapshot: list[dict[str, object]] | None,
+        player_registry: dict[str, dict[str, dict[str, object]]] | None = None,
+    ) -> set[str]:
+        keys: set[str] = set()
+        for row in party_snapshot or []:
+            if not isinstance(row, dict):
+                continue
+            for value in (
+                row.get("player_slug"),
+                row.get("slug"),
+                row.get("name"),
+                row.get("character_name"),
+            ):
+                key = self._player_slug_key(value)
+                if key:
+                    keys.add(key)
+        if isinstance(player_registry, dict):
+            for info in (player_registry.get("by_actor_id", {}) or {}).values():
+                if not isinstance(info, dict):
+                    continue
+                for value in (info.get("slug"), info.get("name")):
+                    key = self._player_slug_key(value)
+                    if key:
+                        keys.add(key)
+        return keys
+
     def _build_scene_characters_for_prompt(
         self,
         characters: Dict[str, dict],
         player_state: Dict[str, object],
+        *,
+        excluded_character_keys: set[str] | None = None,
     ) -> list[dict[str, object]]:
         rows: list[dict[str, object]] = []
+        excluded_character_keys = {
+            self._player_slug_key(value)
+            for value in list(excluded_character_keys or set())
+            if self._player_slug_key(value)
+        }
         hidden_prompt_keys = {
             self.AUTOBIOGRAPHY_FIELD,
             self.AUTOBIOGRAPHY_RAW_FIELD,
@@ -11765,6 +11814,12 @@ class ZorkEmulator:
         }
         for slug, char in characters.items():
             if not isinstance(char, dict):
+                continue
+            slug_key = self._player_slug_key(slug)
+            name_key = self._player_slug_key(char.get("name") or slug)
+            if excluded_character_keys and (
+                slug_key in excluded_character_keys or name_key in excluded_character_keys
+            ):
                 continue
             if not self._character_scene_relevance(char, player_state=player_state):
                 continue
@@ -11980,11 +12035,23 @@ class ZorkEmulator:
         party_snapshot: list[dict[str, object]],
         characters: Dict[str, dict],
         location_cards: Dict[str, dict],
+        excluded_character_keys: set[str] | None = None,
     ) -> dict[str, object]:
         location_key = str(player_state.get("location") or "").strip()
+        excluded_character_keys = {
+            self._player_slug_key(value)
+            for value in list(excluded_character_keys or set())
+            if self._player_slug_key(value)
+        }
         present_characters: list[dict[str, object]] = []
         for slug, payload in (characters or {}).items():
             if not isinstance(payload, dict):
+                continue
+            slug_key = self._player_slug_key(slug)
+            name_key = self._player_slug_key(payload.get("name") or slug)
+            if excluded_character_keys and (
+                slug_key in excluded_character_keys or name_key in excluded_character_keys
+            ):
                 continue
             if str(payload.get("location") or "").strip().lower() != location_key.lower():
                 continue
@@ -12671,6 +12738,10 @@ class ZorkEmulator:
         }
 
         player_registry = self._campaign_player_registry(campaign.id, self._session_factory)
+        player_character_keys = self._player_character_prompt_keys(
+            party_snapshot,
+            player_registry=player_registry,
+        )
         player_names: Dict[str, str] = {}
         player_slugs: Dict[str, str] = {}
         for raw_actor_id, info in player_registry.get("by_actor_id", {}).items():
@@ -12792,6 +12863,7 @@ class ZorkEmulator:
             characters,
             player_state,
             recent_text,
+            excluded_character_keys=player_character_keys,
             limit=None,
         )
         character_index_source = self._fit_json_list_to_budget(
@@ -12801,6 +12873,7 @@ class ZorkEmulator:
         scene_characters_for_prompt = self._build_scene_characters_for_prompt(
             characters,
             player_state,
+            excluded_character_keys=player_character_keys,
         )
         scene_characters_for_prompt = scene_characters_for_prompt[: self.MAX_CHARACTERS_IN_PROMPT]
         scene_characters_for_prompt = self._fit_characters_to_budget(
@@ -12842,6 +12915,7 @@ class ZorkEmulator:
             party_snapshot=party_snapshot,
             characters=characters,
             location_cards=location_cards_map,
+            excluded_character_keys=player_character_keys,
         )
         on_rails = bool(state.get("on_rails", False))
         story_context = self._build_story_context(
@@ -12913,12 +12987,6 @@ class ZorkEmulator:
             action_text=action,
         )
 
-        active_location_context = {
-            "room_title": player_state.get("room_title"),
-            "location": player_state.get("location"),
-            "room_summary": player_state.get("room_summary"),
-        }
-
         effective_turn_visibility_default = self._default_prompt_turn_visibility(
             turn_visibility_default,
             player_state,
@@ -12935,7 +13003,6 @@ class ZorkEmulator:
             user_prompt += (
                 f"SOURCE_MATERIAL_DOCS: {self._dump_json(source_payload.get('docs') or [])}\n"
                 f"SOURCE_MATERIAL_KEYS: {self._dump_json(source_payload.get('keys') or [])}\n"
-                f"SOURCE_MATERIAL_CHUNK_COUNT: {source_payload.get('chunk_count')}\n"
             )
             source_digests = source_payload.get("digests") or {}
             if source_digests:
@@ -12947,7 +13014,6 @@ class ZorkEmulator:
             f"CURRENT_GAME_TIME: {self._dump_json(game_time)}\n"
             f"SPEED_MULTIPLIER: {speed_mult}\n"
             f"DIFFICULTY: {difficulty}\n"
-            f"ACTIVE_PLAYER_LOCATION: {self._dump_json(active_location_context)}\n"
             f"MEMORY_LOOKUP_ENABLED: {str(memory_lookup_enabled).lower()}\n"
             f"RECENT_TURNS_LOADED: {str(not bootstrap_only).lower()}\n"
         )
