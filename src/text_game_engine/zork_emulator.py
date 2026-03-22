@@ -16083,7 +16083,61 @@ class ZorkEmulator:
         repaired = cls._repair_trailing_json_commas(repaired)
         repaired = cls._repair_unquoted_json_string_fields(repaired)
         repaired = cls._repair_known_schema_string_fields(repaired)
+        repaired = cls._repair_unmatched_json_closers(repaired)
         return repaired
+
+    @classmethod
+    def _repair_unmatched_json_closers(cls, text: str) -> str:
+        raw = str(text or "")
+        if not raw:
+            return raw
+        out: list[str] = []
+        stack: list[str] = []
+        in_string = False
+        escape = False
+        changed = False
+        closing_for = {"{": "}", "[": "]"}
+        opener_for = {"}": "{", "]": "["}
+
+        for ch in raw:
+            if in_string:
+                out.append(ch)
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == '"':
+                    in_string = False
+                continue
+
+            if ch == '"':
+                in_string = True
+                out.append(ch)
+                continue
+
+            if ch in "{[":
+                stack.append(ch)
+                out.append(ch)
+                continue
+
+            if ch in "}]":
+                expected_opener = opener_for[ch]
+                if stack and stack[-1] == expected_opener:
+                    stack.pop()
+                    out.append(ch)
+                    continue
+                changed = True
+                continue
+
+            out.append(ch)
+
+        if stack:
+            changed = True
+            while stack:
+                out.append(closing_for[stack.pop()])
+
+        repaired = "".join(out)
+        return repaired if changed else raw
 
     # ------------------------------------------------------------------
     # Anti-echo system
