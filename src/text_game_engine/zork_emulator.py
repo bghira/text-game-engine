@@ -258,13 +258,13 @@ class ZorkEmulator:
     PLAYER_STATS_LAST_MESSAGE_AT_KEY = "last_message_at"
     _MENTION_RE = re.compile(r"<@!?(\d+)>")
     DEFAULT_CAMPAIGN_PERSONA = (
-        "A cooperative, curious adventurer: observant, resourceful, and willing to "
-        "engage with absurd situations in-character."
+        "Average build, mid-20s, practical clothes, well-worn boots, alert eyes, "
+        "a satchel slung across one shoulder."
     )
     PRESET_DEFAULT_PERSONAS = {
         "alice": (
-            "A curious and polite wanderer with dry wit, dream-logic intuition, and "
-            "quiet courage in whimsical danger."
+            "Young girl, bright blue eyes, long blonde hair with a black headband, "
+            "pale blue knee-length dress, white pinafore, striped stockings."
         ),
     }
     PRESET_ALIASES = {
@@ -2401,11 +2401,11 @@ class ZorkEmulator:
             return self.DEFAULT_CAMPAIGN_PERSONA
         prompt = (
             f"The campaign is titled: '{campaign_name}'.\n"
-            "If this references a known movie, book, show, or story, describe the MAIN CHARACTER as a person — "
-            "age, vibe, background, and what makes them tick. Not how they speak or narrate.\n"
+            "If this references a known movie, book, show, or story, describe the MAIN CHARACTER's physical appearance — "
+            "age, build, hair, clothing, distinguishing features. Not personality or writing style.\n"
             "If it's an original setting, describe a fitting protagonist the same way.\n"
-            "Write it like a casting brief: '28-year-old ambitious junior associate at a top law firm, "
-            "smart but naive about office politics' — not a voice direction or writing style.\n"
+            "Write it like a casting sheet: 'Late 20s, lean, dark curly hair, rumpled suit, ink-stained fingers, "
+            "nervous energy' — visual details an artist could draw from, not behavior or voice.\n"
             "Return ONLY the persona (1-2 sentences, max 140 chars). No quotes or explanation."
         )
         try:
@@ -6216,7 +6216,7 @@ class ZorkEmulator:
             "centered composition",
         ]
         if persona:
-            prompt_parts.insert(1, f"Persona/style notes: {persona}.")
+            prompt_parts.insert(1, f"Appearance: {persona}.")
         composed = " ".join([part for part in prompt_parts if part])
         composed = re.sub(r"\s+", " ", composed).strip()
         return self._trim_text(composed, 900)
