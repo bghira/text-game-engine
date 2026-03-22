@@ -1264,6 +1264,8 @@ def test_ready_to_write_finalization_reexpands_character_and_location_cards(
         final_location_match = re.search(r"FINAL_LOCATION_CARDS:\s*(\[.*?\])\n", completion.calls[1]["prompt"], re.DOTALL)
         assert final_location_match is not None
         assert '"expanded":' not in final_location_match.group(1)
+        assert "TIMED EVENTS SYSTEM:" in completion.calls[1]["system_prompt"]
+        assert '"set_timer_delay": integer (30-300 seconds)' in completion.calls[1]["system_prompt"]
 
     asyncio.run(run_test())
 
