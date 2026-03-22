@@ -718,6 +718,20 @@ def test_build_prompt_cards_use_top_level_scan_fields_without_compact_duplicatio
                 "summary": "Low lamps, leather couch, humming projector.",
                 "security": "The ranch staff does not come down here uninvited.",
                 "layout": "Screen wall opposite the bar cart.",
+                compat.LOCATION_FACT_PRIORITIES_KEY: {
+                    "security": "critical",
+                    "layout": "scene",
+                },
+            },
+            "oakhaven-projection-booth": {
+                "name": "Projection Booth",
+                "summary": "Dust in the booth light.",
+                "monitoring_station": "recording",
+                "channel_seven": "active",
+                compat.LOCATION_FACT_PRIORITIES_KEY: {
+                    "monitoring_station": "critical",
+                    "channel_seven": "scene",
+                },
             }
         }
         row.state_json = json.dumps(state)
@@ -766,6 +780,39 @@ def test_build_prompt_cards_use_top_level_scan_fields_without_compact_duplicatio
     assert "name" not in room_card["expanded"]
     assert "summary" not in room_card["expanded"]
     assert "exits" not in room_card["expanded"]
+    assert "priority" not in room_card
+    assert room_card["expanded"]["layout"] == "Screen wall opposite the bar cart."
+
+    projection_booth = next(
+        row for row in location_cards if row.get("slug") == "oakhaven-projection-booth"
+    )
+    assert "priority" not in projection_booth
+    assert projection_booth["expanded"]["monitoring_station"] == "recording"
+    assert projection_booth["expanded"].get("channel_seven") is None
+    assert projection_booth["compact"]["monitoring_station"] == "recording"
+    assert projection_booth["compact"].get("channel_seven") is None
+    assert compat.LOCATION_FACT_PRIORITIES_KEY not in projection_booth["available_keys"]
+
+
+def test_location_update_priority_wrapper_persists_hidden_fact_priority_metadata():
+    engine = GameEngine(uow_factory=lambda: None, llm=object())
+
+    applied = engine._apply_location_updates(
+        {},
+        {
+            "hotel-lobby": {
+                "security": {
+                    "value": "Desk clerk now recognizes Rigby.",
+                    "priority": "critical",
+                },
+                "current_activity": "Quiet afternoon check-ins.",
+            }
+        },
+    )
+
+    assert applied["hotel-lobby"]["security"] == "Desk clerk now recognizes Rigby."
+    assert applied["hotel-lobby"]["current_activity"] == "Quiet afternoon check-ins."
+    assert applied["hotel-lobby"][GameEngine.LOCATION_FACT_PRIORITIES_KEY]["security"] == "critical"
 
 
 def test_build_prompt_character_cards_add_birthday_hint_only_on_matching_day(

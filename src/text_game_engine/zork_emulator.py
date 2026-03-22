@@ -360,6 +360,7 @@ class ZorkEmulator:
     MAX_TURN_ADVANCE_MINUTES = 180
     CLOCK_START_DAY_OF_WEEK_KEY = "clock_start_day_of_week"
     LOCATION_CARDS_STATE_KEY = GameEngine.LOCATION_CARDS_STATE_KEY
+    LOCATION_FACT_PRIORITIES_KEY = GameEngine.LOCATION_FACT_PRIORITIES_KEY
     WEEKDAY_NAMES = (
         "monday",
         "tuesday",
@@ -722,7 +723,9 @@ class ZorkEmulator:
         "- location_updates: object (optional; keyed by stable location slugs like 'hotel-lobby' or 'washington-ranch-kitchen'. "
         "Use this for durable place facts: layout, security, atmosphere, notable_objects, current_activity, social_rules, recent_change, and other location-specific continuity. "
         "Do NOT store location facts in WORLD_STATE when they belong to one place. "
-        "Example: {\"location_updates\": {\"hotel-lobby\": {\"security\": \"Desk clerk now recognizes Rigby.\", \"current_activity\": \"Quiet afternoon check-ins.\"}}}\n"
+        "When a fact should stay visible in that location's card even when the player is elsewhere, wrap it as "
+        "{\"value\": \"...\", \"priority\": \"critical\"}. Omit priority for scene-local facts. "
+        "Example: {\"location_updates\": {\"hotel-lobby\": {\"security\": {\"value\": \"Desk clerk now recognizes Rigby.\", \"priority\": \"critical\"}, \"current_activity\": \"Quiet afternoon check-ins.\"}}}\n"
         "If you accidentally put character/location facts into state_update, the harness may relocate them, but do NOT rely on that. Prefer character_updates/location_updates directly.\n"
         "Set deceased_reason to a string when a character dies. "
         "CHARACTER_INDEX / CHARACTER_CARDS are the primary NPC continuity blocks. LOCATION_INDEX / LOCATION_CARDS are the primary place continuity blocks. "
@@ -761,7 +764,7 @@ class ZorkEmulator:
         "- TURN_VISIBILITY_DEFAULT tells you whether this turn should default to public, local, or private context.\n"
         "- SCENE_STATE is the immediate actionable scene: who is present, what is visible, and what tensions are active right now. Use it first for immediate staging.\n"
         "- CHARACTER_INDEX lists NPC slugs and available_keys. CHARACTER_CARDS are the primary NPC fact store: compact facts for all shown NPCs, expanded facts for scene-relevant NPCs.\n"
-        "- LOCATION_INDEX lists known place slugs and available_keys. LOCATION_CARDS are the primary place fact store: compact facts broadly, expanded facts for current/scene-relevant locations.\n"
+        "- LOCATION_INDEX lists known place slugs and available_keys. LOCATION_CARDS are the primary place fact store: critical location facts persist across scenes; non-critical location facts surface when that location is active.\n"
         "- WORLD_STATE is for world facts, investigations, event threads, and cross-entity facts. Do not treat it as a backup character sheet or location encyclopedia.\n"
         "- WORLD_CHARACTERS is kept as a compatibility alias only. Prefer CHARACTER_INDEX and CHARACTER_CARDS when reasoning about NPC continuity.\n"
         "- When SOURCE_MATERIAL_DOCS is present, treat it as canon. On normal turns, source lookup should be part of your research plan before asserting key plot facts, but only query the relevant subset for this turn.\n"
@@ -11532,6 +11535,28 @@ class ZorkEmulator:
             return "scene"
         return "low"
 
+    def _stored_location_field_priority(
+        self,
+        location_row: Dict[str, object] | None,
+        field_name: str,
+    ) -> str:
+        key = str(field_name or "").strip()
+        raw_map = (
+            location_row.get(self.LOCATION_FACT_PRIORITIES_KEY)
+            if isinstance(location_row, dict)
+            else None
+        )
+        if isinstance(raw_map, dict):
+            raw_value = raw_map.get(key)
+            text = re.sub(r"[^a-z]+", "-", str(raw_value or "").strip().lower()).strip("-")
+            if text in {"critical", "always", "sticky", "persistent"}:
+                return "critical"
+            if text in {"scene", "active", "local"}:
+                return "scene"
+            if text in {"low", "minor", "ephemeral", "temporary"}:
+                return "low"
+        return self._location_field_priority(field_name)
+
     def _build_character_index_for_prompt(
         self,
         characters_for_prompt: list[dict[str, object]],
@@ -11687,7 +11712,9 @@ class ZorkEmulator:
             if not isinstance(payload, dict):
                 continue
             available_keys = sorted(
-                key for key in payload.keys() if not str(key).startswith("_")
+                key
+                for key in payload.keys()
+                if key != self.LOCATION_FACT_PRIORITIES_KEY and not str(key).startswith("_")
             )
             rows.append(
                 {
@@ -11715,14 +11742,18 @@ class ZorkEmulator:
         for slug, payload in sorted(location_cards.items()):
             if not isinstance(payload, dict):
                 continue
-            available_keys = [key for key in payload.keys() if not str(key).startswith("_")]
-            priorities = {
-                key: self._location_field_priority(key)
-                for key in available_keys
-            }
+            available_keys = [
+                key
+                for key in payload.keys()
+                if key != self.LOCATION_FACT_PRIORITIES_KEY and not str(key).startswith("_")
+            ]
+            is_active_location = slug.lower() == active_location
             compact: dict[str, object] = {}
             for key in available_keys:
                 if key in top_level_keys or key in suppressed_card_keys:
+                    continue
+                priority = self._stored_location_field_priority(payload, key)
+                if priority != "critical" and not is_active_location:
                     continue
                 compact_value = self._compact_prompt_fact_value(payload.get(key))
                 if compact_value:
@@ -11731,14 +11762,13 @@ class ZorkEmulator:
             for key in available_keys:
                 if key in top_level_keys or key in suppressed_card_keys:
                     continue
-                priority = priorities.get(key, "low")
-                if priority == "critical" or (
-                    priority == "scene" and slug.lower() == active_location
-                ):
-                    value = payload.get(key)
-                    if value in (None, "", [], {}):
-                        continue
-                    expanded[key] = value
+                priority = self._stored_location_field_priority(payload, key)
+                if priority != "critical" and not is_active_location:
+                    continue
+                value = payload.get(key)
+                if value in (None, "", [], {}):
+                    continue
+                expanded[key] = value
             rows.append(
                 {
                     "slug": slug,
@@ -11750,7 +11780,6 @@ class ZorkEmulator:
                     "available_keys": sorted(available_keys),
                     "compact": compact,
                     "expanded": expanded,
-                    "priority": priorities,
                 }
             )
         return rows

@@ -23,6 +23,7 @@ from .types import DiceCheckRequest, DiceCheckResult, ResolveTurnInput, ResolveT
 class GameEngine:
     AUTO_FIX_COUNTERS_KEY = "_auto_fix_counters"
     LOCATION_CARDS_STATE_KEY = "_location_cards"
+    LOCATION_FACT_PRIORITIES_KEY = "_fact_priorities"
     MIN_TURN_ADVANCE_MINUTES = 20
     DEFAULT_TURN_ADVANCE_MINUTES = 20
     MAX_TURN_ADVANCE_MINUTES = 180
@@ -1454,6 +1455,42 @@ class GameEngine:
         updates: dict[str, Any],
         on_rails: bool = False,
     ) -> dict[str, Any]:
+        def _normalize_priority(value: object) -> str | None:
+            text = re.sub(r"[^a-z]+", "-", str(value or "").strip().lower()).strip("-")
+            if not text:
+                return None
+            if text in {"critical", "always", "sticky", "persistent"}:
+                return "critical"
+            if text in {"scene", "active", "local"}:
+                return "scene"
+            if text in {"low", "minor", "ephemeral", "temporary"}:
+                return "low"
+            return None
+
+        def _extract_priority_payload(fields: dict[str, Any]) -> tuple[dict[str, Any], dict[str, str]]:
+            clean_fields: dict[str, Any] = {}
+            priorities: dict[str, str] = {}
+            raw_priority_map = fields.get(cls.LOCATION_FACT_PRIORITIES_KEY)
+            if isinstance(raw_priority_map, dict):
+                for raw_key, raw_value in raw_priority_map.items():
+                    field_key = str(raw_key or "").strip()
+                    priority = _normalize_priority(raw_value)
+                    if field_key and priority:
+                        priorities[field_key] = priority
+            for key, value in fields.items():
+                if key == cls.LOCATION_FACT_PRIORITIES_KEY:
+                    continue
+                if isinstance(value, dict):
+                    wrapper_keys = {str(item).strip().lower() for item in value.keys()}
+                    if "value" in wrapper_keys and wrapper_keys <= {"value", "priority"}:
+                        clean_fields[key] = value.get("value")
+                        priority = _normalize_priority(value.get("priority"))
+                        if priority:
+                            priorities[key] = priority
+                        continue
+                clean_fields[key] = value
+            return clean_fields, priorities
+
         merged = dict(existing) if isinstance(existing, dict) else {}
         if not isinstance(updates, dict):
             return merged
@@ -1483,16 +1520,30 @@ class GameEngine:
                 continue
             if not isinstance(fields, dict):
                 continue
+            normalized_fields, priority_updates = _extract_priority_payload(fields)
             if target_slug and target_slug in merged and isinstance(merged[target_slug], dict):
-                for key, value in fields.items():
+                fact_priorities = merged[target_slug].get(cls.LOCATION_FACT_PRIORITIES_KEY)
+                if not isinstance(fact_priorities, dict):
+                    fact_priorities = {}
+                for key, value in normalized_fields.items():
                     if value is None:
                         merged[target_slug].pop(key, None)
+                        fact_priorities.pop(key, None)
                     else:
                         merged[target_slug][key] = value
+                        if key in priority_updates:
+                            fact_priorities[key] = priority_updates[key]
+                if fact_priorities:
+                    merged[target_slug][cls.LOCATION_FACT_PRIORITIES_KEY] = fact_priorities
+                else:
+                    merged[target_slug].pop(cls.LOCATION_FACT_PRIORITIES_KEY, None)
             else:
                 if on_rails:
                     continue
-                merged[target_slug or slug] = dict(fields)
+                new_row = dict(normalized_fields)
+                if priority_updates:
+                    new_row[cls.LOCATION_FACT_PRIORITIES_KEY] = dict(priority_updates)
+                merged[target_slug or slug] = new_row
         return merged
 
     @staticmethod
