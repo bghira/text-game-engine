@@ -2246,6 +2246,103 @@ class ZorkEmulator:
                     lines.append(f"   - {sc_title}")
         return "\n".join(lines)
 
+    @classmethod
+    def _normalize_setup_variant_main_character(cls, value: Any) -> Any:
+        if isinstance(value, dict):
+            normalized = dict(value)
+            name = str(
+                normalized.get("name")
+                or normalized.get("character_name")
+                or normalized.get("title")
+                or normalized.get("label")
+                or ""
+            ).strip()
+            if name:
+                normalized["name"] = name
+            return normalized
+        if isinstance(value, list) and value:
+            first = value[0]
+            normalized_first = cls._normalize_setup_variant_main_character(first)
+            return normalized_first or "The Protagonist"
+        text = str(value or "").strip()
+        return text or "The Protagonist"
+
+    @classmethod
+    def _normalize_setup_variant_npcs(cls, value: Any) -> list[Any]:
+        if isinstance(value, list):
+            return list(value)
+        if isinstance(value, dict):
+            nested = value.get("characters") or value.get("npcs") or value.get("essential_npcs")
+            if isinstance(nested, list):
+                return list(nested)
+            return [dict(value)]
+        text = str(value or "").strip()
+        return [text] if text else []
+
+    @classmethod
+    def _normalize_setup_variant_chapter_outline(cls, value: Any) -> list[dict[str, Any]]:
+        if isinstance(value, dict):
+            nested = value.get("chapters") or value.get("chapter_outline") or value.get("outline")
+            if isinstance(nested, list):
+                value = nested
+            else:
+                value = [value]
+        if not isinstance(value, list):
+            text = str(value or "").strip()
+            return [{"title": text}] if text else []
+
+        normalized: list[dict[str, Any]] = []
+        for idx, chapter in enumerate(value, start=1):
+            if isinstance(chapter, dict):
+                title = str(
+                    chapter.get("title")
+                    or chapter.get("name")
+                    or chapter.get("chapter")
+                    or chapter.get("label")
+                    or ""
+                ).strip()
+                summary = str(
+                    chapter.get("summary")
+                    or chapter.get("description")
+                    or chapter.get("premise")
+                    or ""
+                ).strip()
+                normalized_chapter = dict(chapter)
+                if title:
+                    normalized_chapter["title"] = title
+                elif not normalized_chapter.get("title"):
+                    normalized_chapter["title"] = f"Chapter {idx}"
+                if summary and not normalized_chapter.get("summary"):
+                    normalized_chapter["summary"] = summary
+                normalized.append(normalized_chapter)
+                continue
+            text = str(chapter or "").strip()
+            if text:
+                normalized.append({"title": text})
+        return normalized
+
+    @classmethod
+    def _format_setup_variant_person(cls, value: Any) -> str:
+        if isinstance(value, dict):
+            name = str(
+                value.get("name")
+                or value.get("character_name")
+                or value.get("title")
+                or value.get("label")
+                or ""
+            ).strip()
+            role = str(value.get("role") or value.get("job") or value.get("archetype") or "").strip()
+            if name and role:
+                return f"{name} ({role})"
+            if name:
+                return name
+            if role:
+                return role
+            desc = str(value.get("description") or value.get("summary") or "").strip()
+            return desc or cls._dump_json(value)
+        text = str(value or "").strip()
+        return text
+
     def record_player_message(
         self,
         player: Player,
@@ -4986,9 +5083,15 @@ class ZorkEmulator:
                             "id": str(row.get("id") or f"variant-{idx}"),
                             "title": str(row.get("title") or f"Variant {idx}").strip(),
                             "summary": summary,
-                            "main_character": str(row.get("main_character") or "The Protagonist").strip(),
-                            "essential_npcs": row.get("essential_npcs", []),
-                            "chapter_outline": row.get("chapter_outline", []),
+                            "main_character": self._normalize_setup_variant_main_character(
+                                row.get("main_character")
+                            ),
+                            "essential_npcs": self._normalize_setup_variant_npcs(
+                                row.get("essential_npcs", [])
+                            ),
+                            "chapter_outline": self._normalize_setup_variant_chapter_outline(
+                                row.get("chapter_outline", [])
+                            ),
                         }
                     )
 
@@ -5029,13 +5132,32 @@ class ZorkEmulator:
         for idx, variant in enumerate(variants, start=1):
             lines.append(f"**{idx}. {variant.get('title', 'Untitled')}**")
             lines.append(f"_{variant.get('summary', '')}_")
-            lines.append(f"Main character: {variant.get('main_character', 'TBD')}")
+            lines.append(
+                f"Main character: {self._format_setup_variant_person(variant.get('main_character', 'TBD'))}"
+            )
             npcs = variant.get("essential_npcs", [])
             if isinstance(npcs, list) and npcs:
-                lines.append(f"Key NPCs: {', '.join([str(n) for n in npcs])}")
+                npc_labels = [
+                    self._format_setup_variant_person(npc)
+                    for npc in npcs
+                    if str(self._format_setup_variant_person(npc) or "").strip()
+                ]
+                if npc_labels:
+                    lines.append(f"Key NPCs: {', '.join(npc_labels)}")
             chapters = variant.get("chapter_outline", [])
             if isinstance(chapters, list) and chapters:
-                titles = [str(ch.get("title", "?")) for ch in chapters if isinstance(ch, dict)]
+                titles = []
+                for ch_idx, ch in enumerate(chapters, start=1):
+                    if not isinstance(ch, dict):
+                        continue
+                    title = str(
+                        ch.get("title")
+                        or ch.get("name")
+                        or ch.get("chapter")
+                        or f"Chapter {ch_idx}"
+                    ).strip()
+                    if title:
+                        titles.append(title)
                 if titles:
                     lines.append(f"Chapters: {' → '.join(titles)}")
             lines.append("")

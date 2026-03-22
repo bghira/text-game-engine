@@ -105,6 +105,33 @@ class NovelIntentProbeCompletionPort:
         return '{"narration":"ok"}'
 
 
+class StructuredVariantCompletionPort:
+    async def complete(self, system_prompt, prompt, *, temperature=0.8, max_tokens=2048):
+        if "You classify whether text references a known published work" in system_prompt:
+            return (
+                '{"is_known_work": true, "work_type": "film", '
+                '"work_description": "A woman returns home for a funeral and uncovers a secret.", '
+                '"suggested_title": "Coastal Warning"}'
+            )
+        if "creative game designer" in system_prompt:
+            return (
+                '{"variants":[{"id":"variant-1","title":"The Locked Box",'
+                '"summary":"A funeral return opens an old surveillance wound.",'
+                '"main_character":{"name":"Lison Farrand","role":"Rare Book Dealer","description":"Quiet and observant."},'
+                '"essential_npcs":[{"name":"Agapito Reyes","role":"Lighthouse Keeper"},{"name":"Balbino Serra","role":"The Money"}],'
+                '"chapter_outline":[{"name":"The Funeral"},{"chapter":"The Box"},{"label":"The Watchers"}]}]}'
+            )
+        if "world-builder for interactive text-adventure campaigns" in system_prompt:
+            return (
+                '{"summary":"Setup summary","setting":"Storm coast","tone":"gothic mystery",'
+                '"default_persona":"A careful returnee with a long memory.","landmarks":["lighthouse"],'
+                '"story_outline":{"chapters":[{"title":"The Funeral"},{"title":"The Box"},{"title":"The Watchers"}]},'
+                '"start_room":{"room_title":"Harbor Road","room_summary":"Salt wind and wet stone","room_description":"The sea keeps its own counsel.","exits":["lighthouse","town"],"location":"harbor-road"},'
+                '"opening_narration":"The town watches before it speaks.","characters":{"agapito-reyes":{"name":"Agapito Reyes"}}}'
+            )
+        return '{"narration":"ok"}'
+
+
 class GuardRetryCompletionPort:
     def __init__(self):
         self.calls = 0
@@ -2188,6 +2215,54 @@ def test_classify_confirm_negative_with_novel_guidance_skips_reclassify(
             setup = state.get("setup_data", {})
             assert setup.get("is_known_work") is False
             assert setup.get("imdb_results") == []
+
+    asyncio.run(run_test())
+
+
+def test_setup_variant_rendering_formats_structured_people_and_chapters(
+    session_factory, seed_campaign_and_actor
+):
+    async def run_test():
+        compat = _build_compat(
+            session_factory,
+            completion_port=StructuredVariantCompletionPort(),
+            imdb_port=StubIMDB(),
+        )
+        campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
+
+        msg = await compat.start_campaign_setup(
+            campaign_id=campaign.id,
+            actor_id=seed_campaign_and_actor["actor_id"],
+            raw_name="Coastal Warning",
+            on_rails=True,
+        )
+        assert "I recognize" in msg
+
+        genre_msg = await compat.handle_setup_message(
+            campaign_id=campaign.id,
+            actor_id=seed_campaign_and_actor["actor_id"],
+            message_text="yes",
+        )
+        assert "genre direction" in genre_msg.lower()
+
+        variants_msg = await compat.handle_setup_message(
+            campaign_id=campaign.id,
+            actor_id=seed_campaign_and_actor["actor_id"],
+            message_text="gothic mystery",
+        )
+        assert "Main character: Lison Farrand (Rare Book Dealer)" in variants_msg
+        assert "Key NPCs: Agapito Reyes (Lighthouse Keeper), Balbino Serra (The Money)" in variants_msg
+        assert "Chapters: The Funeral → The Box → The Watchers" in variants_msg
+        assert "{'name': 'Lison Farrand'" not in variants_msg
+
+        with session_factory() as session:
+            row = session.get(Campaign, campaign.id)
+            state = json.loads(row.state_json or "{}")
+            setup_variants = state.get("setup_data", {}).get("storyline_variants", [])
+            assert isinstance(setup_variants, list) and setup_variants
+            main_character = setup_variants[0].get("main_character")
+            assert isinstance(main_character, dict)
+            assert main_character.get("name") == "Lison Farrand"
 
     asyncio.run(run_test())
 
