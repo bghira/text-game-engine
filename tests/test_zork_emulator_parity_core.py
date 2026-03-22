@@ -2520,6 +2520,40 @@ def test_begin_turn_honors_channel_campaign_binding_when_active_metadata_missing
     asyncio.run(run_test())
 
 
+def test_begin_turn_honors_channel_campaign_binding_over_stale_active_metadata(
+    session_factory,
+    seed_campaign_and_actor,
+):
+    async def run_test():
+        compat = _build_compat(session_factory)
+        actor_id = seed_campaign_and_actor["actor_id"]
+        stale_campaign = compat.get_or_create_campaign("default", "stale", actor_id)
+        bound_campaign = compat.get_or_create_campaign("default", "bound", actor_id)
+        channel = compat.get_or_create_channel("default", "main")
+        with session_factory() as session:
+            channel_row = session.get(GameSession, channel.id)
+            assert channel_row is not None
+            channel_row.enabled = True
+            channel_row.campaign_id = bound_campaign.id
+            channel_row.metadata_json = compat._dump_json({"active_campaign_id": stale_campaign.id})
+            session.commit()
+
+        ctx = LegacyCtx(actor_id, guild_id="default", channel_id="main")
+        campaign_id, error = await compat.begin_turn(ctx, command_prefix="!")
+
+        assert error is None
+        assert campaign_id == bound_campaign.id
+        compat.end_turn(bound_campaign.id, actor_id)
+
+        with session_factory() as session:
+            channel_row = session.get(GameSession, channel.id)
+            assert channel_row is not None
+            meta = compat._load_json(channel_row.metadata_json, {})
+            assert meta.get("active_campaign_id") == bound_campaign.id
+
+    asyncio.run(run_test())
+
+
 def test_context_onboarding_requires_party_choice(session_factory, seed_campaign_and_actor):
     async def run_test():
         compat = _build_compat(session_factory)

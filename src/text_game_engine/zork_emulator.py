@@ -2054,18 +2054,28 @@ class ZorkEmulator:
 
         metadata = self._load_session_metadata(channel)
         active_campaign_id = metadata.get("active_campaign_id")
-        if active_campaign_id:
-            with self._session_factory() as session:
-                campaign = session.get(Campaign, str(active_campaign_id))
-            if campaign is not None:
-                return str(active_campaign_id), None
-
         channel_campaign_id = getattr(channel, "campaign_id", None)
         if channel_campaign_id:
             with self._session_factory() as session:
                 campaign = session.get(Campaign, str(channel_campaign_id))
             if campaign is not None:
+                if str(active_campaign_id or "") != str(channel_campaign_id):
+                    with self._session_factory() as session:
+                        channel_row = session.get(GameSession, channel.id)
+                        if channel_row is not None:
+                            metadata = self._load_session_metadata(channel_row)
+                            metadata["active_campaign_id"] = str(channel_campaign_id)
+                            channel_row.campaign_id = str(channel_campaign_id)
+                            self._store_session_metadata(channel_row, metadata)
+                            channel_row.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
+                            session.commit()
                 return str(channel_campaign_id), None
+
+        if active_campaign_id:
+            with self._session_factory() as session:
+                campaign = session.get(Campaign, str(active_campaign_id))
+            if campaign is not None:
+                return str(active_campaign_id), None
 
         _, campaign = self.enable_channel(guild_id, channel_id, actor_id)
         return campaign.id, None
