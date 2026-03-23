@@ -511,6 +511,7 @@ class ZorkEmulator:
         "- Structure matters: vary sentence length and rhythm. A short sentence after a long one lands harder.\n"
         "- Style is the differentiator. Don't just describe what happens — make how you describe it unmistakable.\n"
         "- BAN: THERAPEUTIC RESOLUTION FRAMING. Do not force scenes, entities, or events into emotional-growth arcs, redemptive learning, spiritual lessons, consent metaphors, or 'finally asking / learning to stay / learning to feel' beats unless the source material and immediate scene explicitly earn it.\n"
+        "- BAN: filing-cabinet phrasing. Avoid defaulting to characters 'filing facts away', 'storing that for later', or otherwise processing new information like clerks or databases. If someone registers something important, describe a fresher concrete reaction, shift in attention, bodily tell, or change in strategy instead.\n"
         "- Things may be practical, random, transactional, grotesque, funny, unresolved, or simply strange. Not every event means something deeper. Sometimes things just happen.\n"
         "- Vary your landing gear. Turns can end mid-exchange, on a practical detail, on a half-finished gesture, abruptly after dialogue. Not every turn needs a final settling sentence that signals 'scene complete' — most shouldn't.\n"
     )
@@ -12134,6 +12135,7 @@ class ZorkEmulator:
             self.AUTOBIOGRAPHY_LAST_COMPRESSED_TURN_FIELD,
             "evolving_personality",
             "created",
+            "relationship",
         }
         top_level_keys = {"name", "location", "current_status"}
         current_day = self._coerce_non_negative_int(

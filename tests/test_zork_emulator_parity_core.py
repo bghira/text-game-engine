@@ -1259,6 +1259,12 @@ def test_ready_to_write_finalization_reexpands_character_and_location_cards(
                         "current_status": "Watching the desk.",
                         "speech_style": "Controlled and exact.",
                         "relationship": "Brittle but engaged.",
+                        "relationships": {
+                            "chace-preston": {
+                                "status": "engaged",
+                                "dynamic": "Tense but still committed.",
+                            }
+                        },
                         "appearance": "Ring catching the lobby light.",
                     }
                 }
@@ -1319,10 +1325,12 @@ def test_ready_to_write_finalization_reexpands_character_and_location_cards(
         assert "FINAL_CHARACTER_CARDS:" in completion.calls[1]["prompt"]
         assert "yasmin-devereaux" in completion.calls[1]["prompt"]
         assert '"speech_style": "Controlled and exact."' in completion.calls[1]["prompt"]
-        assert '"relationship": "Brittle but engaged."' in completion.calls[1]["prompt"]
+        assert '"relationships": {"chace-preston": {"status": "engaged", "dynamic": "Tense but still committed."}}' in completion.calls[1]["prompt"]
+        assert '"relationship": "Brittle but engaged."' not in completion.calls[1]["prompt"]
         assert "FINAL_LOCATION_CARDS:" in completion.calls[1]["prompt"]
         assert "hotel-lobby" in completion.calls[1]["prompt"]
         assert "BAN: THERAPEUTIC RESOLUTION FRAMING." in completion.calls[1]["prompt"]
+        assert "BAN: filing-cabinet phrasing." in completion.calls[1]["prompt"]
         final_location_match = re.search(r"FINAL_LOCATION_CARDS:\s*(\[.*?\])\n", completion.calls[1]["prompt"], re.DOTALL)
         assert final_location_match is not None
         assert '"expanded":' not in final_location_match.group(1)
