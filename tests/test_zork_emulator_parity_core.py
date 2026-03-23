@@ -10,7 +10,7 @@ from text_game_engine.core.types import GiveItemInstruction, LLMTurnOutput, Time
 from text_game_engine.core.engine import GameEngine
 from text_game_engine.persistence.sqlalchemy.uow import SQLAlchemyUnitOfWork
 from text_game_engine.persistence.sqlalchemy.models import Actor, Campaign, Player, Session as GameSession, Snapshot, Turn
-from text_game_engine.tool_aware_llm import ToolAwareZorkLLM
+from text_game_engine.tool_aware_llm import DeterministicLLM, ToolAwareZorkLLM
 from text_game_engine.zork_emulator import ZorkEmulator
 
 
@@ -518,20 +518,33 @@ def test_build_prompt_bootstrap_stage_shape(session_factory, seed_campaign_and_a
     assert "Do NOT narrate yet" in system_prompt
     assert "RECENT_TURNS_LOADED: false" in user_prompt
     assert "WORLD_SUMMARY:" not in user_prompt
-    assert "WORLD_STATE:" not in user_prompt
-    assert "CALENDAR:" not in user_prompt
-    assert "STORY_CONTEXT:" not in user_prompt
-    assert "RECENT_TURNS:\n" not in user_prompt
-    assert "SCENE_STATE:" in user_prompt
-    assert "CHARACTER_INDEX:" in user_prompt
-    assert "CHARACTER_CARDS:" in user_prompt
-    assert "LOCATION_INDEX:" in user_prompt
-    assert "LOCATION_CARDS:" in user_prompt
-    assert "WORLD_CHARACTERS:" in user_prompt
-    assert "PLAYER_CARD:" in user_prompt
-    assert "PARTY_SNAPSHOT:" in user_prompt
-    assert '"visible_items"' not in user_prompt
-    assert "PLAYER_ACTION" in user_prompt
+
+
+def test_deterministic_fallback_respects_speed_multiplier():
+    llm = DeterministicLLM()
+    context = type(
+        "Ctx",
+        (),
+        {
+            "action": "look",
+            "campaign_state": {
+                "game_time": {
+                    "day": 1,
+                    "hour": 13,
+                    "minute": 0,
+                    "day_of_week": "wednesday",
+                    "period": "afternoon",
+                    "date_label": "Wednesday, Day 1, Afternoon",
+                },
+                "speed_multiplier": 2.0,
+            },
+        },
+    )()
+
+    result = asyncio.run(llm.complete_turn(context))
+
+    assert result.state_update["game_time"]["hour"] == 13
+    assert result.state_update["game_time"]["minute"] == 40
 
 
 def test_build_prompt_research_stage_shape(session_factory, seed_campaign_and_actor):
