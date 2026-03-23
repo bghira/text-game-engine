@@ -8106,6 +8106,9 @@ class ZorkEmulator:
                 campaign_state = self.get_campaign_state(campaign_obj)
                 game_time = campaign_state.get("game_time", {})
                 calendar_entries = self._calendar_for_prompt(campaign_state)
+                player_calendar_lines = self._player_calendar_events_for_display(
+                    player_state
+                )
                 date_label = game_time.get("date_label")
                 if not date_label:
                     day = game_time.get("day", "?")
@@ -8138,6 +8141,9 @@ class ZorkEmulator:
                         lines.append(line)
                 else:
                     lines.append("No upcoming events.")
+                if player_calendar_lines:
+                    lines.append("**Personal Events:**")
+                    lines.extend(player_calendar_lines)
                 return "\n".join(lines)
 
             if action_clean in ("roster", "characters", "npcs"):
@@ -10112,6 +10118,42 @@ class ZorkEmulator:
         if calendar_changed and isinstance(campaign_state, dict):
             campaign_state["calendar"] = calendar
         return entries
+
+    @classmethod
+    def _player_calendar_events_for_display(
+        cls,
+        player_state: dict[str, object] | None,
+    ) -> list[str]:
+        if not isinstance(player_state, dict):
+            return []
+        raw_events = player_state.get("calendar_events")
+        if not isinstance(raw_events, list):
+            return []
+
+        lines: list[str] = []
+        for raw in raw_events:
+            if isinstance(raw, dict):
+                title = str(
+                    raw.get("title")
+                    or raw.get("name")
+                    or raw.get("event")
+                    or "Untitled Event"
+                ).strip()
+                time_label = str(raw.get("time") or raw.get("when") or "").strip()
+                location = str(raw.get("location") or raw.get("where") or "").strip()
+                description = str(raw.get("description") or raw.get("summary") or "").strip()
+                line = f"- **{title}**"
+                details = [part for part in (time_label, location) if part]
+                if details:
+                    line += f" - {' | '.join(details)}"
+                if description:
+                    line += f" ({description})"
+                lines.append(line)
+                continue
+            text = str(raw or "").strip()
+            if text:
+                lines.append(f"- **{text}**")
+        return lines
 
     @classmethod
     def _calendar_reminder_text(

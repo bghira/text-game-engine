@@ -2788,7 +2788,18 @@ def test_context_shortcuts_calendar_and_roster(session_factory, seed_campaign_an
         compat.enable_channel("default", "main", seed_campaign_and_actor["actor_id"])
         with session_factory() as session:
             player_row = session.get(Player, player.id)
-            player_row.state_json = compat._dump_json({"party_status": "main_party"})
+            player_row.state_json = compat._dump_json(
+                {
+                    "party_status": "main_party",
+                    "calendar_events": [
+                        {
+                            "title": "Dinner with Yeseniya",
+                            "time": "8:00 PM",
+                            "location": "Sacha's Noodles, Kabuki",
+                        }
+                    ],
+                }
+            )
             campaign_row = session.get(Campaign, campaign.id)
             campaign_state = compat.get_campaign_state(campaign)
             campaign_state["game_time"] = {"day": 3, "hour": 19, "period": "evening"}
@@ -2826,6 +2837,9 @@ def test_context_shortcuts_calendar_and_roster(session_factory, seed_campaign_an
         assert "**Game Time:** Day 3, Evening" in calendar_resp
         assert "Moonrise Ceremony" in calendar_resp
         assert "fires in 3 hour(s)" in calendar_resp
+        assert "**Personal Events:**" in calendar_resp
+        assert "Dinner with Yeseniya" in calendar_resp
+        assert "Sacha's Noodles, Kabuki" in calendar_resp
 
         roster_resp = await compat.play_action(
             ctx,
