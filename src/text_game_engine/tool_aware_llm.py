@@ -58,8 +58,9 @@ class DeterministicLLM:
 
         base_minutes = int(getattr(ZorkEmulator, "DEFAULT_TURN_ADVANCE_MINUTES", 20) or 20)
         min_minutes = int(getattr(ZorkEmulator, "MIN_TURN_ADVANCE_MINUTES", base_minutes) or base_minutes)
+        scaled_min_minutes = max(1, int(round(min_minutes * float(speed_multiplier or 1.0))))
         scaled_minutes = int(round(base_minutes * float(speed_multiplier or 1.0)))
-        minute += max(min_minutes, scaled_minutes)
+        minute += max(scaled_min_minutes, scaled_minutes)
         if minute >= 60:
             hour += minute // 60
             minute = minute % 60
