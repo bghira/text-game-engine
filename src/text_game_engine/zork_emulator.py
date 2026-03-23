@@ -17524,7 +17524,9 @@ class ZorkEmulator:
         # Keep derived fields canonical when model already advanced time.
         if cur_total > pre_total:
             if time_skip_request is None and not self._is_ooc_action_text(action_text):
-                cur_total = max(cur_total, pre_total + self.MIN_TURN_ADVANCE_MINUTES)
+                speed_multiplier = self._speed_multiplier_from_state(campaign_state)
+                min_step = max(1, int(round(self.MIN_TURN_ADVANCE_MINUTES * speed_multiplier)))
+                cur_total = max(cur_total, pre_total + min_step)
             campaign_state["game_time"] = self._game_time_from_total_minutes(
                 cur_total,
                 start_day_of_week=start_day_of_week,
@@ -17548,8 +17550,9 @@ class ZorkEmulator:
                 action_text, narration_text
             )
         speed_multiplier = self._speed_multiplier_from_state(campaign_state)
+        min_step = max(1, int(round(self.MIN_TURN_ADVANCE_MINUTES * speed_multiplier)))
         scaled_minutes = int(round(base_minutes * speed_multiplier))
-        delta_minutes = max(self.MIN_TURN_ADVANCE_MINUTES, scaled_minutes)
+        delta_minutes = max(min_step, scaled_minutes)
         if time_skip_request is None:
             delta_minutes = min(self.MAX_TURN_ADVANCE_MINUTES, delta_minutes)
         else:

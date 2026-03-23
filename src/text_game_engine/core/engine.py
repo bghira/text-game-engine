@@ -2203,7 +2203,9 @@ class GameEngine:
 
         if cur_total > pre_total:
             if time_skip_request is None and not cls._is_ooc_action_text(action_text):
-                min_total = pre_total + cls.MIN_TURN_ADVANCE_MINUTES
+                speed_multiplier = cls._speed_multiplier_from_state(campaign_state)
+                min_step = max(1, int(round(cls.MIN_TURN_ADVANCE_MINUTES * speed_multiplier)))
+                min_total = pre_total + min_step
                 cur_total = max(cur_total, min_total)
             campaign_state["game_time"] = cls._game_time_from_total_minutes(
                 cur_total,
@@ -2224,8 +2226,9 @@ class GameEngine:
         else:
             base_minutes = cls._estimate_turn_time_advance_minutes(action_text, narration_text)
         speed_multiplier = cls._speed_multiplier_from_state(campaign_state)
+        min_step = max(1, int(round(cls.MIN_TURN_ADVANCE_MINUTES * speed_multiplier)))
         scaled = int(round(base_minutes * speed_multiplier))
-        delta_minutes = max(cls.MIN_TURN_ADVANCE_MINUTES, scaled)
+        delta_minutes = max(min_step, scaled)
         if time_skip_request is None:
             delta_minutes = min(cls.MAX_TURN_ADVANCE_MINUTES, delta_minutes)
         else:

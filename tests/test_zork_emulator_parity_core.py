@@ -547,6 +547,30 @@ def test_deterministic_fallback_respects_speed_multiplier():
     assert result.state_update["game_time"]["minute"] == 40
 
 
+def test_deterministic_fallback_allows_sub_20_minute_progress_at_low_speed():
+    llm = DeterministicLLM()
+    context = type(
+        "Ctx",
+        (),
+        {
+            "action": "look",
+            "campaign_state": {
+                "game_time": {
+                    "day": 1,
+                    "hour": 13,
+                    "minute": 0,
+                },
+                "speed_multiplier": 0.1,
+            },
+        },
+    )()
+
+    result = asyncio.run(llm.complete_turn(context))
+
+    assert result.state_update["game_time"]["hour"] == 13
+    assert result.state_update["game_time"]["minute"] == 2
+
+
 def test_build_prompt_research_stage_shape(session_factory, seed_campaign_and_actor):
     compat = _build_compat(session_factory)
     campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
@@ -3704,6 +3728,33 @@ def test_speed_multiplier_scales_timer_delay_and_rendered_line(
         compat.cancel_pending_timer(campaign.id)
 
     asyncio.run(run_test())
+
+
+def test_low_speed_multiplier_scales_standard_turn_time_below_20_minutes(session_factory):
+    compat = _build_compat(session_factory)
+    campaign_state = {
+        "game_time": {
+            "day": 1,
+            "hour": 13,
+            "minute": 0,
+            "day_of_week": "monday",
+            "period": "afternoon",
+            "date_label": "Monday, Day 1, Afternoon",
+        },
+        "speed_multiplier": 0.1,
+        compat.CLOCK_START_DAY_OF_WEEK_KEY: "monday",
+    }
+    pre_turn = compat._extract_game_time_snapshot(campaign_state)
+
+    out = compat._ensure_game_time_progress(
+        campaign_state,
+        pre_turn,
+        action_text="walk around",
+        narration_text="You circle the room.",
+    )
+
+    assert out["game_time"]["hour"] == 13
+    assert out["game_time"]["minute"] == 2
 
 
 # ---------------------------------------------------------------------------
