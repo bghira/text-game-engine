@@ -1883,24 +1883,6 @@ class ToolAwareZorkLLM:
             ).strip()
             if location_key:
                 location_history.append(location_key)
-            turn_row: dict[str, Any] = {
-                "kind": "turn",
-                "turn_id": int(turn.id),
-                "turn_kind": str(turn.kind or ""),
-                "location_key": location_key,
-                "context_key": str(
-                    (visibility or {}).get("context_key") or meta.get("context_key") or ""
-                ).strip()
-                or None,
-                "visibility": str((visibility or {}).get("scope") or "public").strip().lower(),
-            }
-            game_time = meta.get("game_time")
-            if isinstance(game_time, dict):
-                turn_row["day"] = int(game_time.get("day", 1) or 1)
-                turn_row["hour"] = int(game_time.get("hour", 0) or 0)
-                turn_row["minute"] = int(game_time.get("minute", 0) or 0)
-            rows.append(turn_row)
-
             scene_output = meta.get("scene_output")
             beats = scene_output.get("beats") if isinstance(scene_output, dict) else None
             if isinstance(beats, list) and beats:
