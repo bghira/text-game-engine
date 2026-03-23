@@ -1827,6 +1827,53 @@ def test_recent_turns_keep_full_content(session_factory, seed_campaign_and_actor
     assert "...[truncated]" not in user_prompt
 
 
+def test_recent_turns_tool_emits_beats_without_turn_wrapper_rows(
+    session_factory,
+    seed_campaign_and_actor,
+):
+    compat = _build_compat(session_factory)
+    campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
+    compat.get_or_create_player(campaign.id, seed_campaign_and_actor["actor_id"])
+
+    with session_factory() as session:
+        session.add(
+            Turn(
+                campaign_id=campaign.id,
+                session_id=None,
+                actor_id=seed_campaign_and_actor["actor_id"],
+                kind="player",
+                content="look around",
+                meta_json=json.dumps(
+                    {
+                        "game_time": {
+                            "day": 1,
+                            "hour": 9,
+                            "minute": 0,
+                        }
+                    }
+                ),
+            )
+        )
+        session.commit()
+
+    tool_llm = ToolAwareZorkLLM(
+        session_factory=session_factory,
+        completion_port=StubCompletionPort(),
+        temperature=0.8,
+        max_tokens=512,
+    )
+    tool_llm.bind_emulator(compat)
+
+    output = tool_llm._tool_recent_turns(
+        campaign.id,
+        {},
+        actor_id=seed_campaign_and_actor["actor_id"],
+    )
+
+    assert '"kind":"beat"' in output
+    assert '"kind":"turn"' not in output
+
+
 def test_build_prompt_seeds_default_game_time(session_factory, seed_campaign_and_actor):
     compat = _build_compat(session_factory)
     campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
