@@ -464,6 +464,41 @@ def test_build_prompt_shape(session_factory, seed_campaign_and_actor):
     assert "CHARACTER ROSTER & PORTRAITS:" not in system_prompt
 
 
+def test_build_prompt_ignores_non_dict_character_entries(session_factory, seed_campaign_and_actor):
+    compat = _build_compat(session_factory)
+    campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
+    player = compat.get_or_create_player(seed_campaign_and_actor["campaign_id"], seed_campaign_and_actor["actor_id"])
+    with session_factory() as session:
+        campaign_row = session.get(Campaign, campaign.id)
+        player_row = session.get(Player, player.id)
+        assert campaign_row is not None
+        assert player_row is not None
+        campaign_row.characters_json = compat._dump_json(
+            {
+                "broken-entry": ["bad", "shape"],
+                "mira-guide": {
+                    "name": "Mira",
+                    "location": "dock-9",
+                    "current_status": "watchful",
+                },
+            }
+        )
+        player_row.state_json = compat._dump_json({"location": "dock-9"})
+        session.commit()
+
+    turns = compat.get_recent_turns(seed_campaign_and_actor["campaign_id"])
+    _system_prompt, user_prompt = compat.build_prompt(
+        campaign,
+        player,
+        "look",
+        turns,
+        prompt_stage=compat.PROMPT_STAGE_RESEARCH,
+    )
+
+    assert "Mira" in user_prompt
+    assert "broken-entry" not in user_prompt
+
+
 def test_build_prompt_bootstrap_stage_shape(session_factory, seed_campaign_and_actor):
     compat = _build_compat(session_factory)
     campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])

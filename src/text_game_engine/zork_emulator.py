@@ -2122,12 +2122,35 @@ class ZorkEmulator:
                 return parse_json_dict(row.state_json)
         return parse_json_dict(campaign.state_json)
 
+    @classmethod
+    def _normalize_character_roster(cls, raw_characters: object) -> dict[str, Any]:
+        if not isinstance(raw_characters, dict):
+            return {}
+        normalized: dict[str, Any] = {}
+        for raw_slug, raw_entry in raw_characters.items():
+            slug = str(raw_slug or "").strip()
+            if not slug:
+                continue
+            if isinstance(raw_entry, dict):
+                normalized[slug] = raw_entry
+                continue
+            if isinstance(raw_entry, list):
+                first_dict = next(
+                    (item for item in raw_entry if isinstance(item, dict)),
+                    None,
+                )
+                if first_dict is not None:
+                    normalized[slug] = dict(first_dict)
+        return normalized
+
     def get_campaign_characters(self, campaign: Campaign) -> dict[str, Any]:
         with self._session_factory() as session:
             row = session.get(Campaign, campaign.id)
             if row is not None:
-                return parse_json_dict(row.characters_json)
-        return parse_json_dict(campaign.characters_json)
+                return self._normalize_character_roster(
+                    parse_json_dict(row.characters_json)
+                )
+        return self._normalize_character_roster(parse_json_dict(campaign.characters_json))
 
     def get_chapter_list(self, campaign: Campaign) -> dict[str, Any]:
         """Return a structured chapter list for frontend display.
@@ -11840,6 +11863,8 @@ class ZorkEmulator:
         mentioned = []
         distant = []
         for slug, char in characters.items():
+            if not isinstance(char, dict):
+                continue
             slug_key = self._player_slug_key(slug)
             char_location = str(char.get("location") or "").strip().lower()
             char_name = str(char.get("name") or slug).strip().lower()
