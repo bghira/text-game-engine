@@ -18943,29 +18943,7 @@ class ZorkEmulator:
             ]
         if not actor_slug and turn.kind == "player":
             actor_slug = self._player_slug_key(player_name) or f"player-{turn.actor_id}"
-        header = {
-            "kind": "turn",
-            "turn_id": turn_number,
-            "location_key": location_key,
-            "context_key": context_key,
-            "visibility": scope,
-        }
         time_source = entry if isinstance(entry, dict) else meta.get("game_time")
-        if isinstance(time_source, dict):
-            header["day"] = (
-                self._coerce_non_negative_int(time_source.get("day", 1), default=1) or 1
-            )
-            header["hour"] = min(
-                23,
-                max(0, self._coerce_non_negative_int(time_source.get("hour", 0), default=0)),
-            )
-            header["minute"] = min(
-                59,
-                max(
-                    0,
-                    self._coerce_non_negative_int(time_source.get("minute", 0), default=0),
-                ),
-            )
         beat_type = "player_action" if turn.kind == "player" else "narration"
         speaker = actor_slug or ("narrator" if turn.kind == "narrator" else "player")
         actors = [actor_slug] if actor_slug else []
@@ -18989,10 +18967,22 @@ class ZorkEmulator:
             "context_key": context_key,
             "text": text,
         }
-        return [
-            json.dumps(header, ensure_ascii=False, separators=(",", ":")),
-            json.dumps(beat, ensure_ascii=False, separators=(",", ":")),
-        ]
+        if isinstance(time_source, dict):
+            beat["day"] = (
+                self._coerce_non_negative_int(time_source.get("day", 1), default=1) or 1
+            )
+            beat["hour"] = min(
+                23,
+                max(0, self._coerce_non_negative_int(time_source.get("hour", 0), default=0)),
+            )
+            beat["minute"] = min(
+                59,
+                max(
+                    0,
+                    self._coerce_non_negative_int(time_source.get("minute", 0), default=0),
+                ),
+            )
+        return [json.dumps(beat, ensure_ascii=False, separators=(",", ":"))]
 
     def _scene_output_text_from_raw(self, raw_scene_output: object) -> str:
         if not isinstance(raw_scene_output, dict):
@@ -19299,21 +19289,8 @@ class ZorkEmulator:
         if not isinstance(time_index, dict):
             time_index = {}
         entry = time_index.get(str(turn_number))
-        header: Dict[str, object] = {
-            "kind": "turn",
-            "turn_id": turn_number,
-            "location_key": scene_output.get("location_key"),
-            "context_key": scene_output.get("context_key"),
-        }
         meta = self._safe_turn_meta(turn)
         time_source = entry if isinstance(entry, dict) else meta.get("game_time")
-        if isinstance(time_source, dict):
-            header["day"] = self._coerce_non_negative_int(time_source.get("day", 1), default=1) or 1
-            header["hour"] = min(23, max(0, self._coerce_non_negative_int(time_source.get("hour", 0), default=0)))
-            header["minute"] = min(59, max(0, self._coerce_non_negative_int(time_source.get("minute", 0), default=0)))
-        visibility = meta.get("visibility")
-        if isinstance(visibility, dict):
-            header["visibility"] = str(visibility.get("scope") or "").strip().lower() or None
         beat_lines: List[str] = []
         meta_location_key_norm = self._normalize_location_key(meta.get("location_key"))
         fallback_location_key = self._normalize_location_key(
@@ -19396,31 +19373,36 @@ class ZorkEmulator:
                 scene_npc_slugs,
             ):
                 continue
+            beat_row = {
+                "kind": "beat",
+                "turn_id": turn_number,
+                "index": beat_index,
+                "reasoning": str(beat.get("reasoning") or "").strip(),
+                "type": str(beat.get("type") or "narration").strip(),
+                "speaker": str(beat.get("speaker") or "narrator").strip(),
+                "actors": list(beat.get("actors") or []),
+                "listeners": list(beat.get("listeners") or []),
+                "visibility": str(beat.get("visibility") or "local").strip(),
+                "visible_actor_ids": beat_visible_actor_ids,
+                "aware_npc_slugs": list(beat.get("aware_npc_slugs") or []),
+                "location_key": beat.get("location_key"),
+                "context_key": beat.get("context_key"),
+                "text": str(beat.get("text") or "").strip(),
+            }
+            if isinstance(time_source, dict):
+                beat_row["day"] = self._coerce_non_negative_int(time_source.get("day", 1), default=1) or 1
+                beat_row["hour"] = min(23, max(0, self._coerce_non_negative_int(time_source.get("hour", 0), default=0)))
+                beat_row["minute"] = min(59, max(0, self._coerce_non_negative_int(time_source.get("minute", 0), default=0)))
             beat_lines.append(
                 json.dumps(
-                    {
-                        "kind": "beat",
-                        "turn_id": turn_number,
-                        "index": beat_index,
-                        "reasoning": str(beat.get("reasoning") or "").strip(),
-                        "type": str(beat.get("type") or "narration").strip(),
-                        "speaker": str(beat.get("speaker") or "narrator").strip(),
-                        "actors": list(beat.get("actors") or []),
-                        "listeners": list(beat.get("listeners") or []),
-                        "visibility": str(beat.get("visibility") or "local").strip(),
-                        "visible_actor_ids": beat_visible_actor_ids,
-                        "aware_npc_slugs": list(beat.get("aware_npc_slugs") or []),
-                        "location_key": beat.get("location_key"),
-                        "context_key": beat.get("context_key"),
-                        "text": str(beat.get("text") or "").strip(),
-                    },
+                    beat_row,
                     ensure_ascii=False,
                     separators=(",", ":"),
                 )
             )
         if not beat_lines:
             return []
-        return [json.dumps(header, ensure_ascii=False, separators=(",", ":")), *beat_lines]
+        return beat_lines
 
     def _compute_recent_turns_metadata(
         self,

@@ -1267,6 +1267,7 @@ def test_ready_to_write_finalization_uses_final_stage_system_prompt(
         assert "tool_calls MUST be the last top-level key" in completion.calls[1]["system_prompt"]
         assert "make those beats cover the full span implied by state_update.game_time" in completion.calls[1]["system_prompt"]
         assert "follow TURN_TIME_BEAT_GUIDANCE for the current minimum span" in completion.calls[1]["system_prompt"]
+        assert '"kind":"turn"' not in completion.calls[1]["prompt"]
 
     asyncio.run(run_test())
 
@@ -1661,7 +1662,7 @@ def test_recent_turns_include_turn_number_and_in_game_time(session_factory, seed
     turns = compat.get_recent_turns(seed_campaign_and_actor["campaign_id"])
     _, user_prompt = compat.build_prompt(campaign, player, "look", turns)
 
-    assert '"kind":"turn"' in user_prompt
+    assert '"kind":"turn"' not in user_prompt
     assert '"turn_id":' in user_prompt
     assert '"day":2' in user_prompt
     assert '"hour":14' in user_prompt
