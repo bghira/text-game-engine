@@ -3120,6 +3120,7 @@ class ToolAwareZorkLLM:
                         requested_player_slugs=set(),
                         requested_npc_slugs={speaker_slug},
                         scene_npc_slugs=None,
+                        focus_on_requested_receivers=True,
                     )
                     if speaker_recent and speaker_recent != "None":
                         speaker_blocks.append(

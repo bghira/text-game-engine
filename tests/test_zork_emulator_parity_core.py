@@ -2211,6 +2211,98 @@ def test_recent_turns_still_hides_actor_turns_with_suppress_context(
     assert "I text Penny: call me when you can." not in user_prompt
 
 
+def test_recent_turns_focus_mode_filters_speaker_continuity_to_requested_npc(
+    session_factory,
+    seed_campaign_and_actor,
+):
+    compat = _build_compat(session_factory)
+    campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
+    player = compat.get_or_create_player(seed_campaign_and_actor["campaign_id"], seed_campaign_and_actor["actor_id"])
+
+    with session_factory() as session:
+        player_row = session.get(Player, player.id)
+        assert player_row is not None
+        player_row.state_json = compat._dump_json(
+            {
+                "character_name": "Rigby",
+                "location": "kingsland-ave-dumpling-house",
+            }
+        )
+        session.add(
+            Turn(
+                campaign_id=campaign.id,
+                session_id=None,
+                actor_id=player.actor_id,
+                kind="player",
+                content="i get ready for my meeting with simone",
+                meta_json=json.dumps(
+                    {
+                        "game_time": {"day": 3656, "hour": 17, "minute": 10},
+                        "visibility": {
+                            "scope": "local",
+                            "actor_player_slug": "rigby-krinkle",
+                            "location_key": "in-transit-williamsburg",
+                        },
+                        "location_key": "in-transit-williamsburg",
+                    }
+                ),
+            )
+        )
+        session.add(
+            Turn(
+                campaign_id=campaign.id,
+                session_id=None,
+                actor_id=player.actor_id,
+                kind="narrator",
+                content="Simone waits by the entrance.",
+                meta_json=json.dumps(
+                    {
+                        "game_time": {"day": 3656, "hour": 18, "minute": 15},
+                        "visibility": {
+                            "scope": "local",
+                            "actor_player_slug": "rigby-krinkle",
+                            "location_key": "kingsland-ave-dumpling-house",
+                        },
+                        "location_key": "kingsland-ave-dumpling-house",
+                        "scene_output": {
+                            "location_key": "kingsland-ave-dumpling-house",
+                            "beats": [
+                                {
+                                    "reasoning": "Simone is already there.",
+                                    "type": "npc_dialogue",
+                                    "speaker": "simone-ashworth",
+                                    "actors": ["simone-ashworth"],
+                                    "listeners": ["rigby-krinkle"],
+                                    "visibility": "local",
+                                    "aware_npc_slugs": [],
+                                    "text": "She's already there waiting by the entrance.",
+                                }
+                            ],
+                        },
+                    }
+                ),
+            )
+        )
+        session.commit()
+
+    turns = compat.get_recent_turns(seed_campaign_and_actor["campaign_id"])
+    recent = compat._recent_turns_text_for_viewer(
+        campaign,
+        turns,
+        viewer_actor_id=seed_campaign_and_actor["actor_id"],
+        viewer_slug="rigby-krinkle",
+        viewer_location_key="kingsland-ave-dumpling-house",
+        viewer_private_context_key="",
+        requested_player_slugs=set(),
+        requested_npc_slugs={"simone-ashworth"},
+        scene_npc_slugs=None,
+        focus_on_requested_receivers=True,
+    )
+
+    assert "She's already there waiting by the entrance." in recent
+    assert "i get ready for my meeting with simone" not in recent
+
+
 def test_recent_turns_tool_emits_beats_without_turn_wrapper_rows(
     session_factory,
     seed_campaign_and_actor,

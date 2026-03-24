@@ -18746,6 +18746,7 @@ class ZorkEmulator:
         requested_player_slugs: set[str],
         requested_npc_slugs: set[str],
         scene_npc_slugs: Optional[set[str]] = None,
+        focus_on_requested_receivers: bool = False,
     ) -> str:
         recent_lines: List[str] = []
         _OOC_RE = re.compile(r"^\s*\[OOC\b", re.IGNORECASE)
@@ -18771,13 +18772,18 @@ class ZorkEmulator:
             if not content:
                 continue
             meta = self._safe_turn_meta(turn)
-            visible = self._turn_visible_in_recent_turns_context(
-                turn,
-                viewer_actor_id=viewer_actor_id,
-                viewer_slug=viewer_slug,
-                viewer_location_key=viewer_location_key,
-                viewer_private_context_key=viewer_private_context_key,
-            )
+            if focus_on_requested_receivers and (
+                requested_player_slugs or requested_npc_slugs
+            ):
+                visible = False
+            else:
+                visible = self._turn_visible_in_recent_turns_context(
+                    turn,
+                    viewer_actor_id=viewer_actor_id,
+                    viewer_slug=viewer_slug,
+                    viewer_location_key=viewer_location_key,
+                    viewer_private_context_key=viewer_private_context_key,
+                )
             if (
                 not visible
                 and (requested_player_slugs or requested_npc_slugs)
