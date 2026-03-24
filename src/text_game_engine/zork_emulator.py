@@ -1199,12 +1199,14 @@ class ZorkEmulator:
     CALENDAR_TOOL_PROMPT = (
         "\nCALENDAR & GAME TIME SYSTEM:\n"
         "The campaign tracks in-game time via CURRENT_GAME_TIME shown in the user prompt.\n"
+        "The user prompt also includes MIN_TURN_ADVANCE_MINUTES_EFFECTIVE and STANDARD_TURN_ADVANCE_MINUTES_EFFECTIVE for the current campaign speed.\n"
         "Every turn, you MUST advance game_time in state_update by a plausible amount "
-        "(about 20 minutes for an ordinary turn, longer for travel/rest/time skips, etc.). "
+        "(ordinary turns use STANDARD_TURN_ADVANCE_MINUTES_EFFECTIVE as the baseline rhythm, longer for travel/rest/time skips, etc.). "
         "Scale the advance by SPEED_MULTIPLIER — at 2x, time passes roughly twice as fast per turn.\n"
         "The harness derives day_of_week automatically from the campaign's Day 1 weekday. Keep it consistent with the world clock.\n"
-        "Default rhythm: advance the world by roughly 20 minutes per turn unless the scene clearly justifies more.\n"
-        "Do NOT default to 1-5 minute increments. Use sub-15-minute advances only when immediate shared-scene coherence absolutely requires it.\n"
+        "Default rhythm: advance the world by roughly STANDARD_TURN_ADVANCE_MINUTES_EFFECTIVE minutes per turn unless the scene clearly justifies more.\n"
+        "MIN_TURN_ADVANCE_MINUTES_EFFECTIVE is the floor the harness will enforce when you freeze or regress time. Do not pace beats as if less time will pass than that.\n"
+        "Do NOT default below MIN_TURN_ADVANCE_MINUTES_EFFECTIVE unless immediate shared-scene coherence absolutely requires it.\n"
         "Pace game_time by scene needs: prefer larger jumps (20-90 minutes or to the next meaningful beat) when no immediate deadline is active, "
         "and keep finer-grained time only when needed to preserve shared-scene coherence.\n"
         "Update these fields in state_update:\n"
@@ -13376,6 +13378,10 @@ class ZorkEmulator:
             start_day_of_week=self._campaign_start_day_of_week(state),
         )
         speed_mult = state.get("speed_multiplier", 1.0)
+        effective_min_turn_advance = self._effective_min_turn_advance_minutes(speed_mult)
+        effective_standard_turn_advance = self._effective_standard_turn_advance_minutes(
+            speed_mult
+        )
         difficulty = self.normalize_difficulty(state.get("difficulty", "normal"))
         style_direction = self._resolve_style_direction(campaign)
         response_style_note = self._turn_stage_note(difficulty, stage, style_direction=style_direction)
@@ -13455,6 +13461,8 @@ class ZorkEmulator:
         user_prompt += (
             f"CURRENT_GAME_TIME: {self._dump_json(game_time)}\n"
             f"SPEED_MULTIPLIER: {speed_mult}\n"
+            f"MIN_TURN_ADVANCE_MINUTES_EFFECTIVE: {effective_min_turn_advance}\n"
+            f"STANDARD_TURN_ADVANCE_MINUTES_EFFECTIVE: {effective_standard_turn_advance}\n"
             f"DIFFICULTY: {difficulty}\n"
             f"MEMORY_LOOKUP_ENABLED: {str(memory_lookup_enabled).lower()}\n"
             f"RECENT_TURNS_LOADED: {str(not bootstrap_only).lower()}\n"
@@ -13538,6 +13546,8 @@ class ZorkEmulator:
                 system_prompt = f"{system_prompt}{self.TIMER_TOOL_PROMPT}"
             if on_rails and story_context:
                 system_prompt = f"{system_prompt}{self.STORY_OUTLINE_TOOL_PROMPT}"
+            if not on_rails:
+                system_prompt = f"{system_prompt}{self.CHAPTER_PLAN_TOOL_PROMPT}"
             system_prompt = f"{system_prompt}{self.PLOT_PLAN_TOOL_PROMPT}"
             system_prompt = f"{system_prompt}{self.CONSEQUENCE_TOOL_PROMPT}"
             system_prompt = f"{system_prompt}{self.CALENDAR_TOOL_PROMPT}"
@@ -17205,6 +17215,21 @@ class ZorkEmulator:
             return 1.0
         return max(0.1, min(10.0, value))
 
+    def _effective_min_turn_advance_minutes(self, speed_multiplier: float) -> int:
+        try:
+            speed = float(speed_multiplier)
+        except (TypeError, ValueError):
+            speed = 1.0
+        return max(1, int(round(self.MIN_TURN_ADVANCE_MINUTES * speed)))
+
+    def _effective_standard_turn_advance_minutes(self, speed_multiplier: float) -> int:
+        try:
+            speed = float(speed_multiplier)
+        except (TypeError, ValueError):
+            speed = 1.0
+        scaled_default = int(round(self.DEFAULT_TURN_ADVANCE_MINUTES * speed))
+        return max(self._effective_min_turn_advance_minutes(speed), scaled_default)
+
     def _estimate_turn_time_advance_minutes(
         self, action_text: str, narration_text: str
     ) -> int:
@@ -17525,7 +17550,7 @@ class ZorkEmulator:
         if cur_total > pre_total:
             if time_skip_request is None and not self._is_ooc_action_text(action_text):
                 speed_multiplier = self._speed_multiplier_from_state(campaign_state)
-                min_step = max(1, int(round(self.MIN_TURN_ADVANCE_MINUTES * speed_multiplier)))
+                min_step = self._effective_min_turn_advance_minutes(speed_multiplier)
                 cur_total = max(cur_total, pre_total + min_step)
             campaign_state["game_time"] = self._game_time_from_total_minutes(
                 cur_total,
@@ -17550,7 +17575,7 @@ class ZorkEmulator:
                 action_text, narration_text
             )
         speed_multiplier = self._speed_multiplier_from_state(campaign_state)
-        min_step = max(1, int(round(self.MIN_TURN_ADVANCE_MINUTES * speed_multiplier)))
+        min_step = self._effective_min_turn_advance_minutes(speed_multiplier)
         scaled_minutes = int(round(base_minutes * speed_multiplier))
         delta_minutes = max(min_step, scaled_minutes)
         if time_skip_request is None:
