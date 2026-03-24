@@ -1936,6 +1936,66 @@ def test_sms_reply_nudge_dedupes_alias_threads_to_canonical_contact(
     assert joined.count("Penny Reynolds") == 1
 
 
+def test_sms_list_merges_alias_threads_to_canonical_contact(
+    session_factory,
+    seed_campaign_and_actor,
+):
+    compat = _build_compat(session_factory)
+    campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
+    compat.get_or_create_player(campaign.id, seed_campaign_and_actor["actor_id"])
+
+    with session_factory() as session:
+        player = (
+            session.query(Player)
+            .filter(Player.campaign_id == campaign.id)
+            .filter(Player.actor_id == seed_campaign_and_actor["actor_id"])
+            .first()
+        )
+        assert player is not None
+        player_state = json.loads(player.state_json or "{}")
+        player_state["character_name"] = "Chris"
+        player.state_json = compat._dump_json(player_state)
+
+        row = session.get(Campaign, campaign.id)
+        characters = json.loads(row.characters_json or "{}")
+        characters["penny-reynolds"] = {"name": "Penny Reynolds"}
+        row.characters_json = compat._dump_json(characters)
+        session.commit()
+
+    ok, status = compat.write_sms_thread(
+        campaign.id,
+        thread="penny",
+        sender="Penny",
+        recipient="Chris",
+        message="first alias thread",
+        owner_actor_id=seed_campaign_and_actor["actor_id"],
+    )
+    assert ok is True and status == "stored"
+
+    ok, status = compat.write_sms_thread(
+        campaign.id,
+        thread="penny-reynolds",
+        sender="Penny Reynolds",
+        recipient="Chris",
+        message="second canonical thread",
+        owner_actor_id=seed_campaign_and_actor["actor_id"],
+    )
+    assert ok is True and status == "stored"
+
+    listed = compat.list_sms_threads(
+        campaign.id,
+        wildcard="*",
+        limit=20,
+        viewer_actor_id=seed_campaign_and_actor["actor_id"],
+    )
+
+    penny_rows = [row for row in listed if row.get("thread") == "penny-reynolds"]
+    assert len(penny_rows) == 1
+    assert penny_rows[0]["label"] == "Penny Reynolds"
+    assert penny_rows[0]["count"] == 2
+    assert penny_rows[0]["last_preview"] == "second canonical thread"
+
+
 def test_sms_schedule_delivers_later(session_factory, seed_campaign_and_actor):
     compat = _build_compat(session_factory)
     campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])

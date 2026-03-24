@@ -10467,7 +10467,7 @@ class ZorkEmulator:
     ) -> list[dict[str, object]]:
         threads = cls._sms_threads_from_state(campaign_state)
         pattern = str(wildcard or "*").strip().lower() or "*"
-        out: list[dict[str, object]] = []
+        merged: dict[str, dict[str, object]] = {}
         for key in reversed(list(threads.keys())):
             row = threads.get(key) or {}
             label = str(row.get("label") or key)
@@ -10500,20 +10500,46 @@ class ZorkEmulator:
             preview = str(last.get("message") or "").strip()
             if len(preview) > cls.SMS_MAX_PREVIEW_CHARS:
                 preview = preview[: cls.SMS_MAX_PREVIEW_CHARS - 1].rstrip() + "…"
-            out.append(
-                {
+            day = cls._coerce_non_negative_int(last.get("day", 0), default=0)
+            hour = cls._coerce_non_negative_int(last.get("hour", 0), default=0)
+            minute = cls._coerce_non_negative_int(last.get("minute", 0), default=0)
+            turn_id = cls._coerce_non_negative_int(last.get("turn_id", 0), default=0)
+            seq = cls._coerce_non_negative_int(last.get("seq", 0), default=0)
+            sort_key = (day, hour, minute, turn_id, seq)
+
+            existing = merged.get(resolved_thread)
+            if existing is None:
+                merged[resolved_thread] = {
                     "thread": resolved_thread,
                     "label": resolved_label,
                     "count": len(messages),
                     "last_from": str(last.get("from") or ""),
                     "last_preview": preview,
-                    "day": cls._coerce_non_negative_int(last.get("day", 0), default=0),
-                    "hour": cls._coerce_non_negative_int(last.get("hour", 0), default=0),
-                    "minute": cls._coerce_non_negative_int(last.get("minute", 0), default=0),
+                    "day": day,
+                    "hour": hour,
+                    "minute": minute,
+                    "_sort_key": sort_key,
                 }
-            )
-            if len(out) >= max(1, int(limit or 20)):
-                break
+                continue
+
+            existing["count"] = int(existing.get("count") or 0) + len(messages)
+            existing_sort_key = existing.get("_sort_key")
+            if not isinstance(existing_sort_key, tuple) or sort_key >= existing_sort_key:
+                existing["label"] = resolved_label
+                existing["last_from"] = str(last.get("from") or "")
+                existing["last_preview"] = preview
+                existing["day"] = day
+                existing["hour"] = hour
+                existing["minute"] = minute
+                existing["_sort_key"] = sort_key
+
+        out = sorted(
+            merged.values(),
+            key=lambda item: item.get("_sort_key", (0, 0, 0, 0, 0)),
+            reverse=True,
+        )[: max(1, int(limit or 20))]
+        for row in out:
+            row.pop("_sort_key", None)
         return out
 
     @classmethod
@@ -10782,6 +10808,43 @@ class ZorkEmulator:
         return counterpart or viewer
 
     @classmethod
+    def _sms_roster_contact_for_alias(
+        cls,
+        contact_roster: Dict[str, Dict[str, str]] | None,
+        alias: object,
+    ) -> dict[str, str]:
+        alias_key = cls._sms_normalize_thread_key(alias)
+        if not alias_key or not isinstance(contact_roster, dict):
+            return {}
+        exact = dict(contact_roster.get(alias_key) or {})
+        if exact:
+            return exact
+
+        matched_threads: dict[str, dict[str, str]] = {}
+        prefix = f"{alias_key}-"
+        for roster_key, roster_entry in contact_roster.items():
+            if not isinstance(roster_entry, dict):
+                continue
+            roster_key_norm = cls._sms_normalize_thread_key(roster_key)
+            if not roster_key_norm:
+                continue
+            if roster_key_norm != alias_key and not roster_key_norm.startswith(prefix):
+                continue
+            thread_text = cls._sms_normalize_thread_key(
+                roster_entry.get("thread") or roster_key_norm
+            )
+            if not thread_text:
+                continue
+            label_text = str(roster_entry.get("label") or alias_key).strip()
+            matched_threads[thread_text] = {
+                "thread": thread_text,
+                "label": label_text or thread_text,
+            }
+        if len(matched_threads) == 1:
+            return next(iter(matched_threads.values()))
+        return {}
+
+    @classmethod
     def _sms_resolved_contact(
         cls,
         key: str,
@@ -10816,7 +10879,7 @@ class ZorkEmulator:
             norm = cls._sms_normalize_thread_key(raw_text)
             if not norm or norm in aliases:
                 return
-            roster_entry = dict((contact_roster or {}).get(norm) or {})
+            roster_entry = cls._sms_roster_contact_for_alias(contact_roster, norm)
             if roster_entry:
                 thread_text = cls._sms_normalize_thread_key(
                     roster_entry.get("thread") or norm
@@ -10848,7 +10911,7 @@ class ZorkEmulator:
             norm = cls._sms_normalize_thread_key(raw_text)
             if not norm or norm in aliases:
                 continue
-            roster_entry = dict((contact_roster or {}).get(norm) or {})
+            roster_entry = cls._sms_roster_contact_for_alias(contact_roster, norm)
             if roster_entry:
                 thread_text = cls._sms_normalize_thread_key(
                     roster_entry.get("thread") or norm
