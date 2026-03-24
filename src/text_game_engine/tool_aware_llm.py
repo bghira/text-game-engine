@@ -955,7 +955,12 @@ class ToolAwareZorkLLM:
         if not isinstance(location_updates, dict):
             location_updates = {}
 
-        _TOOL_CALLS_ALLOWLIST = frozenset({"sms_write", "sms_schedule"})
+        _TOOL_CALLS_ALLOWLIST = frozenset({
+            "sms_write",
+            "sms_schedule",
+            "plot_plan",
+            "chapter_plan",
+        })
         tool_calls_raw = payload.get("tool_calls")
         tool_calls: list[dict[str, Any]] = []
         if isinstance(tool_calls_raw, list):
@@ -3286,9 +3291,9 @@ class ToolAwareZorkLLM:
                 len(output.narration or ""),
                 context.campaign_id,
             )
-            # Execute any inline tool_calls (sms_write / sms_schedule) that the
-            # LLM included alongside its final narration.  These have already
-            # been validated against the allowlist in _payload_to_output.
+            # Execute any inline tool_calls that the LLM included alongside
+            # its final narration. These have already been validated against
+            # the allowlist in _payload_to_output.
             for tc in output.tool_calls:
                 try:
                     await self._execute_tool_call(context.campaign_id, tc, actor_id=context.actor_id)
