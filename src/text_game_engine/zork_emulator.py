@@ -11580,6 +11580,10 @@ class ZorkEmulator:
                     if isinstance(day_alias, (int, float)) and not isinstance(day_alias, bool):
                         fire_day = int(day_alias)
                 if not isinstance(fire_hour, (int, float)) or isinstance(fire_hour, bool):
+                    hour_alias = entry.get("hour")
+                    if isinstance(hour_alias, (int, float)) and not isinstance(hour_alias, bool):
+                        fire_hour = int(hour_alias)
+                if not isinstance(fire_hour, (int, float)) or isinstance(fire_hour, bool):
                     time_alias = str(entry.get("time") or "").strip()
                     if time_alias:
                         match = re.search(

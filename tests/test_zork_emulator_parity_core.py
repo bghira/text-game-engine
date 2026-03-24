@@ -3407,6 +3407,35 @@ def test_calendar_update_keeps_overdue_and_requires_explicit_remove(
     assert all(e.get("name") != "Moonrise Ceremony" for e in removed.get("calendar", []))
 
 
+def test_game_engine_calendar_update_accepts_title_day_hour_shape(session_factory):
+    engine = GameEngine(
+        uow_factory=lambda: SQLAlchemyUnitOfWork(session_factory),
+        llm=StubLLM(LLMTurnOutput(narration="unused")),
+    )
+    updated = engine._apply_calendar_update(
+        {"game_time": {"day": 3656, "hour": 14}},
+        {
+            "add": [
+                {
+                    "title": "Simone - Kingsland Ave Dumpling House",
+                    "day": 3656,
+                    "hour": 18,
+                    "context": "Dinner with Simone Ashworth, tonight",
+                    "location": "Kingsland Ave Dumpling House, Williamsburg",
+                    "participants": ["player-1440788829291417771", "simone-ashworth"],
+                }
+            ]
+        },
+    )
+    calendar = updated.get("calendar", [])
+    assert len(calendar) == 1
+    assert calendar[0]["name"] == "Simone - Kingsland Ave Dumpling House"
+    assert calendar[0]["fire_day"] == 3656
+    assert calendar[0]["fire_hour"] == 18
+    assert "Kingsland Ave Dumpling House" in str(calendar[0].get("description") or "")
+    assert "player-1440788829291417771" in list(calendar[0].get("target_players") or [])
+
+
 def test_calendar_update_participants_auto_target_acting_player(
     session_factory,
     seed_campaign_and_actor,
