@@ -1454,6 +1454,41 @@ def test_ready_to_write_finalization_reexpands_character_and_location_cards(
                 }
             )
             player_row.state_json = json.dumps(player_state)
+            session.add(
+                Turn(
+                    campaign_id=seed_campaign_and_actor["campaign_id"],
+                    session_id=None,
+                    actor_id=seed_campaign_and_actor["actor_id"],
+                    kind="narrator",
+                    content="Yasmin watches the desk.",
+                    meta_json=json.dumps(
+                        {
+                            "game_time": {"day": 1, "hour": 8, "minute": 30},
+                            "visibility": {
+                                "scope": "local",
+                                "actor_player_slug": "player-actor-1",
+                                "location_key": "hotel-lobby",
+                            },
+                            "location_key": "hotel-lobby",
+                            "scene_output": {
+                                "location_key": "hotel-lobby",
+                                "beats": [
+                                    {
+                                        "reasoning": "Yasmin is present in the lobby.",
+                                        "type": "npc_dialogue",
+                                        "speaker": "yasmin-devereaux",
+                                        "actors": ["yasmin-devereaux"],
+                                        "listeners": ["player-actor-1"],
+                                        "visibility": "local",
+                                        "aware_npc_slugs": [],
+                                        "text": "Yasmin watches the desk.",
+                                    }
+                                ],
+                            },
+                        }
+                    ),
+                )
+            )
             session.commit()
         turns = compat.get_recent_turns(seed_campaign_and_actor["campaign_id"])
         research_system_prompt, research_user_prompt = compat.build_prompt(
@@ -1486,8 +1521,13 @@ def test_ready_to_write_finalization_reexpands_character_and_location_cards(
         assert "FINAL_CHARACTER_CARDS:" in completion.calls[1]["prompt"]
         assert "yasmin-devereaux" in completion.calls[1]["prompt"]
         assert '"speech_style": "Controlled and exact."' in completion.calls[1]["prompt"]
-        assert '"relationships": {"chace-preston": {"status": "engaged", "dynamic": "Tense but still committed."}}' in completion.calls[1]["prompt"]
-        assert '"relationship": "Brittle but engaged."' not in completion.calls[1]["prompt"]
+        final_character_match = re.search(r"FINAL_CHARACTER_CARDS:\s*(\[.*?\])\n", completion.calls[1]["prompt"], re.DOTALL)
+        assert final_character_match is not None
+        final_character_block = final_character_match.group(1)
+        assert '"relationships": {"chace-preston": {"status": "engaged", "dynamic": "Tense but still committed."}}' in final_character_block
+        assert '"relationship": "Brittle but engaged."' not in final_character_block
+        assert "SPEAKER_CONTINUITY[yasmin-devereaux]:" not in completion.calls[1]["prompt"]
+        assert completion.calls[1]["prompt"].count("Yasmin watches the desk.") == 1
         assert "FINAL_LOCATION_CARDS:" in completion.calls[1]["prompt"]
         assert "hotel-lobby" in completion.calls[1]["prompt"]
         assert "BAN: THERAPEUTIC RESOLUTION FRAMING." in completion.calls[1]["prompt"]

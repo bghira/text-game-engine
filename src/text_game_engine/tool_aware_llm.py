@@ -3094,7 +3094,33 @@ class ToolAwareZorkLLM:
                     requested_npc_slugs=scene_npc_slugs,
                     scene_npc_slugs=scene_npc_slugs or None,
                 )
+                shared_recent_texts: set[str] = set()
+                for line in str(shared_recent or "").splitlines():
+                    stripped = line.strip()
+                    if not stripped:
+                        continue
+                    try:
+                        payload = json.loads(stripped)
+                    except Exception:
+                        continue
+                    if not isinstance(payload, dict):
+                        continue
+                    text_value = str(payload.get("text") or "").strip()
+                    if text_value:
+                        shared_recent_texts.add(text_value)
+                if shared_summary:
+                    deduped_summary_lines = [
+                        line
+                        for line in str(shared_summary).splitlines()
+                        if line.strip() and line.strip() not in shared_recent_texts
+                    ]
+                    shared_summary = "\n".join(deduped_summary_lines).strip()
                 if scene_npc_slugs:
+                    _clean_final_user_prompt = re.sub(
+                        r"(?m)^WORLD_SUMMARY(?:_FINAL)?:[^\n]*\n?",
+                        "",
+                        _clean_final_user_prompt,
+                    )
                     _shared_context_block = (
                         f"\nSCENE_PARTICIPANTS_LCD: speakers={sorted(_ready_speakers)} listeners={sorted(_ready_listeners)}\n"
                         "The following WORLD_SUMMARY and RECENT_TURNS are filtered to the LOWEST COMMON DENOMINATOR — "
@@ -3108,6 +3134,11 @@ class ToolAwareZorkLLM:
                         f"\nWORLD_SUMMARY_FINAL: {shared_summary or '(empty)'}\n"
                         f"\nRECENT_TURNS_FINAL:\n{shared_recent}\n"
                     )
+                shared_recent_lines = {
+                    line.strip()
+                    for line in str(shared_recent or "").splitlines()
+                    if line.strip()
+                }
                 speaker_blocks: list[str] = []
                 for speaker_slug in sorted(speaker_npc_slugs):
                     speaker_recent = emulator._recent_turns_text_for_viewer(  # noqa: SLF001
@@ -3123,8 +3154,17 @@ class ToolAwareZorkLLM:
                         focus_on_requested_receivers=True,
                     )
                     if speaker_recent and speaker_recent != "None":
+                        deduped_speaker_lines = [
+                            line
+                            for line in str(speaker_recent).splitlines()
+                            if line.strip() and line.strip() not in shared_recent_lines
+                        ]
+                        if not deduped_speaker_lines:
+                            continue
                         speaker_blocks.append(
-                            f"SPEAKER_CONTINUITY[{speaker_slug}]:\n{speaker_recent}\n"
+                            f"SPEAKER_CONTINUITY[{speaker_slug}]:\n"
+                            + "\n".join(deduped_speaker_lines)
+                            + "\n"
                         )
                 if speaker_blocks:
                     _speaker_continuity_block = (
