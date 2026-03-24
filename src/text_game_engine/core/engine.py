@@ -2596,6 +2596,8 @@ class GameEngine:
             "target_player",
             "targets",
             "target",
+            "participants",
+            "participant",
             "players",
             "player",
             "player_id",
@@ -2810,11 +2812,44 @@ class GameEngine:
             for entry in to_add:
                 if not isinstance(entry, dict):
                     continue
-                name = str(entry.get("name") or "").strip()
+                name = str(
+                    entry.get("name")
+                    or entry.get("title")
+                    or entry.get("event_key")
+                    or ""
+                ).strip()
                 if not name:
                     continue
                 fire_day = entry.get("fire_day")
                 fire_hour = entry.get("fire_hour")
+                if not isinstance(fire_day, (int, float)) or isinstance(fire_day, bool):
+                    day_alias = entry.get("day")
+                    if isinstance(day_alias, (int, float)) and not isinstance(day_alias, bool):
+                        fire_day = int(day_alias)
+                if not isinstance(fire_hour, (int, float)) or isinstance(fire_hour, bool):
+                    hour_alias = entry.get("hour")
+                    if isinstance(hour_alias, (int, float)) and not isinstance(hour_alias, bool):
+                        fire_hour = int(hour_alias)
+                if not isinstance(fire_hour, (int, float)) or isinstance(fire_hour, bool):
+                    time_alias = str(entry.get("time") or "").strip()
+                    if time_alias:
+                        match = re.search(
+                            r"(?:day\s*(?P<day>\d+)[,\s-]*)?(?P<hour>\d{1,2}):(?P<minute>\d{2})\s*(?P<ampm>[ap]m)?",
+                            time_alias,
+                            re.IGNORECASE,
+                        )
+                        if match:
+                            if not isinstance(fire_day, (int, float)) or isinstance(fire_day, bool):
+                                day_group = match.group("day")
+                                if day_group:
+                                    fire_day = int(day_group)
+                            parsed_hour = int(match.group("hour"))
+                            ampm = str(match.group("ampm") or "").strip().lower()
+                            if ampm == "pm" and parsed_hour < 12:
+                                parsed_hour += 12
+                            elif ampm == "am" and parsed_hour == 12:
+                                parsed_hour = 0
+                            fire_hour = parsed_hour
                 if (
                     isinstance(fire_day, (int, float))
                     and not isinstance(fire_day, bool)
@@ -2841,9 +2876,22 @@ class GameEngine:
                     "fire_hour": resolved_fire_hour,
                     "created_day": current_day,
                     "created_hour": current_hour,
-                    "description": str(entry.get("description") or "")[:200],
+                    "description": str(
+                        entry.get("description")
+                        or entry.get("notes")
+                        or entry.get("details")
+                        or entry.get("context")
+                        or ""
+                    )[:200],
                     "known_by": self._calendar_known_by_from_event(entry),
                 }
+                location_text = str(entry.get("location") or "").strip()
+                if location_text and not str(event.get("description") or "").strip():
+                    event["description"] = f"Location: {location_text}"[:200]
+                elif location_text:
+                    event["description"] = (
+                        f"{str(event.get('description') or '').strip()} Location: {location_text}"
+                    )[:200]
                 target_players = self._calendar_target_tokens_from_event(entry)
                 if target_players:
                     event["target_players"] = target_players
