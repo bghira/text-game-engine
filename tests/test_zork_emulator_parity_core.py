@@ -445,6 +445,7 @@ def test_build_prompt_shape(session_factory, seed_campaign_and_actor):
     assert "SPEED_MULTIPLIER:" in user_prompt
     assert "MIN_TURN_ADVANCE_MINUTES_EFFECTIVE:" in user_prompt
     assert "STANDARD_TURN_ADVANCE_MINUTES_EFFECTIVE:" in user_prompt
+    assert "TURN_TIME_BEAT_GUIDANCE:" in user_prompt
     assert "MEMORY_LOOKUP_ENABLED:" in user_prompt
     assert "RECENT_TURNS_LOADED: true" in user_prompt
     assert "CALENDAR:" in user_prompt
@@ -597,8 +598,11 @@ def test_build_prompt_research_stage_shape(session_factory, seed_campaign_and_ac
     assert "CALENDAR & GAME TIME SYSTEM:" in system_prompt
     assert "MIN_TURN_ADVANCE_MINUTES_EFFECTIVE" in system_prompt
     assert "STANDARD_TURN_ADVANCE_MINUTES_EFFECTIVE" in system_prompt
+    assert "TURN_TIME_BEAT_GUIDANCE" in system_prompt
     assert "Do NOT output planning prose" in system_prompt
     assert "STANDARD_TURN_ADVANCE_MINUTES_EFFECTIVE minutes per turn" in system_prompt
+    assert "TEMPORAL BEAT COVERAGE RULE" in system_prompt
+    assert "Follow TURN_TIME_BEAT_GUIDANCE from the user prompt" in system_prompt
     assert "OFF-RAILS CHAPTER MANAGEMENT TOOL" in system_prompt
     assert '"tool_call": "chapter_plan"' in system_prompt
     assert '"tool_call": "plot_plan"' in system_prompt
@@ -1260,6 +1264,8 @@ def test_ready_to_write_finalization_uses_final_stage_system_prompt(
         assert '"tool_call": "plot_plan"' in completion.calls[1]["system_prompt"]
         assert '"tool_call": "chapter_plan"' in completion.calls[1]["system_prompt"]
         assert "tool_calls MUST be the last top-level key" in completion.calls[1]["system_prompt"]
+        assert "make those beats cover the full span implied by state_update.game_time" in completion.calls[1]["system_prompt"]
+        assert "follow TURN_TIME_BEAT_GUIDANCE for the current minimum span" in completion.calls[1]["system_prompt"]
 
     asyncio.run(run_test())
 
@@ -3796,6 +3802,10 @@ def test_build_prompt_exposes_effective_turn_advance_minutes_for_current_speed(
 
     assert "MIN_TURN_ADVANCE_MINUTES_EFFECTIVE: 2" in user_prompt
     assert "STANDARD_TURN_ADVANCE_MINUTES_EFFECTIVE: 2" in user_prompt
+    assert (
+        "TURN_TIME_BEAT_GUIDANCE: Sub-5-minute turn: stay immediate and continuous."
+        in user_prompt
+    )
     assert "MIN_TURN_ADVANCE_MINUTES_EFFECTIVE" in system_prompt
 
 
