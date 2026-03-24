@@ -18694,6 +18694,8 @@ class ZorkEmulator:
         viewer_private_context_key: str,
     ) -> bool:
         meta = self._safe_turn_meta(turn)
+        if bool(meta.get("suppress_context")):
+            return False
         if str(getattr(turn, "actor_id", "") or "").strip() == str(viewer_actor_id or "").strip():
             return True
         visibility = meta.get("visibility")
