@@ -679,7 +679,7 @@ class ZorkEmulator:
         "Use when a subplot beat should push the outlined story forward without explicit state_update scene change.)\n"
         '- turn_visibility: object (optional; who should get this turn in future prompt context. Keys: "scope" ("public"|"private"|"limited"|"local"), "player_slugs" (array of player slugs from PARTY_SNAPSHOT, typically in `player-<actor_id>` form), "npc_slugs" (array of CHARACTER_INDEX / WORLD_CHARACTERS slugs who overheard/noticed), and optional "reason". This changes prompt visibility only; it does NOT change shared world state.)\n'
         "- scene_image_prompt: string (optional; include whenever the visible scene changes in a meaningful way: entering a room, newly visible characters/objects, reveals, or strong visual shifts)\n"
-        '- tool_calls: array (optional; inline side-effect tool invocations supported in final JSON. Only "sms_write" and "sms_schedule" are allowed here. Use this when narration includes an SMS/phone reply or delayed SMS that must persist in the log.)\n'
+        '- tool_calls: array (optional; inline side-effect tool invocations supported in final JSON. Allowed here: "sms_write", "sms_schedule", "plot_plan", "chapter_plan". Use this when the narrated outcome should also persist a text-message side effect or update off-rails plot/chapter structure. If present, tool_calls MUST be the last top-level key in the final JSON object.)\n'
         "- set_timer_delay: integer (optional; 30-300 seconds, see TIMED EVENTS SYSTEM below)\n"
         "- set_timer_event: string (optional; what happens when the timer expires)\n"
         "- set_timer_interruptible: boolean (optional; default true)\n"
@@ -1262,9 +1262,11 @@ class ZorkEmulator:
     FINAL_STAGE_OPERATIONAL_PROMPT = (
         "\nFINALIZATION OPERATIONAL RULES:\n"
         "- You are in the final JSON-writing stage. Do NOT return a standalone tool_call object now.\n"
-        '- You MAY include "tool_calls" in the final JSON, but ONLY for sms_write and sms_schedule.\n'
+        '- You MAY include "tool_calls" in the final JSON for sms_write, sms_schedule, plot_plan, and chapter_plan only.\n'
+        '- If present, tool_calls MUST be the last top-level key in the final JSON object.\n'
         "- If narration includes an SMS/phone reply or outgoing SMS that must persist, include a matching sms_write in tool_calls so both sides of the conversation are logged.\n"
         "- If scheduling a delayed incoming SMS, use tool_calls with sms_schedule and do NOT narrate that delayed message as already received.\n"
+        '- In off-rails play, use tool_calls with {"tool_call": "plot_plan", ...} or {"tool_call": "chapter_plan", ...} when the narrated turn meaningfully creates, advances, resolves, or restructures ongoing story threads or chapter flow.\n'
         "- If the current scene has a believable grounded clock and needs forced urgency, you may include set_timer_delay / set_timer_event / set_timer_interruptible / set_timer_interrupt_action / set_timer_interrupt_scope in the final JSON.\n"
         "- Timers are for real pressure: force a decision, trigger a grounded consequence, move the player, or force an encounter. Do NOT use timers for trivial flavor.\n"
         "- Timer events must be grounded in established scene facts. Use interrupt_scope=local for hazards anchored to the acting player's immediate situation and global for campaign-wide clocks. Prefer interruptible=false only when the event is already unavoidable.\n"

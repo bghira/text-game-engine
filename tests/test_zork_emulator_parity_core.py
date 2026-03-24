@@ -1257,6 +1257,9 @@ def test_ready_to_write_finalization_uses_final_stage_system_prompt(
         assert len(completion.calls) == 2
         assert '"tool_call": "ready_to_write"' in completion.calls[0]["system_prompt"]
         assert '"tool_call": "ready_to_write"' not in completion.calls[1]["system_prompt"]
+        assert '"tool_call": "plot_plan"' in completion.calls[1]["system_prompt"]
+        assert '"tool_call": "chapter_plan"' in completion.calls[1]["system_prompt"]
+        assert "tool_calls MUST be the last top-level key" in completion.calls[1]["system_prompt"]
 
     asyncio.run(run_test())
 
@@ -3953,7 +3956,7 @@ def test_apply_character_updates_new_char_gets_all_fields(session_factory):
 
 
 def test_payload_to_output_filters_tool_calls_to_allowlist(session_factory, seed_campaign_and_actor):
-    """Only sms_write and sms_schedule should survive the allowlist filter."""
+    """Only explicitly allowed inline final tool_calls should survive."""
     completion = StubCompletionPort()
     tool_llm = ToolAwareZorkLLM(
         session_factory=session_factory,
@@ -3970,15 +3973,18 @@ def test_payload_to_output_filters_tool_calls_to_allowlist(session_factory, seed
         "tool_calls": [
             {"tool_call": "sms_write", "thread": "saul", "from": "Saul", "to": "Dale", "message": "On my way."},
             {"tool_call": "sms_schedule", "thread": "saul", "from": "Saul", "to": "Dale", "message": "Later.", "delay_seconds": 60},
+            {"tool_call": "plot_plan", "plans": [{"thread": "dock-9", "setup": "A debt comes due."}]},
+            {"tool_call": "chapter_plan", "action": "create", "chapter": {"slug": "arrival", "title": "Arrival"}},
             {"tool_call": "memory_search", "queries": ["danger"]},  # NOT in allowlist
-            {"tool_call": "plot_plan"},  # NOT in allowlist
         ],
     }
 
     output = tool_llm._payload_to_output(payload, actor_id=seed_campaign_and_actor["actor_id"])
-    assert len(output.tool_calls) == 2
+    assert len(output.tool_calls) == 4
     assert output.tool_calls[0]["tool_call"] == "sms_write"
     assert output.tool_calls[1]["tool_call"] == "sms_schedule"
+    assert output.tool_calls[2]["tool_call"] == "plot_plan"
+    assert output.tool_calls[3]["tool_call"] == "chapter_plan"
 
 
 def test_tool_calls_sms_write_executed_in_complete_turn(session_factory, seed_campaign_and_actor):
@@ -4042,6 +4048,100 @@ def test_tool_calls_sms_write_executed_in_complete_turn(session_factory, seed_ca
         assert any(m["from"] == "Saul" and "Dock 9" in m["message"] for m in messages)
 
     asyncio.run(run_test())
+
+
+def test_tool_calls_plot_and_chapter_plan_execute_in_complete_turn(
+    session_factory,
+    seed_campaign_and_actor,
+):
+    """Inline final-stage plot/chapter planning calls should persist state."""
+
+    class PlotAndChapterToolCallCompletionPort:
+        async def complete(self, system_prompt, prompt, *, temperature=0.8, max_tokens=2048):
+            return json.dumps({
+                "narration": "The walk around the district clarifies the next arc.",
+                "state_update": {
+                    "game_time": {
+                        "day": 1,
+                        "hour": 10,
+                        "minute": 0,
+                        "day_of_week": "monday",
+                        "period": "morning",
+                        "date_label": "Monday, Day 1, Morning",
+                    },
+                },
+                "summary_update": "A new thread and chapter direction emerge.",
+                "tool_calls": [
+                    {
+                        "tool_call": "plot_plan",
+                        "plans": [
+                            {
+                                "thread": "dock-debt",
+                                "setup": "Someone from Dock 9 wants payment.",
+                                "intended_payoff": "The collector arrives in person.",
+                                "target_turns": 3,
+                            },
+                        ],
+                    },
+                    {
+                        "tool_call": "chapter_plan",
+                        "action": "create",
+                        "chapter": {
+                            "slug": "dock-9-pressure",
+                            "title": "Dock 9 Pressure",
+                            "summary": "Debt pressure tightens around the player.",
+                            "current_scene": "dock-9-street",
+                        },
+                    },
+                ],
+            })
+
+    completion = PlotAndChapterToolCallCompletionPort()
+    tool_llm = ToolAwareZorkLLM(
+        session_factory=session_factory,
+        completion_port=completion,
+        temperature=0.8,
+        max_tokens=2048,
+    )
+    compat = _build_compat(session_factory, completion_port=completion)
+    tool_llm.bind_emulator(compat)
+
+    campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
+    compat.get_or_create_player(campaign.id, seed_campaign_and_actor["actor_id"])
+
+    with session_factory() as session:
+        row = session.get(Campaign, campaign.id)
+        state = json.loads(row.state_json or "{}")
+        state["on_rails"] = False
+        row.state_json = json.dumps(state)
+        session.commit()
+
+    async def run_test():
+        class _Ctx:
+            def __init__(self, campaign_id, actor_id, action):
+                self.campaign_id = campaign_id
+                self.actor_id = actor_id
+                self.action = action
+                self.session_id = None
+                self.player_state = {}
+                self.campaign_state = {}
+
+        ctx = _Ctx(
+            campaign_id=campaign.id,
+            actor_id=seed_campaign_and_actor["actor_id"],
+            action="walk around",
+        )
+        output = await tool_llm.complete_turn(ctx)
+        assert output.narration == "The walk around the district clarifies the next arc."
+        assert [tc["tool_call"] for tc in output.tool_calls] == ["plot_plan", "chapter_plan"]
+
+    asyncio.run(run_test())
+
+    with session_factory() as session:
+        row = session.get(Campaign, campaign.id)
+        state = json.loads(row.state_json or "{}")
+        assert state["_plot_threads"]["dock-debt"]["setup"] == "Someone from Dock 9 wants payment."
+        assert state["_chapter_plan"]["dock-9-pressure"]["title"] == "Dock 9 Pressure"
 
 
 # ---------------------------------------------------------------------------
