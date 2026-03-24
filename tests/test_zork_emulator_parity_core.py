@@ -1759,6 +1759,78 @@ def test_sms_list_and_read_prefer_roster_contact_name_over_legacy_pair_thread(
     assert str(messages[0]["thread"]).endswith("actor-actor-1")
 
 
+def test_sms_reply_nudge_dedupes_alias_threads_to_canonical_contact(
+    session_factory,
+    seed_campaign_and_actor,
+):
+    compat = _build_compat(session_factory)
+    compat.NPC_NUDGE_CHANCE = 0.0
+    compat.SMS_REPLY_NUDGE_CHANCE = 1.0
+    campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
+    compat.get_or_create_player(campaign.id, seed_campaign_and_actor["actor_id"])
+
+    with session_factory() as session:
+        player = (
+            session.query(Player)
+            .filter(Player.campaign_id == campaign.id)
+            .filter(Player.actor_id == seed_campaign_and_actor["actor_id"])
+            .first()
+        )
+        assert player is not None
+        player_state = json.loads(player.state_json or "{}")
+        player_state["character_name"] = "Chris"
+        player.state_json = compat._dump_json(player_state)
+
+        row = session.get(Campaign, campaign.id)
+        characters = json.loads(row.characters_json or "{}")
+        characters["penny-reynolds"] = {"name": "Penny Reynolds"}
+        row.characters_json = compat._dump_json(characters)
+        session.commit()
+
+    ok1, status1 = compat.write_sms_thread(
+        campaign.id,
+        thread="penny",
+        sender="Chris",
+        recipient="Penny Reynolds",
+        message="checking in",
+        owner_actor_id=seed_campaign_and_actor["actor_id"],
+    )
+    ok2, status2 = compat.write_sms_thread(
+        campaign.id,
+        thread="penny-reynolds",
+        sender="Chris",
+        recipient="Penny Reynolds",
+        message="still there?",
+        owner_actor_id=seed_campaign_and_actor["actor_id"],
+    )
+    assert ok1 is True and status1 == "stored"
+    assert ok2 is True and status2 == "stored"
+
+    with session_factory() as session:
+        player = (
+            session.query(Player)
+            .filter(Player.campaign_id == campaign.id)
+            .filter(Player.actor_id == seed_campaign_and_actor["actor_id"])
+            .first()
+        )
+        assert player is not None
+        player_state = compat.get_player_state(player)
+        row = session.get(Campaign, campaign.id)
+        campaign_state = compat.get_campaign_state(row)
+
+    nudge_lines = compat._passive_npc_sms_nudge_lines(
+        campaign,
+        campaign_state,
+        player,
+        player_state,
+    )
+    joined = "\n".join(nudge_lines)
+    assert "SMS_REPLY_NUDGE:" in joined
+    assert "Penny Reynolds" in joined
+    assert "penny and penny-reynolds" not in joined
+    assert joined.count("Penny Reynolds") == 1
+
+
 def test_sms_schedule_delivers_later(session_factory, seed_campaign_and_actor):
     compat = _build_compat(session_factory)
     campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
