@@ -443,6 +443,8 @@ def test_build_prompt_shape(session_factory, seed_campaign_and_actor):
     assert "CAMPAIGN:" in user_prompt
     assert "CURRENT_GAME_TIME:" in user_prompt
     assert "SPEED_MULTIPLIER:" in user_prompt
+    assert "MIN_TURN_ADVANCE_MINUTES_EFFECTIVE:" in user_prompt
+    assert "STANDARD_TURN_ADVANCE_MINUTES_EFFECTIVE:" in user_prompt
     assert "MEMORY_LOOKUP_ENABLED:" in user_prompt
     assert "RECENT_TURNS_LOADED: true" in user_prompt
     assert "CALENDAR:" in user_prompt
@@ -593,9 +595,13 @@ def test_build_prompt_research_stage_shape(session_factory, seed_campaign_and_ac
     )
     assert '{"tool_call": "sms_list"' in system_prompt
     assert "CALENDAR & GAME TIME SYSTEM:" in system_prompt
+    assert "MIN_TURN_ADVANCE_MINUTES_EFFECTIVE" in system_prompt
+    assert "STANDARD_TURN_ADVANCE_MINUTES_EFFECTIVE" in system_prompt
     assert "Do NOT output planning prose" in system_prompt
-    assert "roughly 20 minutes per turn" in system_prompt
-    assert "OFF-RAILS CHAPTER MANAGEMENT TOOL" not in system_prompt
+    assert "STANDARD_TURN_ADVANCE_MINUTES_EFFECTIVE minutes per turn" in system_prompt
+    assert "OFF-RAILS CHAPTER MANAGEMENT TOOL" in system_prompt
+    assert '"tool_call": "chapter_plan"' in system_prompt
+    assert '"tool_call": "plot_plan"' in system_prompt
     assert "RECENT_TURNS_LOADED: true" in user_prompt
     assert "RECENT_TURNS:\n" in user_prompt
     assert "No planning prose or self-talk in research phase" in user_prompt
@@ -755,7 +761,9 @@ def test_build_prompt_offrails_ignores_legacy_chapters_and_uses_plot_threads(
     assert "Legacy Chapter Leak" not in user_prompt
     assert "ACTIVE SUBPLOTS:" in user_prompt
     assert "ring-pressure" in user_prompt
-    assert "OFF-RAILS CHAPTER MANAGEMENT TOOL" not in system_prompt
+    assert "OFF-RAILS CHAPTER MANAGEMENT TOOL" in system_prompt
+    assert '"tool_call": "chapter_plan"' in system_prompt
+    assert '"tool_call": "plot_plan"' in system_prompt
 
 
 def test_build_prompt_keeps_autobiography_out_of_character_cards(
@@ -2110,7 +2118,8 @@ def test_build_prompt_offrails_filters_private_plot_threads_by_viewer(
     assert "public-thread" in user_prompt
     assert "private-thread" not in user_prompt
     assert "Only the second player should know this." not in user_prompt
-    assert "OFF-RAILS CHAPTER MANAGEMENT TOOL" not in system_prompt
+    assert "OFF-RAILS CHAPTER MANAGEMENT TOOL" in system_prompt
+    assert '"tool_call": "chapter_plan"' in system_prompt
     assert "story_outline" not in system_prompt.lower()
 
 
@@ -3755,6 +3764,36 @@ def test_low_speed_multiplier_scales_standard_turn_time_below_20_minutes(session
 
     assert out["game_time"]["hour"] == 13
     assert out["game_time"]["minute"] == 2
+
+
+def test_build_prompt_exposes_effective_turn_advance_minutes_for_current_speed(
+    session_factory,
+    seed_campaign_and_actor,
+):
+    compat = _build_compat(session_factory)
+    campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
+    player = compat.get_or_create_player(seed_campaign_and_actor["campaign_id"], seed_campaign_and_actor["actor_id"])
+
+    with session_factory() as session:
+        row = session.get(Campaign, campaign.id)
+        assert row is not None
+        state = compat.get_campaign_state(row)
+        state["speed_multiplier"] = 0.1
+        row.state_json = compat._dump_json(state)
+        session.commit()
+
+    turns = compat.get_recent_turns(seed_campaign_and_actor["campaign_id"])
+    system_prompt, user_prompt = compat.build_prompt(
+        campaign,
+        player,
+        "walk around",
+        turns,
+        prompt_stage=compat.PROMPT_STAGE_RESEARCH,
+    )
+
+    assert "MIN_TURN_ADVANCE_MINUTES_EFFECTIVE: 2" in user_prompt
+    assert "STANDARD_TURN_ADVANCE_MINUTES_EFFECTIVE: 2" in user_prompt
+    assert "MIN_TURN_ADVANCE_MINUTES_EFFECTIVE" in system_prompt
 
 
 # ---------------------------------------------------------------------------
