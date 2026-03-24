@@ -60,6 +60,13 @@ class TurnClaim:
     actor_id: str
 
 
+@dataclass(frozen=True)
+class TurnTimeBeatGuidance:
+    min_minutes: int
+    max_minutes: int | None
+    rule_text: str
+
+
 class ZorkEmulator:
     """Compatibility facade shaped after discord_tron_master's ZorkEmulator.
 
@@ -371,6 +378,48 @@ class ZorkEmulator:
         "sunday",
     )
     DAYS_PER_GAME_YEAR = 365
+    TURN_TIME_BEAT_GUIDANCE_BUCKETS = (
+        TurnTimeBeatGuidance(
+            min_minutes=0,
+            max_minutes=4,
+            rule_text="Sub-5-minute turn: stay immediate and continuous. One gesture, one exchange, one visible shift. No montage.",
+        ),
+        TurnTimeBeatGuidance(
+            min_minutes=5,
+            max_minutes=45,
+            rule_text="Around-30-minute turn: show one short sequence with clear progression; skip only trivial connective tissue.",
+        ),
+        TurnTimeBeatGuidance(
+            min_minutes=46,
+            max_minutes=90,
+            rule_text="Around-60-minute turn: compress routine movement, waiting, or work; land on the key change, discovery, or arrival.",
+        ),
+        TurnTimeBeatGuidance(
+            min_minutes=91,
+            max_minutes=12 * 60,
+            rule_text="Several-hours turn: summarize the intervening stretch and land on the most important encounter, consequence, or endpoint.",
+        ),
+        TurnTimeBeatGuidance(
+            min_minutes=(12 * 60) + 1,
+            max_minutes=2 * 24 * 60,
+            rule_text="About-1-day turn: write the defining developments of that day. Do not fake hour-by-hour playback.",
+        ),
+        TurnTimeBeatGuidance(
+            min_minutes=(2 * 24 * 60) + 1,
+            max_minutes=(365 * 24 * 60) - 1,
+            rule_text="Multi-day-to-subyear turn: use montage/summary logic for days, weeks, or months. Show accumulated change, recurring pattern, or one anchor moment plus what changed durably.",
+        ),
+        TurnTimeBeatGuidance(
+            min_minutes=365 * 24 * 60,
+            max_minutes=(2 * 365 * 24 * 60) - 1,
+            rule_text="About-1-year turn: treat it as a major seasonal or life shift. Foreground what changed in status, relationships, location, body, routine, or world conditions.",
+        ),
+        TurnTimeBeatGuidance(
+            min_minutes=2 * 365 * 24 * 60,
+            max_minutes=None,
+            rule_text="Multi-year turn: treat it as an era jump. Do not narrate it like one continuous scene; present the new status quo and the decisive long-term consequences of elapsed time.",
+        ),
+    )
     LITERARY_STYLES_STATE_KEY = "literary_styles"
     MAX_LITERARY_STYLES_PROMPT_CHARS = 3000
     MAX_LITERARY_STYLE_PROFILE_CHARS = 400
@@ -467,7 +516,7 @@ class ZorkEmulator:
         "intended_payoff",
     }
     RESPONSE_STYLE_NOTE = (
-        "[SYSTEM NOTE: FOR THIS RESPONSE ONLY: use the current style direction. Narrate in 1 to 2 beats as needed. "
+        "[SYSTEM NOTE: FOR THIS RESPONSE ONLY: use the current style direction. Narrate in 1 to 2 beats as needed, and make those beats cover the full in-world time you advance this turn. "
         "No recap of unchanged facts. No flowery language unless a character canonically speaks that way. "
         "Do not restage the room with a closing tableau or camera sweep over unchanged props, plates, parked cars, shadows, music, or weather. "
         "If those details did not materially change this turn, leave them implicit. "
@@ -514,6 +563,7 @@ class ZorkEmulator:
         "- BAN: filing-cabinet phrasing. Avoid defaulting to characters 'filing facts away', 'storing that for later', or otherwise processing new information like clerks or databases. If someone registers something important, describe a fresher concrete reaction, shift in attention, bodily tell, or change in strategy instead.\n"
         "- Things may be practical, random, transactional, grotesque, funny, unresolved, or simply strange. Not every event means something deeper. Sometimes things just happen.\n"
         "- Vary your landing gear. Turns can end mid-exchange, on a practical detail, on a half-finished gesture, abruptly after dialogue. Not every turn needs a final settling sentence that signals 'scene complete' — most shouldn't.\n"
+        "- Temporal coverage matters: your 1 to 2 beats must justify the full amount of in-world time you advance. Stay immediate for short spans; compress visibly for larger spans. Follow TURN_TIME_BEAT_GUIDANCE when it is provided.\n"
     )
     DEFAULT_STYLE_DIRECTION = "Mulberry Award-winning literature"
     PROMPT_STAGE_BOOTSTRAP = "bootstrap"  # Deprecated: kept for logging/audit only; bootstrap LLM call eliminated.
@@ -744,7 +794,7 @@ class ZorkEmulator:
         "- Do NOT repeat the narration outside the JSON object.\n"
         "- Keep narration under 1800 characters.\n"
         "- Write in the current style direction.\n"
-        "- Narrate in 1 to 2 beats as needed for the turn.\n"
+        "- Narrate in 1 to 2 beats as needed for the turn, and make those beats cover the full span implied by state_update.game_time.\n"
         "- Avoid flowery language unless a specific character canonically speaks that way. Avoid novel-style interior monologue, melodrama, or comic-book framing.\n"
         "- Vary pacing and sentence rhythm from turn to turn while staying true to the speaking character.\n"
         "- When LITERARY_STYLES is present, it contains named style profiles extracted from real literary works. Each profile describes prose craft: rhythm, register, texture, and avoidances.\n"
@@ -764,6 +814,7 @@ class ZorkEmulator:
         "- CLOSING CADENCE: do not write a settlement phrase — a rhythmically final sentence that resolves scene energy with prosodic falling meter. If tension is still live, the last sentence should leave it live. Vary how turns end: mid-dialogue, mid-action, on a question, on a practical detail, abruptly. A turn that always lands with the same settling rhythm trains the reader to stop feeling tension.\n"
         "- No refrain or motific repetition — do not repeat the same structural tail, closing image, or variable-word-swap line across consecutive turns. A repeated line does not accumulate weight; it becomes a crutch. If you catch yourself ending two turns the same way, cut the pattern.\n"
         "- Keep diction plain and direct; prioritize immediate consequences and available choices.\n"
+        "- Temporal pacing is mandatory: follow TURN_TIME_BEAT_GUIDANCE for the current minimum span, and if you choose a larger jump than that, scale the compression up so the elapsed time is legible in the prose.\n"
         "- RECENT_TURNS includes turn/time tags like [TURN #N | Day D HH:MM]. Use them to track pacing and chronology.\n"
         "- RECENT_TURNS is already filtered to what the acting player plausibly knows. Hidden/private turns from other players are omitted.\n"
         "- TURN_VISIBILITY_DEFAULT tells you whether this turn should default to public, local, or private context.\n"
@@ -1199,7 +1250,7 @@ class ZorkEmulator:
     CALENDAR_TOOL_PROMPT = (
         "\nCALENDAR & GAME TIME SYSTEM:\n"
         "The campaign tracks in-game time via CURRENT_GAME_TIME shown in the user prompt.\n"
-        "The user prompt also includes MIN_TURN_ADVANCE_MINUTES_EFFECTIVE and STANDARD_TURN_ADVANCE_MINUTES_EFFECTIVE for the current campaign speed.\n"
+        "The user prompt also includes MIN_TURN_ADVANCE_MINUTES_EFFECTIVE, STANDARD_TURN_ADVANCE_MINUTES_EFFECTIVE, and TURN_TIME_BEAT_GUIDANCE for the current campaign speed.\n"
         "Every turn, you MUST advance game_time in state_update by a plausible amount "
         "(ordinary turns use STANDARD_TURN_ADVANCE_MINUTES_EFFECTIVE as the baseline rhythm, longer for travel/rest/time skips, etc.). "
         "Scale the advance by SPEED_MULTIPLIER — at 2x, time passes roughly twice as fast per turn.\n"
@@ -1207,6 +1258,8 @@ class ZorkEmulator:
         "Default rhythm: advance the world by roughly STANDARD_TURN_ADVANCE_MINUTES_EFFECTIVE minutes per turn unless the scene clearly justifies more.\n"
         "MIN_TURN_ADVANCE_MINUTES_EFFECTIVE is the floor the harness will enforce when you freeze or regress time. Do not pace beats as if less time will pass than that.\n"
         "Do NOT default below MIN_TURN_ADVANCE_MINUTES_EFFECTIVE unless immediate shared-scene coherence absolutely requires it.\n"
+        "TEMPORAL BEAT COVERAGE RULE: the 1 to 2 beats you write must cover at least MIN_TURN_ADVANCE_MINUTES_EFFECTIVE and also the full span of any larger jump you choose in state_update.game_time.\n"
+        "Follow TURN_TIME_BEAT_GUIDANCE from the user prompt as the harness-selected pacing rule for the current minimum turn span. If you intentionally choose a larger jump than that minimum, scale up naturally instead of staying too immediate.\n"
         "Pace game_time by scene needs: prefer larger jumps (20-90 minutes or to the next meaningful beat) when no immediate deadline is active, "
         "and keep finer-grained time only when needed to preserve shared-scene coherence.\n"
         "Update these fields in state_update:\n"
@@ -13384,6 +13437,9 @@ class ZorkEmulator:
         effective_standard_turn_advance = self._effective_standard_turn_advance_minutes(
             speed_mult
         )
+        turn_time_beat_guidance = self._turn_time_beat_guidance(
+            effective_min_turn_advance
+        )
         difficulty = self.normalize_difficulty(state.get("difficulty", "normal"))
         style_direction = self._resolve_style_direction(campaign)
         response_style_note = self._turn_stage_note(difficulty, stage, style_direction=style_direction)
@@ -13465,6 +13521,7 @@ class ZorkEmulator:
             f"SPEED_MULTIPLIER: {speed_mult}\n"
             f"MIN_TURN_ADVANCE_MINUTES_EFFECTIVE: {effective_min_turn_advance}\n"
             f"STANDARD_TURN_ADVANCE_MINUTES_EFFECTIVE: {effective_standard_turn_advance}\n"
+            f"TURN_TIME_BEAT_GUIDANCE: {turn_time_beat_guidance}\n"
             f"DIFFICULTY: {difficulty}\n"
             f"MEMORY_LOOKUP_ENABLED: {str(memory_lookup_enabled).lower()}\n"
             f"RECENT_TURNS_LOADED: {str(not bootstrap_only).lower()}\n"
@@ -16539,7 +16596,7 @@ class ZorkEmulator:
             r'(?!true\s*[,}\]]|false\s*[,}\]]|null\s*[,}\]])'
             r'(?=[A-Za-z])'
             r'(?P<value>.*?)'
-            r'(?=,\s*"[^"]+"\s*:|,\s*\{|\s*[}\]])',
+            r'(?=,\s*"[^"]+"\s*:|,\s*\{|\s*[}\]]|\s*$)',
             re.DOTALL,
         )
 
@@ -16583,7 +16640,7 @@ class ZorkEmulator:
             rf'("(?P<key>{field_names})"\s*:\s*)'
             r'(?!(?:"|\{|\[|true\s*[,}\]]|false\s*[,}\]]|null\s*[,}\]]|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?\s*[,}\]]))'
             r'(?P<value>.*?)'
-            r'(?=,\s*"[^"]+"\s*:|,\s*\{|\s*[}\]])',
+            r'(?=,\s*"[^"]+"\s*:|,\s*\{|\s*[}\]]|\s*$)',
             re.DOTALL,
         )
 
@@ -17231,6 +17288,18 @@ class ZorkEmulator:
             speed = 1.0
         scaled_default = int(round(self.DEFAULT_TURN_ADVANCE_MINUTES * speed))
         return max(self._effective_min_turn_advance_minutes(speed), scaled_default)
+
+    def _turn_time_beat_guidance(self, min_turn_minutes: int) -> str:
+        try:
+            minutes = max(0, int(min_turn_minutes))
+        except (TypeError, ValueError):
+            minutes = self.MIN_TURN_ADVANCE_MINUTES
+        for bucket in self.TURN_TIME_BEAT_GUIDANCE_BUCKETS:
+            if minutes < bucket.min_minutes:
+                continue
+            if bucket.max_minutes is None or minutes <= bucket.max_minutes:
+                return bucket.rule_text
+        return self.TURN_TIME_BEAT_GUIDANCE_BUCKETS[-1].rule_text
 
     def _estimate_turn_time_advance_minutes(
         self, action_text: str, narration_text: str

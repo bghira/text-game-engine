@@ -57,6 +57,11 @@ class TestParseJsonLenient:
         assert isinstance(result, dict)
         assert "narration" in result
 
+    def test_unquoted_string_value_at_eof_repaired(self, emulator):
+        text = '{"scene_output":{"beats":[{"text":His'
+        result = emulator._parse_json_lenient(text)
+        assert result["scene_output"]["beats"][0]["text"] == "His"
+
     def test_python_dict_coercion(self, emulator):
         result = emulator._parse_json_lenient("{'narration': 'hello', 'xp': 5}")
         assert result == {"narration": "hello", "xp": 5}
@@ -514,6 +519,22 @@ class TestPlainTextSearchIntentRecovery:
             "tool_call": "memory_search",
             "queries": ["query one", "query two", "query three"],
         }
+
+    def test_parse_model_payload_recovers_truncated_unquoted_text_value(self):
+        from text_game_engine.tool_aware_llm import ToolAwareZorkLLM
+        from text_game_engine.zork_emulator import ZorkEmulator
+
+        emulator = ZorkEmulator.__new__(ZorkEmulator)
+        llm = ToolAwareZorkLLM.__new__(ToolAwareZorkLLM)
+        llm._emulator = emulator
+        llm._zork_log = lambda *args, **kwargs: None
+
+        payload = llm._parse_model_payload(
+            '{"reasoning":"brief","state_update":{},"scene_output":{"beats":[{"text":His'
+        )
+
+        assert payload is not None
+        assert payload["scene_output"]["beats"][0]["text"] == "His"
 
 
 class TestMemorySearchCategoryFiltering:
