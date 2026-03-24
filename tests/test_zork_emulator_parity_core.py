@@ -460,6 +460,7 @@ def test_build_prompt_shape(session_factory, seed_campaign_and_actor):
     assert "SCENE_STATE is the immediate actionable scene" in system_prompt
     assert "CHARACTER_INDEX is the roster-wide NPC continuity block" in system_prompt
     assert "WORLD_STATE is for world facts" in system_prompt
+    assert "do not assume every partnered NPC is automatically loyal, transparent, or stable" in system_prompt
     assert "not plot-armored" in system_prompt
     assert '{"tool_call": "memory_terms"' not in system_prompt
     assert '{"tool_call": "sms_list"' not in system_prompt
