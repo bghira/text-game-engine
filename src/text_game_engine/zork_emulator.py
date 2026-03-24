@@ -18694,6 +18694,8 @@ class ZorkEmulator:
         viewer_private_context_key: str,
     ) -> bool:
         meta = self._safe_turn_meta(turn)
+        if str(getattr(turn, "actor_id", "") or "").strip() == str(viewer_actor_id or "").strip():
+            return True
         visibility = meta.get("visibility")
         if isinstance(visibility, dict):
             scope = str(visibility.get("scope") or "").strip().lower()
@@ -19319,6 +19321,7 @@ class ZorkEmulator:
         viewer_slug_key = self._player_slug_key(viewer_slug)
         viewer_location_key_norm = self._normalize_location_key(viewer_location_key)
         viewer_private_context_key_norm = str(viewer_private_context_key or "").strip()
+        is_actor_turn = str(getattr(turn, "actor_id", "") or "").strip() == str(viewer_actor_id or "").strip()
         for beat_index, beat in enumerate(beats):
             if not isinstance(beat, dict):
                 continue
@@ -19349,9 +19352,12 @@ class ZorkEmulator:
                 beat_visible = True
             elif beat_visibility == "local":
                 beat_visible = bool(
-                    viewer_location_key_norm
-                    and beat_location_keys
-                    and viewer_location_key_norm in beat_location_keys
+                    is_actor_turn
+                    or (
+                        viewer_location_key_norm
+                        and beat_location_keys
+                        and viewer_location_key_norm in beat_location_keys
+                    )
                 )
             elif beat_visibility in {"private", "limited"}:
                 beat_visible = (
