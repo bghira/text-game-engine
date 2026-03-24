@@ -4327,4 +4327,4 @@ def test_sms_unread_notification_uses_bilateral_thread_label(session_factory):
 
     assert notice is not None
     assert "Unread SMS: 1 message(s) in 1 thread(s)" in notice
-    assert "(chace-preston<->gwen)" in notice
+    assert "(chace-preston↔gwen)" in notice
