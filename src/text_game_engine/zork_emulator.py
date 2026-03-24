@@ -10771,14 +10771,14 @@ class ZorkEmulator:
             and resolved_counterpart not in viewer_aliases
             and resolved_counterpart != viewer
         ):
-            return f"{viewer}<->{resolved_counterpart}"
+            return f"{viewer}↔{resolved_counterpart}"
         counterpart = cls._sms_counterpart_display_label(
             row,
             actor_id=actor_id,
             player_state=player_state,
         )
         if viewer and counterpart:
-            return f"{viewer}<->{counterpart}"
+            return f"{viewer}↔{counterpart}"
         return counterpart or viewer
 
     @classmethod
