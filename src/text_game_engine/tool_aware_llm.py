@@ -2943,8 +2943,26 @@ class ToolAwareZorkLLM:
                 payload = restaged_payload
 
         if emulator._is_tool_call(payload) and str(payload.get("tool_call") or "").strip().lower() != "ready_to_write":  # noqa: E501, SLF001
-            logger.warning("_resolve_payload: max tool rounds exceeded, still has tool_call=%s", payload.get("tool_call"))
-            return None
+            pending_tool_name = str(payload.get("tool_call") or "").strip().lower()
+            logger.warning(
+                "_resolve_payload: max tool rounds exceeded, still has tool_call=%s; forcing finalization",
+                payload.get("tool_call"),
+            )
+            pending_tool_json = json.dumps(payload, ensure_ascii=False, default=str)
+            _append_tool_history_entry(
+                "system_note",
+                "\n\nTOOL_ROUND_LIMIT_REACHED: Research/tool rounds are exhausted. "
+                "Do NOT call any more research tools. Proceed to final narration/state JSON now. "
+                "If the pending action is appropriate for final inline tool_calls "
+                "(sms_write, sms_schedule, plot_plan, chapter_plan), move it under final JSON tool_calls instead of returning a standalone tool_call.\n"
+                f"PENDING_TOOL_CALL: {pending_tool_json}",
+            )
+            payload = {
+                "tool_call": "ready_to_write",
+                "speakers": [],
+                "listeners": [],
+                "_forced_after_tool_round_limit": pending_tool_name or "unknown",
+            }
 
         # Dedicated ready_to_write finalization: the payload is the tool call
         # itself (no narration), so issue the actual writing call with craft guidance.

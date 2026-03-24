@@ -1270,6 +1270,111 @@ def test_ready_to_write_finalization_uses_final_stage_system_prompt(
     asyncio.run(run_test())
 
 
+def test_resolve_payload_forces_finalization_after_tool_round_limit(
+    session_factory,
+    seed_campaign_and_actor,
+):
+    class LoopingSmsWriteCompletionPort:
+        def __init__(self):
+            self.calls = []
+
+        async def complete(self, system_prompt, prompt, *, temperature=0.8, max_tokens=2048):
+            self.calls.append({"system_prompt": system_prompt, "prompt": prompt})
+            if len(self.calls) == 1:
+                return json.dumps({
+                    "tool_call": "sms_write",
+                    "thread": "penny",
+                    "from": "Chris",
+                    "to": "Penny",
+                    "message": "You there?",
+                })
+            if len(self.calls) == 2:
+                return json.dumps({
+                    "tool_call": "sms_write",
+                    "thread": "penny",
+                    "from": "Chris",
+                    "to": "Penny",
+                    "message": "You there?",
+                })
+            return json.dumps({
+                "reasoning": "Forced to finalize after tool loop.",
+                "narration": "Chris pockets the phone and waits.",
+                "state_update": {
+                    "game_time": {
+                        "day": 1,
+                        "hour": 9,
+                        "minute": 20,
+                        "day_of_week": "monday",
+                        "period": "morning",
+                        "date_label": "Monday, Day 1, Morning",
+                    },
+                },
+                "summary_update": "Chris is waiting on Penny.",
+                "tool_calls": [
+                    {
+                        "tool_call": "sms_write",
+                        "thread": "penny",
+                        "from": "Chris",
+                        "to": "Penny",
+                        "message": "You there?",
+                    },
+                ],
+            })
+
+    async def run_test():
+        completion = LoopingSmsWriteCompletionPort()
+        engine = GameEngine(
+            uow_factory=lambda: SQLAlchemyUnitOfWork(session_factory),
+            llm=StubLLM(LLMTurnOutput(narration="unused")),
+        )
+        compat = ZorkEmulator(engine, session_factory, completion_port=completion)
+        tool_llm = ToolAwareZorkLLM(
+            session_factory=session_factory,
+            completion_port=completion,
+            temperature=0.8,
+            max_tokens=2048,
+            max_tool_rounds=1,
+        )
+        tool_llm.bind_emulator(compat)
+
+        campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
+        player = compat.get_or_create_player(seed_campaign_and_actor["campaign_id"], seed_campaign_and_actor["actor_id"])
+        turns = compat.get_recent_turns(seed_campaign_and_actor["campaign_id"])
+        research_system_prompt, research_user_prompt = compat.build_prompt(
+            campaign,
+            player,
+            "text Penny",
+            turns,
+            prompt_stage=compat.PROMPT_STAGE_RESEARCH,
+        )
+        final_system_prompt, final_user_prompt = compat.build_prompt(
+            campaign,
+            player,
+            "text Penny",
+            turns,
+            prompt_stage=compat.PROMPT_STAGE_FINAL,
+        )
+
+        payload = await tool_llm._resolve_payload(  # noqa: SLF001
+            seed_campaign_and_actor["campaign_id"],
+            seed_campaign_and_actor["actor_id"],
+            "text Penny",
+            research_system_prompt,
+            research_user_prompt,
+            final_system_prompt,
+            final_user_prompt,
+        )
+
+        assert payload is not None
+        assert payload.get("narration") == "Chris pockets the phone and waits."
+        assert payload.get("tool_calls")[0]["tool_call"] == "sms_write"
+        assert len(completion.calls) == 3
+        assert "TOOL_ROUND_LIMIT_REACHED" in completion.calls[2]["prompt"]
+        assert "Do NOT call any more tools now. Return final narration/state JSON directly." in completion.calls[2]["prompt"]
+
+    asyncio.run(run_test())
+
+
 def test_ready_to_write_finalization_reexpands_character_and_location_cards(
     session_factory,
     seed_campaign_and_actor,
