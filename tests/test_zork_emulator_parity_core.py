@@ -3406,6 +3406,43 @@ def test_calendar_update_keeps_overdue_and_requires_explicit_remove(
     assert all(e.get("name") != "Moonrise Ceremony" for e in removed.get("calendar", []))
 
 
+def test_calendar_update_participants_auto_target_acting_player(
+    session_factory,
+    seed_campaign_and_actor,
+):
+    compat = _build_compat(session_factory)
+    tool_llm = ToolAwareZorkLLM(
+        session_factory=session_factory,
+        completion_port=StubCompletionPort(),
+        temperature=0.8,
+        max_tokens=2048,
+    )
+    tool_llm.bind_emulator(compat)
+
+    output = tool_llm._payload_to_output(
+        {
+            "narration": "Rigby sets the plan.",
+            "state_update": {},
+            "calendar_update": {
+                "add": [
+                    {
+                        "title": "Study session with Penny - Library",
+                        "day": 3658,
+                        "hour": 19,
+                        "participants": ["penny-reynolds"],
+                    }
+                ]
+            },
+        },
+        actor_id=seed_campaign_and_actor["actor_id"],
+        character_name="Rigby",
+    )
+
+    add_rows = output.state_update.get("calendar_update", {}).get("add", [])
+    assert len(add_rows) == 1
+    assert add_rows[0]["target_players"] == [seed_campaign_and_actor["actor_id"]]
+
+
 def test_legacy_setup_signatures(session_factory, seed_campaign_and_actor):
     async def run_test():
         compat = _build_compat(
