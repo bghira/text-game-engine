@@ -13115,6 +13115,8 @@ class ZorkEmulator:
             "target_player",
             "targets",
             "target",
+            "participants",
+            "participant",
             "players",
             "player",
             "player_id",

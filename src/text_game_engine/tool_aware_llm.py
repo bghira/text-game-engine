@@ -868,10 +868,15 @@ class ToolAwareZorkLLM:
                     visibility = str(row.get("visibility") or "").strip().lower()
                     target_players = row.get("target_players")
                     target_player = row.get("target_player")
+                    participants = row.get("participants")
+                    participant = row.get("participant")
+                    has_participants = bool(participant) or (
+                        isinstance(participants, list) and bool(participants)
+                    )
                     has_targets = bool(target_player) or (
                         isinstance(target_players, list) and bool(target_players)
                     )
-                    if visibility == "private" and not has_targets and actor_id:
+                    if (visibility == "private" or has_participants) and not has_targets and actor_id:
                         row["target_players"] = [str(actor_id)]
             state_update["calendar_update"] = extracted_calendar_update
 
