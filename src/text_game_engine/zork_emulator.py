@@ -17538,7 +17538,9 @@ class ZorkEmulator:
             # Also check for threads where the last message was FROM the player (unanswered by NPC)
             sms_threads = self._sms_threads_from_state(campaign_state)
             player_aliases = self._sms_player_aliases(actor_id=actor_id, player_state=player_state)
+            contact_roster = self._sms_contact_roster(campaign)
             unanswered_by_npc: list[str] = []
+            unanswered_seen: set[str] = set()
             for thread_key, thread_data in sms_threads.items():
                 if not isinstance(thread_data, dict):
                     continue
@@ -17550,7 +17552,26 @@ class ZorkEmulator:
                     continue
                 from_norm = self._sms_normalize_thread_key(last_msg.get("from"))
                 if from_norm and from_norm in player_aliases:
-                    label = str(thread_data.get("label") or thread_key).strip()[:40]
+                    resolved_contact = self._sms_resolved_contact(
+                        str(thread_key),
+                        thread_data,
+                        viewer_actor_id=actor_id,
+                        player_state=player_state,
+                        contact_roster=contact_roster,
+                        visible_messages=messages,
+                    )
+                    canonical_thread = self._sms_normalize_thread_key(
+                        resolved_contact.get("thread") or thread_key
+                    )
+                    if canonical_thread and canonical_thread in unanswered_seen:
+                        continue
+                    if canonical_thread:
+                        unanswered_seen.add(canonical_thread)
+                    label = str(
+                        resolved_contact.get("label")
+                        or thread_data.get("label")
+                        or thread_key
+                    ).strip()[:40]
                     if label:
                         unanswered_by_npc.append(label)
             if unanswered_by_npc:
