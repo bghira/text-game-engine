@@ -1438,6 +1438,10 @@ class ZorkEmulator:
         self._pending_sms_tasks: dict[str, set[asyncio.Task]] = {}
         self._turn_ephemeral_notices: dict[tuple[str, str, str | None], list[str]] = {}
 
+    @property
+    def notification_port(self) -> NotificationPort | None:
+        return self._notification_port
+
     # ------------------------------------------------------------------
     # Compatibility helpers
     # ------------------------------------------------------------------

@@ -5560,6 +5560,97 @@ def test_song_search_tool_falls_back_to_youtube_results_url_on_lookup_failure(
     assert "https://www.youtube.com/results?search_query=Rush+YYZ" in sent
 
 
+def test_song_search_tool_neutralizes_discord_mentions_and_skips_duplicate_title(
+    monkeypatch,
+    session_factory,
+    seed_campaign_and_actor,
+):
+    notification_port = StubNotificationPort()
+    compat = _build_compat(session_factory, notification_port=notification_port)
+
+    monkeypatch.setattr(
+        "text_game_engine.tool_aware_llm._search_youtube_first_result",
+        lambda query: {
+            "title": "https://www.youtube.com/watch?v=abc123",
+            "channel": "",
+            "url": "https://www.youtube.com/watch?v=abc123",
+        },
+    )
+
+    completion = StubCompletionPort()
+    tool_llm = ToolAwareZorkLLM(
+        session_factory=session_factory,
+        completion_port=completion,
+        temperature=0.8,
+        max_tokens=2048,
+    )
+    tool_llm.bind_emulator(compat)
+
+    campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
+
+    async def run_test():
+        result = await tool_llm._execute_tool_call(
+            campaign.id,
+            {
+                "tool_call": "song_search",
+                "query": "https://www.youtube.com/watch?v=abc123",
+                "sender": "@everyone Penny",
+                "message": "listen <@1234567890> now",
+            },
+            actor_id=seed_campaign_and_actor["actor_id"],
+        )
+        assert "SONG_SEARCH_RESULT:" in result
+        assert '"delivered":true' in result.lower()
+
+    asyncio.run(run_test())
+
+    assert len(notification_port.channel_messages) == 1
+    sent = notification_port.channel_messages[0]["message"]
+    assert "@\u200beveryone Penny" in sent
+    assert "<@\u200b1234567890>" in sent
+    assert sent.count("https://www.youtube.com/watch?v=abc123") == 1
+
+
+def test_song_search_direct_url_rejects_non_youtube_hosts():
+    from text_game_engine.tool_aware_llm import _search_youtube_first_result
+
+    result = _search_youtube_first_result("https://example.com/phish")
+    assert isinstance(result, dict)
+    assert result["url"] == "https://www.youtube.com/results?search_query=https%3A%2F%2Fexample.com%2Fphish"
+
+
+def test_song_search_tool_times_out_cleanly(monkeypatch, session_factory, seed_campaign_and_actor):
+    notification_port = StubNotificationPort()
+    compat = _build_compat(session_factory, notification_port=notification_port)
+
+    async def run_test():
+        async def fake_wait_for(awaitable, timeout):
+            raise asyncio.TimeoutError()
+
+        monkeypatch.setattr("text_game_engine.tool_aware_llm.asyncio.wait_for", fake_wait_for)
+
+        completion = StubCompletionPort()
+        tool_llm = ToolAwareZorkLLM(
+            session_factory=session_factory,
+            completion_port=completion,
+            temperature=0.8,
+            max_tokens=2048,
+        )
+        tool_llm.bind_emulator(compat)
+
+        campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
+        result = await tool_llm._execute_tool_call(
+            campaign.id,
+            {"tool_call": "song_search", "query": "Rush YYZ"},
+            actor_id=seed_campaign_and_actor["actor_id"],
+        )
+        assert "found=false" in result
+        assert "timeout=true" in result
+
+    asyncio.run(run_test())
+    assert notification_port.channel_messages == []
+
+
 def test_tool_calls_song_search_executed_in_complete_turn(
     monkeypatch,
     session_factory,
