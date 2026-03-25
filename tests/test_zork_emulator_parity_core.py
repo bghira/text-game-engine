@@ -248,6 +248,28 @@ class StubMediaPort:
         return True
 
 
+class StubNotificationPort:
+    def __init__(self):
+        self.channel_messages = []
+        self.dm_messages = []
+
+    async def send_channel_message(self, campaign_id: str, message: str) -> None:
+        self.channel_messages.append(
+            {
+                "campaign_id": str(campaign_id),
+                "message": str(message),
+            }
+        )
+
+    async def send_dm(self, actor_id: str, message: str) -> None:
+        self.dm_messages.append(
+            {
+                "actor_id": str(actor_id),
+                "message": str(message),
+            }
+        )
+
+
 class StubCtx:
     class _Author:
         id = "actor-1"
@@ -350,7 +372,14 @@ class FakeHTTPResponse:
         return False
 
 
-def _build_compat(session_factory, completion_port=None, timer_effects=None, imdb_port=None, media_port=None):
+def _build_compat(
+    session_factory,
+    completion_port=None,
+    timer_effects=None,
+    imdb_port=None,
+    media_port=None,
+    notification_port=None,
+):
     llm = StubLLM(LLMTurnOutput(narration="Compat narration"))
     engine = GameEngine(
         uow_factory=lambda: SQLAlchemyUnitOfWork(session_factory),
@@ -363,6 +392,7 @@ def _build_compat(session_factory, completion_port=None, timer_effects=None, imd
         timer_effects_port=timer_effects,
         imdb_port=imdb_port,
         media_port=media_port,
+        notification_port=notification_port,
     )
 
 
@@ -1365,6 +1395,8 @@ def test_ready_to_write_finalization_uses_final_stage_system_prompt(
         assert '"tool_call": "ready_to_write"' not in completion.calls[1]["system_prompt"]
         assert '"tool_call": "plot_plan"' in completion.calls[1]["system_prompt"]
         assert '"tool_call": "chapter_plan"' in completion.calls[1]["system_prompt"]
+        assert '"tool_call": "song_search"' in completion.calls[0]["system_prompt"]
+        assert '"tool_call": "song_search"' in completion.calls[1]["system_prompt"]
         assert "tool_calls MUST be the last top-level key" in completion.calls[1]["system_prompt"]
         assert "make those beats cover the full span implied by state_update.game_time" in completion.calls[1]["system_prompt"]
         assert "follow TURN_TIME_BEAT_GUIDANCE for the current minimum span" in completion.calls[1]["system_prompt"]
@@ -4971,16 +5003,18 @@ def test_payload_to_output_filters_tool_calls_to_allowlist(session_factory, seed
             {"tool_call": "sms_schedule", "thread": "saul", "from": "Saul", "to": "Dale", "message": "Later.", "delay_seconds": 60},
             {"tool_call": "plot_plan", "plans": [{"thread": "dock-9", "setup": "A debt comes due."}]},
             {"tool_call": "chapter_plan", "action": "create", "chapter": {"slug": "arrival", "title": "Arrival"}},
+            {"tool_call": "song_search", "query": "The Cure Just Like Heaven"},
             {"tool_call": "memory_search", "queries": ["danger"]},  # NOT in allowlist
         ],
     }
 
     output = tool_llm._payload_to_output(payload, actor_id=seed_campaign_and_actor["actor_id"])
-    assert len(output.tool_calls) == 4
+    assert len(output.tool_calls) == 5
     assert output.tool_calls[0]["tool_call"] == "sms_write"
     assert output.tool_calls[1]["tool_call"] == "sms_schedule"
     assert output.tool_calls[2]["tool_call"] == "plot_plan"
     assert output.tool_calls[3]["tool_call"] == "chapter_plan"
+    assert output.tool_calls[4]["tool_call"] == "song_search"
 
 
 def test_tool_calls_sms_write_executed_in_complete_turn(session_factory, seed_campaign_and_actor):
@@ -5138,6 +5172,141 @@ def test_tool_calls_plot_and_chapter_plan_execute_in_complete_turn(
         state = json.loads(row.state_json or "{}")
         assert state["_plot_threads"]["dock-debt"]["setup"] == "Someone from Dock 9 wants payment."
         assert state["_chapter_plan"]["dock-9-pressure"]["title"] == "Dock 9 Pressure"
+
+
+def test_song_search_tool_posts_channel_link(monkeypatch, session_factory, seed_campaign_and_actor):
+    notification_port = StubNotificationPort()
+    compat = _build_compat(session_factory, notification_port=notification_port)
+
+    monkeypatch.setattr(
+        "text_game_engine.tool_aware_llm._search_youtube_first_result",
+        lambda query: {
+            "title": "Just Like Heaven",
+            "channel": "The Cure",
+            "url": "https://www.youtube.com/watch?v=test-song",
+        },
+    )
+
+    completion = StubCompletionPort()
+    tool_llm = ToolAwareZorkLLM(
+        session_factory=session_factory,
+        completion_port=completion,
+        temperature=0.8,
+        max_tokens=2048,
+    )
+    tool_llm.bind_emulator(compat)
+
+    campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
+
+    async def run_test():
+        result = await tool_llm._execute_tool_call(
+            campaign.id,
+            {
+                "tool_call": "song_search",
+                "query": "The Cure Just Like Heaven",
+                "sender": "Simone",
+                "message": "For the walk home.",
+            },
+            actor_id=seed_campaign_and_actor["actor_id"],
+        )
+        assert "SONG_SEARCH_RESULT:" in result
+        assert '"delivered":true' in result.lower()
+
+    asyncio.run(run_test())
+
+    assert len(notification_port.channel_messages) == 1
+    sent = notification_port.channel_messages[0]
+    assert sent["campaign_id"] == campaign.id
+    assert "**[Song] Simone**" in sent["message"]
+    assert "For the walk home." in sent["message"]
+    assert "Just Like Heaven - The Cure" in sent["message"]
+    assert "https://www.youtube.com/watch?v=test-song" in sent["message"]
+
+
+def test_tool_calls_song_search_executed_in_complete_turn(
+    monkeypatch,
+    session_factory,
+    seed_campaign_and_actor,
+):
+    notification_port = StubNotificationPort()
+    monkeypatch.setattr(
+        "text_game_engine.tool_aware_llm._search_youtube_first_result",
+        lambda query: {
+            "title": "Bizarre Love Triangle",
+            "channel": "New Order",
+            "url": "https://www.youtube.com/watch?v=triangle",
+        },
+    )
+
+    class SongToolCallCompletionPort:
+        async def complete(self, system_prompt, prompt, *, temperature=0.8, max_tokens=2048):
+            return json.dumps({
+                "narration": "She sends the track without comment.",
+                "state_update": {
+                    "game_time": {
+                        "day": 1,
+                        "hour": 10,
+                        "minute": 0,
+                        "day_of_week": "monday",
+                        "period": "morning",
+                        "date_label": "Monday, Day 1, Morning",
+                    },
+                },
+                "summary_update": "A song link lands in the thread.",
+                "tool_calls": [
+                    {
+                        "tool_call": "song_search",
+                        "query": "New Order Bizarre Love Triangle",
+                        "sender": "Penny",
+                        "message": "This one.",
+                    },
+                ],
+            })
+
+    completion = SongToolCallCompletionPort()
+    tool_llm = ToolAwareZorkLLM(
+        session_factory=session_factory,
+        completion_port=completion,
+        temperature=0.8,
+        max_tokens=2048,
+    )
+    compat = _build_compat(
+        session_factory,
+        completion_port=completion,
+        notification_port=notification_port,
+    )
+    tool_llm.bind_emulator(compat)
+
+    campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
+    compat.get_or_create_player(campaign.id, seed_campaign_and_actor["actor_id"])
+
+    async def run_test():
+        class _Ctx:
+            def __init__(self, campaign_id, actor_id, action):
+                self.campaign_id = campaign_id
+                self.actor_id = actor_id
+                self.action = action
+                self.session_id = None
+                self.player_state = {}
+                self.campaign_state = {}
+
+        ctx = _Ctx(
+            campaign_id=campaign.id,
+            actor_id=seed_campaign_and_actor["actor_id"],
+            action="text back",
+        )
+        output = await tool_llm.complete_turn(ctx)
+        assert len(output.tool_calls) == 1
+        assert output.tool_calls[0]["tool_call"] == "song_search"
+
+    asyncio.run(run_test())
+
+    assert len(notification_port.channel_messages) == 1
+    sent = notification_port.channel_messages[0]["message"]
+    assert "**[Song] Penny**" in sent
+    assert "This one." in sent
+    assert "Bizarre Love Triangle - New Order" in sent
+    assert "https://www.youtube.com/watch?v=triangle" in sent
 
 
 # ---------------------------------------------------------------------------

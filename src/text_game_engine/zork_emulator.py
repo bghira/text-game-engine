@@ -1024,13 +1024,16 @@ class ZorkEmulator:
         "The system shows a live countdown in Discord. "
         "If the player acts before it expires, the timer is cancelled (if interruptible). "
         "If the player does NOT act in time, the system auto-fires the event.\n"
-        "PURPOSE: Timed events should FORCE THE PLAYER TO MAKE A DECISION or DRAG THEM WHERE THEY NEED TO BE.\n"
-        "- Use timers to push the story forward when the player is stalling, idle, or refusing to engage.\n"
+        "PURPOSE: Timed events FORCE THE PLAYER TO MAKE A DECISION or DRAG THEM WHERE THEY NEED TO BE. "
+        "The world should almost always be in motion — a scene with no timer is a scene where nothing is pressing, and that should be rare.\n"
+        "DEFAULT TO SETTING A TIMER. On every turn, ask yourself: is there ANY reason the world would not wait patiently? "
+        "An NPC mid-conversation, a vehicle in motion, weather shifting, an authority figure expecting compliance, "
+        "a social situation with momentum, a noise that demands investigation — all of these warrant a timer. "
+        "Only omit a timer when the scene is genuinely, completely static with no external pressures.\n"
         "- Use SCENE_STATE, RAILS_CONTEXT, and PARTY_SNAPSHOT to decide scope and narrative impact.\n"
         "- NPCs should grab, escort, or coerce the player. Environments should shift and force movement.\n"
         "- The event should advance the plot: move the player to the next location, "
         "force an encounter, have an NPC intervene, or change the scene decisively.\n"
-        "- Do NOT use timers for trivial flavor. They should always have real consequences that change game state.\n"
         "- Timer events must be grounded in established scene facts (known NPCs, known hazards, known locations).\n"
         "- Do NOT spawn unrelated antagonists, wildlife attacks, or media response solely to create urgency.\n"
         "- Set interruptible=false for events the player cannot avoid (e.g. structural collapse already in motion, a trap already sprung, mandatory roll call).\n"
@@ -1042,7 +1045,6 @@ class ZorkEmulator:
         "- Use whenever the scene has a deadline, the player is stalling, an NPC is impatient, "
         "or the world should move without the player.\n"
         "- Your narration should hint at urgency narratively (e.g. 'the footsteps grow louder') but NEVER include countdowns, timestamps, emoji clocks, or explicit seconds. The system adds its own countdown display automatically.\n"
-        "- No quota: only set a timer when the current scene has a believable, already-grounded clock.\n"
     )
     MEMORY_LOOKUP_MIN_SUMMARY_CHARS = 2000
     MEMORY_TOOL_DISABLED_PROMPT = (
@@ -1097,6 +1099,17 @@ class ZorkEmulator:
         "SMS continuity rule: do NOT leak scene context into SMS content unless the SMS explicitly mentions it.\n"
         "SMS privacy rule: do NOT leave literal player command lines like 'I text X ...' in narration or shared room context; the SMS log is the canonical record.\n"
         "NPC SMS responses/knowledge must be limited to what that thread and established continuity plausibly reveal.\n"
+    )
+    SONG_SEARCH_TOOL_PROMPT = (
+        "\nYou also have a song_search tool for sharing a real song link into the active Discord thread/channel.\n"
+        "Use it when a moment genuinely calls for a song, when an NPC would plausibly drop a track/link, or when a meme-like music share would materially help the player.\n"
+        "Return ONLY:\n"
+        '{"tool_call": "song_search", "query": "artist and song title"}\n'
+        "Optional sender/caption example:\n"
+        '{"tool_call": "song_search", "query": "Cocteau Twins Heaven or Las Vegas", "sender": "Simone", "message": "No explanation. Just this."}\n'
+        "The harness will search and post the resulting YouTube link as a separate Discord message.\n"
+        "Do NOT fake a link yourself. Do NOT narrate the song as already heard unless the link actually matters in-scene and you are also making it available with song_search.\n"
+        "Use sparingly; this is for meaningful texture, not every turn.\n"
     )
     MEMORY_TOOL_PROMPT = (
         "\nYou have a memory_search tool. To use it, return ONLY:\n"
@@ -1333,11 +1346,12 @@ class ZorkEmulator:
     FINAL_STAGE_OPERATIONAL_PROMPT = (
         "\nFINALIZATION OPERATIONAL RULES:\n"
         "- You are in the final JSON-writing stage. Do NOT return a standalone tool_call object now.\n"
-        '- You MAY include "tool_calls" in the final JSON for sms_write, sms_schedule, plot_plan, and chapter_plan only.\n'
+        '- You MAY include "tool_calls" in the final JSON for sms_write, sms_schedule, plot_plan, chapter_plan, and song_search only.\n'
         '- If present, tool_calls MUST be the last top-level key in the final JSON object.\n'
         "- If narration includes an SMS/phone reply or outgoing SMS that must persist, include a matching sms_write in tool_calls so both sides of the conversation are logged.\n"
         "- If scheduling a delayed incoming SMS, use tool_calls with sms_schedule and do NOT narrate that delayed message as already received.\n"
         '- In off-rails play, use tool_calls with {"tool_call": "plot_plan", ...} or {"tool_call": "chapter_plan", ...} when the narrated turn meaningfully creates, advances, resolves, or restructures ongoing story threads or chapter flow.\n'
+        '- Use tool_calls with {"tool_call": "song_search", "query": "..."} when the turn should make a real song link available in the Discord thread/channel.\n'
         "- If the current scene has a believable grounded clock and needs forced urgency, you may include set_timer_delay / set_timer_event / set_timer_interruptible / set_timer_interrupt_action / set_timer_interrupt_scope in the final JSON.\n"
         "- Timers are for real pressure: force a decision, trigger a grounded consequence, move the player, or force an encounter. Do NOT use timers for trivial flavor.\n"
         "- Timer events must be grounded in established scene facts. Use interrupt_scope=local for hazards anchored to the acting player's immediate situation and global for campaign-wide clocks. Prefer interruptible=false only when the event is already unavoidable.\n"
@@ -14007,6 +14021,7 @@ class ZorkEmulator:
             else:
                 system_prompt = f"{system_prompt}{self.MEMORY_TOOL_DISABLED_PROMPT}"
             system_prompt = f"{system_prompt}{self.SMS_TOOL_PROMPT}"
+            system_prompt = f"{system_prompt}{self.SONG_SEARCH_TOOL_PROMPT}"
             if state.get("timed_events_enabled", True):
                 system_prompt = f"{system_prompt}{self.TIMER_TOOL_PROMPT}"
             if on_rails and story_context:
