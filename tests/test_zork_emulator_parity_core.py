@@ -395,6 +395,39 @@ def test_guardrails_onrails_timed_events_toggles(session_factory, seed_campaign_
     assert compat.is_timed_events_enabled(campaign) is False
 
 
+def test_campaign_clock_setter_canonicalizes_and_can_reanchor_weekday(
+    session_factory,
+    seed_campaign_and_actor,
+):
+    compat = _build_compat(session_factory)
+    campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
+
+    updated = compat.set_campaign_clock(
+        campaign,
+        day=2,
+        hour=9,
+        minute=15,
+        day_of_week="thursday",
+    )
+    assert isinstance(updated, dict)
+    assert updated.get("day") == 2
+    assert updated.get("hour") == 9
+    assert updated.get("minute") == 15
+    assert updated.get("day_of_week") == "thursday"
+    assert "Thursday, Day 2" in str(updated.get("date_label") or "")
+
+    current = compat.get_campaign_clock(campaign)
+    assert current.get("day_of_week") == "thursday"
+    assert current.get("hour") == 9
+    assert current.get("minute") == 15
+
+    with session_factory() as session:
+        row = session.get(Campaign, campaign.id)
+        state = json.loads(row.state_json or "{}")
+        assert state.get("clock_start_day_of_week") == "wednesday"
+        assert state.get("game_time", {}).get("day_of_week") == "thursday"
+
+
 def test_json_parsing_helpers(session_factory, seed_campaign_and_actor):
     compat = _build_compat(session_factory)
 
@@ -442,6 +475,8 @@ def test_build_prompt_shape(session_factory, seed_campaign_and_actor):
     assert "CALENDAR_REMINDERS" in user_prompt
     assert "CAMPAIGN:" in user_prompt
     assert "CURRENT_GAME_TIME:" in user_prompt
+    assert "TIME_MODEL:" in user_prompt
+    assert "CALENDAR_POLICY:" in user_prompt
     assert "SPEED_MULTIPLIER:" in user_prompt
     assert "MIN_TURN_ADVANCE_MINUTES_EFFECTIVE:" in user_prompt
     assert "STANDARD_TURN_ADVANCE_MINUTES_EFFECTIVE:" in user_prompt
@@ -2495,6 +2530,61 @@ def test_build_prompt_includes_weekday_in_current_game_time(session_factory, see
     assert "CURRENT_GAME_TIME:" in user_prompt
 
 
+def test_build_prompt_individual_clocks_uses_player_time_and_exposes_global_time(
+    session_factory, seed_campaign_and_actor
+):
+    compat = _build_compat(session_factory)
+    campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
+    player = compat.get_or_create_player(seed_campaign_and_actor["campaign_id"], seed_campaign_and_actor["actor_id"])
+    turns = compat.get_recent_turns(seed_campaign_and_actor["campaign_id"])
+
+    with session_factory() as session:
+        campaign_row = session.get(Campaign, campaign.id)
+        campaign_row.state_json = compat._dump_json(
+            {
+                "clock_start_day_of_week": "monday",
+                "time_model": "individual_clocks",
+                "calendar_policy": "consequential",
+                "game_time": {"day": 9, "hour": 14, "minute": 0},
+            }
+        )
+        player_row = (
+            session.query(Player)
+            .filter(Player.campaign_id == campaign.id)
+            .filter(Player.actor_id == seed_campaign_and_actor["actor_id"])
+            .one()
+        )
+        player_state = json.loads(player_row.state_json or "{}")
+        player_state["game_time"] = {"day": 3, "hour": 8, "minute": 30}
+        player_state["location"] = "queens-apartment"
+        player_state["room_title"] = "Queens Apartment"
+        player_row.state_json = compat._dump_json(player_state)
+        session.add(Actor(id="actor-2", display_name="Penny Player", kind="human", metadata_json="{}"))
+        other = Player(
+            campaign_id=campaign.id,
+            actor_id="actor-2",
+            state_json=compat._dump_json(
+                {
+                    "character_name": "Penny Reynolds",
+                    "location": "queens-apartment",
+                    "room_title": "Queens Apartment",
+                    "game_time": {"day": 11, "hour": 20, "minute": 15},
+                }
+            ),
+            attributes_json="{}",
+        )
+        session.add(other)
+        session.commit()
+
+    _, user_prompt = compat.build_prompt(campaign, player, "look", turns)
+
+    assert 'TIME_MODEL: individual_clocks' in user_prompt
+    assert 'CALENDAR_POLICY: consequential' in user_prompt
+    assert 'CURRENT_GAME_TIME: {"day": 3, "hour": 8, "minute": 30' in user_prompt
+    assert 'GLOBAL_GAME_TIME: {"day": 9, "hour": 14, "minute": 0' in user_prompt
+    assert '"game_time": {"day": 11, "hour": 20, "minute": 15}' in user_prompt
+
+
 def test_story_context_includes_next_three_and_coerces_progress_indices(session_factory, seed_campaign_and_actor):
     compat = _build_compat(session_factory)
 
@@ -2767,10 +2857,17 @@ def test_setup_flow_with_attachment_and_confirm(session_factory, seed_campaign_a
         )
         assert "campaign structure" in structure_msg.lower()
 
-        genre_msg = await compat.handle_setup_message(
+        calendar_msg = await compat.handle_setup_message(
             campaign_id=campaign.id,
             actor_id=seed_campaign_and_actor["actor_id"],
             message_text="character-centric",
+        )
+        assert "time and personal calendar events" in calendar_msg.lower()
+
+        genre_msg = await compat.handle_setup_message(
+            campaign_id=campaign.id,
+            actor_id=seed_campaign_and_actor["actor_id"],
+            message_text="consequential-calendar",
         )
         assert "genre direction" in genre_msg.lower()
 
@@ -2827,10 +2924,17 @@ def test_classify_confirm_negative_with_novel_guidance_skips_reclassify(
         assert "campaign structure" in structure_msg.lower()
         assert probe.reclassify_calls == 0
 
-        genre_msg = await compat.handle_setup_message(
+        calendar_msg = await compat.handle_setup_message(
             campaign_id=campaign.id,
             actor_id=seed_campaign_and_actor["actor_id"],
             message_text="character-centric",
+        )
+        assert "time and personal calendar events" in calendar_msg.lower()
+
+        genre_msg = await compat.handle_setup_message(
+            campaign_id=campaign.id,
+            actor_id=seed_campaign_and_actor["actor_id"],
+            message_text="consequential-calendar",
         )
         assert "genre direction" in genre_msg.lower()
 
@@ -2879,10 +2983,17 @@ def test_setup_variant_rendering_formats_structured_people_and_chapters(
         )
         assert "campaign structure" in structure_msg.lower()
 
-        genre_msg = await compat.handle_setup_message(
+        calendar_msg = await compat.handle_setup_message(
             campaign_id=campaign.id,
             actor_id=seed_campaign_and_actor["actor_id"],
             message_text="character-centric",
+        )
+        assert "time and personal calendar events" in calendar_msg.lower()
+
+        genre_msg = await compat.handle_setup_message(
+            campaign_id=campaign.id,
+            actor_id=seed_campaign_and_actor["actor_id"],
+            message_text="consequential-calendar",
         )
         assert "genre direction" in genre_msg.lower()
 
@@ -2934,10 +3045,17 @@ def test_setup_shared_world_does_not_auto_assign_player_identity(
         )
         assert "shared-world" in structure_msg.lower()
 
-        genre_msg = await compat.handle_setup_message(
+        calendar_msg = await compat.handle_setup_message(
             campaign_id=campaign.id,
             actor_id=seed_campaign_and_actor["actor_id"],
             message_text="shared-world",
+        )
+        assert "time and personal calendar events" in calendar_msg.lower()
+
+        genre_msg = await compat.handle_setup_message(
+            campaign_id=campaign.id,
+            actor_id=seed_campaign_and_actor["actor_id"],
+            message_text="individual-calendars",
         )
         assert "genre direction" in genre_msg.lower()
 
@@ -2959,6 +3077,8 @@ def test_setup_shared_world_does_not_auto_assign_player_identity(
             row = session.get(Campaign, campaign.id)
             state = json.loads(row.state_json or "{}")
             assert state.get("world_structure") == "shared-world"
+            assert state.get("time_model") == "individual_clocks"
+            assert state.get("calendar_policy") == "consequential"
             player = (
                 session.query(Player)
                 .filter(Player.campaign_id == campaign.id)
@@ -3454,7 +3574,7 @@ def test_context_shortcuts_calendar_and_roster(session_factory, seed_campaign_an
             campaign_id=campaign.id,
         )
         assert calendar_resp is not None
-        assert "**Game Time:** Day 3, Evening" in calendar_resp
+        assert "**Game Time:** Wednesday, Day 3, Evening" in calendar_resp
         assert "Moonrise Ceremony" in calendar_resp
         assert "fires in 3 hour(s)" in calendar_resp
         assert "**Personal Events:**" in calendar_resp
@@ -3604,6 +3724,173 @@ def test_main_party_location_sync_updates_other_players(
     asyncio.run(run_test())
 
 
+def test_individual_clocks_keep_campaign_clock_global_and_player_time_personal(
+    session_factory,
+    seed_campaign_and_actor,
+):
+    async def run_test():
+        llm = StubLLM(
+            LLMTurnOutput(
+                narration="You let the evening inch forward.",
+                state_update={"game_time": {"day": 3, "hour": 9, "minute": 30}},
+                player_state_update={"room_summary": "Still in the apartment."},
+            )
+        )
+        engine = GameEngine(
+            uow_factory=lambda: SQLAlchemyUnitOfWork(session_factory),
+            llm=llm,
+        )
+        compat = ZorkEmulator(game_engine=engine, session_factory=session_factory)
+        campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
+        compat.get_or_create_player(campaign.id, seed_campaign_and_actor["actor_id"])
+
+        with session_factory() as session:
+            session.add(Actor(id="actor-2", display_name="Second Player", kind="human", metadata_json="{}"))
+            session.commit()
+            player_two = compat.get_or_create_player(campaign.id, "actor-2")
+            campaign_row = session.get(Campaign, campaign.id)
+            campaign_row.state_json = compat._dump_json(
+                {
+                    "time_model": "individual_clocks",
+                    "calendar_policy": "consequential",
+                    "clock_start_day_of_week": "wednesday",
+                    "speed_multiplier": 0.1,
+                    "game_time": {"day": 100, "hour": 12, "minute": 0},
+                }
+            )
+            player_one_row = (
+                session.query(Player)
+                .filter(Player.campaign_id == campaign.id)
+                .filter(Player.actor_id == seed_campaign_and_actor["actor_id"])
+                .one()
+            )
+            player_one_row.state_json = compat._dump_json(
+                {
+                    "character_name": "Rigby Krinkle",
+                    "location": "queens-apartment",
+                    "room_title": "Queens Apartment",
+                    "game_time": {"day": 3, "hour": 9, "minute": 0},
+                }
+            )
+            player_two_row = session.get(Player, player_two.id)
+            player_two_row.state_json = compat._dump_json(
+                {
+                    "character_name": "Penny Reynolds",
+                    "location": "queens-apartment",
+                    "room_title": "Queens Apartment",
+                    "game_time": {"day": 7, "hour": 14, "minute": 0},
+                }
+            )
+            session.commit()
+
+        out = await compat.play_action(
+            campaign_id=campaign.id,
+            actor_id=seed_campaign_and_actor["actor_id"],
+            action="wait",
+        )
+        assert out is not None
+
+        with session_factory() as session:
+            campaign_row = session.get(Campaign, campaign.id)
+            campaign_state = json.loads(campaign_row.state_json or "{}")
+            assert campaign_state.get("game_time") == {"day": 100, "hour": 12, "minute": 0}
+
+            player_one_row = (
+                session.query(Player)
+                .filter(Player.campaign_id == campaign.id)
+                .filter(Player.actor_id == seed_campaign_and_actor["actor_id"])
+                .one()
+            )
+            player_one_state = json.loads(player_one_row.state_json or "{}")
+            assert player_one_state.get("game_time", {}).get("day") == 3
+            assert player_one_state.get("game_time", {}).get("hour") == 9
+            assert player_one_state.get("game_time", {}).get("minute") == 30
+            assert player_one_state.get("game_time", {}).get("day_of_week") == "friday"
+            assert "Friday, Day 3" in str(player_one_state.get("game_time", {}).get("date_label") or "")
+
+            player_two_row = (
+                session.query(Player)
+                .filter(Player.campaign_id == campaign.id)
+                .filter(Player.actor_id == "actor-2")
+                .one()
+            )
+            player_two_state = json.loads(player_two_row.state_json or "{}")
+            assert player_two_state.get("game_time") == {"day": 7, "hour": 14, "minute": 0}
+
+    asyncio.run(run_test())
+
+
+def test_individual_clocks_personal_progress_inherits_campaign_speed_and_weekday(
+    session_factory,
+    seed_campaign_and_actor,
+):
+    async def run_test():
+        llm = StubLLM(
+            LLMTurnOutput(
+                narration="You pause and take stock.",
+                state_update={},
+                player_state_update={"room_summary": "Still in the apartment."},
+            )
+        )
+        engine = GameEngine(
+            uow_factory=lambda: SQLAlchemyUnitOfWork(session_factory),
+            llm=llm,
+        )
+        compat = ZorkEmulator(game_engine=engine, session_factory=session_factory)
+        campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
+        compat.get_or_create_player(campaign.id, seed_campaign_and_actor["actor_id"])
+
+        with session_factory() as session:
+            campaign_row = session.get(Campaign, campaign.id)
+            campaign_row.state_json = compat._dump_json(
+                {
+                    "time_model": "individual_clocks",
+                    "calendar_policy": "consequential",
+                    "clock_start_day_of_week": "wednesday",
+                    "speed_multiplier": 0.1,
+                    "game_time": {"day": 100, "hour": 12, "minute": 0},
+                }
+            )
+            player_one_row = (
+                session.query(Player)
+                .filter(Player.campaign_id == campaign.id)
+                .filter(Player.actor_id == seed_campaign_and_actor["actor_id"])
+                .one()
+            )
+            player_one_row.state_json = compat._dump_json(
+                {
+                    "character_name": "Rigby Krinkle",
+                    "location": "queens-apartment",
+                    "room_title": "Queens Apartment",
+                    "game_time": {"day": 3, "hour": 9, "minute": 0},
+                }
+            )
+            session.commit()
+
+        out = await compat.play_action(
+            campaign_id=campaign.id,
+            actor_id=seed_campaign_and_actor["actor_id"],
+            action="look",
+        )
+        assert out is not None
+
+        with session_factory() as session:
+            player_one_row = (
+                session.query(Player)
+                .filter(Player.campaign_id == campaign.id)
+                .filter(Player.actor_id == seed_campaign_and_actor["actor_id"])
+                .one()
+            )
+            player_one_state = json.loads(player_one_row.state_json or "{}")
+            assert player_one_state.get("game_time", {}).get("day") == 3
+            assert player_one_state.get("game_time", {}).get("hour") == 9
+            assert player_one_state.get("game_time", {}).get("minute") == 2
+            assert player_one_state.get("game_time", {}).get("day_of_week") == "friday"
+            assert "Friday, Day 3" in str(player_one_state.get("game_time", {}).get("date_label") or "")
+
+    asyncio.run(run_test())
+
+
 def test_calendar_update_keeps_overdue_and_requires_explicit_remove(
     session_factory, seed_campaign_and_actor
 ):
@@ -3710,6 +3997,90 @@ def test_calendar_update_participants_auto_target_acting_player(
     assert add_rows[0]["target_players"] == [seed_campaign_and_actor["actor_id"]]
 
 
+def test_calendar_for_prompt_loose_policy_rolls_personal_event_forward(session_factory):
+    compat = _build_compat(session_factory)
+    campaign_state = {
+        "time_model": "shared_clock",
+        "calendar_policy": "loose",
+        "game_time": {"day": 10, "hour": 12},
+        "calendar": [
+            {
+                "name": "Dinner with Simone",
+                "fire_day": 9,
+                "fire_hour": 18,
+                "target_players": ["actor-1"],
+            }
+        ],
+    }
+    player_state = {"character_name": "Rigby Krinkle"}
+
+    entries = compat._calendar_for_prompt(
+        campaign_state,
+        player_state=player_state,
+        viewer_actor_id="actor-1",
+    )
+
+    assert len(entries) == 1
+    assert entries[0]["fire_day"] == 10
+    assert entries[0]["hours_remaining"] >= 0
+    assert entries[0]["status"] in {"today", "imminent", "upcoming"}
+    assert campaign_state["calendar"][0]["fire_day"] == 10
+
+    stale_state = {
+        "time_model": "shared_clock",
+        "calendar_policy": "loose",
+        "game_time": {"day": 400, "hour": 12},
+        "calendar": [
+            {
+                "name": "Very Old Appointment",
+                "fire_day": 10,
+                "fire_hour": 18,
+                "target_players": ["actor-1"],
+            }
+        ],
+    }
+    stale_entries = compat._calendar_for_prompt(
+        stale_state,
+        player_state=player_state,
+        viewer_actor_id="actor-1",
+    )
+    assert len(stale_entries) == 1
+    assert stale_entries[0]["fire_day"] == 400
+    assert stale_entries[0]["hours_remaining"] >= 0
+    assert stale_state["calendar"][0]["fire_day"] == 400
+
+
+def test_calendar_for_prompt_individual_clocks_uses_personal_time_for_targeted_event(session_factory):
+    compat = _build_compat(session_factory)
+    campaign_state = {
+        "time_model": "individual_clocks",
+        "calendar_policy": "consequential",
+        "game_time": {"day": 30, "hour": 12},
+        "calendar": [
+            {
+                "name": "Study session with Penny",
+                "fire_day": 5,
+                "fire_hour": 19,
+                "target_players": ["actor-1"],
+            }
+        ],
+    }
+    player_state = {
+        "character_name": "Rigby Krinkle",
+        "game_time": {"day": 4, "hour": 18},
+    }
+
+    entries = compat._calendar_for_prompt(
+        campaign_state,
+        player_state=player_state,
+        viewer_actor_id="actor-1",
+    )
+
+    assert len(entries) == 1
+    assert entries[0]["status"] in {"today", "imminent", "upcoming"}
+    assert entries[0]["hours_remaining"] > 0
+
+
 def test_legacy_setup_signatures(session_factory, seed_campaign_and_actor):
     async def run_test():
         compat = _build_compat(
@@ -3740,9 +4111,17 @@ def test_legacy_setup_signatures(session_factory, seed_campaign_and_actor):
         )
         assert "campaign structure" in structure_msg.lower()
 
-        genre_msg = await compat.handle_setup_message(
+        calendar_msg = await compat.handle_setup_message(
             ctx,
             "character-centric",
+            campaign,
+            command_prefix="!",
+        )
+        assert "time and personal calendar events" in calendar_msg.lower()
+
+        genre_msg = await compat.handle_setup_message(
+            ctx,
+            "consequential-calendar",
             campaign,
             command_prefix="!",
         )

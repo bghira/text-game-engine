@@ -28,6 +28,8 @@ class GameEngine:
     DEFAULT_TURN_ADVANCE_MINUTES = 20
     MAX_TURN_ADVANCE_MINUTES = 180
     CLOCK_START_DAY_OF_WEEK_KEY = "clock_start_day_of_week"
+    TIME_MODEL_SHARED_CLOCK = "shared_clock"
+    TIME_MODEL_INDIVIDUAL_CLOCKS = "individual_clocks"
     WEEKDAY_NAMES = (
         "monday",
         "tuesday",
@@ -725,9 +727,18 @@ class GameEngine:
             campaign_state = parse_json_dict(campaign.state_json)
             campaign_characters = parse_json_dict(campaign.characters_json)
             player_state = parse_json_dict(player.state_json)
-            pre_turn_game_time = self._extract_game_time_snapshot(context.campaign_state)
+            time_model = self._time_model_from_state(campaign_state)
+            if time_model == self.TIME_MODEL_INDIVIDUAL_CLOCKS:
+                pre_turn_game_time = self._extract_game_time_snapshot({"game_time": player_state.get("game_time") or campaign_state.get("game_time") or {}})
+            else:
+                pre_turn_game_time = self._extract_game_time_snapshot(context.campaign_state)
 
             campaign_state_update = dict(llm_output.state_update or {})
+            personal_game_time_update = (
+                campaign_state_update.pop("game_time", None)
+                if time_model == self.TIME_MODEL_INDIVIDUAL_CLOCKS
+                else None
+            )
             campaign_state_update = self._normalize_story_progress_update(
                 campaign_state,
                 campaign_state_update,
@@ -793,12 +804,13 @@ class GameEngine:
                 calendar_update,
                 resolution_context=resolution_context,
             )
-            campaign_state = self._ensure_game_time_progress(
-                campaign_state,
-                pre_turn_game_time,
-                action_text=turn_input.action,
-                narration_text=llm_output.narration or "",
-            )
+            if time_model != self.TIME_MODEL_INDIVIDUAL_CLOCKS:
+                campaign_state = self._ensure_game_time_progress(
+                    campaign_state,
+                    pre_turn_game_time,
+                    action_text=turn_input.action,
+                    narration_text=llm_output.narration or "",
+                )
 
             # --- Dice / Puzzle / Minigame Phase C processing ---
             player_attributes = parse_json_dict(player.attributes_json) if player.attributes_json else {}
@@ -835,7 +847,33 @@ class GameEngine:
                 campaign_state_update,
             )
             raw_player_update = llm_output.player_state_update or {}
-            if isinstance(raw_player_update, dict):
+            if not isinstance(raw_player_update, dict):
+                raw_player_update = {}
+            if time_model == self.TIME_MODEL_INDIVIDUAL_CLOCKS:
+                personal_time_state = {
+                    "time_model": time_model,
+                    self.CLOCK_START_DAY_OF_WEEK_KEY: campaign_state.get(
+                        self.CLOCK_START_DAY_OF_WEEK_KEY
+                    ),
+                    "speed_multiplier": campaign_state.get("speed_multiplier"),
+                }
+                personal_time_state["game_time"] = (
+                    personal_game_time_update
+                    if isinstance(personal_game_time_update, dict)
+                    else player_state.get("game_time")
+                    or campaign_state.get("game_time")
+                    or {}
+                )
+                personal_time_state = self._ensure_game_time_progress(
+                    personal_time_state,
+                    pre_turn_game_time,
+                    action_text=turn_input.action,
+                    narration_text=llm_output.narration or "",
+                )
+                game_time_now = personal_time_state.get("game_time")
+                if isinstance(game_time_now, dict) and game_time_now:
+                    raw_player_update.setdefault("game_time", game_time_now)
+            else:
                 game_time_now = campaign_state.get("game_time")
                 if isinstance(game_time_now, dict) and game_time_now:
                     raw_player_update.setdefault("game_time", game_time_now)
@@ -854,7 +892,12 @@ class GameEngine:
                 player_state["character_name"] = str(
                     _cn.get("name") or _cn.get("character_name") or ""
                 ).strip() or str(_cn)
-            post_turn_game_time = self._extract_game_time_snapshot(campaign_state)
+            if time_model == self.TIME_MODEL_INDIVIDUAL_CLOCKS:
+                post_turn_game_time = self._extract_game_time_snapshot(
+                    {"game_time": player_state.get("game_time") or campaign_state.get("game_time") or {}}
+                )
+            else:
+                post_turn_game_time = self._extract_game_time_snapshot(campaign_state)
             actor_location_key = self._room_key_from_state(player_state)
             turn_visibility = self._normalize_turn_visibility(
                 turn_input.actor_id,
@@ -945,7 +988,11 @@ class GameEngine:
                 turn_input.campaign_id,
                 turn_input.actor_id,
                 dict(getattr(llm_output, "other_player_state_updates", {}) or {}),
-                game_time_update=post_turn_game_time if isinstance(post_turn_game_time, dict) else None,
+                game_time_update=(
+                    post_turn_game_time
+                    if time_model != self.TIME_MODEL_INDIVIDUAL_CLOCKS and isinstance(post_turn_game_time, dict)
+                    else None
+                ),
                 player_state_sanitizer=self._player_state_sanitizer,
                 action_text=turn_input.action,
                 narration_text=narration,
@@ -2123,6 +2170,13 @@ class GameEngine:
         if value <= 0:
             return 1.0
         return max(0.1, min(10.0, value))
+
+    @classmethod
+    def _time_model_from_state(cls, campaign_state: dict[str, Any] | None) -> str:
+        raw = str((campaign_state or {}).get("time_model") or "").strip().lower()
+        if raw == cls.TIME_MODEL_INDIVIDUAL_CLOCKS:
+            return cls.TIME_MODEL_INDIVIDUAL_CLOCKS
+        return cls.TIME_MODEL_SHARED_CLOCK
 
     @classmethod
     def _estimate_turn_time_advance_minutes(cls, action_text: str, narration_text: str) -> int:
