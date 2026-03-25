@@ -12505,6 +12505,9 @@ class ZorkEmulator:
             self.AUTOBIOGRAPHY_LAST_COMPRESSED_TURN_FIELD,
             "evolving_personality",
             "created",
+            "compact",
+            "expanded",
+            "priority",
         }
         current_day = self._coerce_non_negative_int(
             self._extract_game_time_snapshot(campaign_state or {}).get("day"),
@@ -12595,6 +12598,9 @@ class ZorkEmulator:
             "evolving_personality",
             "created",
             "relationship",
+            "compact",
+            "expanded",
+            "priority",
         }
         top_level_keys = {"name", "location", "location_last_updated", "current_status"}
         current_day = self._coerce_non_negative_int(

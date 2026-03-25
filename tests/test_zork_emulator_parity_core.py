@@ -520,6 +520,34 @@ def test_character_updates_stamp_harness_managed_location_last_updated():
     }
 
 
+def test_state_to_roster_sync_stamps_location_last_updated_on_location_change():
+    synced, changed = GameEngine._sync_npc_locations_from_state_to_roster(
+        {
+            "kowalski": {
+                "name": "Kowalski",
+                "location": "nyu-tisch-lighting-lab",
+                "current_status": "Watching the setup.",
+                "location_last_updated": {"day": 1, "hour": 1, "loc": "nyu-tisch-lighting-lab"},
+            }
+        },
+        {
+            "kowalski": {
+                "location": "soundstage-back-lot",
+                "current_status": "Smoking behind the grip truck.",
+            }
+        },
+        game_time={"day": 14, "hour": 16, "minute": 30},
+    )
+    assert changed == 2
+    assert synced["kowalski"]["location"] == "soundstage-back-lot"
+    assert synced["kowalski"]["location_last_updated"] == {
+        "day": 14,
+        "hour": 16,
+        "minute": 30,
+        "loc": "soundstage-back-lot",
+    }
+
+
 def test_json_parsing_helpers(session_factory, seed_campaign_and_actor):
     compat = _build_compat(session_factory)
 
@@ -1038,6 +1066,76 @@ def test_build_prompt_character_index_carries_roster_criticals_while_cards_stay_
     assert gwen_card["expanded"].get("speech_style") is None
 
 
+def test_build_prompt_hides_internal_card_shape_keys_from_character_cards(
+    session_factory,
+    seed_campaign_and_actor,
+):
+    compat = _build_compat(session_factory)
+    campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
+    player = compat.get_or_create_player(seed_campaign_and_actor["campaign_id"], seed_campaign_and_actor["actor_id"])
+    with session_factory() as session:
+        row = session.get(Campaign, seed_campaign_and_actor["campaign_id"])
+        row.characters_json = json.dumps(
+            {
+                "penny-reynolds": {
+                    "name": "Penny Reynolds",
+                    "age": "18",
+                    "gender": "cis-female",
+                    "location": "tony-condo-interior",
+                    "current_status": "At the table, waiting.",
+                    "relationships": {"tony": {"dynamic": "family by choice"}},
+                    "compact": {
+                        "relationships": "{\"tony\": {\"dynamic\": \"family by choice\"}}",
+                    },
+                    "expanded": {
+                        "relationships": {"tony": {"dynamic": "family by choice"}},
+                    },
+                    "priority": {
+                        "relationships": "critical",
+                    },
+                }
+            }
+        )
+        player_row = (
+            session.query(Player)
+            .filter(Player.campaign_id == seed_campaign_and_actor["campaign_id"])
+            .filter(Player.actor_id == seed_campaign_and_actor["actor_id"])
+            .one()
+        )
+        player_state = json.loads(player_row.state_json or "{}")
+        player_state["location"] = "tony-condo-interior"
+        player_state["room_title"] = "Tony Condo Interior"
+        player_state["room_summary"] = "Dining table, low light."
+        player_row.state_json = json.dumps(player_state)
+        session.commit()
+
+    turns = compat.get_recent_turns(seed_campaign_and_actor["campaign_id"])
+    _system_prompt, user_prompt = compat.build_prompt(campaign, player, "look", turns)
+
+    index_match = re.search(r"CHARACTER_INDEX:\s*(\[.*?\])\nCHARACTER_CARDS:", user_prompt, re.DOTALL)
+    assert index_match is not None
+    character_index = json.loads(index_match.group(1))
+    penny_index = next(row for row in character_index if row.get("slug") == "penny-reynolds")
+    assert "compact" not in penny_index["available_keys"]
+    assert "expanded" not in penny_index["available_keys"]
+    assert "priority" not in penny_index["available_keys"]
+
+    cards_match = re.search(r"CHARACTER_CARDS:\s*(\[.*?\])\nLOCATION_INDEX:", user_prompt, re.DOTALL)
+    assert cards_match is not None
+    character_cards = json.loads(cards_match.group(1))
+    penny_card = next(row for row in character_cards if row.get("slug") == "penny-reynolds")
+    assert "compact" not in penny_card["available_keys"]
+    assert "expanded" not in penny_card["available_keys"]
+    assert "priority" not in penny_card["available_keys"]
+    assert penny_card["compact"].get("compact") is None
+    assert penny_card["compact"].get("expanded") is None
+    assert penny_card["compact"].get("priority") is None
+    assert penny_card["expanded"].get("compact") is None
+    assert penny_card["expanded"].get("expanded") is None
+    assert penny_card["expanded"].get("priority") is None
+    assert '"compact": "{' not in cards_match.group(1)
+
+
 def test_build_prompt_excludes_real_player_characters_from_npc_prompt_blocks(
     session_factory,
     seed_campaign_and_actor,
@@ -1401,6 +1499,197 @@ def test_ready_to_write_finalization_uses_final_stage_system_prompt(
         assert "make those beats cover the full span implied by state_update.game_time" in completion.calls[1]["system_prompt"]
         assert "follow TURN_TIME_BEAT_GUIDANCE for the current minimum span" in completion.calls[1]["system_prompt"]
         assert '"kind":"turn"' not in completion.calls[1]["prompt"]
+
+    asyncio.run(run_test())
+
+
+def test_ready_to_write_lcd_backfills_older_shared_turns_after_solo_gap(
+    session_factory,
+    seed_campaign_and_actor,
+):
+    class LcdBackfillCompletionPort:
+        def __init__(self):
+            self.calls = []
+
+        async def complete(self, system_prompt, prompt, *, temperature=0.8, max_tokens=2048):
+            self.calls.append({"system_prompt": system_prompt, "prompt": prompt})
+            if len(self.calls) == 1:
+                return '{"tool_call":"ready_to_write","speakers":["penny-reynolds"],"listeners":["tony"]}'
+            return (
+                '{"reasoning":"finalized","narration":"Final scene.","state_update":{"game_time":{"day":3657,"hour":20,"minute":0,"day_of_week":"tuesday","period":"evening","date_label":"Tuesday, Day 3657, Evening"}},"summary_update":"done"}'
+            )
+
+    async def run_test():
+        completion = LcdBackfillCompletionPort()
+        engine = GameEngine(
+            uow_factory=lambda: SQLAlchemyUnitOfWork(session_factory),
+            llm=StubLLM(LLMTurnOutput(narration="unused")),
+        )
+        compat = ZorkEmulator(engine, session_factory, completion_port=completion)
+        tool_llm = ToolAwareZorkLLM(
+            session_factory=session_factory,
+            completion_port=completion,
+            temperature=0.8,
+            max_tokens=2048,
+        )
+        tool_llm.bind_emulator(compat)
+
+        campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
+        player = compat.get_or_create_player(campaign.id, seed_campaign_and_actor["actor_id"])
+
+        with session_factory() as session:
+            row = session.get(Campaign, campaign.id)
+            row.characters_json = json.dumps(
+                {
+                    "penny-reynolds": {
+                        "name": "Penny Reynolds",
+                        "location": "tony-condo-interior",
+                        "current_status": "At the table.",
+                    }
+                }
+            )
+            player_row = session.get(Player, player.id)
+            player_state = json.loads(player_row.state_json or "{}")
+            player_state["character_name"] = "Tony"
+            player_state["location"] = "tony-condo-interior"
+            player_state["room_title"] = "Tony Condo Interior"
+            player_state["room_summary"] = "Candles on the counter."
+            player_row.state_json = json.dumps(player_state)
+
+            session.add(
+                Turn(
+                    campaign_id=campaign.id,
+                    session_id=None,
+                    actor_id=player.actor_id,
+                    kind="narrator",
+                    content="Older shared beat",
+                    meta_json=json.dumps(
+                        {
+                            "game_time": {"day": 3657, "hour": 18, "minute": 15},
+                            "visibility": {
+                                "scope": "local",
+                                "actor_player_slug": "tony",
+                                "location_key": "tony-condo-interior",
+                            },
+                            "scene_output": {
+                                "beats": [
+                                    {
+                                        "type": "npc_dialogue",
+                                        "speaker": "penny-reynolds",
+                                        "actors": ["penny-reynolds"],
+                                        "listeners": ["tony"],
+                                        "visibility": "local",
+                                        "text": "Older shared beat with Penny.",
+                                    }
+                                ]
+                            },
+                            "location_key": "tony-condo-interior",
+                        }
+                    ),
+                )
+            )
+
+            for idx in range(30):
+                session.add(
+                    Turn(
+                        campaign_id=campaign.id,
+                        session_id=None,
+                        actor_id=player.actor_id,
+                        kind="narrator",
+                        content=f"Solo gap beat {idx}",
+                        meta_json=json.dumps(
+                            {
+                                "game_time": {"day": 3657, "hour": 18, "minute": 20 + idx},
+                                "visibility": {
+                                    "scope": "local",
+                                    "actor_player_slug": "tony",
+                                    "location_key": "tony-condo-interior",
+                                },
+                                "scene_output": {
+                                    "beats": [
+                                        {
+                                            "type": "action",
+                                            "speaker": "tony",
+                                            "actors": ["tony"],
+                                            "listeners": [],
+                                            "visibility": "local",
+                                            "text": f"Solo gap beat {idx}.",
+                                        }
+                                    ]
+                                },
+                                "location_key": "tony-condo-interior",
+                            }
+                        ),
+                    )
+                )
+
+            session.add(
+                Turn(
+                    campaign_id=campaign.id,
+                    session_id=None,
+                    actor_id=player.actor_id,
+                    kind="narrator",
+                    content="Recent shared beat",
+                    meta_json=json.dumps(
+                        {
+                            "game_time": {"day": 3657, "hour": 19, "minute": 55},
+                            "visibility": {
+                                "scope": "local",
+                                "actor_player_slug": "tony",
+                                "location_key": "tony-condo-interior",
+                            },
+                            "scene_output": {
+                                "beats": [
+                                    {
+                                        "type": "npc_dialogue",
+                                        "speaker": "penny-reynolds",
+                                        "actors": ["penny-reynolds"],
+                                        "listeners": ["tony"],
+                                        "visibility": "local",
+                                        "text": "Recent shared beat with Penny.",
+                                    }
+                                ]
+                            },
+                            "location_key": "tony-condo-interior",
+                        }
+                    ),
+                )
+            )
+            session.commit()
+
+        turns = compat.get_recent_turns(campaign.id)
+        research_system_prompt, research_user_prompt = compat.build_prompt(
+            campaign,
+            player,
+            "look",
+            turns,
+            prompt_stage=compat.PROMPT_STAGE_RESEARCH,
+        )
+        final_system_prompt, final_user_prompt = compat.build_prompt(
+            campaign,
+            player,
+            "look",
+            turns,
+            prompt_stage=compat.PROMPT_STAGE_FINAL,
+        )
+
+        payload = await tool_llm._resolve_payload(
+            campaign.id,
+            seed_campaign_and_actor["actor_id"],
+            "look",
+            research_system_prompt,
+            research_user_prompt,
+            final_system_prompt,
+            final_user_prompt,
+        )
+
+        assert payload is not None
+        lcd_prompt = completion.calls[1]["prompt"]
+        assert "RECENT_TURNS_LCD:" in lcd_prompt
+        assert "Older shared beat with Penny." in lcd_prompt
+        assert "Recent shared beat with Penny." in lcd_prompt
+        assert "Solo gap beat 0." not in lcd_prompt
+        assert "Solo gap beat 29." not in lcd_prompt
 
     asyncio.run(run_test())
 
@@ -5221,6 +5510,54 @@ def test_song_search_tool_posts_channel_link(monkeypatch, session_factory, seed_
     assert "For the walk home." in sent["message"]
     assert "Just Like Heaven - The Cure" in sent["message"]
     assert "https://www.youtube.com/watch?v=test-song" in sent["message"]
+
+
+def test_song_search_tool_falls_back_to_youtube_results_url_on_lookup_failure(
+    monkeypatch,
+    session_factory,
+    seed_campaign_and_actor,
+):
+    notification_port = StubNotificationPort()
+    compat = _build_compat(session_factory, notification_port=notification_port)
+
+    monkeypatch.setattr(
+        "text_game_engine.tool_aware_llm._search_youtube_first_result",
+        lambda query: {
+            "title": query,
+            "channel": "",
+            "url": "https://www.youtube.com/results?search_query=Rush+YYZ",
+        },
+    )
+
+    completion = StubCompletionPort()
+    tool_llm = ToolAwareZorkLLM(
+        session_factory=session_factory,
+        completion_port=completion,
+        temperature=0.8,
+        max_tokens=2048,
+    )
+    tool_llm.bind_emulator(compat)
+
+    campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
+
+    async def run_test():
+        result = await tool_llm._execute_tool_call(
+            campaign.id,
+            {
+                "tool_call": "song_search",
+                "query": "Rush YYZ",
+            },
+            actor_id=seed_campaign_and_actor["actor_id"],
+        )
+        assert "SONG_SEARCH_RESULT:" in result
+        assert '"delivered":true' in result.lower()
+
+    asyncio.run(run_test())
+
+    assert len(notification_port.channel_messages) == 1
+    sent = notification_port.channel_messages[0]["message"]
+    assert "Rush YYZ" in sent
+    assert "https://www.youtube.com/results?search_query=Rush+YYZ" in sent
 
 
 def test_tool_calls_song_search_executed_in_complete_turn(

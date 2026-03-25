@@ -7,7 +7,7 @@ import re
 from datetime import UTC, datetime
 from fnmatch import fnmatch
 from typing import Any, Callable
-from urllib.parse import urlparse
+from urllib.parse import quote_plus, urlparse
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +31,11 @@ def _search_youtube_first_result(query: str) -> dict[str, str] | None:
     try:
         import yt_dlp
     except Exception:
-        return None
+        return {
+            "title": text,
+            "url": f"https://www.youtube.com/results?search_query={quote_plus(text)}",
+            "channel": "",
+        }
 
     opts = {
         "quiet": True,
@@ -44,7 +48,11 @@ def _search_youtube_first_result(query: str) -> dict[str, str] | None:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(f"ytsearch1:{text}", download=False)
     except Exception:
-        return None
+        return {
+            "title": text,
+            "url": f"https://www.youtube.com/results?search_query={quote_plus(text)}",
+            "channel": "",
+        }
     if not isinstance(info, dict):
         return None
     entries = info.get("entries")
@@ -72,7 +80,11 @@ def _search_youtube_first_result(query: str) -> dict[str, str] | None:
         ).split()
     ).strip()
     if not url:
-        return None
+        return {
+            "title": title or text,
+            "url": f"https://www.youtube.com/results?search_query={quote_plus(text)}",
+            "channel": channel,
+        }
     return {
         "title": title or text,
         "url": url,
@@ -3213,7 +3225,11 @@ class ToolAwareZorkLLM:
                         "\nFINAL_LOCATION_CARDS: "
                         f"{emulator._dump_json(narrowed_location_cards)}\n"  # noqa: SLF001
                     )
-                turns = emulator.get_recent_turns(campaign_id)
+                recent_turn_limit = max(
+                    int(getattr(emulator, "MAX_RECENT_TURNS", 24) or 24) * 4,
+                    64,
+                )
+                turns = emulator.get_recent_turns(campaign_id, limit=recent_turn_limit)
                 shared_summary = emulator._compose_world_summary(  # noqa: SLF001
                     campaign,
                     campaign_state,

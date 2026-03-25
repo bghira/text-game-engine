@@ -880,6 +880,7 @@ class GameEngine:
             campaign_characters, _ = self._sync_npc_locations_from_state_to_roster(
                 campaign_characters,
                 campaign_state_update,
+                game_time=effective_turn_game_time,
             )
             if self._player_state_sanitizer is not None and isinstance(raw_player_update, dict):
                 raw_player_update = self._player_state_sanitizer(
@@ -1791,11 +1792,15 @@ class GameEngine:
         cls,
         existing: dict[str, Any],
         state_update: dict[str, Any],
+        game_time: dict[str, Any] | None = None,
     ) -> tuple[dict[str, Any], int]:
         merged = dict(existing) if isinstance(existing, dict) else {}
         if not isinstance(state_update, dict) or not merged:
             return merged, 0
         overlay_mutable = {"location", "current_status", "allegiance", "evolving_personality"}
+        location_stamp: dict[str, Any] | None = None
+        if isinstance(game_time, dict) and game_time:
+            location_stamp = cls._extract_game_time_snapshot({"game_time": game_time})
         changed = 0
         for slug, overlay in state_update.items():
             if not isinstance(overlay, dict):
@@ -1806,6 +1811,7 @@ class GameEngine:
             entry = merged[target_slug]
             if not isinstance(entry, dict):
                 continue
+            old_location_raw = str(entry.get("location") or "").strip()
             for field in overlay_mutable:
                 if field not in overlay:
                     continue
@@ -1815,6 +1821,16 @@ class GameEngine:
                 if entry.get(field) != new_val:
                     entry[field] = new_val
                     changed += 1
+            new_location_raw = str(entry.get("location") or "").strip()
+            if (
+                location_stamp
+                and new_location_raw
+                and old_location_raw.lower() != new_location_raw.lower()
+            ):
+                entry["location_last_updated"] = {
+                    **location_stamp,
+                    "loc": new_location_raw,
+                }
         return merged, changed
 
     @classmethod
