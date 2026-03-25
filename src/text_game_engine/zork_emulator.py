@@ -7858,7 +7858,23 @@ class ZorkEmulator:
 
                 return display_narration
             if result.status == "busy":
-                return None
+                timed_event_notice = self.get_timed_event_in_progress_notice(
+                    campaign_id,
+                    actor_id,
+                )
+                if timed_event_notice:
+                    self._logger.warning(
+                        "play_action busy during timed event: campaign=%s actor=%s",
+                        campaign_id,
+                        actor_id,
+                    )
+                    return timed_event_notice
+                self._logger.warning(
+                    "play_action busy with no timed-event notice: campaign=%s actor=%s",
+                    campaign_id,
+                    actor_id,
+                )
+                return "Another turn is already resolving. Please retry."
             if result.status == "conflict":
                 return "The world shifts under your feet. Please try again."
             return f"Engine error: {result.conflict_reason or 'unknown'}"

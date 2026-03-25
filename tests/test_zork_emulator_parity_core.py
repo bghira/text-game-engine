@@ -6,7 +6,7 @@ import json
 import re
 import time
 
-from text_game_engine.core.types import GiveItemInstruction, LLMTurnOutput, TimerInstruction
+from text_game_engine.core.types import GiveItemInstruction, LLMTurnOutput, ResolveTurnResult, TimerInstruction
 from text_game_engine.core.engine import GameEngine
 from text_game_engine.persistence.sqlalchemy.uow import SQLAlchemyUnitOfWork
 from text_game_engine.persistence.sqlalchemy.models import Actor, Campaign, Player, Session as GameSession, Snapshot, Turn
@@ -5203,6 +5203,47 @@ def test_interruptible_timer_can_still_be_averted_during_fire_grace_window(
         assert _channel_id == "chan-1"
         assert _message_id == "msg-1"
         assert "Timer interrupted/averted" in replacement
+
+    asyncio.run(run_test())
+
+
+def test_play_action_busy_returns_timed_event_notice_instead_of_none(
+    uow_factory,
+    session_factory,
+    seed_campaign_and_actor,
+):
+    async def run_test():
+        llm = StubLLM(LLMTurnOutput(narration="unused"))
+        engine = GameEngine(uow_factory=uow_factory, llm=llm)
+        compat = ZorkEmulator(
+            game_engine=engine,
+            session_factory=session_factory,
+        )
+
+        async def _busy_resolve_turn(*args, **kwargs):
+            return ResolveTurnResult(status="busy", conflict_reason="turn_inflight")
+
+        engine.resolve_turn = _busy_resolve_turn  # type: ignore[method-assign]
+        compat._set_timed_event_inflight(
+            seed_campaign_and_actor["campaign_id"],
+            seed_campaign_and_actor["actor_id"],
+            "The vault seals",
+        )
+        try:
+            narration = await compat.play_action(
+                campaign_id=seed_campaign_and_actor["campaign_id"],
+                actor_id=seed_campaign_and_actor["actor_id"],
+                action="run for the door",
+            )
+        finally:
+            compat._clear_timed_event_inflight(
+                seed_campaign_and_actor["campaign_id"],
+                seed_campaign_and_actor["actor_id"],
+            )
+
+        assert narration is not None
+        assert "Timed event in progress" in narration
+        assert "The vault seals" in narration
 
     asyncio.run(run_test())
 
