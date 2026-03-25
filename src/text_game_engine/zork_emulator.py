@@ -8748,6 +8748,60 @@ class ZorkEmulator:
             campaign.updated_at = row.updated_at
         return True
 
+    def get_campaign_clock(self, campaign: Campaign | None) -> Dict[str, object]:
+        if campaign is None:
+            return {}
+        campaign_state = self.get_campaign_state(campaign)
+        snapshot = self._extract_game_time_snapshot(campaign_state)
+        start_day_of_week = self._campaign_start_day_of_week(campaign_state)
+        return self._game_time_from_total_minutes(
+            self._game_time_to_total_minutes(snapshot),
+            start_day_of_week=start_day_of_week,
+        )
+
+    def set_campaign_clock(
+        self,
+        campaign: Campaign | None,
+        *,
+        day: int,
+        hour: int,
+        minute: int = 0,
+        day_of_week: object | None = None,
+    ) -> Dict[str, object] | None:
+        if campaign is None:
+            return None
+        resolved_day = max(1, self._coerce_non_negative_int(day, default=1) or 1)
+        resolved_hour = min(23, max(0, self._coerce_non_negative_int(hour, default=0)))
+        resolved_minute = min(59, max(0, self._coerce_non_negative_int(minute, default=0)))
+        campaign_state = self.get_campaign_state(campaign)
+        if day_of_week is not None and str(day_of_week).strip():
+            requested_weekday = self._normalize_weekday_name(day_of_week)
+            inferred_start = self._infer_start_day_of_week_from_game_time(
+                {
+                    "day": resolved_day,
+                    "day_of_week": requested_weekday,
+                }
+            )
+            if inferred_start:
+                campaign_state[self.CLOCK_START_DAY_OF_WEEK_KEY] = inferred_start
+        start_day_of_week = self._campaign_start_day_of_week(campaign_state)
+        total_minutes = ((resolved_day - 1) * 24 * 60) + (resolved_hour * 60) + resolved_minute
+        canonical = self._game_time_from_total_minutes(
+            total_minutes,
+            start_day_of_week=start_day_of_week,
+        )
+        campaign_state["game_time"] = canonical
+        with self._session_factory() as session:
+            row = session.get(Campaign, campaign.id)
+            if row is None:
+                return None
+            row.state_json = self._dump_json(campaign_state)
+            row.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
+            session.commit()
+            campaign.state_json = row.state_json
+            campaign.updated_at = row.updated_at
+        return canonical
+
     @classmethod
     def normalize_difficulty(cls, value: object) -> str:
         text = " ".join(str(value or "").strip().lower().split())

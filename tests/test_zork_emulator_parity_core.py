@@ -395,6 +395,39 @@ def test_guardrails_onrails_timed_events_toggles(session_factory, seed_campaign_
     assert compat.is_timed_events_enabled(campaign) is False
 
 
+def test_campaign_clock_setter_canonicalizes_and_can_reanchor_weekday(
+    session_factory,
+    seed_campaign_and_actor,
+):
+    compat = _build_compat(session_factory)
+    campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
+
+    updated = compat.set_campaign_clock(
+        campaign,
+        day=2,
+        hour=9,
+        minute=15,
+        day_of_week="thursday",
+    )
+    assert isinstance(updated, dict)
+    assert updated.get("day") == 2
+    assert updated.get("hour") == 9
+    assert updated.get("minute") == 15
+    assert updated.get("day_of_week") == "thursday"
+    assert "Thursday, Day 2" in str(updated.get("date_label") or "")
+
+    current = compat.get_campaign_clock(campaign)
+    assert current.get("day_of_week") == "thursday"
+    assert current.get("hour") == 9
+    assert current.get("minute") == 15
+
+    with session_factory() as session:
+        row = session.get(Campaign, campaign.id)
+        state = json.loads(row.state_json or "{}")
+        assert state.get("clock_start_day_of_week") == "wednesday"
+        assert state.get("game_time", {}).get("day_of_week") == "thursday"
+
+
 def test_json_parsing_helpers(session_factory, seed_campaign_and_actor):
     compat = _build_compat(session_factory)
 
