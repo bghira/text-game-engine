@@ -9,7 +9,7 @@ import time
 from text_game_engine.core.types import GiveItemInstruction, LLMTurnOutput, ResolveTurnResult, TimerInstruction
 from text_game_engine.core.engine import GameEngine
 from text_game_engine.persistence.sqlalchemy.uow import SQLAlchemyUnitOfWork
-from text_game_engine.persistence.sqlalchemy.models import Actor, Campaign, Player, Session as GameSession, Snapshot, Turn
+from text_game_engine.persistence.sqlalchemy.models import Actor, Campaign, Player, Session as GameSession, Snapshot, Timer, Turn
 from text_game_engine.tool_aware_llm import DeterministicLLM, ToolAwareZorkLLM
 from text_game_engine.zork_emulator import ZorkEmulator
 
@@ -5285,6 +5285,17 @@ def test_timed_events_speed_multiplier_scales_timer_delay_and_rendered_line(
         assert pending is not None
         # 120s / 2.0 speed = 60s, then realtime compression (* 0.2) = 12s
         assert int(pending.get("delay", 0)) == 12
+
+        with session_factory() as session:
+            timer_row = (
+                session.query(Timer)
+                .filter(Timer.campaign_id == campaign.id)
+                .order_by(Timer.created_at.desc())
+                .first()
+            )
+            assert timer_row is not None
+            due_delta = (timer_row.due_at - datetime.now(timezone.utc).replace(tzinfo=None)).total_seconds()
+            assert 5 <= due_delta <= 18
 
         timer_match = re.search(r"<t:(\d+):F>", narration)
         assert timer_match is not None

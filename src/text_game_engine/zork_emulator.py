@@ -9245,11 +9245,27 @@ class ZorkEmulator:
         interrupt_scope: str = "global",
         interrupt_actor_id: str | None = None,
     ) -> None:
+        effective_delay = max(0, int(delay_seconds or 0))
+        actual_due_at = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(
+            seconds=effective_delay
+        )
+        with self._session_factory() as session:
+            timer = (
+                session.query(Timer)
+                .filter_by(campaign_id=campaign_id)
+                .filter(Timer.status.in_(["scheduled_unbound", "scheduled_bound"]))
+                .order_by(Timer.created_at.desc())
+                .first()
+            )
+            if timer is not None:
+                timer.due_at = actual_due_at
+                timer.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
+                session.commit()
         task = asyncio.create_task(
             self._timer_task(
                 campaign_id,
                 channel_id,
-                delay_seconds,
+                effective_delay,
                 event_description,
             )
         )
@@ -9258,7 +9274,7 @@ class ZorkEmulator:
             "channel_id": channel_id,
             "message_id": None,
             "event": event_description,
-            "delay": delay_seconds,
+            "delay": effective_delay,
             "interruptible": interruptible,
             "interrupt_action": interrupt_action,
             "interrupt_scope": self._normalize_timer_interrupt_scope(interrupt_scope),
