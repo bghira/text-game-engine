@@ -5149,6 +5149,64 @@ def test_timer_task_edits_line_to_expired_warning(
     asyncio.run(run_test())
 
 
+def test_interruptible_timer_can_still_be_averted_during_fire_grace_window(
+    uow_factory,
+    session_factory,
+    seed_campaign_and_actor,
+):
+    async def run_test():
+        timer_effects = StubTimerEffects()
+        llm = StubLLM(LLMTurnOutput(narration="ok"))
+        engine = GameEngine(uow_factory=uow_factory, llm=llm)
+        compat = ZorkEmulator(
+            game_engine=engine,
+            session_factory=session_factory,
+            timer_effects_port=timer_effects,
+        )
+        compat.TIMER_INTERRUPT_GRACE_SECONDS = 0.05
+
+        executed = False
+
+        async def _should_not_execute(*args, **kwargs):
+            nonlocal executed
+            executed = True
+            return None
+
+        compat._execute_timed_event = _should_not_execute  # type: ignore[attr-defined]
+        sleeper = asyncio.create_task(
+            compat._timer_task(
+                seed_campaign_and_actor["campaign_id"],
+                "chan-1",
+                0,
+                "The vault seals",
+            )
+        )
+        compat._pending_timers[seed_campaign_and_actor["campaign_id"]] = {
+            "task": sleeper,
+            "channel_id": "chan-1",
+            "message_id": "msg-1",
+            "event": "The vault seals",
+            "delay": 0,
+            "interruptible": True,
+            "interrupt_action": "You dive through before it closes.",
+        }
+
+        await asyncio.sleep(0.01)
+        cancelled = compat.cancel_pending_timer(seed_campaign_and_actor["campaign_id"])
+        await asyncio.sleep(0.08)
+
+        assert cancelled is not None
+        assert executed is False
+        assert seed_campaign_and_actor["campaign_id"] not in compat._pending_timers
+        assert timer_effects.edits
+        _channel_id, _message_id, replacement = timer_effects.edits[-1]
+        assert _channel_id == "chan-1"
+        assert _message_id == "msg-1"
+        assert "Timer interrupted/averted" in replacement
+
+    asyncio.run(run_test())
+
+
 def test_timed_events_speed_multiplier_scales_timer_delay_and_rendered_line(
     uow_factory,
     session_factory,

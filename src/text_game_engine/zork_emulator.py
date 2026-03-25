@@ -9260,6 +9260,23 @@ class ZorkEmulator:
             await asyncio.sleep(delay_seconds)
         except asyncio.CancelledError:
             return
+        timer_ctx = self._pending_timers.get(campaign_id)
+        if timer_ctx is None:
+            return
+        grace_seconds = 0.0
+        if bool(timer_ctx.get("interruptible", True)):
+            try:
+                grace_seconds = max(
+                    0.0,
+                    float(getattr(self, "TIMER_INTERRUPT_GRACE_SECONDS", 0.0) or 0.0),
+                )
+            except (TypeError, ValueError):
+                grace_seconds = 0.0
+        if grace_seconds > 0:
+            try:
+                await asyncio.sleep(grace_seconds)
+            except asyncio.CancelledError:
+                return
         timer_ctx = self._pending_timers.pop(campaign_id, None)
         if timer_ctx:
             msg_id = timer_ctx.get("message_id")
