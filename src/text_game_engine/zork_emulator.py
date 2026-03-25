@@ -103,7 +103,7 @@ class ZorkEmulator:
     XP_PER_LEVEL = 50
     ATTENTION_WINDOW_SECONDS = 600
     IMMUTABLE_CHARACTER_FIELDS: set = frozenset({
-        "name", "age", "gender", "personality", "background", "appearance", "speech_style",
+        "name", "age", "gender", "personality", "background", "appearance", "speech_style", "location_last_updated",
     })
     ATTACHMENT_MAX_BYTES = 500_000
     ATTACHMENT_CHUNK_TOKENS = 50_000
@@ -769,6 +769,8 @@ class ZorkEmulator:
         "Relationship nuance rule: do not assume every partnered NPC is automatically loyal, transparent, or stable. "
         "Usually relationship behavior should align with the rest of the character's profile and background; rarely, when other traits clearly support it, a character may be flaky, evasive, dishonest, or unfaithful with a partner. "
         "If you choose that, ground it in the broader character build instead of adding it as random spice.\n"
+        "The harness manages location_last_updated whenever an NPC's location changes. Do NOT include location_last_updated in character_updates.\n"
+        "Research continuity rule: if an NPC's location_last_updated is many in-world days behind CURRENT_GAME_TIME and nothing recent anchors them where they are, you may quietly refresh their location/current_status to a plausible off-screen state that fits their background, obligations, and current plot pressure. Do this sparingly; do NOT move scene-bound NPCs just to make the roster feel busy.\n"
         "Examples:\n"
         "  Create NPC: {\"character_updates\": {\"wren\": {\"name\": \"Wren\", \"age\": \"34\", \"gender\": \"cis-female\", \"personality\": \"Guarded, observant, dry.\", \"background\": \"Former hotel manager pulled into the expedition.\", \"appearance\": \"Lean woman in a weather-stained blazer, dark braid, sharp eyes, practical shoes, realistic style.\", \"speech_style\": \"Short sentences. Dry humor. Avoids sentiment.\", \"location\": \"jekyll-castle-east-annex-laboratory\", \"current_status\": \"Watching the doorway.\", \"allegiance\": \"self\", \"relationship\": \"wary ally\"}}}\n"
         "  Update NPC location/status: {\"character_updates\": {\"wren\": {\"location\": \"jekyll-castle-east-annex-laboratory\", \"current_status\": \"Processing that the castle trip was unnecessary.\", \"allegiance\": \"The expedition, reluctantly.\"}}}\n"
@@ -1326,6 +1328,7 @@ class ZorkEmulator:
         "distinguishing marks, pose, and art style cues. Keep it 1-3 sentences, "
         "70-150 words, vivid and concrete.\n"
         "Do NOT include image_url in character_updates — the harness manages that field.\n"
+        "Do NOT include location_last_updated in character_updates — the harness manages that field.\n"
     )
     FINAL_STAGE_OPERATIONAL_PROMPT = (
         "\nFINALIZATION OPERATIONAL RULES:\n"
@@ -10050,9 +10053,13 @@ class ZorkEmulator:
         existing: Dict[str, dict],
         updates: Dict[str, object],
         on_rails: bool = False,
+        game_time: Dict[str, object] | None = None,
     ) -> Dict[str, dict]:
         if not isinstance(updates, dict):
             return existing
+        location_stamp = None
+        if isinstance(game_time, dict) and game_time:
+            location_stamp = self._extract_game_time_snapshot({"game_time": game_time})
         for raw_slug, fields in updates.items():
             slug = str(raw_slug).strip()
             if not slug:
@@ -10082,13 +10089,29 @@ class ZorkEmulator:
             if not isinstance(fields, dict):
                 continue
             if target_slug in existing:
+                old_location = str(existing[target_slug].get("location") or "").strip().lower()
                 for key, value in fields.items():
                     if key not in self.IMMUTABLE_CHARACTER_FIELDS:
                         existing[target_slug][key] = value
+                new_location_raw = str(existing[target_slug].get("location") or "").strip()
+                new_location = new_location_raw.lower()
+                if location_stamp and new_location_raw and old_location != new_location:
+                    existing[target_slug]["location_last_updated"] = {
+                        **location_stamp,
+                        "loc": new_location_raw,
+                    }
             else:
                 if on_rails:
                     continue
-                existing[slug] = dict(fields)
+                new_entry = dict(fields)
+                new_entry.pop("location_last_updated", None)
+                new_location_raw = str(new_entry.get("location") or "").strip()
+                if location_stamp and new_location_raw:
+                    new_entry["location_last_updated"] = {
+                        **location_stamp,
+                        "loc": new_location_raw,
+                    }
+                existing[slug] = new_entry
         return existing
 
     def _resolve_existing_character_slug(
@@ -12390,6 +12413,7 @@ class ZorkEmulator:
             "age",
             "gender",
             "location",
+            "location_last_updated",
             "current_status",
             "speech_style",
             "relationship",
@@ -12506,6 +12530,7 @@ class ZorkEmulator:
                     "slug": slug,
                     "name": str(entry.get("name") or slug).strip(),
                     "location": source.get("location"),
+                    "location_last_updated": source.get("location_last_updated"),
                     "current_status": source.get("current_status"),
                     "available_keys": available_keys,
                     "critical": critical,
@@ -12557,7 +12582,7 @@ class ZorkEmulator:
             "created",
             "relationship",
         }
-        top_level_keys = {"name", "location", "current_status"}
+        top_level_keys = {"name", "location", "location_last_updated", "current_status"}
         current_day = self._coerce_non_negative_int(
             self._extract_game_time_snapshot(campaign_state or {}).get("day"),
             default=0,
@@ -12617,6 +12642,7 @@ class ZorkEmulator:
                     "slug": slug,
                     "name": str(source.get("name") or entry.get("name") or slug).strip(),
                     "location": source.get("location"),
+                    "location_last_updated": source.get("location_last_updated"),
                     "current_status": source.get("current_status"),
                     "available_keys": sorted(available_keys),
                     "compact": compact,
@@ -12988,6 +13014,7 @@ class ZorkEmulator:
             characters,
             character_updates,
             on_rails=bool(campaign_state.get("on_rails")),
+            game_time=self._extract_game_time_snapshot(normalized_state),
         )
         existing_locations = {}
         raw_locations = normalized_state.get(self.LOCATION_CARDS_STATE_KEY)

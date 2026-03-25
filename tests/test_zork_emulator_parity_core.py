@@ -452,6 +452,44 @@ def test_campaign_clock_type_setter_reuses_setup_mode_mapping(
         assert state.get("calendar_policy") == "loose"
 
 
+def test_character_updates_stamp_harness_managed_location_last_updated():
+    stamped = GameEngine._apply_character_updates(
+        {},
+        {
+            "kowalski": {
+                "name": "Kowalski",
+                "location": "nyu-tisch-lighting-lab",
+                "current_status": "Watching the setup.",
+                "location_last_updated": {"day": 1, "hour": 1, "loc": "wrong-place"},
+            }
+        },
+        game_time={"day": 12, "hour": 14, "minute": 20},
+    )
+    assert stamped["kowalski"]["location_last_updated"] == {
+        "day": 12,
+        "hour": 14,
+        "minute": 20,
+        "loc": "nyu-tisch-lighting-lab",
+    }
+
+    restamped = GameEngine._apply_character_updates(
+        stamped,
+        {
+            "kowalski": {
+                "location": "soundstage-back-lot",
+                "location_last_updated": {"day": 2, "hour": 2, "loc": "still-wrong"},
+            }
+        },
+        game_time={"day": 13, "hour": 9, "minute": 5},
+    )
+    assert restamped["kowalski"]["location_last_updated"] == {
+        "day": 13,
+        "hour": 9,
+        "minute": 5,
+        "loc": "soundstage-back-lot",
+    }
+
+
 def test_json_parsing_helpers(session_factory, seed_campaign_and_actor):
     compat = _build_compat(session_factory)
 
@@ -659,6 +697,7 @@ def test_build_prompt_research_stage_shape(session_factory, seed_campaign_and_ac
     assert "MIN_TURN_ADVANCE_MINUTES_EFFECTIVE" in system_prompt
     assert "STANDARD_TURN_ADVANCE_MINUTES_EFFECTIVE" in system_prompt
     assert "TURN_TIME_BEAT_GUIDANCE" in system_prompt
+    assert "location_last_updated" in system_prompt
     assert "Do NOT output planning prose" in system_prompt
     assert "STANDARD_TURN_ADVANCE_MINUTES_EFFECTIVE minutes per turn" in system_prompt
     assert "TEMPORAL BEAT COVERAGE RULE" in system_prompt
@@ -890,6 +929,7 @@ def test_build_prompt_character_index_carries_roster_criticals_while_cards_stay_
                     "age": "34",
                     "gender": "cis-female",
                     "location": "hotel-lobby",
+                    "location_last_updated": {"day": 12, "hour": 14, "minute": 20, "loc": "hotel-lobby"},
                     "current_status": "Watching the desk.",
                     "speech_style": "Short sentences.",
                     "allegiance": "The configuration.",
@@ -933,6 +973,7 @@ def test_build_prompt_character_index_carries_roster_criticals_while_cards_stay_
     assert gwen_index["critical"]["allegiance"] == "The configuration."
     assert gwen_index["critical"]["age"] == "34"
     assert gwen_index["critical"]["gender"] == "cis-female"
+    assert gwen_index["location_last_updated"] == {"day": 12, "hour": 14, "minute": 20, "loc": "hotel-lobby"}
     assert yasmin_index["critical"]["relationship"] == "Engaged."
     assert yasmin_index["critical"]["speech_style"] == "Sharp and quick."
     assert yasmin_index["critical"]["gender"] == "cis-female"
@@ -961,6 +1002,7 @@ def test_build_prompt_character_index_carries_roster_criticals_while_cards_stay_
     assert {row.get("slug") for row in character_cards} == {"gwen"}
     gwen_card = character_cards[0]
     assert "priority" not in gwen_card
+    assert gwen_card["location_last_updated"] == {"day": 12, "hour": 14, "minute": 20, "loc": "hotel-lobby"}
     assert gwen_card["expanded"]["personality"] == "Professional, observant, wry."
     assert gwen_card["compact"].get("speech_style") is None
     assert gwen_card["expanded"].get("speech_style") is None

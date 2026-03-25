@@ -837,18 +837,10 @@ class GameEngine:
                     }
                     campaign_state.pop("_active_minigame", None)
                     campaign_state.pop("_minigame_result", None)
-            campaign_characters = self._apply_character_updates(
-                campaign_characters,
-                merged_character_updates,
-                on_rails=_on_rails,
-            )
-            campaign_characters, _ = self._sync_npc_locations_from_state_to_roster(
-                campaign_characters,
-                campaign_state_update,
-            )
             raw_player_update = llm_output.player_state_update or {}
             if not isinstance(raw_player_update, dict):
                 raw_player_update = {}
+            effective_turn_game_time: dict[str, Any] | None = None
             if time_model == self.TIME_MODEL_INDIVIDUAL_CLOCKS:
                 personal_time_state = {
                     "time_model": time_model,
@@ -872,11 +864,23 @@ class GameEngine:
                 )
                 game_time_now = personal_time_state.get("game_time")
                 if isinstance(game_time_now, dict) and game_time_now:
+                    effective_turn_game_time = dict(game_time_now)
                     raw_player_update.setdefault("game_time", game_time_now)
             else:
                 game_time_now = campaign_state.get("game_time")
                 if isinstance(game_time_now, dict) and game_time_now:
+                    effective_turn_game_time = dict(game_time_now)
                     raw_player_update.setdefault("game_time", game_time_now)
+            campaign_characters = self._apply_character_updates(
+                campaign_characters,
+                merged_character_updates,
+                on_rails=_on_rails,
+                game_time=effective_turn_game_time,
+            )
+            campaign_characters, _ = self._sync_npc_locations_from_state_to_roster(
+                campaign_characters,
+                campaign_state_update,
+            )
             if self._player_state_sanitizer is not None and isinstance(raw_player_update, dict):
                 raw_player_update = self._player_state_sanitizer(
                     player_state,
@@ -1394,10 +1398,14 @@ class GameEngine:
         existing: dict[str, Any],
         updates: dict[str, Any],
         on_rails: bool = False,
+        game_time: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         merged = dict(existing) if isinstance(existing, dict) else {}
         if not isinstance(updates, dict):
             return merged
+        location_stamp: dict[str, Any] | None = None
+        if isinstance(game_time, dict) and game_time:
+            location_stamp = cls._extract_game_time_snapshot({"game_time": game_time})
         for raw_slug, fields in updates.items():
             slug = str(raw_slug).strip()
             if not slug:
@@ -1429,11 +1437,18 @@ class GameEngine:
                 continue
             if target_slug and target_slug in merged:
                 # Existing character — only accept mutable fields.
-                _IMMUTABLE: set[str] = set()
+                _IMMUTABLE: set[str] = {"location_last_updated"}
                 old_location = str(merged[target_slug].get("location") or "").strip().lower()
                 for key, value in fields.items():
                     if key not in _IMMUTABLE:
                         merged[target_slug][key] = value
+                new_location_raw = str(merged[target_slug].get("location") or "").strip()
+                new_location = new_location_raw.lower()
+                if location_stamp and new_location_raw and old_location != new_location:
+                    merged[target_slug]["location_last_updated"] = {
+                        **location_stamp,
+                        "loc": new_location_raw,
+                    }
                 # If location changed but current_status wasn't updated,
                 # clear the stale status to avoid contradictions.
                 if (
@@ -1448,7 +1463,15 @@ class GameEngine:
                 if on_rails:
                     continue
                 # New character — store everything.
-                merged[slug] = dict(fields)
+                new_entry = dict(fields)
+                new_entry.pop("location_last_updated", None)
+                new_location_raw = str(new_entry.get("location") or "").strip()
+                if location_stamp and new_location_raw:
+                    new_entry["location_last_updated"] = {
+                        **location_stamp,
+                        "loc": new_location_raw,
+                    }
+                merged[slug] = new_entry
         return merged
 
     @classmethod
