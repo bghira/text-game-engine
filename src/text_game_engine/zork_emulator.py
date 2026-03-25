@@ -249,7 +249,7 @@ class ZorkEmulator:
         "preserving all scene image details from scene in image 1"
     )
     TIMER_REALTIME_SCALE = 0.2
-    TIMER_REALTIME_MIN_SECONDS = 60
+    TIMER_REALTIME_MIN_SECONDS = 90
     TIMER_REALTIME_MAX_SECONDS = 120
     TIMER_INTERRUPT_GRACE_SECONDS = 1.0
     PROCESSING_EMOJI = "🤔"
@@ -7719,7 +7719,7 @@ class ZorkEmulator:
                     speed = self.get_timed_events_speed_multiplier(campaign_row)
                     if speed > 0:
                         timer_delay_seconds = int(timer_delay_seconds / speed)
-                    timer_delay_seconds = max(60, min(300, timer_delay_seconds))
+                    timer_delay_seconds = max(90, min(300, timer_delay_seconds))
                     timer_delay_seconds = self._compress_realtime_timer_delay(
                         timer_delay_seconds
                     )

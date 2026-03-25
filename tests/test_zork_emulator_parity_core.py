@@ -5400,7 +5400,7 @@ def test_timed_events_speed_multiplier_scales_timer_delay_and_rendered_line(
         assert pending is not None
         # 120s / 2.0 speed = 60s, then realtime compression would be 12s,
         # but the runtime floor keeps it readable.
-        assert int(pending.get("delay", 0)) == 60
+        assert int(pending.get("delay", 0)) == 90
 
         with session_factory() as session:
             timer_row = (
@@ -5411,13 +5411,13 @@ def test_timed_events_speed_multiplier_scales_timer_delay_and_rendered_line(
             )
             assert timer_row is not None
             due_delta = (timer_row.due_at - datetime.now(timezone.utc).replace(tzinfo=None)).total_seconds()
-            assert 50 <= due_delta <= 85
+            assert 80 <= due_delta <= 115
 
         timer_match = re.search(r"<t:(\d+):R>", narration)
         assert timer_match is not None
         expiry_ts = int(timer_match.group(1))
         delta = expiry_ts - int(time.time())
-        assert 50 <= delta <= 85
+        assert 80 <= delta <= 115
 
         compat.cancel_pending_timer(campaign.id)
 
@@ -5533,7 +5533,7 @@ def test_game_speed_multiplier_no_longer_scales_timer_delay(
         # Game-time speed should not affect realtime timers anymore.
         # 120s at default timed-events speed would compress to 24s, but the
         # runtime floor keeps it readable.
-        assert int(pending.get("delay", 0)) == 60
+        assert int(pending.get("delay", 0)) == 90
 
         compat.cancel_pending_timer(campaign.id)
 
