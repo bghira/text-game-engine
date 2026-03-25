@@ -4701,7 +4701,9 @@ def test_play_action_appends_inventory_and_timer_and_persists(
         )
         assert narration is not None
         assert "Inventory: Lantern" in narration
-        assert "⏰ <t:" in narration
+        assert "⏰ Timer pending: fires <t:" in narration
+        assert " fires <t:" in narration
+        assert ":F> (" in narration
         assert "(act to prevent!)" in narration
 
         with session_factory() as session:
@@ -5006,7 +5008,86 @@ def test_narration_footer_is_stripped_before_persist(
     asyncio.run(run_test())
 
 
-def test_speed_multiplier_scales_timer_delay_and_rendered_line(
+def test_cancel_pending_timer_edits_line_to_interrupted_averted(
+    uow_factory,
+    session_factory,
+    seed_campaign_and_actor,
+):
+    async def run_test():
+        timer_effects = StubTimerEffects()
+        llm = StubLLM(LLMTurnOutput(narration="ok"))
+        engine = GameEngine(uow_factory=uow_factory, llm=llm)
+        compat = ZorkEmulator(
+            game_engine=engine,
+            session_factory=session_factory,
+            timer_effects_port=timer_effects,
+        )
+
+        sleeper = asyncio.create_task(asyncio.sleep(60))
+        compat._pending_timers[seed_campaign_and_actor["campaign_id"]] = {
+            "task": sleeper,
+            "channel_id": "chan-1",
+            "message_id": "msg-1",
+            "event": "The vault seals",
+            "delay": 60,
+            "interruptible": True,
+        }
+        compat.cancel_pending_timer(seed_campaign_and_actor["campaign_id"])
+        await asyncio.sleep(0)
+        assert timer_effects.edits
+        _channel_id, _message_id, replacement = timer_effects.edits[-1]
+        assert _channel_id == "chan-1"
+        assert _message_id == "msg-1"
+        assert "Timer interrupted/averted" in replacement
+        assert "Averted: The vault seals" in replacement
+
+    asyncio.run(run_test())
+
+
+def test_timer_task_edits_line_to_expired_warning(
+    uow_factory,
+    session_factory,
+    seed_campaign_and_actor,
+):
+    async def run_test():
+        timer_effects = StubTimerEffects()
+        llm = StubLLM(LLMTurnOutput(narration="ok"))
+        engine = GameEngine(uow_factory=uow_factory, llm=llm)
+        compat = ZorkEmulator(
+            game_engine=engine,
+            session_factory=session_factory,
+            timer_effects_port=timer_effects,
+        )
+
+        async def _noop_execute(*args, **kwargs):
+            return None
+
+        compat._execute_timed_event = _noop_execute  # type: ignore[attr-defined]
+        compat._pending_timers[seed_campaign_and_actor["campaign_id"]] = {
+            "task": None,
+            "channel_id": "chan-1",
+            "message_id": "msg-1",
+            "event": "The vault seals",
+            "delay": 0,
+            "interruptible": True,
+        }
+        await compat._timer_task(
+            seed_campaign_and_actor["campaign_id"],
+            "chan-1",
+            0,
+            "The vault seals",
+        )
+        await asyncio.sleep(0)
+        assert timer_effects.edits
+        _channel_id, _message_id, replacement = timer_effects.edits[-1]
+        assert _channel_id == "chan-1"
+        assert _message_id == "msg-1"
+        assert replacement == "⚠️ *Timer expired - The vault seals*"
+
+    asyncio.run(run_test())
+
+
+def test_timed_events_speed_multiplier_scales_timer_delay_and_rendered_line(
     uow_factory,
     session_factory,
     seed_campaign_and_actor,
@@ -5029,8 +5110,8 @@ def test_speed_multiplier_scales_timer_delay_and_rendered_line(
             surface_key="discord:default:chan-speed",
             surface_channel_id="chan-speed",
         )
-        assert compat.set_speed_multiplier(campaign, 2.0) is True
-        assert compat.get_speed_multiplier(campaign) == 2.0
+        assert compat.set_timed_events_speed_multiplier(campaign, 2.0) is True
+        assert compat.get_timed_events_speed_multiplier(campaign) == 2.0
 
         narration = await compat.play_action(
             campaign_id=campaign.id,
@@ -5044,11 +5125,56 @@ def test_speed_multiplier_scales_timer_delay_and_rendered_line(
         # 120s / 2.0 speed = 60s, then realtime compression (* 0.2) = 12s
         assert int(pending.get("delay", 0)) == 12
 
-        timer_match = re.search(r"<t:(\d+):R>", narration)
+        timer_match = re.search(r"<t:(\d+):F>", narration)
         assert timer_match is not None
         expiry_ts = int(timer_match.group(1))
         delta = expiry_ts - int(time.time())
         assert 5 <= delta <= 18
+
+        compat.cancel_pending_timer(campaign.id)
+
+    asyncio.run(run_test())
+
+
+def test_game_speed_multiplier_no_longer_scales_timer_delay(
+    uow_factory,
+    session_factory,
+    seed_campaign_and_actor,
+):
+    async def run_test():
+        llm = StubLLM(
+            LLMTurnOutput(
+                narration="The lights dim ominously.",
+                timer_instruction=TimerInstruction(delay_seconds=120, event_text="The vault seals"),
+            )
+        )
+        engine = GameEngine(uow_factory=uow_factory, llm=llm)
+        compat = ZorkEmulator(game_engine=engine, session_factory=session_factory)
+
+        campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
+        compat.get_or_create_player(campaign.id, seed_campaign_and_actor["actor_id"])
+        session_row = compat.get_or_create_session(
+            campaign_id=campaign.id,
+            surface="discord_channel",
+            surface_key="discord:default:chan-speed-2",
+            surface_channel_id="chan-speed-2",
+        )
+        assert compat.set_speed_multiplier(campaign, 2.0) is True
+        assert compat.get_speed_multiplier(campaign) == 2.0
+        assert compat.get_timed_events_speed_multiplier(campaign) == 1.0
+
+        narration = await compat.play_action(
+            campaign_id=campaign.id,
+            actor_id=seed_campaign_and_actor["actor_id"],
+            action="wait",
+            session_id=session_row.id,
+        )
+        assert narration is not None
+        pending = compat._pending_timers.get(campaign.id)
+        assert pending is not None
+        # Game-time speed should not affect realtime timers anymore.
+        # 120s at default timed-events speed, then realtime compression (* 0.2) = 24s
+        assert int(pending.get("delay", 0)) == 24
 
         compat.cancel_pending_timer(campaign.id)
 
