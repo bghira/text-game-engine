@@ -251,6 +251,7 @@ class ZorkEmulator:
     TIMER_REALTIME_SCALE = 0.2
     TIMER_REALTIME_MIN_SECONDS = 5
     TIMER_REALTIME_MAX_SECONDS = 120
+    TIMER_INTERRUPT_GRACE_SECONDS = 1.0
     PROCESSING_EMOJI = "🤔"
 
     MAIN_PARTY_TOKEN = "main party"
@@ -1415,6 +1416,7 @@ class ZorkEmulator:
         self._logger = logging.getLogger(__name__)
         self._inflight_turns: set[tuple[str, str]] = set()
         self._inflight_turns_lock = threading.Lock()
+        self._timed_event_inflight: dict[tuple[str, str], str] = {}
         self._attachment_processor = (
             AttachmentTextProcessor(
                 completion=completion_port,
@@ -7553,6 +7555,36 @@ class ZorkEmulator:
             self._inflight_turns.discard(key)
             self._claims.pop(key, None)
 
+    def _set_timed_event_inflight(
+        self,
+        campaign_id: str,
+        actor_id: str,
+        event_description: str,
+    ) -> None:
+        key = (str(campaign_id), str(actor_id))
+        with self._inflight_turns_lock:
+            self._timed_event_inflight[key] = str(event_description or "").strip()
+
+    def _clear_timed_event_inflight(self, campaign_id: str, actor_id: str) -> None:
+        key = (str(campaign_id), str(actor_id))
+        with self._inflight_turns_lock:
+            self._timed_event_inflight.pop(key, None)
+
+    def get_timed_event_in_progress_notice(
+        self,
+        campaign_id: str,
+        actor_id: str,
+    ) -> str | None:
+        key = (str(campaign_id), str(actor_id))
+        with self._inflight_turns_lock:
+            event_description = str(self._timed_event_inflight.get(key) or "").strip()
+        if not event_description:
+            return None
+        return (
+            "⏰ Timed event in progress. Your action is waiting for it to finish.\n"
+            f"Pending event: {event_description}"
+        )
+
     async def _play_action_with_ids(
         self,
         campaign_id: str,
@@ -8666,9 +8698,66 @@ class ZorkEmulator:
 
             session.commit()
 
+    def bind_latest_narrator_message(
+        self,
+        campaign_id: str,
+        bot_message_id: str | int,
+    ) -> bool:
+        bot_id = str(bot_message_id or "").strip()
+        if not bot_id:
+            return False
+        with self._session_factory() as session:
+            narrator_turn = (
+                session.query(Turn)
+                .filter(Turn.campaign_id == campaign_id)
+                .filter(Turn.kind == "narrator")
+                .order_by(Turn.id.desc())
+                .first()
+            )
+            if narrator_turn is None:
+                return False
+            narrator_turn.external_message_id = bot_id
+            session.commit()
+            return True
+
     # ------------------------------------------------------------------
     # Timer integration compatibility
     # ------------------------------------------------------------------
+
+    def get_pending_timer_notice(
+        self,
+        campaign_id: str,
+    ) -> str | None:
+        with self._session_factory() as session:
+            timer = (
+                session.query(Timer)
+                .filter_by(campaign_id=campaign_id)
+                .filter(Timer.status.in_(["scheduled_unbound", "scheduled_bound"]))
+                .order_by(Timer.created_at.desc())
+                .first()
+            )
+            if timer is None:
+                return None
+            due_at = getattr(timer, "due_at", None)
+            if due_at is None:
+                return None
+            try:
+                import calendar as _calendar
+
+                due_ts = int(_calendar.timegm(due_at.utctimetuple()))
+            except Exception:
+                return None
+            event_text = str(getattr(timer, "event_text", "") or "").strip() or "Something happens."
+            if bool(getattr(timer, "interruptible", True)):
+                interrupt_action = str(getattr(timer, "interrupt_action", "") or "").strip()
+                interrupt_hint = interrupt_action or "Act before it fires to avert it."
+            else:
+                interrupt_hint = "Unavoidable."
+            return (
+                f"⏰ *Timed event:* {event_text}\n"
+                f"Fires <t:{due_ts}:F> (<t:{due_ts}:R>)\n"
+                f"{interrupt_hint}"
+            )
 
     def register_timer_message(
         self,
@@ -9255,97 +9344,101 @@ class ZorkEmulator:
         if not active_actor_id:
             return
 
-        result = await self._engine.resolve_turn(
-            ResolveTurnInput(
+        self._set_timed_event_inflight(campaign_id, active_actor_id, event_description)
+        try:
+            result = await self._engine.resolve_turn(
+                ResolveTurnInput(
+                    campaign_id=campaign_id,
+                    actor_id=active_actor_id,
+                    action=f"[SYSTEM EVENT - TIMED]: {event_description}",
+                    record_player_turn=False,
+                    allow_timer_instruction=False,
+                )
+            )
+            if result.status != "ok":
+                return
+            self._sync_main_party_room_state(campaign_id, active_actor_id)
+            await self._enqueue_new_character_portraits(
                 campaign_id=campaign_id,
                 actor_id=active_actor_id,
-                action=f"[SYSTEM EVENT - TIMED]: {event_description}",
-                record_player_turn=False,
-                allow_timer_instruction=False,
+                pre_slugs=pre_character_slugs,
+                channel_id=channel_id,
             )
-        )
-        if result.status != "ok":
-            return
-        self._sync_main_party_room_state(campaign_id, active_actor_id)
-        await self._enqueue_new_character_portraits(
-            campaign_id=campaign_id,
-            actor_id=active_actor_id,
-            pre_slugs=pre_character_slugs,
-            channel_id=channel_id,
-        )
-        if result.scene_image_prompt and channel_id:
-            scene_ctx = SimpleNamespace(
-                author=SimpleNamespace(id=str(active_actor_id)),
-                channel=SimpleNamespace(id=str(channel_id)),
-            )
-            asyncio.create_task(
-                self._enqueue_scene_image(
-                    scene_ctx,
-                    str(result.scene_image_prompt),
-                    campaign_id=campaign_id,
+            if result.scene_image_prompt and channel_id:
+                scene_ctx = SimpleNamespace(
+                    author=SimpleNamespace(id=str(active_actor_id)),
+                    channel=SimpleNamespace(id=str(channel_id)),
                 )
-            )
-        asyncio.create_task(self._enqueue_new_character_enrichments(
-            campaign_id=campaign_id,
-            pre_slugs=pre_character_slugs,
-        ))
-        narration = self._strip_narration_footer(result.narration or "")
-        if (
-            " ".join(str(narration or "").lower().split())
-            == "the world shifts, but nothing clear emerges."
-        ):
-            self._logger.warning(
-                "Timed event generic fallback: campaign=%s actor=%s event=%r",
-                campaign_id,
-                active_actor_id,
-                event_description,
-            )
-            narration = str(event_description or "Something happens.").strip()
-        # Embed the timed-event narrator turn for memory search.
-        if self._memory_port is not None and narration:
-            try:
-                with self._session_factory() as _embed_session:
-                    last_turns = (
-                        _embed_session.query(Turn)
-                        .filter(Turn.campaign_id == campaign_id)
-                        .filter(Turn.kind == "narrator")
-                        .order_by(Turn.id.desc())
-                        .limit(1)
-                        .all()
-                    )
-                if last_turns:
-                    _embed_turn = last_turns[0]
-                    _embed_meta = self._safe_turn_meta(_embed_turn)
-                    _embed_visibility = _embed_meta.get("visibility")
-                    self._memory_port.store_turn_embedding(
-                        turn_id=int(_embed_turn.id),
+                asyncio.create_task(
+                    self._enqueue_scene_image(
+                        scene_ctx,
+                        str(result.scene_image_prompt),
                         campaign_id=campaign_id,
-                        actor_id=active_actor_id,
-                        kind="narrator",
-                        content=narration,
-                        metadata=self._turn_embedding_metadata(
-                            visibility=_embed_visibility if isinstance(_embed_visibility, dict) else None,
-                            actor_player_slug=_embed_meta.get("actor_player_slug"),
-                            location_key=_embed_meta.get("location_key"),
-                            session_id=None,
-                        ),
                     )
-            except Exception:
-                logger.debug(
-                    "Timed-event turn embedding skipped for campaign=%s",
+                )
+            asyncio.create_task(self._enqueue_new_character_enrichments(
+                campaign_id=campaign_id,
+                pre_slugs=pre_character_slugs,
+            ))
+            narration = self._strip_narration_footer(result.narration or "")
+            if (
+                " ".join(str(narration or "").lower().split())
+                == "the world shifts, but nothing clear emerges."
+            ):
+                self._logger.warning(
+                    "Timed event generic fallback: campaign=%s actor=%s event=%r",
                     campaign_id,
-                    exc_info=True,
+                    active_actor_id,
+                    event_description,
                 )
-        if narration and self._timer_effects_port is not None:
-            try:
-                await self._timer_effects_port.emit_timed_event(
-                    campaign_id=campaign_id,
-                    channel_id=channel_id,
-                    actor_id=active_actor_id,
-                    narration=narration,
-                )
-            except Exception:
-                return
+                narration = str(event_description or "Something happens.").strip()
+            # Embed the timed-event narrator turn for memory search.
+            if self._memory_port is not None and narration:
+                try:
+                    with self._session_factory() as _embed_session:
+                        last_turns = (
+                            _embed_session.query(Turn)
+                            .filter(Turn.campaign_id == campaign_id)
+                            .filter(Turn.kind == "narrator")
+                            .order_by(Turn.id.desc())
+                            .limit(1)
+                            .all()
+                        )
+                    if last_turns:
+                        _embed_turn = last_turns[0]
+                        _embed_meta = self._safe_turn_meta(_embed_turn)
+                        _embed_visibility = _embed_meta.get("visibility")
+                        self._memory_port.store_turn_embedding(
+                            turn_id=int(_embed_turn.id),
+                            campaign_id=campaign_id,
+                            actor_id=active_actor_id,
+                            kind="narrator",
+                            content=narration,
+                            metadata=self._turn_embedding_metadata(
+                                visibility=_embed_visibility if isinstance(_embed_visibility, dict) else None,
+                                actor_player_slug=_embed_meta.get("actor_player_slug"),
+                                location_key=_embed_meta.get("location_key"),
+                                session_id=None,
+                            ),
+                        )
+                except Exception:
+                    logger.debug(
+                        "Timed-event turn embedding skipped for campaign=%s",
+                        campaign_id,
+                        exc_info=True,
+                    )
+            if narration and self._timer_effects_port is not None:
+                try:
+                    await self._timer_effects_port.emit_timed_event(
+                        campaign_id=campaign_id,
+                        channel_id=channel_id,
+                        actor_id=active_actor_id,
+                        narration=narration,
+                    )
+                except Exception:
+                    return
+        finally:
+            self._clear_timed_event_inflight(campaign_id, active_actor_id)
 
     def _trim_text(self, text: str, max_chars: int) -> str:
         if text is None:
