@@ -1061,6 +1061,8 @@ class GameEngine:
                 "location_key": self._room_key_from_state(player_state),
                 "suppress_context": suppress_recent_context,
             }
+            if str(turn_input.action or "").startswith("[SYSTEM EVENT - TIMED]:"):
+                narrator_turn_meta["system_event"] = "timed"
             if reasoning_text:
                 narrator_turn_meta["reasoning"] = reasoning_text
             if isinstance(llm_output.summary_update, str) and llm_output.summary_update.strip():

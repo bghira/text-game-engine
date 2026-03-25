@@ -19,7 +19,7 @@ from urllib import error as urllib_error
 from urllib import parse as urllib_parse
 from urllib import request as urllib_request
 
-from sqlalchemy import func, or_
+from sqlalchemy import and_, func, or_
 
 from .core.attachments import (
     AttachmentProcessingConfig,
@@ -7956,7 +7956,7 @@ class ZorkEmulator:
                     interrupt_hint = "unavoidable"
                 decorated = (
                     f"{decorated}\n\n"
-                    f"⏰ Timer pending: fires <t:{expiry_ts}:F> (<t:{expiry_ts}:R>) - {event_hint} ({interrupt_hint})"
+                    f"⏰ *Timed event:* <t:{expiry_ts}:R> - {event_hint} ({interrupt_hint})"
                 )
 
             if campaign is not None:
@@ -8642,7 +8642,16 @@ class ZorkEmulator:
                         session.query(Turn.id)
                         .filter(Turn.campaign_id == campaign_id)
                         .filter(Turn.id > target_turn_id)
-                        .filter(Turn.session_id.in_(scoped_session_ids))
+                        .filter(
+                            or_(
+                                Turn.session_id.in_(scoped_session_ids),
+                                and_(
+                                    Turn.session_id.is_(None),
+                                    Turn.kind == "narrator",
+                                    Turn.meta_json.like('%"system_event": "timed"%'),
+                                ),
+                            )
+                        )
                         .all()
                     )
                 ]
@@ -9249,6 +9258,7 @@ class ZorkEmulator:
         actual_due_at = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(
             seconds=effective_delay
         )
+        timer_session_id: str | None = None
         with self._session_factory() as session:
             timer = (
                 session.query(Timer)
@@ -9260,6 +9270,7 @@ class ZorkEmulator:
             if timer is not None:
                 timer.due_at = actual_due_at
                 timer.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
+                timer_session_id = str(getattr(timer, "session_id", "") or "").strip() or None
                 session.commit()
         task = asyncio.create_task(
             self._timer_task(
@@ -9275,6 +9286,7 @@ class ZorkEmulator:
             "message_id": None,
             "event": event_description,
             "delay": effective_delay,
+            "session_id": timer_session_id,
             "interruptible": interruptible,
             "interrupt_action": interrupt_action,
             "interrupt_scope": self._normalize_timer_interrupt_scope(interrupt_scope),
@@ -9322,16 +9334,21 @@ class ZorkEmulator:
                     )
                 )
         preferred_actor_id = None
+        session_id = None
         if timer_ctx is not None:
             raw_actor_id = timer_ctx.get("interrupt_actor_id")
             if raw_actor_id is not None:
                 preferred_actor_id = str(raw_actor_id).strip() or None
+            raw_session_id = timer_ctx.get("session_id")
+            if raw_session_id is not None:
+                session_id = str(raw_session_id).strip() or None
         try:
             await self._execute_timed_event(
                 campaign_id,
                 channel_id,
                 event_description,
                 preferred_actor_id=preferred_actor_id,
+                session_id=session_id,
             )
         except Exception:
             self._logger.exception(
@@ -9346,6 +9363,7 @@ class ZorkEmulator:
         channel_id: str,
         event_description: str,
         preferred_actor_id: str | None = None,
+        session_id: str | None = None,
     ) -> None:
         active_actor_id: str | None = None
         pre_character_slugs: set[str] = set()
@@ -9400,6 +9418,7 @@ class ZorkEmulator:
                     campaign_id=campaign_id,
                     actor_id=active_actor_id,
                     action=f"[SYSTEM EVENT - TIMED]: {event_description}",
+                    session_id=session_id,
                     record_player_turn=False,
                     allow_timer_instruction=False,
                 )

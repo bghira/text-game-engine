@@ -4763,9 +4763,8 @@ def test_play_action_appends_inventory_and_timer_and_persists(
         )
         assert narration is not None
         assert "Inventory: Lantern" in narration
-        assert "⏰ Timer pending: fires <t:" in narration
-        assert " fires <t:" in narration
-        assert ":F> (" in narration
+        assert "⏰ *Timed event:* <t:" in narration
+        assert ":R> - The vault seals" in narration
         assert "(act to prevent!)" in narration
 
         with session_factory() as session:
@@ -5149,6 +5148,122 @@ def test_timer_task_edits_line_to_expired_warning(
     asyncio.run(run_test())
 
 
+def test_channel_scoped_rewind_removes_timed_event_turns(
+    uow_factory,
+    session_factory,
+    seed_campaign_and_actor,
+):
+    class SequenceStubLLM:
+        def __init__(self, outputs):
+            self.outputs = list(outputs)
+
+        async def complete_turn(self, context, **kwargs):
+            if self.outputs:
+                return self.outputs.pop(0)
+            return LLMTurnOutput(narration="fallback")
+
+    async def run_test():
+        llm = SequenceStubLLM(
+            [
+                LLMTurnOutput(
+                    narration="You wait by the sealed vault door.",
+                    timer_instruction=TimerInstruction(
+                        delay_seconds=60,
+                        event_text="The vault seals shut.",
+                        interruptible=True,
+                    ),
+                ),
+                LLMTurnOutput(narration="The vault slams fully shut."),
+            ]
+        )
+        engine = GameEngine(uow_factory=uow_factory, llm=llm)
+        compat = ZorkEmulator(game_engine=engine, session_factory=session_factory)
+        campaign_id = seed_campaign_and_actor["campaign_id"]
+        actor_id = seed_campaign_and_actor["actor_id"]
+        compat.get_or_create_player(campaign_id, actor_id)
+        session_row = compat.get_or_create_session(
+            campaign_id=campaign_id,
+            surface="discord",
+            surface_key="discord:test:main",
+            surface_channel_id="chan-1",
+        )
+
+        narration = await compat.play_action(
+            campaign_id=campaign_id,
+            actor_id=actor_id,
+            action="wait",
+            session_id=session_row.id,
+        )
+        assert narration is not None
+
+        with session_factory() as session:
+            target_turn = (
+                session.query(Turn)
+                .filter(Turn.campaign_id == campaign_id)
+                .filter(Turn.kind == "narrator")
+                .order_by(Turn.id.asc())
+                .first()
+            )
+            assert target_turn is not None
+            target_turn.external_message_id = "msg-1"
+            session.commit()
+
+        compat._schedule_timer(
+            campaign_id=campaign_id,
+            channel_id="chan-1",
+            delay_seconds=0,
+            event_description="The vault seals shut.",
+            interruptible=True,
+            interrupt_actor_id=actor_id,
+        )
+        pending = compat._pending_timers.get(campaign_id)
+        assert pending is not None
+        assert pending.get("session_id") == session_row.id
+
+        await compat._execute_timed_event(
+            campaign_id,
+            "chan-1",
+            "The vault seals shut.",
+            preferred_actor_id=actor_id,
+            session_id=session_row.id,
+        )
+
+        with session_factory() as session:
+            timed_turn = (
+                session.query(Turn)
+                .filter(Turn.campaign_id == campaign_id)
+                .filter(Turn.kind == "narrator")
+                .order_by(Turn.id.desc())
+                .first()
+            )
+            assert timed_turn is not None
+            assert timed_turn.id != target_turn.id
+            assert timed_turn.session_id == session_row.id
+            timed_meta = json.loads(timed_turn.meta_json or "{}")
+            assert timed_meta.get("system_event") == "timed"
+
+        result = compat.execute_rewind(
+            campaign_id,
+            "msg-1",
+            channel_id="chan-1",
+        )
+        assert result is not None
+        rewind_turn_id, deleted_count = result
+        assert rewind_turn_id == target_turn.id
+        assert deleted_count >= 1
+
+        with session_factory() as session:
+            remaining_turns = (
+                session.query(Turn)
+                .filter(Turn.campaign_id == campaign_id)
+                .order_by(Turn.id.asc())
+                .all()
+            )
+            assert all(row.id <= target_turn.id for row in remaining_turns)
+
+    asyncio.run(run_test())
+
+
 def test_interruptible_timer_can_still_be_averted_during_fire_grace_window(
     uow_factory,
     session_factory,
@@ -5297,7 +5412,7 @@ def test_timed_events_speed_multiplier_scales_timer_delay_and_rendered_line(
             due_delta = (timer_row.due_at - datetime.now(timezone.utc).replace(tzinfo=None)).total_seconds()
             assert 5 <= due_delta <= 18
 
-        timer_match = re.search(r"<t:(\d+):F>", narration)
+        timer_match = re.search(r"<t:(\d+):R>", narration)
         assert timer_match is not None
         expiry_ts = int(timer_match.group(1))
         delta = expiry_ts - int(time.time())
