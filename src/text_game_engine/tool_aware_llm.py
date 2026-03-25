@@ -2420,7 +2420,7 @@ class ToolAwareZorkLLM:
                 .order_by(Turn.id.desc())
                 .first()
             )
-        speed = self._emulator.get_speed_multiplier(campaign) if campaign is not None else 1.0
+        speed = self._emulator.get_timed_events_speed_multiplier(campaign) if campaign is not None else 1.0
         if speed > 0:
             delay_seconds = int(delay_seconds / speed)
         delay_seconds = max(15, min(86_400, delay_seconds))

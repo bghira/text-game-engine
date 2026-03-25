@@ -7636,7 +7636,7 @@ class ZorkEmulator:
                     timer_delay_seconds = int(result.timer_instruction.delay_seconds)
                     with self._session_factory() as session:
                         campaign_row = session.get(Campaign, campaign_id)
-                    speed = self.get_speed_multiplier(campaign_row)
+                    speed = self.get_timed_events_speed_multiplier(campaign_row)
                     if speed > 0:
                         timer_delay_seconds = int(timer_delay_seconds / speed)
                     timer_delay_seconds = max(15, min(300, timer_delay_seconds))
@@ -7860,7 +7860,7 @@ class ZorkEmulator:
                     interrupt_hint = "unavoidable"
                 decorated = (
                     f"{decorated}\n\n"
-                    f"⏰ <t:{expiry_ts}:R>: {event_hint} ({interrupt_hint})"
+                    f"⏰ Timer pending: fires <t:{expiry_ts}:F> (<t:{expiry_ts}:R>) - {event_hint} ({interrupt_hint})"
                 )
 
             if campaign is not None:
@@ -8739,6 +8739,16 @@ class ZorkEmulator:
         except (TypeError, ValueError):
             return 1.0
 
+    def get_timed_events_speed_multiplier(self, campaign: Campaign | None) -> float:
+        if campaign is None:
+            return 1.0
+        campaign_state = self.get_campaign_state(campaign)
+        raw = campaign_state.get("timed_events_speed_multiplier", 1.0)
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            return 1.0
+
     @classmethod
     def _compress_realtime_timer_delay(cls, delay_seconds: object) -> int:
         try:
@@ -8758,6 +8768,23 @@ class ZorkEmulator:
         multiplier = max(0.1, min(10.0, float(multiplier)))
         campaign_state = self.get_campaign_state(campaign)
         campaign_state["speed_multiplier"] = multiplier
+        with self._session_factory() as session:
+            row = session.get(Campaign, campaign.id)
+            if row is None:
+                return False
+            row.state_json = self._dump_json(campaign_state)
+            row.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
+            session.commit()
+            campaign.state_json = row.state_json
+            campaign.updated_at = row.updated_at
+        return True
+
+    def set_timed_events_speed_multiplier(self, campaign: Campaign | None, multiplier: float) -> bool:
+        if campaign is None:
+            return False
+        multiplier = max(0.1, min(10.0, float(multiplier)))
+        campaign_state = self.get_campaign_state(campaign)
+        campaign_state["timed_events_speed_multiplier"] = multiplier
         with self._session_factory() as session:
             row = session.get(Campaign, campaign.id)
             if row is None:
@@ -9040,7 +9067,7 @@ class ZorkEmulator:
                 self._edit_timer_line(
                     str(channel_id),
                     str(message_id),
-                    f"✅ *Timer cancelled - you acted in time. (Averted: {event})*",
+                    f"✅ *Timer interrupted/averted - you acted in time. (Averted: {event})*",
                 )
             )
         return ctx_dict
@@ -17993,37 +18020,6 @@ class ZorkEmulator:
         - Having an NPC reply to or initiate an SMS conversation
         """
         lines: list[str] = []
-
-        # --- NPC reuse nudge ---
-        if random.random() < self.NPC_NUDGE_CHANCE:
-            characters = parse_json_dict(campaign.characters_json)
-            player_location = str(player_state.get("room_title") or "").strip().lower()
-            # Find NPCs that aren't in the player's current location
-            off_scene: list[str] = []
-            for slug, char in characters.items():
-                if not isinstance(char, dict):
-                    continue
-                if char.get("deceased_reason"):
-                    continue
-                if char.get("remove"):
-                    continue
-                npc_location = str(char.get("current_status") or char.get("location") or "").strip().lower()
-                name = str(char.get("name") or slug).strip()
-                if not name:
-                    continue
-                # Skip NPCs already co-located with the player
-                if player_location and npc_location and player_location in npc_location:
-                    continue
-                off_scene.append(name)
-            if off_scene:
-                picks = random.sample(off_scene, min(2, len(off_scene)))
-                names_str = " or ".join(picks)
-                lines.append(
-                    f"NPC_ACTIVITY_NUDGE: Consider weaving {names_str} into this scene — "
-                    f"they could arrive, be heard from, pass through, send a message, or be mentioned by another character. "
-                    f"Existing NPCs should not fade into the background; the world feels alive when characters "
-                    f"reappear with their own agendas and reactions to recent events."
-                )
 
         # --- Passive SMS reply nudge ---
         if random.random() < self.SMS_REPLY_NUDGE_CHANCE:
