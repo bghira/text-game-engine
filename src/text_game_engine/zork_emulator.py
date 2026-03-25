@@ -1438,6 +1438,10 @@ class ZorkEmulator:
         self._pending_sms_tasks: dict[str, set[asyncio.Task]] = {}
         self._turn_ephemeral_notices: dict[tuple[str, str, str | None], list[str]] = {}
 
+    @property
+    def notification_port(self) -> NotificationPort | None:
+        return self._notification_port
+
     # ------------------------------------------------------------------
     # Compatibility helpers
     # ------------------------------------------------------------------
@@ -12505,6 +12509,9 @@ class ZorkEmulator:
             self.AUTOBIOGRAPHY_LAST_COMPRESSED_TURN_FIELD,
             "evolving_personality",
             "created",
+            "compact",
+            "expanded",
+            "priority",
         }
         current_day = self._coerce_non_negative_int(
             self._extract_game_time_snapshot(campaign_state or {}).get("day"),
@@ -12595,6 +12602,9 @@ class ZorkEmulator:
             "evolving_personality",
             "created",
             "relationship",
+            "compact",
+            "expanded",
+            "priority",
         }
         top_level_keys = {"name", "location", "location_last_updated", "current_status"}
         current_day = self._coerce_non_negative_int(

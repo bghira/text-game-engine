@@ -7,7 +7,7 @@ import re
 from datetime import UTC, datetime
 from fnmatch import fnmatch
 from typing import Any, Callable
-from urllib.parse import urlparse
+from urllib.parse import quote_plus, urlparse
 
 logger = logging.getLogger(__name__)
 
@@ -16,22 +16,71 @@ from .core.types import GiveItemInstruction, LLMTurnOutput, TimerInstruction
 from .persistence.sqlalchemy.models import Campaign, Player, Turn
 from .zork_emulator import ZorkEmulator
 
+_YOUTUBE_ALLOWED_HOSTS = frozenset({
+    "youtube.com",
+    "www.youtube.com",
+    "m.youtube.com",
+    "music.youtube.com",
+    "youtu.be",
+})
+
+
+def _is_allowed_youtube_url(text: str) -> bool:
+    parsed = urlparse(str(text or "").strip())
+    if parsed.scheme not in {"http", "https"}:
+        return False
+    host = str(parsed.netloc or "").strip().lower()
+    if not host:
+        return False
+    if "@" in host:
+        host = host.rsplit("@", 1)[-1]
+    if ":" in host:
+        host = host.split(":", 1)[0]
+    return host in _YOUTUBE_ALLOWED_HOSTS
+
+
+def _neutralize_discord_mentions(text: object) -> str:
+    value = " ".join(str(text or "").split()).strip()
+    if not value:
+        return ""
+    value = value.replace("@everyone", "@\u200beveryone")
+    value = value.replace("@here", "@\u200bhere")
+    value = re.sub(
+        r"<@([!&]?\d+)>",
+        lambda match: f"<@\u200b{match.group(1)}>",
+        value,
+    )
+    return value
+
 
 def _search_youtube_first_result(query: str) -> dict[str, str] | None:
     text = " ".join(str(query or "").split()).strip()
     if not text:
         return None
     parsed = urlparse(text)
-    if parsed.scheme in {"http", "https"} and parsed.netloc:
+    if _is_allowed_youtube_url(text):
         return {
             "title": text,
             "url": text,
             "channel": "",
         }
+    if parsed.scheme in {"http", "https"} and parsed.netloc:
+        return {
+            "title": text,
+            "url": f"https://www.youtube.com/results?search_query={quote_plus(text)}",
+            "channel": "",
+        }
     try:
         import yt_dlp
-    except Exception:
-        return None
+    except ImportError:
+        logger.warning(
+            "yt_dlp is not installed; YouTube search functionality is unavailable."
+        )
+        return {
+            "title": text,
+            "url": f"https://www.youtube.com/results?search_query={quote_plus(text)}",
+            "channel": "",
+        }
 
     opts = {
         "quiet": True,
@@ -44,7 +93,11 @@ def _search_youtube_first_result(query: str) -> dict[str, str] | None:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(f"ytsearch1:{text}", download=False)
     except Exception:
-        return None
+        return {
+            "title": text,
+            "url": f"https://www.youtube.com/results?search_query={quote_plus(text)}",
+            "channel": "",
+        }
     if not isinstance(info, dict):
         return None
     entries = info.get("entries")
@@ -72,7 +125,11 @@ def _search_youtube_first_result(query: str) -> dict[str, str] | None:
         ).split()
     ).strip()
     if not url:
-        return None
+        return {
+            "title": title or text,
+            "url": f"https://www.youtube.com/results?search_query={quote_plus(text)}",
+            "channel": channel,
+        }
     return {
         "title": title or text,
         "url": url,
@@ -2663,7 +2720,22 @@ class ToolAwareZorkLLM:
         if not query:
             return "SONG_SEARCH_RESULT: missing query"
 
-        result = await asyncio.to_thread(_search_youtube_first_result, query)
+        search_task = asyncio.create_task(
+            asyncio.to_thread(_search_youtube_first_result, query)
+        )
+        try:
+            result = await asyncio.wait_for(
+                search_task,
+                timeout=10.0,
+            )
+        except asyncio.TimeoutError:
+            search_task.cancel()
+            logger.warning(
+                "song_search timeout for campaign=%s query=%r",
+                campaign_id,
+                query,
+            )
+            return f"SONG_SEARCH_RESULT: query={query!r} found=false delivered=false timeout=true"
         if not isinstance(result, dict):
             return f"SONG_SEARCH_RESULT: query={query!r} found=false delivered=false"
 
@@ -2673,8 +2745,12 @@ class ToolAwareZorkLLM:
         if not url:
             return f"SONG_SEARCH_RESULT: query={query!r} found=false delivered=false"
 
-        sender = " ".join(str(payload.get("sender") or payload.get("from") or "").split()).strip()
-        message = " ".join(str(payload.get("message") or payload.get("caption") or "").split()).strip()
+        sender = _neutralize_discord_mentions(
+            payload.get("sender") or payload.get("from") or ""
+        )
+        message = _neutralize_discord_mentions(
+            payload.get("message") or payload.get("caption") or ""
+        )
         lines = []
         if sender:
             lines.append(f"**[Song] {sender}**")
@@ -2685,13 +2761,14 @@ class ToolAwareZorkLLM:
         title_line = title
         if channel:
             title_line = f"{title_line} - {channel}"
-        lines.append(title_line)
+        if title_line and title_line != url:
+            lines.append(title_line)
         lines.append(url)
         delivery_text = "\n".join(line for line in lines if line).strip()
 
         delivered = False
         emulator = self._emulator
-        notification_port = getattr(emulator, "_notification_port", None) if emulator is not None else None
+        notification_port = emulator.notification_port if emulator is not None else None
         if notification_port is not None:
             try:
                 await notification_port.send_channel_message(
@@ -3213,7 +3290,11 @@ class ToolAwareZorkLLM:
                         "\nFINAL_LOCATION_CARDS: "
                         f"{emulator._dump_json(narrowed_location_cards)}\n"  # noqa: SLF001
                     )
-                turns = emulator.get_recent_turns(campaign_id)
+                recent_turn_limit = max(
+                    int(getattr(emulator, "MAX_RECENT_TURNS", 24) or 24) * 4,
+                    64,
+                )
+                turns = emulator.get_recent_turns(campaign_id, limit=recent_turn_limit)
                 shared_summary = emulator._compose_world_summary(  # noqa: SLF001
                     campaign,
                     campaign_state,
