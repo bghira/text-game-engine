@@ -7,6 +7,7 @@ import re
 from datetime import UTC, datetime
 from fnmatch import fnmatch
 from typing import Any, Callable
+from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
@@ -14,6 +15,69 @@ from .core.ports import ProgressCallback
 from .core.types import GiveItemInstruction, LLMTurnOutput, TimerInstruction
 from .persistence.sqlalchemy.models import Campaign, Player, Turn
 from .zork_emulator import ZorkEmulator
+
+
+def _search_youtube_first_result(query: str) -> dict[str, str] | None:
+    text = " ".join(str(query or "").split()).strip()
+    if not text:
+        return None
+    parsed = urlparse(text)
+    if parsed.scheme in {"http", "https"} and parsed.netloc:
+        return {
+            "title": text,
+            "url": text,
+            "channel": "",
+        }
+    try:
+        import yt_dlp
+    except Exception:
+        return None
+
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "extract_flat": "in_playlist",
+        "default_search": "ytsearch1",
+    }
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(f"ytsearch1:{text}", download=False)
+    except Exception:
+        return None
+    if not isinstance(info, dict):
+        return None
+    entries = info.get("entries")
+    entry = None
+    if isinstance(entries, list) and entries:
+        first = entries[0]
+        if isinstance(first, dict):
+            entry = first
+    if entry is None:
+        entry = info if isinstance(info, dict) else None
+    if not isinstance(entry, dict):
+        return None
+    url = str(entry.get("webpage_url") or entry.get("url") or "").strip()
+    if url and not url.startswith("http"):
+        video_id = str(entry.get("id") or "").strip()
+        if video_id:
+            url = f"https://www.youtube.com/watch?v={video_id}"
+    title = " ".join(str(entry.get("title") or "").split()).strip()
+    channel = " ".join(
+        str(
+            entry.get("channel")
+            or entry.get("uploader")
+            or entry.get("channel_name")
+            or ""
+        ).split()
+    ).strip()
+    if not url:
+        return None
+    return {
+        "title": title or text,
+        "url": url,
+        "channel": channel,
+    }
 
 
 async def _notify_progress(
@@ -971,6 +1035,7 @@ class ToolAwareZorkLLM:
             "sms_schedule",
             "plot_plan",
             "chapter_plan",
+            "song_search",
         })
         tool_calls_raw = payload.get("tool_calls")
         tool_calls: list[dict[str, Any]] = []
@@ -2582,6 +2647,75 @@ class ToolAwareZorkLLM:
             session.commit()
         return f"CONSEQUENCE_LOG_RESULT: added={added} resolved={resolved} removed={removed} total={len(rows)}"
 
+    async def _tool_song_search(
+        self,
+        campaign_id: str,
+        payload: dict[str, Any],
+    ) -> str:
+        query = " ".join(
+            str(
+                payload.get("query")
+                or payload.get("song")
+                or payload.get("search")
+                or ""
+            ).split()
+        ).strip()
+        if not query:
+            return "SONG_SEARCH_RESULT: missing query"
+
+        result = await asyncio.to_thread(_search_youtube_first_result, query)
+        if not isinstance(result, dict):
+            return f"SONG_SEARCH_RESULT: query={query!r} found=false delivered=false"
+
+        title = " ".join(str(result.get("title") or query).split()).strip()
+        url = str(result.get("url") or "").strip()
+        channel = " ".join(str(result.get("channel") or "").split()).strip()
+        if not url:
+            return f"SONG_SEARCH_RESULT: query={query!r} found=false delivered=false"
+
+        sender = " ".join(str(payload.get("sender") or payload.get("from") or "").split()).strip()
+        message = " ".join(str(payload.get("message") or payload.get("caption") or "").split()).strip()
+        lines = []
+        if sender:
+            lines.append(f"**[Song] {sender}**")
+        else:
+            lines.append("**[Song]**")
+        if message:
+            lines.append(message)
+        title_line = title
+        if channel:
+            title_line = f"{title_line} - {channel}"
+        lines.append(title_line)
+        lines.append(url)
+        delivery_text = "\n".join(line for line in lines if line).strip()
+
+        delivered = False
+        emulator = self._emulator
+        notification_port = getattr(emulator, "_notification_port", None) if emulator is not None else None
+        if notification_port is not None:
+            try:
+                await notification_port.send_channel_message(
+                    campaign_id=str(campaign_id),
+                    message=delivery_text,
+                )
+                delivered = True
+            except Exception:
+                logger.debug(
+                    "song_search delivery failed for campaign=%s query=%r",
+                    campaign_id,
+                    query,
+                    exc_info=True,
+                )
+
+        title_json = json.dumps(title, ensure_ascii=True)
+        channel_json = json.dumps(channel, ensure_ascii=True)
+        url_json = json.dumps(url, ensure_ascii=True)
+        return (
+            "SONG_SEARCH_RESULT: "
+            f'{{"query":{json.dumps(query, ensure_ascii=True)},"title":{title_json},"channel":{channel_json},'
+            f'"url":{url_json},"delivered":{str(delivered).lower()}}}'
+        )
+
     async def _execute_tool_call(
         self,
         campaign_id: str,
@@ -2628,6 +2762,8 @@ class ToolAwareZorkLLM:
             return self._tool_chapter_plan(campaign_id, payload)
         if name == "consequence_log":
             return self._tool_consequence_log(campaign_id, payload)
+        if name == "song_search":
+            return await self._tool_song_search(campaign_id, payload)
         if name == "ready_to_write":
             return "READY_TO_WRITE_ACK"
         if name == "recent_turns":
@@ -3186,6 +3322,9 @@ class ToolAwareZorkLLM:
                 "RESEARCH_COMPLETE: Context gathering is complete.\n"
                 "Do NOT call any more tools now. Return final narration/state JSON directly.\n"
                 "REQUIRED fields: reasoning, scene_output, state_update (with game_time), summary_update.\n"
+                "OPTIONAL but encouraged: set_timer_delay + set_timer_event (include these in the SAME JSON object "
+                "to schedule a timed event — the world should almost always have something pressing). "
+                "Also optional: set_timer_interruptible, set_timer_interrupt_action, set_timer_interrupt_scope.\n"
                 "scene_output MUST be an object with keys location_key, context_key, and beats.\n"
                 "beats MUST be an array of 1 to 2 beat objects; scene_output as a plain string is invalid.\n"
                 "narration is optional when scene_output is present; prefer omitting it and let the harness render beat text.\n"

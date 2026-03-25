@@ -98,6 +98,13 @@ class IMDBLookupPort(Protocol):
 
 
 class NotificationPort(Protocol):
+    async def send_channel_message(
+        self,
+        campaign_id: str,
+        message: str,
+    ) -> None:
+        ...
+
     async def send_dm(
         self,
         actor_id: str,
