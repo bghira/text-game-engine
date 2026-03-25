@@ -428,6 +428,30 @@ def test_campaign_clock_setter_canonicalizes_and_can_reanchor_weekday(
         assert state.get("game_time", {}).get("day_of_week") == "thursday"
 
 
+def test_campaign_clock_type_setter_reuses_setup_mode_mapping(
+    session_factory,
+    seed_campaign_and_actor,
+):
+    compat = _build_compat(session_factory)
+    campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
+
+    updated, error = compat.set_campaign_clock_type(campaign, "individual-calendars")
+    assert error is None
+    assert updated == "individual-calendars"
+    assert compat.get_campaign_clock_type(campaign) == "individual-calendars"
+
+    updated, error = compat.set_campaign_clock_type(campaign, "loose")
+    assert error is None
+    assert updated == "loose-calendar"
+    assert compat.get_campaign_clock_type(campaign) == "loose-calendar"
+
+    with session_factory() as session:
+        row = session.get(Campaign, campaign.id)
+        state = json.loads(row.state_json or "{}")
+        assert state.get("time_model") == "shared_clock"
+        assert state.get("calendar_policy") == "loose"
+
+
 def test_json_parsing_helpers(session_factory, seed_campaign_and_actor):
     compat = _build_compat(session_factory)
 

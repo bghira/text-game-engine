@@ -8802,6 +8802,48 @@ class ZorkEmulator:
             campaign.updated_at = row.updated_at
         return canonical
 
+    def get_campaign_clock_type(self, campaign: Campaign | None) -> str:
+        if campaign is None:
+            return "consequential-calendar"
+        campaign_state = self.get_campaign_state(campaign)
+        time_model = self._time_model_from_state(campaign_state)
+        calendar_policy = self._calendar_policy_from_state(campaign_state)
+        if time_model == self.TIME_MODEL_INDIVIDUAL_CLOCKS:
+            return "individual-calendars"
+        if calendar_policy == self.CALENDAR_POLICY_LOOSE:
+            return "loose-calendar"
+        return "consequential-calendar"
+
+    def set_campaign_clock_type(
+        self,
+        campaign: Campaign | None,
+        value: object,
+    ) -> tuple[str | None, str | None]:
+        if campaign is None:
+            return None, "No campaign."
+        choice, error = self._parse_setup_calendar_time_policy_choice(str(value or ""))
+        if choice is None:
+            return None, error or (
+                "Reply with `loose-calendar`, `consequential-calendar`, or `individual-calendars`."
+            )
+        campaign_state = self.get_campaign_state(campaign)
+        campaign_state["time_model"] = str(
+            choice.get("time_model") or self.TIME_MODEL_SHARED_CLOCK
+        )
+        campaign_state["calendar_policy"] = str(
+            choice.get("calendar_policy") or self.CALENDAR_POLICY_CONSEQUENTIAL
+        )
+        with self._session_factory() as session:
+            row = session.get(Campaign, campaign.id)
+            if row is None:
+                return None, "Campaign not found."
+            row.state_json = self._dump_json(campaign_state)
+            row.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
+            session.commit()
+            campaign.state_json = row.state_json
+            campaign.updated_at = row.updated_at
+        return self.get_campaign_clock_type(campaign), None
+
     @classmethod
     def normalize_difficulty(cls, value: object) -> str:
         text = " ".join(str(value or "").strip().lower().split())
