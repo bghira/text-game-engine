@@ -3691,6 +3691,99 @@ def test_main_party_location_sync_updates_other_players(
     asyncio.run(run_test())
 
 
+def test_individual_clocks_keep_campaign_clock_global_and_player_time_personal(
+    session_factory,
+    seed_campaign_and_actor,
+):
+    async def run_test():
+        llm = StubLLM(
+            LLMTurnOutput(
+                narration="You let the evening inch forward.",
+                state_update={"game_time": {"day": 3, "hour": 9, "minute": 30}},
+                player_state_update={"room_summary": "Still in the apartment."},
+            )
+        )
+        engine = GameEngine(
+            uow_factory=lambda: SQLAlchemyUnitOfWork(session_factory),
+            llm=llm,
+        )
+        compat = ZorkEmulator(game_engine=engine, session_factory=session_factory)
+        campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
+        compat.get_or_create_player(campaign.id, seed_campaign_and_actor["actor_id"])
+
+        with session_factory() as session:
+            session.add(Actor(id="actor-2", display_name="Second Player", kind="human", metadata_json="{}"))
+            session.commit()
+            player_two = compat.get_or_create_player(campaign.id, "actor-2")
+            campaign_row = session.get(Campaign, campaign.id)
+            campaign_row.state_json = compat._dump_json(
+                {
+                    "time_model": "individual_clocks",
+                    "calendar_policy": "consequential",
+                    "clock_start_day_of_week": "monday",
+                    "game_time": {"day": 100, "hour": 12, "minute": 0},
+                }
+            )
+            player_one_row = (
+                session.query(Player)
+                .filter(Player.campaign_id == campaign.id)
+                .filter(Player.actor_id == seed_campaign_and_actor["actor_id"])
+                .one()
+            )
+            player_one_row.state_json = compat._dump_json(
+                {
+                    "character_name": "Rigby Krinkle",
+                    "location": "queens-apartment",
+                    "room_title": "Queens Apartment",
+                    "game_time": {"day": 3, "hour": 9, "minute": 0},
+                }
+            )
+            player_two_row = session.get(Player, player_two.id)
+            player_two_row.state_json = compat._dump_json(
+                {
+                    "character_name": "Penny Reynolds",
+                    "location": "queens-apartment",
+                    "room_title": "Queens Apartment",
+                    "game_time": {"day": 7, "hour": 14, "minute": 0},
+                }
+            )
+            session.commit()
+
+        out = await compat.play_action(
+            campaign_id=campaign.id,
+            actor_id=seed_campaign_and_actor["actor_id"],
+            action="wait",
+        )
+        assert out is not None
+
+        with session_factory() as session:
+            campaign_row = session.get(Campaign, campaign.id)
+            campaign_state = json.loads(campaign_row.state_json or "{}")
+            assert campaign_state.get("game_time") == {"day": 100, "hour": 12, "minute": 0}
+
+            player_one_row = (
+                session.query(Player)
+                .filter(Player.campaign_id == campaign.id)
+                .filter(Player.actor_id == seed_campaign_and_actor["actor_id"])
+                .one()
+            )
+            player_one_state = json.loads(player_one_row.state_json or "{}")
+            assert player_one_state.get("game_time", {}).get("day") == 3
+            assert player_one_state.get("game_time", {}).get("hour") == 9
+            assert player_one_state.get("game_time", {}).get("minute") == 30
+
+            player_two_row = (
+                session.query(Player)
+                .filter(Player.campaign_id == campaign.id)
+                .filter(Player.actor_id == "actor-2")
+                .one()
+            )
+            player_two_state = json.loads(player_two_row.state_json or "{}")
+            assert player_two_state.get("game_time") == {"day": 7, "hour": 14, "minute": 0}
+
+    asyncio.run(run_test())
+
+
 def test_calendar_update_keeps_overdue_and_requires_explicit_remove(
     session_factory, seed_campaign_and_actor
 ):

@@ -88,13 +88,19 @@ class DeterministicLLM:
     async def complete_turn(self, context, *, progress: ProgressCallback | None = None) -> LLMTurnOutput:
         action = (context.action or "").strip()
         lowered = action.lower()
-        current_time = (
-            context.campaign_state.get("game_time", {})
-            if isinstance(context.campaign_state, dict)
-            else {}
-        )
+        campaign_state = context.campaign_state if isinstance(context.campaign_state, dict) else {}
+        player_state = context.player_state if isinstance(getattr(context, "player_state", None), dict) else {}
+        time_model = str(campaign_state.get("time_model") or "").strip().lower()
+        if time_model == "individual_clocks":
+            current_time = (
+                player_state.get("game_time")
+                if isinstance(player_state.get("game_time"), dict)
+                else campaign_state.get("game_time", {})
+            )
+        else:
+            current_time = campaign_state.get("game_time", {})
         speed_multiplier = self._speed_multiplier(
-            context.campaign_state if isinstance(context.campaign_state, dict) else {}
+            campaign_state
         )
         next_time = self._advance_time(
             current_time if isinstance(current_time, dict) else {},
