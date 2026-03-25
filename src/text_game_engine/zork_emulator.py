@@ -366,6 +366,10 @@ class ZorkEmulator:
     DEFAULT_TURN_ADVANCE_MINUTES = 20
     MAX_TURN_ADVANCE_MINUTES = 180
     CLOCK_START_DAY_OF_WEEK_KEY = "clock_start_day_of_week"
+    TIME_MODEL_SHARED_CLOCK = "shared_clock"
+    TIME_MODEL_INDIVIDUAL_CLOCKS = "individual_clocks"
+    CALENDAR_POLICY_LOOSE = "loose"
+    CALENDAR_POLICY_CONSEQUENTIAL = "consequential"
     LOCATION_CARDS_STATE_KEY = GameEngine.LOCATION_CARDS_STATE_KEY
     LOCATION_FACT_PRIORITIES_KEY = GameEngine.LOCATION_FACT_PRIORITIES_KEY
     WEEKDAY_NAMES = (
@@ -1253,6 +1257,11 @@ class ZorkEmulator:
     CALENDAR_TOOL_PROMPT = (
         "\nCALENDAR & GAME TIME SYSTEM:\n"
         "The campaign tracks in-game time via CURRENT_GAME_TIME shown in the user prompt.\n"
+        "The user prompt also includes TIME_MODEL and CALENDAR_POLICY.\n"
+        "If TIME_MODEL is individual_clocks, CURRENT_GAME_TIME is the acting player's personal present, while GLOBAL_GAME_TIME (when shown) is the shared world clock for global events.\n"
+        "In individual_clocks mode, players may share a location slug without sharing the same moment. Same location does NOT imply direct co-presence.\n"
+        "Use PLAYER_CARD.state.game_time and PARTY_SNAPSHOT[*].game_time to judge whether other real players are actually in the same moment or only in the same place at another time.\n"
+        "Only treat real players as directly witnessing or interacting with each other when both location and time align closely enough for a shared scene.\n"
         "The user prompt also includes MIN_TURN_ADVANCE_MINUTES_EFFECTIVE, STANDARD_TURN_ADVANCE_MINUTES_EFFECTIVE, and TURN_TIME_BEAT_GUIDANCE for the current campaign speed.\n"
         "Every turn, you MUST advance game_time in state_update by a plausible amount "
         "(ordinary turns use STANDARD_TURN_ADVANCE_MINUTES_EFFECTIVE as the baseline rhythm, longer for travel/rest/time skips, etc.). "
@@ -1281,6 +1290,9 @@ class ZorkEmulator:
         "- Keep known_by to character names from PARTY_SNAPSHOT / CHARACTER_INDEX. Omit known_by for globally-known events.\n"
         "- target_player / target_players are optional player-specific targets. These may be a Discord ID, a Discord mention, a player slug, or a PARTY_SNAPSHOT-style string such as '<@123> (Rigby)'.\n"
         "- If no target_player(s) are provided, the event is treated as global.\n"
+        "- In shared_clock + loose mode, overdue player-targeted appointments may slide forward instead of being lost.\n"
+        "- In shared_clock + consequential mode, overdue player-targeted appointments remain visible as missed/unresolved until the player deals with them.\n"
+        "- In individual_clocks mode, player-targeted appointments are judged against that player's own game_time, not another player's pace.\n"
         "- Do NOT decrement counters manually by re-adding events each turn. The harness computes remaining days automatically.\n"
         "- You will receive CALENDAR_REMINDERS in the prompt for imminent/overdue events, including hour-level countdowns near deadline.\n"
         "- CALENDAR_REMINDERS are sparse urgency signals. Do NOT echo them every turn; only surface them in narration when relevant to the current action/scene, when the player asks, or when the event is immediate.\n"
@@ -3842,6 +3854,13 @@ class ZorkEmulator:
                     setup_data,
                     clean_text,
                 )
+            elif phase == "calendar_time_policy_pick":
+                result = await self._setup_handle_calendar_time_policy_pick(
+                    campaign,
+                    state,
+                    setup_data,
+                    clean_text,
+                )
             elif phase == "genre_pick":
                 result = await self._setup_handle_genre_pick(
                     campaign,
@@ -5508,6 +5527,72 @@ class ZorkEmulator:
             return "shared-world", None
         return None, "Reply with `character-centric` or `shared-world`."
 
+    @classmethod
+    def _setup_calendar_time_policy_prompt(cls) -> str:
+        return (
+            "How should time and personal calendar events work in this campaign?\n\n"
+            "1. **loose-calendar** — one shared world clock; if another player's progress would skip a personal appointment, the harness slides it forward by one day instead of dropping it.\n"
+            "2. **consequential-calendar** — one shared world clock; if a personal appointment is missed, it stays visible as missed until the player deals with it.\n"
+            "3. **individual-calendars** — each player keeps their own personal game_time and personal calendar pace; players can share a location slug without sharing the same moment.\n\n"
+            "Reply with **loose-calendar**, **consequential-calendar**, or **individual-calendars**.\n"
+            "Short aliases also work: **loose**, **consequential**, **individual**."
+        )
+
+    @classmethod
+    def _parse_setup_calendar_time_policy_choice(
+        cls,
+        content: str,
+    ) -> tuple[dict[str, str] | None, str | None]:
+        raw = str(content or "").strip().lower()
+        if not raw:
+            return None, "Please choose a time/calendar handling mode."
+
+        normalized = raw.replace("_", "-").replace(" ", "-")
+        normalized = re.sub(r"-{2,}", "-", normalized).strip("-")
+        loose_tokens = {
+            "1",
+            "loose",
+            "loose-calendar",
+            "soft-calendar",
+            "floating-calendar",
+            "reschedule",
+        }
+        consequential_tokens = {
+            "2",
+            "consequential",
+            "consequential-calendar",
+            "strict-calendar",
+            "missed-events",
+            "shared-clock",
+        }
+        individual_tokens = {
+            "3",
+            "individual",
+            "individual-calendar",
+            "individual-calendars",
+            "individual-clocks",
+            "async",
+            "asynchronous",
+        }
+        if normalized in loose_tokens:
+            return {
+                "time_model": cls.TIME_MODEL_SHARED_CLOCK,
+                "calendar_policy": cls.CALENDAR_POLICY_LOOSE,
+            }, None
+        if normalized in consequential_tokens:
+            return {
+                "time_model": cls.TIME_MODEL_SHARED_CLOCK,
+                "calendar_policy": cls.CALENDAR_POLICY_CONSEQUENTIAL,
+            }, None
+        if normalized in individual_tokens:
+            return {
+                "time_model": cls.TIME_MODEL_INDIVIDUAL_CLOCKS,
+                "calendar_policy": cls.CALENDAR_POLICY_CONSEQUENTIAL,
+            }, None
+        return None, (
+            "Reply with `loose-calendar`, `consequential-calendar`, or `individual-calendars`."
+        )
+
     async def _setup_handle_classify_confirm(
         self,
         campaign: Campaign,
@@ -5724,6 +5809,24 @@ class ZorkEmulator:
         if error:
             return f"{error}\n\n{self._setup_world_structure_prompt()}"
         setup_data["world_structure"] = world_structure
+        state["setup_phase"] = "calendar_time_policy_pick"
+        state["setup_data"] = setup_data
+        return self._setup_calendar_time_policy_prompt()
+
+    async def _setup_handle_calendar_time_policy_pick(
+        self,
+        campaign: Campaign,
+        state: dict[str, Any],
+        setup_data: dict[str, Any],
+        message_text: str,
+    ) -> str:
+        choice, error = self._parse_setup_calendar_time_policy_choice(message_text)
+        if error:
+            return f"{error}\n\n{self._setup_calendar_time_policy_prompt()}"
+        setup_data["time_model"] = str(choice.get("time_model") or self.TIME_MODEL_SHARED_CLOCK)
+        setup_data["calendar_policy"] = str(
+            choice.get("calendar_policy") or self.CALENDAR_POLICY_CONSEQUENTIAL
+        )
         state["setup_phase"] = "genre_pick"
         state["setup_data"] = setup_data
         return self._setup_genre_prompt()
@@ -5790,6 +5893,8 @@ class ZorkEmulator:
         world_structure = str(
             setup_data.get("world_structure") or "character-centric"
         ).strip().lower()
+        time_model = self._time_model_from_state(setup_data)
+        calendar_policy = self._calendar_policy_from_state(setup_data)
 
         # Build source material index hint if docs are available.
         source_payload = self._source_material_prompt_payload(str(campaign.id))
@@ -5879,6 +5984,24 @@ class ZorkEmulator:
                     "\nCampaign structure: character-centric.\n"
                     "It is acceptable to build the world around a central player-facing lead or main viewpoint.\n"
                 )
+            if time_model == self.TIME_MODEL_INDIVIDUAL_CLOCKS:
+                time_context = (
+                    "\nTime/calendar handling: individual-calendars.\n"
+                    "Different players may occupy the same location in different personal times. "
+                    "Build a world that tolerates asynchronous progression, traces of prior visits, "
+                    "and personal appointments that matter on each player's own pace.\n"
+                )
+            elif calendar_policy == self.CALENDAR_POLICY_LOOSE:
+                time_context = (
+                    "\nTime/calendar handling: loose-calendar on a shared world clock.\n"
+                    "Personal appointments should be resilient. If timing slips because of other players' progress, "
+                    "the harness may slide them forward instead of treating them as lost.\n"
+                )
+            else:
+                time_context = (
+                    "\nTime/calendar handling: consequential-calendar on a shared world clock.\n"
+                    "Missed appointments should matter and remain part of continuity until addressed.\n"
+                )
             finalize_system = (
                 "You are a world-builder for interactive text-adventure campaigns.\n"
                 "For non-canonical/original characters, choose distinctive specific names; avoid generic defaults "
@@ -5897,6 +6020,7 @@ class ZorkEmulator:
                 f"{attachment_context}"
                 f"{source_index_hint}"
                 f"{structure_context}"
+                f"{time_context}"
                 f"{genre_context}"
                 f"Chosen storyline:\n{self._dump_json(chosen)}\n\n"
                 "Expand chapter outline into full chapters with 2-4 scenes each."
@@ -5911,6 +6035,7 @@ class ZorkEmulator:
                             f"{attachment_context}"
                             f"{source_index_hint}"
                             f"{structure_context}"
+                            f"{time_context}"
                             f"{genre_context}"
                             "Source-material summary (if present) is authoritative; keep names, locations, and plot faithful to it.\n"
                             f"Chosen storyline:\n{self._dump_json(chosen)}"
@@ -6002,6 +6127,8 @@ class ZorkEmulator:
         state["on_rails"] = on_rails
         state["puzzle_mode"] = novel_prefs.get("puzzle_mode", "none")
         state["world_structure"] = world_structure
+        state["time_model"] = time_model
+        state["calendar_policy"] = calendar_policy
 
         if opening:
             room_title = start_room.get("room_title", "") if isinstance(start_room, dict) else ""
@@ -6398,6 +6525,7 @@ class ZorkEmulator:
                         "attribute_cues": attribute_cues,
                         "location": state.get("location"),
                         "room_title": state.get("room_title"),
+                        "game_time": state.get("game_time") if isinstance(state.get("game_time"), dict) else None,
                     }
                 )
                 if len(out) >= self.MAX_PARTY_CONTEXT_PLAYERS:
@@ -8192,8 +8320,15 @@ class ZorkEmulator:
 
             if action_clean in ("calendar", "cal", "events"):
                 campaign_state = self.get_campaign_state(campaign_obj)
-                game_time = campaign_state.get("game_time", {})
-                calendar_entries = self._calendar_for_prompt(campaign_state)
+                game_time, _global_game_time, _time_model, _calendar_policy = self._current_game_time_for_prompt(
+                    campaign_state,
+                    player_state,
+                )
+                calendar_entries = self._calendar_for_prompt(
+                    campaign_state,
+                    player_state=player_state,
+                    viewer_actor_id=actor_id_text,
+                )
                 player_calendar_lines = self._player_calendar_events_for_display(
                     player_state
                 )
@@ -8212,7 +8347,10 @@ class ZorkEmulator:
                         fire_hour = max(0, min(23, int(event.get("fire_hour", 23))))
                         desc = str(event.get("description", "") or "")
                         if hours_remaining < 0:
-                            eta = f"overdue by {abs(hours_remaining)} hour(s)"
+                            if str(event.get("status") or "").strip().lower() == "missed":
+                                eta = "missed and still unresolved"
+                            else:
+                                eta = f"overdue by {abs(hours_remaining)} hour(s)"
                         elif hours_remaining == 0:
                             eta = "fires now"
                         elif hours_remaining < 48:
@@ -10135,13 +10273,32 @@ class ZorkEmulator:
     def _calendar_for_prompt(
         cls,
         campaign_state: Dict[str, object],
+        *,
+        player_state: dict[str, object] | None = None,
+        viewer_actor_id: object = None,
     ) -> list[dict[str, object]]:
         game_time = campaign_state.get("game_time") if isinstance(campaign_state, dict) else {}
         if not isinstance(game_time, dict):
             game_time = {}
-        current_day = cls._coerce_non_negative_int(game_time.get("day", 1), default=1) or 1
-        current_hour = cls._coerce_non_negative_int(game_time.get("hour", 8), default=8)
-        current_hour = min(23, max(0, current_hour))
+        time_model = cls._time_model_from_state(campaign_state)
+        calendar_policy = cls._calendar_policy_from_state(campaign_state)
+        global_day = cls._coerce_non_negative_int(game_time.get("day", 1), default=1) or 1
+        global_hour = cls._coerce_non_negative_int(game_time.get("hour", 8), default=8)
+        global_hour = min(23, max(0, global_hour))
+        current_day = global_day
+        current_hour = global_hour
+        if time_model == cls.TIME_MODEL_INDIVIDUAL_CLOCKS and isinstance(player_state, dict):
+            player_game_time = player_state.get("game_time")
+            if isinstance(player_game_time, dict) and player_game_time:
+                current_day = cls._coerce_non_negative_int(
+                    player_game_time.get("day", global_day),
+                    default=global_day,
+                ) or global_day
+                current_hour = cls._coerce_non_negative_int(
+                    player_game_time.get("hour", global_hour),
+                    default=global_hour,
+                )
+                current_hour = min(23, max(0, current_hour))
         calendar = campaign_state.get("calendar") if isinstance(campaign_state, dict) else []
         if not isinstance(calendar, list):
             calendar = []
@@ -10181,9 +10338,31 @@ class ZorkEmulator:
                 if "time_unit" in raw:
                     raw.pop("time_unit", None)
                     calendar_changed = True
+            event_targets_viewer = cls._calendar_event_targets_player(
+                normalized,
+                actor_id=viewer_actor_id,
+                player_state=player_state,
+            )
+            if (
+                time_model == cls.TIME_MODEL_SHARED_CLOCK
+                and calendar_policy == cls.CALENDAR_POLICY_LOOSE
+                and event_targets_viewer
+            ):
+                while ((fire_day - current_day) * 24) + (fire_hour - current_hour) < 0:
+                    fire_day += 1
+                    calendar_changed = True
+                if isinstance(raw, dict):
+                    raw["fire_day"] = fire_day
+                    raw["fire_hour"] = fire_hour
             hours_remaining = ((fire_day - current_day) * 24) + (fire_hour - current_hour)
             days_remaining = fire_day - current_day
-            if hours_remaining < 0:
+            if (
+                hours_remaining < 0
+                and event_targets_viewer
+                and calendar_policy == cls.CALENDAR_POLICY_CONSEQUENTIAL
+            ):
+                status = "missed"
+            elif hours_remaining < 0:
                 status = "overdue"
             elif days_remaining == 0:
                 status = "today"
@@ -10192,9 +10371,13 @@ class ZorkEmulator:
             else:
                 status = "upcoming"
             view = dict(normalized)
+            view["fire_day"] = fire_day
+            view["fire_hour"] = fire_hour
             view["days_remaining"] = days_remaining
             view["hours_remaining"] = hours_remaining
             view["status"] = status
+            if event_targets_viewer:
+                view["targeted_to_active_player"] = True
             entries.append(view)
         entries.sort(
             key=lambda item: (
@@ -10324,10 +10507,16 @@ class ZorkEmulator:
             current_event_keys.add(event_key)
             if reminder_state.get(event_key) == bucket:
                 continue
+            status = str(event.get("status") or "").strip().lower()
             if hours < 0:
-                alerts.append(
-                    f"- OVERDUE: {name} (was Day {fire_day}, {fire_hour:02d}:00; {abs(hours)} hour(s) overdue)"
-                )
+                if status == "missed":
+                    alerts.append(
+                        f"- MISSED: {name} (was Day {fire_day}, {fire_hour:02d}:00; still unresolved)"
+                    )
+                else:
+                    alerts.append(
+                        f"- OVERDUE: {name} (was Day {fire_day}, {fire_hour:02d}:00; {abs(hours)} hour(s) overdue)"
+                    )
             elif hours == 0:
                 alerts.append(
                     f"- NOW: {name} (fires at Day {fire_day}, {fire_hour:02d}:00)"
@@ -12648,6 +12837,7 @@ class ZorkEmulator:
                 {
                     "slug": str(row.get("slug") or row.get("player_slug") or "").strip(),
                     "name": str(row.get("character_name") or row.get("name") or "").strip(),
+                    "game_time": row.get("game_time") if isinstance(row.get("game_time"), dict) else None,
                 }
             )
         location_row = location_cards.get(location_key) if isinstance(location_cards, dict) else {}
@@ -13504,9 +13694,9 @@ class ZorkEmulator:
             party_snapshot,
             scene_characters_for_prompt,
         )
-        game_time = self._game_time_from_total_minutes(
-            self._game_time_to_total_minutes(state.get("game_time") or {}),
-            start_day_of_week=self._campaign_start_day_of_week(state),
+        game_time, global_game_time, time_model, calendar_policy = self._current_game_time_for_prompt(
+            state,
+            player_state,
         )
         speed_mult = state.get("speed_multiplier", 1.0)
         effective_min_turn_advance = self._effective_min_turn_advance_minutes(speed_mult)
@@ -13524,7 +13714,11 @@ class ZorkEmulator:
             ensure_ascii=True,
             sort_keys=True,
         )
-        calendar_for_prompt = self._calendar_for_prompt(state)
+        calendar_for_prompt = self._calendar_for_prompt(
+            state,
+            player_state=player_state,
+            viewer_actor_id=player.actor_id,
+        )
         calendar_state_after = json.dumps(
             state.get("calendar") or [],
             ensure_ascii=True,
@@ -13594,7 +13788,16 @@ class ZorkEmulator:
                     )
         user_prompt += (
             f"CURRENT_GAME_TIME: {self._dump_json(game_time)}\n"
-            f"SPEED_MULTIPLIER: {speed_mult}\n"
+            + (
+                f"GLOBAL_GAME_TIME: {self._dump_json(global_game_time)}\n"
+                if time_model == self.TIME_MODEL_INDIVIDUAL_CLOCKS
+                else ""
+            )
+            + (
+                f"TIME_MODEL: {time_model}\n"
+                f"CALENDAR_POLICY: {calendar_policy}\n"
+            )
+            + f"SPEED_MULTIPLIER: {speed_mult}\n"
             f"MIN_TURN_ADVANCE_MINUTES_EFFECTIVE: {effective_min_turn_advance}\n"
             f"STANDARD_TURN_ADVANCE_MINUTES_EFFECTIVE: {effective_standard_turn_advance}\n"
             f"TURN_TIME_BEAT_GUIDANCE: {turn_time_beat_guidance}\n"
@@ -17349,6 +17552,76 @@ class ZorkEmulator:
         if value <= 0:
             return 1.0
         return max(0.1, min(10.0, value))
+
+    @classmethod
+    def _time_model_from_state(cls, campaign_state: Dict[str, object] | None) -> str:
+        raw = str((campaign_state or {}).get("time_model") or "").strip().lower()
+        if raw == cls.TIME_MODEL_INDIVIDUAL_CLOCKS:
+            return cls.TIME_MODEL_INDIVIDUAL_CLOCKS
+        return cls.TIME_MODEL_SHARED_CLOCK
+
+    @classmethod
+    def _calendar_policy_from_state(cls, campaign_state: Dict[str, object] | None) -> str:
+        raw = str((campaign_state or {}).get("calendar_policy") or "").strip().lower()
+        if raw == cls.CALENDAR_POLICY_LOOSE:
+            return cls.CALENDAR_POLICY_LOOSE
+        return cls.CALENDAR_POLICY_CONSEQUENTIAL
+
+    @classmethod
+    def _calendar_event_targets_player(
+        cls,
+        event: object,
+        *,
+        actor_id: object = None,
+        player_state: dict[str, object] | None = None,
+    ) -> bool:
+        target_tokens = cls._calendar_target_tokens_from_event(event)
+        if not target_tokens:
+            return False
+        aliases: set[str] = set()
+
+        def _add(raw: object) -> None:
+            text = str(raw or "").strip()
+            if not text:
+                return
+            aliases.add(" ".join(text.lower().split())[:160])
+            slug_key = cls._player_slug_key(text)
+            if slug_key:
+                aliases.add(slug_key[:160])
+
+        _add(actor_id)
+        _add(cls._player_visibility_slug(actor_id))
+        if isinstance(actor_id, str) and actor_id.strip():
+            _add(f"<@{actor_id.strip()}>")
+        if isinstance(player_state, dict):
+            _add(player_state.get("character_name"))
+        for token in target_tokens:
+            normalized = " ".join(str(token or "").strip().lower().split())[:160]
+            slug_key = cls._player_slug_key(token)
+            if normalized in aliases or (slug_key and slug_key in aliases):
+                return True
+        return False
+
+    def _current_game_time_for_prompt(
+        self,
+        campaign_state: dict[str, object],
+        player_state: dict[str, object],
+    ) -> tuple[dict[str, object], dict[str, object], str, str]:
+        global_game_time = self._game_time_from_total_minutes(
+            self._game_time_to_total_minutes(campaign_state.get("game_time") or {}),
+            start_day_of_week=self._campaign_start_day_of_week(campaign_state),
+        )
+        time_model = self._time_model_from_state(campaign_state)
+        calendar_policy = self._calendar_policy_from_state(campaign_state)
+        if time_model == self.TIME_MODEL_INDIVIDUAL_CLOCKS:
+            raw_player_time = player_state.get("game_time") if isinstance(player_state, dict) else None
+            if isinstance(raw_player_time, dict) and raw_player_time:
+                player_game_time = self._game_time_from_total_minutes(
+                    self._game_time_to_total_minutes(raw_player_time),
+                    start_day_of_week=self._campaign_start_day_of_week(campaign_state),
+                )
+                return player_game_time, global_game_time, time_model, calendar_policy
+        return global_game_time, global_game_time, time_model, calendar_policy
 
     def _effective_min_turn_advance_minutes(self, speed_multiplier: float) -> int:
         try:
