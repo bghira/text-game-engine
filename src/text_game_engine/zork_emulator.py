@@ -249,7 +249,7 @@ class ZorkEmulator:
         "preserving all scene image details from scene in image 1"
     )
     TIMER_REALTIME_SCALE = 0.2
-    TIMER_REALTIME_MIN_SECONDS = 45
+    TIMER_REALTIME_MIN_SECONDS = 60
     TIMER_REALTIME_MAX_SECONDS = 120
     TIMER_INTERRUPT_GRACE_SECONDS = 1.0
     PROCESSING_EMOJI = "🤔"
@@ -7719,7 +7719,7 @@ class ZorkEmulator:
                     speed = self.get_timed_events_speed_multiplier(campaign_row)
                     if speed > 0:
                         timer_delay_seconds = int(timer_delay_seconds / speed)
-                    timer_delay_seconds = max(45, min(300, timer_delay_seconds))
+                    timer_delay_seconds = max(60, min(300, timer_delay_seconds))
                     timer_delay_seconds = self._compress_realtime_timer_delay(
                         timer_delay_seconds
                     )
@@ -8783,6 +8783,136 @@ class ZorkEmulator:
                 f"Fires <t:{due_ts}:F> (<t:{due_ts}:R>)\n"
                 f"{interrupt_hint}"
             )
+
+    @classmethod
+    def _render_inline_timer_line(
+        cls,
+        *,
+        due_at: datetime,
+        event_text: str,
+        interruptible: bool,
+        interrupt_scope: str = "global",
+    ) -> str | None:
+        if due_at is None:
+            return None
+        try:
+            import calendar as _calendar
+
+            expiry_ts = int(_calendar.timegm(due_at.utctimetuple()))
+        except Exception:
+            return None
+        scope = cls._normalize_timer_interrupt_scope(interrupt_scope)
+        if interruptible:
+            interrupt_hint = (
+                "acting player can prevent"
+                if scope == "local"
+                else "act to prevent!"
+            )
+        else:
+            interrupt_hint = "unavoidable"
+        return f"⏰ *Timed event:* <t:{expiry_ts}:R> - {event_text} ({interrupt_hint})"
+
+    def has_active_timer_for_message(self, message_id: str | int) -> bool:
+        try:
+            mid = str(int(message_id))
+        except (TypeError, ValueError):
+            return False
+        with self._session_factory() as session:
+            timer = (
+                session.query(Timer)
+                .filter(Timer.external_message_id == mid)
+                .filter(Timer.status.in_(["scheduled_unbound", "scheduled_bound"]))
+                .order_by(Timer.updated_at.desc(), Timer.created_at.desc())
+                .first()
+            )
+            return timer is not None
+
+    def extend_pending_timer_for_message(
+        self,
+        message_id: str | int,
+        *,
+        extra_seconds: int = 60,
+    ) -> dict[str, Any] | None:
+        try:
+            mid = str(int(message_id))
+        except (TypeError, ValueError):
+            return None
+        try:
+            extra = max(1, int(extra_seconds))
+        except (TypeError, ValueError):
+            extra = 60
+
+        with self._session_factory() as session:
+            timer = (
+                session.query(Timer)
+                .filter(Timer.external_message_id == mid)
+                .filter(Timer.status.in_(["scheduled_unbound", "scheduled_bound"]))
+                .order_by(Timer.updated_at.desc(), Timer.created_at.desc())
+                .first()
+            )
+            if timer is None:
+                return None
+            campaign_id = str(getattr(timer, "campaign_id", "") or "").strip()
+            if not campaign_id:
+                return None
+            pending = self._pending_timers.get(campaign_id)
+            if not isinstance(pending, dict):
+                return None
+            if str(pending.get("message_id") or "").strip() != mid:
+                return None
+
+            now = datetime.now(timezone.utc).replace(tzinfo=None)
+            current_due_at = getattr(timer, "due_at", None) or now
+            remaining = max(0, int((current_due_at - now).total_seconds()))
+            new_delay = remaining + extra
+            new_due_at = now + timedelta(seconds=new_delay)
+
+            timer.due_at = new_due_at
+            timer.updated_at = now
+            session.commit()
+
+            task = pending.get("task")
+            if task is not None and not task.done():
+                task.cancel()
+            channel_id = str(
+                pending.get("channel_id")
+                or getattr(timer, "external_thread_id", None)
+                or getattr(timer, "external_channel_id", None)
+                or ""
+            ).strip()
+            if not channel_id:
+                return None
+            pending["task"] = asyncio.create_task(
+                self._timer_task(
+                    campaign_id,
+                    channel_id,
+                    new_delay,
+                    str(getattr(timer, "event_text", "") or pending.get("event") or "Something happens."),
+                )
+            )
+            pending["delay"] = new_delay
+            pending["channel_id"] = channel_id
+            pending["message_id"] = mid
+            self._pending_timers[campaign_id] = pending
+
+            replacement = self._render_inline_timer_line(
+                due_at=new_due_at,
+                event_text=str(getattr(timer, "event_text", "") or pending.get("event") or "Something happens."),
+                interruptible=bool(getattr(timer, "interruptible", True)),
+                interrupt_scope=self._normalize_timer_interrupt_scope(
+                    pending.get("interrupt_scope", "global")
+                ),
+            )
+            if replacement:
+                asyncio.create_task(self._edit_timer_line(channel_id, mid, replacement))
+            return {
+                "campaign_id": campaign_id,
+                "message_id": mid,
+                "channel_id": channel_id,
+                "delay": new_delay,
+                "due_at": new_due_at,
+                "replacement": replacement,
+            }
 
     def register_timer_message(
         self,

@@ -5400,7 +5400,7 @@ def test_timed_events_speed_multiplier_scales_timer_delay_and_rendered_line(
         assert pending is not None
         # 120s / 2.0 speed = 60s, then realtime compression would be 12s,
         # but the runtime floor keeps it readable.
-        assert int(pending.get("delay", 0)) == 45
+        assert int(pending.get("delay", 0)) == 60
 
         with session_factory() as session:
             timer_row = (
@@ -5411,13 +5411,83 @@ def test_timed_events_speed_multiplier_scales_timer_delay_and_rendered_line(
             )
             assert timer_row is not None
             due_delta = (timer_row.due_at - datetime.now(timezone.utc).replace(tzinfo=None)).total_seconds()
-            assert 35 <= due_delta <= 70
+            assert 50 <= due_delta <= 85
 
         timer_match = re.search(r"<t:(\d+):R>", narration)
         assert timer_match is not None
         expiry_ts = int(timer_match.group(1))
         delta = expiry_ts - int(time.time())
-        assert 35 <= delta <= 70
+        assert 50 <= delta <= 85
+
+        compat.cancel_pending_timer(campaign.id)
+
+    asyncio.run(run_test())
+
+
+def test_extend_pending_timer_for_message_adds_60_seconds_and_edits_line(
+    uow_factory,
+    session_factory,
+    seed_campaign_and_actor,
+):
+    async def run_test():
+        timer_effects = StubTimerEffects()
+        llm = StubLLM(
+            LLMTurnOutput(
+                narration="The lights dim ominously.",
+                timer_instruction=TimerInstruction(delay_seconds=120, event_text="The vault seals"),
+            )
+        )
+        engine = GameEngine(uow_factory=uow_factory, llm=llm)
+        compat = ZorkEmulator(
+            game_engine=engine,
+            session_factory=session_factory,
+            timer_effects_port=timer_effects,
+        )
+
+        campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
+        compat.get_or_create_player(campaign.id, seed_campaign_and_actor["actor_id"])
+        session_row = compat.get_or_create_session(
+            campaign_id=campaign.id,
+            surface="discord_channel",
+            surface_key="discord:default:chan-extend",
+            surface_channel_id="chan-extend",
+        )
+
+        narration = await compat.play_action(
+            campaign_id=campaign.id,
+            actor_id=seed_campaign_and_actor["actor_id"],
+            action="wait",
+            session_id=session_row.id,
+        )
+        assert narration is not None
+        assert compat.register_timer_message(campaign.id, "1001", "chan-extend") is True
+
+        pending_before = compat._pending_timers.get(campaign.id)
+        assert pending_before is not None
+        delay_before = int(pending_before.get("delay", 0))
+        result = compat.extend_pending_timer_for_message("1001", extra_seconds=60)
+        assert result is not None
+        await asyncio.sleep(0)
+
+        pending_after = compat._pending_timers.get(campaign.id)
+        assert pending_after is not None
+        assert int(pending_after.get("delay", 0)) >= delay_before + 55
+        assert timer_effects.edits
+        _channel_id, _message_id, replacement = timer_effects.edits[-1]
+        assert _channel_id == "chan-extend"
+        assert _message_id == "1001"
+        assert replacement.startswith("⏰ *Timed event:* <t:")
+
+        with session_factory() as session:
+            timer_row = (
+                session.query(Timer)
+                .filter(Timer.campaign_id == campaign.id)
+                .order_by(Timer.created_at.desc())
+                .first()
+            )
+            assert timer_row is not None
+            due_delta = (timer_row.due_at - datetime.now(timezone.utc).replace(tzinfo=None)).total_seconds()
+            assert due_delta >= delay_before + 50
 
         compat.cancel_pending_timer(campaign.id)
 
@@ -5463,7 +5533,7 @@ def test_game_speed_multiplier_no_longer_scales_timer_delay(
         # Game-time speed should not affect realtime timers anymore.
         # 120s at default timed-events speed would compress to 24s, but the
         # runtime floor keeps it readable.
-        assert int(pending.get("delay", 0)) == 45
+        assert int(pending.get("delay", 0)) == 60
 
         compat.cancel_pending_timer(campaign.id)
 
