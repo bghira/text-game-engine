@@ -852,12 +852,18 @@ class GameEngine:
             if time_model == self.TIME_MODEL_INDIVIDUAL_CLOCKS:
                 personal_time_state = {
                     "time_model": time_model,
-                    "game_time": personal_game_time_update
+                    self.CLOCK_START_DAY_OF_WEEK_KEY: campaign_state.get(
+                        self.CLOCK_START_DAY_OF_WEEK_KEY
+                    ),
+                    "speed_multiplier": campaign_state.get("speed_multiplier"),
+                }
+                personal_time_state["game_time"] = (
+                    personal_game_time_update
                     if isinstance(personal_game_time_update, dict)
                     else player_state.get("game_time")
                     or campaign_state.get("game_time")
-                    or {},
-                }
+                    or {}
+                )
                 personal_time_state = self._ensure_game_time_progress(
                     personal_time_state,
                     pre_turn_game_time,

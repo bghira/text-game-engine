@@ -10402,8 +10402,12 @@ class ZorkEmulator:
                 and calendar_policy == cls.CALENDAR_POLICY_LOOSE
                 and event_targets_viewer
             ):
-                while ((fire_day - current_day) * 24) + (fire_hour - current_hour) < 0:
-                    fire_day += 1
+                hours_remaining_before_roll = ((fire_day - current_day) * 24) + (
+                    fire_hour - current_hour
+                )
+                if hours_remaining_before_roll < 0:
+                    day_jump = max(1, ((-hours_remaining_before_roll) + 23) // 24)
+                    fire_day += day_jump
                     calendar_changed = True
                 if isinstance(raw, dict):
                     raw["fire_day"] = fire_day

@@ -91,7 +91,7 @@ class DeterministicLLM:
         campaign_state = context.campaign_state if isinstance(context.campaign_state, dict) else {}
         player_state = context.player_state if isinstance(getattr(context, "player_state", None), dict) else {}
         time_model = str(campaign_state.get("time_model") or "").strip().lower()
-        if time_model == "individual_clocks":
+        if time_model == ZorkEmulator.TIME_MODEL_INDIVIDUAL_CLOCKS:
             current_time = (
                 player_state.get("game_time")
                 if isinstance(player_state.get("game_time"), dict)
