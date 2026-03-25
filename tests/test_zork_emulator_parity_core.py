@@ -2576,6 +2576,7 @@ def test_recent_turns_keeps_actor_local_history_after_location_change(
     compat = _build_compat(session_factory)
     campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
     player = compat.get_or_create_player(seed_campaign_and_actor["campaign_id"], seed_campaign_and_actor["actor_id"])
+    other_player = compat.get_or_create_player(seed_campaign_and_actor["campaign_id"], "actor-2")
 
     with session_factory() as session:
         player_row = session.get(Player, player.id)
@@ -2627,6 +2628,67 @@ def test_recent_turns_keeps_actor_local_history_after_location_change(
     _system_prompt, user_prompt = compat.build_prompt(campaign, player, "look", turns)
 
     assert "You mutter to yourself in the old room." in user_prompt
+
+
+def test_recent_turns_keeps_shared_local_listener_history_after_location_change(
+    session_factory,
+    seed_campaign_and_actor,
+):
+    compat = _build_compat(session_factory)
+    campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
+    player = compat.get_or_create_player(seed_campaign_and_actor["campaign_id"], seed_campaign_and_actor["actor_id"])
+    other_player = compat.get_or_create_player(seed_campaign_and_actor["campaign_id"], "actor-2")
+
+    with session_factory() as session:
+        player_row = session.get(Player, player.id)
+        assert player_row is not None
+        player_row.state_json = compat._dump_json(
+            {
+                "character_name": "Tony",
+                "location": "room-b",
+            }
+        )
+        session.add(
+            Turn(
+                campaign_id=campaign.id,
+                session_id=None,
+                actor_id=other_player.actor_id,
+                kind="narrator",
+                content="Penny says she is staying.",
+                meta_json=json.dumps(
+                    {
+                        "game_time": {"day": 1, "hour": 9, "minute": 0},
+                        "visibility": {
+                            "scope": "local",
+                            "location_key": "room-a",
+                        },
+                        "location_key": "room-a",
+                        "scene_output": {
+                            "location_key": "room-a",
+                            "beats": [
+                                {
+                                    "reasoning": "Shared local beat in the old room.",
+                                    "type": "npc_dialogue",
+                                    "speaker": "penny-reynolds",
+                                    "actors": ["penny-reynolds"],
+                                    "listeners": ["tony"],
+                                    "visibility": "local",
+                                    "visible_actor_ids": [player.actor_id],
+                                    "aware_npc_slugs": [],
+                                    "text": "Penny says she is staying.",
+                                }
+                            ],
+                        },
+                    }
+                ),
+            )
+        )
+        session.commit()
+
+    turns = compat.get_recent_turns(seed_campaign_and_actor["campaign_id"])
+    _system_prompt, user_prompt = compat.build_prompt(campaign, player, "look", turns)
+
+    assert "Penny says she is staying." in user_prompt
 
 
 def test_recent_turns_still_hides_actor_turns_with_suppress_context(

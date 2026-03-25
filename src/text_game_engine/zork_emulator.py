@@ -1865,9 +1865,57 @@ class ZorkEmulator:
             viewer_loc_norm = cls._normalize_location_key(viewer_location_key)
             if viewer_loc_norm and turn_location_keys and viewer_loc_norm in turn_location_keys:
                 return True
+            if cls._viewer_participated_in_turn_scene_output(
+                turn,
+                viewer_actor_id=viewer_actor_id,
+                viewer_slug=viewer_slug,
+            ):
+                return True
         if viewer_actor_id in actor_ids:
             return True
         return bool(viewer_slug and viewer_slug in player_slugs)
+
+    @classmethod
+    def _viewer_participated_in_turn_scene_output(
+        cls,
+        turn: Turn,
+        *,
+        viewer_actor_id: str,
+        viewer_slug: str,
+    ) -> bool:
+        meta = cls._safe_turn_meta(turn)
+        scene_output = meta.get("scene_output")
+        if not isinstance(scene_output, dict):
+            return False
+        beats = scene_output.get("beats")
+        if not isinstance(beats, list):
+            return False
+        viewer_actor_id_text = str(viewer_actor_id or "").strip()
+        viewer_slug_key = cls._player_slug_key(viewer_slug)
+        if not viewer_actor_id_text and not viewer_slug_key:
+            return False
+        for beat in beats:
+            if not isinstance(beat, dict):
+                continue
+            visible_actor_ids = {
+                str(item or "").strip()
+                for item in list(beat.get("visible_actor_ids") or [])
+                if str(item or "").strip()
+            }
+            if viewer_actor_id_text and viewer_actor_id_text in visible_actor_ids:
+                return True
+            participant_slugs = {
+                cls._player_slug_key(item)
+                for item in (
+                    list(beat.get("actors") or [])
+                    + list(beat.get("listeners") or [])
+                    + [beat.get("speaker")]
+                )
+                if cls._player_slug_key(item)
+            }
+            if viewer_slug_key and viewer_slug_key in participant_slugs:
+                return True
+        return False
 
     @staticmethod
     def _normalize_timer_interrupt_scope(value: object) -> str:
@@ -19139,6 +19187,10 @@ class ZorkEmulator:
                     viewer_location_key_norm
                     and turn_location_keys
                     and viewer_location_key_norm in turn_location_keys
+                ) or self._viewer_participated_in_turn_scene_output(
+                    turn,
+                    viewer_actor_id=viewer_actor_id,
+                    viewer_slug=viewer_slug,
                 )
             if scope in {"private", "limited"} and turn_context_key:
                 return self._turn_visible_to_viewer(
@@ -19759,6 +19811,11 @@ class ZorkEmulator:
             elif beat_visibility == "local":
                 beat_visible = bool(
                     is_actor_turn
+                    or (
+                        viewer_actor_id is not None
+                        and str(viewer_actor_id).strip() in beat_visible_actor_ids
+                    )
+                    or (viewer_slug_key and viewer_slug_key in beat_actor_listener_slugs)
                     or (
                         viewer_location_key_norm
                         and beat_location_keys
