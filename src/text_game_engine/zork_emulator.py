@@ -18380,38 +18380,70 @@ class ZorkEmulator:
             player_aliases = self._sms_player_aliases(actor_id=actor_id, player_state=player_state)
             contact_roster = self._sms_contact_roster(campaign)
             unanswered_by_npc: list[str] = []
-            unanswered_seen: set[str] = set()
-            for thread_key, thread_data in sms_threads.items():
+            merged_threads: dict[str, dict[str, Any]] = {}
+            for thread_order, (thread_key, thread_data) in enumerate(sms_threads.items()):
                 if not isinstance(thread_data, dict):
                     continue
                 messages = thread_data.get("messages")
                 if not isinstance(messages, list) or not messages:
                     continue
-                last_msg = messages[-1] if messages else None
+                visible_messages = self._sms_visible_messages_for_viewer(
+                    thread_data,
+                    viewer_actor_id=actor_id,
+                    player_state=player_state,
+                )
+                if not visible_messages:
+                    continue
+                resolved_contact = self._sms_resolved_contact(
+                    str(thread_key),
+                    thread_data,
+                    viewer_actor_id=actor_id,
+                    player_state=player_state,
+                    contact_roster=contact_roster,
+                    visible_messages=visible_messages,
+                )
+                canonical_thread = self._sms_normalize_thread_key(
+                    resolved_contact.get("thread") or thread_key
+                ) or self._sms_normalize_thread_key(thread_key) or str(thread_key)
+                merged_entry = merged_threads.setdefault(
+                    canonical_thread,
+                    {
+                        "label": str(
+                            resolved_contact.get("label")
+                            or thread_data.get("label")
+                            or thread_key
+                        ).strip()[:40],
+                        "messages": [],
+                    },
+                )
+                for msg_index, msg in enumerate(visible_messages):
+                    if not isinstance(msg, dict):
+                        continue
+                    merged_entry["messages"].append(
+                        {
+                            "row": msg,
+                            "sort_key": (
+                                self._coerce_non_negative_int(msg.get("turn_id", 0), default=0),
+                                self._coerce_non_negative_int(msg.get("day", 0), default=0),
+                                self._coerce_non_negative_int(msg.get("hour", 0), default=0),
+                                self._coerce_non_negative_int(msg.get("minute", 0), default=0),
+                                self._coerce_non_negative_int(msg.get("seq", 0), default=0),
+                                thread_order,
+                                msg_index,
+                            ),
+                        }
+                    )
+            for merged_entry in merged_threads.values():
+                merged_messages = merged_entry.get("messages") or []
+                if not isinstance(merged_messages, list) or not merged_messages:
+                    continue
+                merged_messages.sort(key=lambda item: item.get("sort_key") or ())
+                last_msg = merged_messages[-1].get("row") if isinstance(merged_messages[-1], dict) else None
                 if not isinstance(last_msg, dict):
                     continue
                 from_norm = self._sms_normalize_thread_key(last_msg.get("from"))
                 if from_norm and from_norm in player_aliases:
-                    resolved_contact = self._sms_resolved_contact(
-                        str(thread_key),
-                        thread_data,
-                        viewer_actor_id=actor_id,
-                        player_state=player_state,
-                        contact_roster=contact_roster,
-                        visible_messages=messages,
-                    )
-                    canonical_thread = self._sms_normalize_thread_key(
-                        resolved_contact.get("thread") or thread_key
-                    )
-                    if canonical_thread and canonical_thread in unanswered_seen:
-                        continue
-                    if canonical_thread:
-                        unanswered_seen.add(canonical_thread)
-                    label = str(
-                        resolved_contact.get("label")
-                        or thread_data.get("label")
-                        or thread_key
-                    ).strip()[:40]
+                    label = str(merged_entry.get("label") or "").strip()[:40]
                     if label:
                         unanswered_by_npc.append(label)
             if unanswered_by_npc:

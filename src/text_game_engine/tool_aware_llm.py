@@ -53,6 +53,25 @@ def _neutralize_discord_mentions(text: object) -> str:
     return value
 
 
+def _strip_reasoning_from_recent_turn_jsonl(text: object) -> str:
+    lines: list[str] = []
+    for raw_line in str(text or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            payload = json.loads(line)
+        except Exception:
+            lines.append(line)
+            continue
+        if not isinstance(payload, dict):
+            lines.append(line)
+            continue
+        payload.pop("reasoning", None)
+        lines.append(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+    return "\n".join(lines).strip()
+
+
 def _search_youtube_first_result(query: str) -> dict[str, str] | None:
     text = " ".join(str(query or "").split()).strip()
     if not text:
@@ -3339,6 +3358,7 @@ class ToolAwareZorkLLM:
                     ]
                     shared_summary = "\n".join(deduped_summary_lines).strip()
                 if scene_npc_slugs:
+                    shared_recent_lcd = _strip_reasoning_from_recent_turn_jsonl(shared_recent)
                     _clean_final_user_prompt = re.sub(
                         r"(?m)^WORLD_SUMMARY(?:_FINAL)?:[^\n]*\n?",
                         "",
@@ -3350,7 +3370,7 @@ class ToolAwareZorkLLM:
                         "only events that ALL named participants would plausibly know about. "
                         "Use this as the shared pool for common knowledge in the scene.\n"
                         f"\nWORLD_SUMMARY_LCD: {shared_summary or '(empty)'}\n"
-                        f"\nRECENT_TURNS_LCD:\n{shared_recent}\n"
+                        f"\nRECENT_TURNS_LCD:\n{shared_recent_lcd}\n"
                     )
                 elif shared_recent and shared_recent != "None":
                     _shared_context_block = (
