@@ -344,6 +344,34 @@ class ToolAwareZorkLLM:
         return normalized
 
     @staticmethod
+    def _prune_recent_turn_tool_row(row: object) -> dict[str, Any]:
+        if not isinstance(row, dict):
+            return {}
+        cleaned: dict[str, Any] = {}
+        for key, value in row.items():
+            normalized = value
+            if isinstance(normalized, str):
+                normalized = normalized.strip()
+                if key == "visibility" and normalized.lower() == "local":
+                    continue
+            elif isinstance(normalized, list):
+                normalized = [
+                    item.strip() if isinstance(item, str) else item
+                    for item in normalized
+                    if (item.strip() if isinstance(item, str) else item) not in ("", None)
+                ]
+            elif isinstance(normalized, dict):
+                normalized = {
+                    inner_key: inner_value
+                    for inner_key, inner_value in normalized.items()
+                    if inner_value not in ("", None, [], {})
+                }
+            if normalized in ("", None, [], {}):
+                continue
+            cleaned[str(key)] = normalized
+        return cleaned
+
+    @staticmethod
     def _memory_tool_jsonl(records: list[dict[str, Any]]) -> str:
         return "\n".join(
             json.dumps(
@@ -2107,7 +2135,12 @@ class ToolAwareZorkLLM:
         if not rows:
             header_lines.append("None")
             return "\n".join(header_lines)
-        return "\n".join(header_lines) + "\n" + self._memory_tool_jsonl(rows)
+        cleaned_rows = [
+            self._prune_recent_turn_tool_row(row)
+            for row in rows
+            if isinstance(row, dict)
+        ]
+        return "\n".join(header_lines) + "\n" + self._memory_tool_jsonl(cleaned_rows)
 
     def _tool_memory_turn(
         self,

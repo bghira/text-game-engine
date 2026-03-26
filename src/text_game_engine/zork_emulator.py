@@ -19788,7 +19788,41 @@ class ZorkEmulator:
                     self._coerce_non_negative_int(time_source.get("minute", 0), default=0),
                 ),
             )
-        return [json.dumps(beat, ensure_ascii=False, separators=(",", ":"))]
+        return [
+            json.dumps(
+                self._prune_recent_turn_output_row(beat),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        ]
+
+    @staticmethod
+    def _prune_recent_turn_output_row(row: object) -> dict[str, object]:
+        if not isinstance(row, dict):
+            return {}
+        cleaned: dict[str, object] = {}
+        for key, value in row.items():
+            normalized = value
+            if isinstance(normalized, str):
+                normalized = normalized.strip()
+                if key == "visibility" and normalized.lower() == "local":
+                    continue
+            elif isinstance(normalized, list):
+                normalized = [
+                    item.strip() if isinstance(item, str) else item
+                    for item in normalized
+                    if (item.strip() if isinstance(item, str) else item) not in {"", None}
+                ]
+            elif isinstance(normalized, dict):
+                normalized = {
+                    inner_key: inner_value
+                    for inner_key, inner_value in normalized.items()
+                    if inner_value not in ("", None, [], {})
+                }
+            if normalized in ("", None, [], {}):
+                continue
+            cleaned[str(key)] = normalized
+        return cleaned
 
     def _scene_output_text_from_raw(self, raw_scene_output: object) -> str:
         if not isinstance(raw_scene_output, dict):
@@ -20049,7 +20083,13 @@ class ZorkEmulator:
             "context_key": scene_output.get("context_key"),
             "visibility": str((turn_visibility or {}).get("scope") or "").strip().lower() or "local",
         }
-        lines.append(json.dumps(header, ensure_ascii=False, separators=(",", ":")))
+        lines.append(
+            json.dumps(
+                self._prune_recent_turn_output_row(header),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        )
         for beat_index, beat in enumerate(beats):
             if not isinstance(beat, dict):
                 continue
@@ -20069,7 +20109,13 @@ class ZorkEmulator:
                 "context_key": beat.get("context_key"),
                 "text": str(beat.get("text") or "").strip(),
             }
-            lines.append(json.dumps(line, ensure_ascii=False, separators=(",", ":")))
+            lines.append(
+                json.dumps(
+                    self._prune_recent_turn_output_row(line),
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+            )
         return "\n".join(lines)
 
     def _scene_output_recent_lines(
@@ -20206,7 +20252,7 @@ class ZorkEmulator:
                 beat_row["minute"] = min(59, max(0, self._coerce_non_negative_int(time_source.get("minute", 0), default=0)))
             beat_lines.append(
                 json.dumps(
-                    beat_row,
+                    self._prune_recent_turn_output_row(beat_row),
                     ensure_ascii=False,
                     separators=(",", ":"),
                 )
