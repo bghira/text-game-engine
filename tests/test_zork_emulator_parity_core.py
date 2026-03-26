@@ -1566,6 +1566,7 @@ def test_ready_to_write_lcd_backfills_older_shared_turns_after_solo_gap(
                     meta_json=json.dumps(
                         {
                             "game_time": {"day": 3657, "hour": 18, "minute": 15},
+                            "summary_update": "Penny and Tony already shared an earlier conversation beat.",
                             "visibility": {
                                 "scope": "local",
                                 "actor_player_slug": "tony",
@@ -1633,6 +1634,7 @@ def test_ready_to_write_lcd_backfills_older_shared_turns_after_solo_gap(
                     meta_json=json.dumps(
                         {
                             "game_time": {"day": 3657, "hour": 19, "minute": 55},
+                            "summary_update": "Penny and Tony reconnect in the current scene.",
                             "visibility": {
                                 "scope": "local",
                                 "actor_player_slug": "tony",
@@ -1686,6 +1688,9 @@ def test_ready_to_write_lcd_backfills_older_shared_turns_after_solo_gap(
         assert payload is not None
         lcd_prompt = completion.calls[1]["prompt"]
         assert "RECENT_TURNS_LCD:" in lcd_prompt
+        assert "WORLD_SUMMARY_LCD:" in lcd_prompt
+        assert "Penny and Tony already shared an earlier conversation beat." in lcd_prompt
+        assert "Penny and Tony reconnect in the current scene." in lcd_prompt
         assert "Older shared beat with Penny." in lcd_prompt
         assert "Recent shared beat with Penny." in lcd_prompt
         assert "Solo gap beat 0." not in lcd_prompt

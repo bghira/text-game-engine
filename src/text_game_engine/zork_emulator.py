@@ -9680,6 +9680,7 @@ class ZorkEmulator:
         viewer_location_key: str = "",
         viewer_private_context_key: str = "",
         scene_npc_slugs: set[str] | None = None,
+        recent_turn_window: int = 24,
         max_chars: int = 1600,
     ) -> str:
         summary = self._strip_inventory_mentions(campaign.summary or "")
@@ -9704,8 +9705,9 @@ class ZorkEmulator:
         for raw_line in str(summary or "").splitlines():
             _append_if_relevant(persisted_lines, raw_line)
 
+        summary_turn_window = max(1, int(recent_turn_window or 24))
         if isinstance(turns, list) and viewer_actor_id and turns:
-            for turn in turns[-24:]:
+            for turn in turns[-summary_turn_window:]:
                 if not isinstance(turn, Turn) or turn.kind != "narrator":
                     continue
                 if not self._turn_visible_in_recent_turns_context(

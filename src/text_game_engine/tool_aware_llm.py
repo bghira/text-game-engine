@@ -3356,6 +3356,7 @@ class ToolAwareZorkLLM:
                     viewer_location_key=viewer_location_key,
                     viewer_private_context_key=viewer_private_context_key,
                     scene_npc_slugs=scene_npc_slugs or None,
+                    recent_turn_window=recent_turn_limit,
                     max_chars=emulator.MAX_SUMMARY_CHARS,  # noqa: SLF001
                 )
                 shared_recent = emulator._recent_turns_text_for_viewer(  # noqa: SLF001
@@ -3383,7 +3384,7 @@ class ToolAwareZorkLLM:
                     text_value = str(payload.get("text") or "").strip()
                     if text_value:
                         shared_recent_texts.add(text_value)
-                if shared_summary:
+                if shared_summary and not scene_npc_slugs:
                     deduped_summary_lines = [
                         line
                         for line in str(shared_summary).splitlines()
