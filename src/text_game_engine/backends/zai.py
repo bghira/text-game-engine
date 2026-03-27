@@ -9,7 +9,7 @@ from .base import ChatMessage, CompletionRequest, CompletionResult
 logger = logging.getLogger(__name__)
 
 _DEFAULT_BASE_URL = "https://api.z.ai/api/coding/paas/v4"
-_DEFAULT_MODEL = "glm-5"
+_DEFAULT_MODEL = "glm-5.1"
 
 
 class ZAIBackend:
