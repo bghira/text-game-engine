@@ -37,7 +37,7 @@ GameEngine(
     llm,
     actor_resolver=None,
     clock=None,
-    lease_ttl_seconds=90,
+    lease_ttl_seconds=600,
     max_conflict_retries=1,
 )
 ```

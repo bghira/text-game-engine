@@ -30,6 +30,7 @@ class GameEngine:
     CLOCK_START_DAY_OF_WEEK_KEY = "clock_start_day_of_week"
     TIME_MODEL_SHARED_CLOCK = "shared_clock"
     TIME_MODEL_INDIVIDUAL_CLOCKS = "individual_clocks"
+    DEFAULT_LEASE_TTL_SECONDS = 600
     WEEKDAY_NAMES = (
         "monday",
         "tuesday",
@@ -46,7 +47,7 @@ class GameEngine:
         llm: LLMPort,
         actor_resolver: ActorResolverPort | None = None,
         clock: Callable[[], datetime] | None = None,
-        lease_ttl_seconds: int = 90,
+        lease_ttl_seconds: int = DEFAULT_LEASE_TTL_SECONDS,
         max_conflict_retries: int = 1,
         player_state_sanitizer: Callable[
             [dict[str, Any], dict[str, Any], str, str], dict[str, Any]
