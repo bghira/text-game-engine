@@ -3036,6 +3036,63 @@ def test_recent_turns_tool_emits_beats_without_turn_wrapper_rows(
     assert '"visibility":"local"' not in output
 
 
+def test_character_cards_tool_returns_scene_cards_instead_of_unsupported_error(
+    session_factory,
+    seed_campaign_and_actor,
+):
+    compat = _build_compat(session_factory)
+    campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
+    compat.get_or_create_player(campaign.id, seed_campaign_and_actor["actor_id"])
+
+    with session_factory() as session:
+        campaign_row = session.get(Campaign, campaign.id)
+        assert campaign_row is not None
+        campaign_row.characters_json = compat._dump_json(
+            {
+                "kowalski": {
+                    "name": "Kowalski",
+                    "location": "lighting-lab",
+                    "current_status": "Adjusting a barn door by feel.",
+                    "speech_style": "Short, technical sentences.",
+                }
+            }
+        )
+        player_row = (
+            session.query(Player)
+            .filter(Player.campaign_id == campaign.id, Player.actor_id == seed_campaign_and_actor["actor_id"])
+            .one()
+        )
+        assert player_row is not None
+        player_row.state_json = compat._dump_json(
+            {
+                "location": "lighting-lab",
+                "room_title": "Lighting Lab",
+            }
+        )
+        session.commit()
+
+    tool_llm = ToolAwareZorkLLM(
+        session_factory=session_factory,
+        completion_port=StubCompletionPort(),
+        temperature=0.8,
+        max_tokens=512,
+    )
+    tool_llm.bind_emulator(compat)
+
+    async def run_test():
+        result = await tool_llm._execute_tool_call(
+            campaign.id,
+            {"tool_call": "character_cards"},
+            actor_id=seed_campaign_and_actor["actor_id"],
+        )
+        assert "CHARACTER_CARDS_RESULT:" in result
+        assert "unsupported tool_call" not in result
+        payload = json.loads(result.split("CHARACTER_CARDS_RESULT:", 1)[1].strip())
+        assert payload[0]["slug"] == "kowalski"
+
+    asyncio.run(run_test())
+
+
 def test_build_prompt_seeds_default_game_time(session_factory, seed_campaign_and_actor):
     compat = _build_compat(session_factory)
     campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])

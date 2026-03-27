@@ -1971,6 +1971,82 @@ class ToolAwareZorkLLM:
             "or fewer filters."
         )
 
+    def _tool_character_cards(
+        self,
+        campaign_id: str,
+        payload: dict[str, Any],
+        *,
+        actor_id: str | None = None,
+    ) -> str:
+        emulator = self._emulator
+        if emulator is None or not actor_id:
+            return "CHARACTER_CARDS_RESULT: unavailable"
+
+        with self._session_factory() as session:
+            campaign = session.get(Campaign, campaign_id)
+            if campaign is None:
+                return "CHARACTER_CARDS_RESULT: campaign not found"
+            player = (
+                session.query(Player)
+                .filter(Player.campaign_id == campaign_id, Player.actor_id == actor_id)
+                .one_or_none()
+            )
+            if player is None:
+                return "CHARACTER_CARDS_RESULT: player not found"
+            player_state = emulator.get_player_state(player)
+            campaign_state = emulator.get_campaign_state(campaign)
+            characters = emulator.get_campaign_characters(campaign)
+
+        raw_character = str(
+            payload.get("character")
+            or payload.get("slug")
+            or payload.get("npc")
+            or payload.get("name")
+            or ""
+        ).strip()
+
+        if raw_character:
+            resolved_slug = emulator._resolve_existing_character_slug(characters, raw_character) or raw_character  # noqa: SLF001
+            source = dict(characters.get(resolved_slug) or {})
+            if not source:
+                return (
+                    "CHARACTER_CARDS_RESULT: character not found. "
+                    "Use an NPC slug from CHARACTER_INDEX / CHARACTER_CARDS."
+                )
+            source["_slug"] = resolved_slug
+            cards = emulator._build_character_cards_for_prompt(  # noqa: SLF001
+                [source],
+                characters=characters,
+                campaign_state=campaign_state,
+                player_state=player_state,
+                include_critical_fields=False,
+            )
+            return f"CHARACTER_CARDS_RESULT: {emulator._dump_json(cards)}"  # noqa: SLF001
+
+        player_registry = emulator._campaign_player_registry(campaign_id, self._session_factory)  # noqa: SLF001
+        excluded_character_keys = emulator._player_character_prompt_keys(  # noqa: SLF001
+            [],
+            player_registry=player_registry,
+        )
+        scene_characters = emulator._build_scene_characters_for_prompt(  # noqa: SLF001
+            characters,
+            player_state,
+            excluded_character_keys=excluded_character_keys,
+        )
+        scene_characters = scene_characters[: emulator.MAX_CHARACTERS_IN_PROMPT]  # noqa: SLF001
+        scene_characters = emulator._fit_characters_to_budget(  # noqa: SLF001
+            scene_characters,
+            emulator.MAX_CHARACTERS_CHARS,  # noqa: SLF001
+        )
+        cards = emulator._build_character_cards_for_prompt(  # noqa: SLF001
+            scene_characters,
+            characters=characters,
+            campaign_state=campaign_state,
+            player_state=player_state,
+            include_critical_fields=False,
+        )
+        return f"CHARACTER_CARDS_RESULT: {emulator._dump_json(cards)}"  # noqa: SLF001
+
     def _tool_recent_turns(
         self,
         campaign_id: str,
@@ -2871,6 +2947,8 @@ class ToolAwareZorkLLM:
             return await self._tool_autobiography_compress(campaign_id, payload)
         if name == "name_generate":
             return self._tool_name_generate(campaign_id, payload)
+        if name == "character_cards":
+            return self._tool_character_cards(campaign_id, payload, actor_id=actor_id)
         if name == "memory_turn":
             return self._tool_memory_turn(campaign_id, payload, actor_id=actor_id)
         if name == "memory_store":
