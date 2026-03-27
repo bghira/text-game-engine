@@ -3451,9 +3451,7 @@ class ToolAwareZorkLLM:
                         "Do NOT let listeners or silent bystanders act on a speaker's private continuity unless they were independently involved in those same events.\n\n"
                         + "\n".join(speaker_blocks)
                     )
-            finalize_prompt = (
-                f"{_clean_final_user_prompt}\n"
-                f"{_clean_tool_history}\n\n"
+            final_output_contract = (
                 "RESEARCH_COMPLETE: Context gathering is complete.\n"
                 "Do NOT call any more tools now. Return final narration/state JSON directly.\n"
                 "REQUIRED fields: reasoning, scene_output, state_update (with game_time), summary_update.\n"
@@ -3463,6 +3461,11 @@ class ToolAwareZorkLLM:
                 "scene_output MUST be an object with keys location_key, context_key, and beats.\n"
                 "beats MUST be an array of 1 to 2 beat objects; scene_output as a plain string is invalid.\n"
                 "narration is optional when scene_output is present; prefer omitting it and let the harness render beat text.\n"
+            )
+            finalize_prompt = (
+                f"{_clean_final_user_prompt}\n"
+                f"{_clean_tool_history}\n\n"
+                + final_output_contract
                 + _pc_reminder
                 + _shared_context_block
                 + _speaker_continuity_block
@@ -3483,6 +3486,18 @@ class ToolAwareZorkLLM:
             if finalized_payload is not None and not emulator._is_tool_call(finalized_payload):  # noqa: SLF001
                 payload = finalized_payload
 
+        final_output_contract = (
+            "RESEARCH_COMPLETE: Context gathering is complete.\n"
+            "Do NOT call any more tools now. Return final narration/state JSON directly.\n"
+            "REQUIRED fields: reasoning, scene_output, state_update (with game_time), summary_update.\n"
+            "OPTIONAL: set_timer_delay + set_timer_event (include these in the SAME JSON object "
+            "to schedule a timed event when the world has external pressure that would escalate without player input). "
+            "Also optional: set_timer_interruptible, set_timer_interrupt_action, set_timer_interrupt_scope.\n"
+            "scene_output MUST be an object with keys location_key, context_key, and beats.\n"
+            "beats MUST be an array of 1 to 2 beat objects; scene_output as a plain string is invalid.\n"
+            "narration is optional when scene_output is present; prefer omitting it and let the harness render beat text.\n"
+        )
+
         if self._is_emptyish_payload(payload):
             await _notify_progress(progress, "refining")
             for attempt in range(2):
@@ -3490,14 +3505,11 @@ class ToolAwareZorkLLM:
                 repair_prompt = (
                     f"{user_prompt}\n"
                     f"{tool_history}\n\n"
-                    "OUTPUT_VALIDATION_FAILED: previous response was too empty.\n"
-                    "Return ONLY final JSON (no tool_call) with:\n"
-                    "- reasoning string grounded in evidence/context used\n"
-                    "- scene_output object containing one concrete scene development\n"
-                    "- scene_output.beats as an array, not a string\n"
-                    "- state_update object with game_time advanced\n"
-                    "- summary_update with durable consequence when applicable.\n"
-                    "narration is optional when scene_output is present.\n"
+                    + final_output_contract
+                    + "OUTPUT_VALIDATION_FAILED: previous response was too empty.\n"
+                    "Follow the same JSON contract above.\n"
+                    "If the turn is mostly OOC, low-motion, or intentionally minimal, one concise valid beat is enough.\n"
+                    "Do not invent extra scene action just to satisfy this retry.\n"
                 )
                 self._zork_log(
                     f"EMPTY RESPONSE REPAIR campaign={campaign_id} attempt={attempt + 1}",

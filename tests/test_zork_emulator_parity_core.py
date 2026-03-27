@@ -1503,6 +1503,81 @@ def test_ready_to_write_finalization_uses_final_stage_system_prompt(
     asyncio.run(run_test())
 
 
+def test_empty_response_repair_reuses_final_output_contract_without_forcing_extra_scene_action(
+    session_factory,
+    seed_campaign_and_actor,
+):
+    class EmptyRepairCompletionPort:
+        def __init__(self):
+            self.calls = []
+
+        async def complete(self, system_prompt, prompt, *, temperature=0.8, max_tokens=2048):
+            self.calls.append({"system_prompt": system_prompt, "prompt": prompt})
+            if len(self.calls) == 1:
+                return '{"tool_call":"ready_to_write"}'
+            if len(self.calls) == 2:
+                return "{}"
+            return (
+                '{"reasoning":"repair","scene_output":{"location_key":"room","context_key":"ooc","beats":[{"type":"narration","speaker":"narrator","text":"[OOC: Copy that.]"}]},'
+                '"state_update":{"game_time":{"day":1,"hour":9,"minute":0,"day_of_week":"monday","period":"morning","date_label":"Monday, Day 1, Morning"}},'
+                '"summary_update":"OOC clarification delivered."}'
+            )
+
+    async def run_test():
+        completion = EmptyRepairCompletionPort()
+        engine = GameEngine(
+            uow_factory=lambda: SQLAlchemyUnitOfWork(session_factory),
+            llm=StubLLM(LLMTurnOutput(narration="unused")),
+        )
+        compat = ZorkEmulator(engine, session_factory, completion_port=completion)
+        tool_llm = ToolAwareZorkLLM(
+            session_factory=session_factory,
+            completion_port=completion,
+            temperature=0.8,
+            max_tokens=2048,
+        )
+        tool_llm.bind_emulator(compat)
+
+        campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
+        player = compat.get_or_create_player(seed_campaign_and_actor["campaign_id"], seed_campaign_and_actor["actor_id"])
+        turns = compat.get_recent_turns(seed_campaign_and_actor["campaign_id"])
+        research_system_prompt, research_user_prompt = compat.build_prompt(
+            campaign,
+            player,
+            "[OOC: clarify]",
+            turns,
+            prompt_stage=compat.PROMPT_STAGE_RESEARCH,
+        )
+        final_system_prompt, final_user_prompt = compat.build_prompt(
+            campaign,
+            player,
+            "[OOC: clarify]",
+            turns,
+            prompt_stage=compat.PROMPT_STAGE_FINAL,
+        )
+
+        payload = await tool_llm._resolve_payload(  # noqa: SLF001
+            seed_campaign_and_actor["campaign_id"],
+            seed_campaign_and_actor["actor_id"],
+            "[OOC: clarify]",
+            research_system_prompt,
+            research_user_prompt,
+            final_system_prompt,
+            final_user_prompt,
+        )
+
+        assert payload is not None
+        assert len(completion.calls) == 3
+        repair_prompt = completion.calls[2]["prompt"]
+        assert "REQUIRED fields: reasoning, scene_output, state_update (with game_time), summary_update." in repair_prompt
+        assert "scene_output MUST be an object with keys location_key, context_key, and beats." in repair_prompt
+        assert "beats MUST be an array of 1 to 2 beat objects" in repair_prompt
+        assert "one concise valid beat is enough" in repair_prompt
+        assert "scene_output object containing one concrete scene development" not in repair_prompt
+
+    asyncio.run(run_test())
+
+
 def test_ready_to_write_lcd_backfills_older_shared_turns_after_solo_gap(
     session_factory,
     seed_campaign_and_actor,
