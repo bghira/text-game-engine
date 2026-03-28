@@ -9792,6 +9792,25 @@ class ZorkEmulator:
         return "\n".join(kept).strip()
 
     @classmethod
+    def _strip_reasoning_from_recent_turn_jsonl(cls, text: object) -> str:
+        lines: list[str] = []
+        for raw_line in str(text or "").splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                payload = json.loads(line)
+            except Exception:
+                lines.append(line)
+                continue
+            if not isinstance(payload, dict):
+                lines.append(line)
+                continue
+            payload.pop("reasoning", None)
+            lines.append(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+        return "\n".join(lines).strip()
+
+    @classmethod
     def _split_prompt_tail(cls, prompt: object) -> tuple[str, str]:
         value = str(prompt or "")
         if not value:
@@ -14196,6 +14215,7 @@ class ZorkEmulator:
                     )
                 )
         recent_text = "\n".join(recent_lines) if recent_lines else "None"
+        recent_text = self._strip_reasoning_from_recent_turn_jsonl(recent_text)
 
         rails_context = self._build_rails_context(player_state, party_snapshot)
         active_plot_threads = self._active_plot_threads_for_viewer(

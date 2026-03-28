@@ -1459,8 +1459,8 @@ def test_ready_to_write_finalization_uses_final_stage_system_prompt(
         tool_llm.bind_emulator(compat)
 
         campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
-        player = compat.get_or_create_player(seed_campaign_and_actor["campaign_id"], seed_campaign_and_actor["actor_id"])
-        turns = compat.get_recent_turns(seed_campaign_and_actor["campaign_id"])
+        player = compat.get_or_create_player(campaign.id, seed_campaign_and_actor["actor_id"])
+        turns = compat.get_recent_turns(campaign.id)
         research_system_prompt, research_user_prompt = compat.build_prompt(
             campaign,
             player,
@@ -1539,8 +1539,8 @@ def test_empty_response_repair_reuses_final_output_contract_without_forcing_extr
         tool_llm.bind_emulator(compat)
 
         campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
-        player = compat.get_or_create_player(seed_campaign_and_actor["campaign_id"], seed_campaign_and_actor["actor_id"])
-        turns = compat.get_recent_turns(seed_campaign_and_actor["campaign_id"])
+        player = compat.get_or_create_player(campaign.id, seed_campaign_and_actor["actor_id"])
+        turns = compat.get_recent_turns(campaign.id)
         research_system_prompt, research_user_prompt = compat.build_prompt(
             campaign,
             player,
@@ -1848,8 +1848,8 @@ def test_resolve_payload_forces_finalization_after_tool_round_limit(
         tool_llm.bind_emulator(compat)
 
         campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
-        player = compat.get_or_create_player(seed_campaign_and_actor["campaign_id"], seed_campaign_and_actor["actor_id"])
-        turns = compat.get_recent_turns(seed_campaign_and_actor["campaign_id"])
+        player = compat.get_or_create_player(campaign.id, seed_campaign_and_actor["actor_id"])
+        turns = compat.get_recent_turns(campaign.id)
         research_system_prompt, research_user_prompt = compat.build_prompt(
             campaign,
             player,
@@ -1917,7 +1917,7 @@ def test_ready_to_write_finalization_reexpands_character_and_location_cards(
         tool_llm.bind_emulator(compat)
 
         campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
-        player = compat.get_or_create_player(seed_campaign_and_actor["campaign_id"], seed_campaign_and_actor["actor_id"])
+        player = compat.get_or_create_player(campaign.id, seed_campaign_and_actor["actor_id"])
         with session_factory() as session:
             row = session.get(Campaign, seed_campaign_and_actor["campaign_id"])
             row.characters_json = json.dumps(
@@ -1998,7 +1998,7 @@ def test_ready_to_write_finalization_reexpands_character_and_location_cards(
                 )
             )
             session.commit()
-        turns = compat.get_recent_turns(seed_campaign_and_actor["campaign_id"])
+        turns = compat.get_recent_turns(campaign.id)
         research_system_prompt, research_user_prompt = compat.build_prompt(
             campaign,
             player,
@@ -3074,6 +3074,8 @@ def test_recent_turns_keeps_shared_local_listener_history_after_location_change(
     _system_prompt, user_prompt = compat.build_prompt(campaign, player, "look", turns)
 
     assert "Penny says she is staying." in user_prompt
+    recent_block = user_prompt.split("RECENT_TURNS:\n", 1)[1].split("\nPLAYER_ACTION ", 1)[0]
+    assert '"reasoning":' not in recent_block
 
 
 def test_recent_turns_still_hides_actor_turns_with_suppress_context(
@@ -3210,6 +3212,114 @@ def test_recent_turns_focus_mode_filters_speaker_continuity_to_requested_npc(
 
     assert "She's already there waiting by the entrance." in recent
     assert "i get ready for my meeting with simone" not in recent
+
+
+def test_ready_to_write_strips_reasoning_from_recent_turns_lcd_and_speaker_continuity(
+    session_factory,
+    seed_campaign_and_actor,
+):
+    class SpeakerContinuityCompletionPort:
+        def __init__(self):
+            self.calls = []
+
+        async def complete(self, system_prompt, prompt, *, temperature=0.8, max_tokens=2048):
+            self.calls.append({"system_prompt": system_prompt, "prompt": prompt})
+            if len(self.calls) == 1:
+                return '{"tool_call":"ready_to_write","speakers":["simone-ashworth"],"listeners":[]}'
+            return (
+                '{"reasoning":"finalized","narration":"Final scene.","state_update":{"game_time":{"day":1,"hour":9,"minute":0,"day_of_week":"monday","period":"morning","date_label":"Monday, Day 1, Morning"}},"summary_update":"done"}'
+            )
+
+    async def run_test():
+        completion = SpeakerContinuityCompletionPort()
+        engine = GameEngine(
+            uow_factory=lambda: SQLAlchemyUnitOfWork(session_factory),
+            llm=StubLLM(LLMTurnOutput(narration="unused")),
+        )
+        compat = ZorkEmulator(engine, session_factory, completion_port=completion)
+        tool_llm = ToolAwareZorkLLM(
+            session_factory=session_factory,
+            completion_port=completion,
+            temperature=0.8,
+            max_tokens=2048,
+        )
+        tool_llm.bind_emulator(compat)
+
+        campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
+        player = compat.get_or_create_player(campaign.id, seed_campaign_and_actor["actor_id"])
+
+        with session_factory() as session:
+            row = session.get(Campaign, campaign.id)
+            assert row is not None
+            characters = json.loads(row.characters_json or "{}")
+            characters["simone-ashworth"] = {"name": "Simone Ashworth"}
+            row.characters_json = compat._dump_json(characters)
+            session.commit()
+
+        def fake_recent_turns_text_for_viewer(
+            self,
+            campaign,
+            turns,
+            *,
+            viewer_actor_id,
+            viewer_slug,
+            viewer_location_key,
+            viewer_private_context_key,
+            requested_player_slugs,
+            requested_npc_slugs,
+            scene_npc_slugs=None,
+            focus_on_requested_receivers=False,
+        ):
+            if focus_on_requested_receivers:
+                return (
+                    '{"kind":"beat","reasoning":"speaker-private context","type":"npc_dialogue",'
+                    '"speaker":"simone-ashworth","text":"Private Simone continuity."}'
+                )
+            return (
+                '{"kind":"beat","reasoning":"shared visible context","type":"npc_dialogue",'
+                '"speaker":"narrator","text":"Shared room beat."}'
+            )
+
+        compat._recent_turns_text_for_viewer = fake_recent_turns_text_for_viewer.__get__(compat, ZorkEmulator)
+
+        turns = compat.get_recent_turns(campaign.id)
+        research_system_prompt, research_user_prompt = compat.build_prompt(
+            campaign,
+            player,
+            "look",
+            turns,
+            prompt_stage=compat.PROMPT_STAGE_RESEARCH,
+        )
+        final_system_prompt, final_user_prompt = compat.build_prompt(
+            campaign,
+            player,
+            "look",
+            turns,
+            prompt_stage=compat.PROMPT_STAGE_FINAL,
+        )
+
+        payload = await tool_llm._resolve_payload(
+            campaign.id,
+            seed_campaign_and_actor["actor_id"],
+            "look",
+            research_system_prompt,
+            research_user_prompt,
+            final_system_prompt,
+            final_user_prompt,
+        )
+
+        assert payload is not None
+        final_prompt = completion.calls[1]["prompt"]
+        assert "RECENT_TURNS_LCD:" in final_prompt
+        assert "SPEAKER_CONTINUITY[simone-ashworth]:" in final_prompt
+        recent_final_block = final_prompt.split("RECENT_TURNS_LCD:\n", 1)[1].split("\n\n", 1)[0]
+        speaker_block = final_prompt.split("SPEAKER_CONTINUITY[simone-ashworth]:\n", 1)[1].split("\n\n", 1)[0]
+        assert '"reasoning":' not in recent_final_block
+        assert '"reasoning":' not in speaker_block
+        assert "Shared room beat." in recent_final_block
+        assert "Private Simone continuity." in speaker_block
+
+    asyncio.run(run_test())
 
 
 def test_recent_turns_tool_emits_beats_without_turn_wrapper_rows(

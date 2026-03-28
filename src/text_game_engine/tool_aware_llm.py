@@ -3448,6 +3448,7 @@ class ToolAwareZorkLLM:
                     requested_npc_slugs=scene_npc_slugs,
                     scene_npc_slugs=scene_npc_slugs or None,
                 )
+                shared_recent = emulator._strip_reasoning_from_recent_turn_jsonl(shared_recent)  # noqa: SLF001
                 shared_recent_texts: set[str] = set()
                 for line in str(shared_recent or "").splitlines():
                     stripped = line.strip()
@@ -3470,7 +3471,6 @@ class ToolAwareZorkLLM:
                     ]
                     shared_summary = "\n".join(deduped_summary_lines).strip()
                 if scene_npc_slugs:
-                    shared_recent_lcd = _strip_reasoning_from_recent_turn_jsonl(shared_recent)
                     _clean_final_user_prompt = re.sub(
                         r"(?m)^WORLD_SUMMARY(?:_FINAL)?:[^\n]*\n?",
                         "",
@@ -3482,7 +3482,7 @@ class ToolAwareZorkLLM:
                         "only events that ALL named participants would plausibly know about. "
                         "Use this as the shared pool for common knowledge in the scene.\n"
                         f"\nWORLD_SUMMARY_LCD: {shared_summary or '(empty)'}\n"
-                        f"\nRECENT_TURNS_LCD:\n{shared_recent_lcd}\n"
+                        f"\nRECENT_TURNS_LCD:\n{shared_recent}\n"
                     )
                 elif shared_recent and shared_recent != "None":
                     _shared_context_block = (
@@ -3508,6 +3508,7 @@ class ToolAwareZorkLLM:
                         scene_npc_slugs=None,
                         focus_on_requested_receivers=True,
                     )
+                    speaker_recent = emulator._strip_reasoning_from_recent_turn_jsonl(speaker_recent)  # noqa: SLF001
                     if speaker_recent and speaker_recent != "None":
                         deduped_speaker_lines = [
                             line
