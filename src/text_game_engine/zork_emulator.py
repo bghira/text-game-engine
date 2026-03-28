@@ -736,7 +736,7 @@ class ZorkEmulator:
         '- co_located_player_slugs: array (optional; exact PARTY_SNAPSHOT player_slugs for OTHER CAMPAIGN_PLAYERS who remain physically with the acting player after this turn. Use only for room/location sync; it does NOT authorize new dialogue, actions, or decisions for them.)\n'
         '- story_progression: object (optional; Keys: advance (bool), target ("hold"|"next-scene"|"next-chapter"), reason (string). '
         "Use when a subplot beat should push the outlined story forward without explicit state_update scene change.)\n"
-        '- turn_visibility: object (optional; who should get this turn in future prompt context. Keys: "scope" ("public"|"private"|"limited"|"local"), "player_slugs" (array of player slugs from PARTY_SNAPSHOT, typically in `player-<actor_id>` form), "npc_slugs" (array of CHARACTER_INDEX / WORLD_CHARACTERS slugs who overheard/noticed), and optional "reason". This changes prompt visibility only; it does NOT change shared world state.)\n'
+        '- turn_visibility: object (optional; who should get this turn in future prompt context. Keys: "scope" ("public"|"private"|"limited"|"local"), "player_slugs" (array of player slugs, typically `player-<actor_id>` — may be from PARTY_SNAPSHOT OR from WORLD_SUMMARY/RECENT_TURNS/known campaign players even if not co-located), "npc_slugs" (array of CHARACTER_INDEX / WORLD_CHARACTERS slugs who overheard/noticed), and optional "reason". This changes prompt visibility only; it does NOT change shared world state.)\n'
         "- scene_image_prompt: string (optional; include whenever the visible scene changes in a meaningful way: entering a room, newly visible characters/objects, reveals, or strong visual shifts)\n"
         '- tool_calls: array (optional; inline side-effect tool invocations supported in final JSON. Allowed here: "sms_write", "sms_schedule", "plot_plan", "chapter_plan". Use this when the narrated outcome should also persist a text-message side effect or update off-rails plot/chapter structure. If present, tool_calls MUST be the last top-level key in the final JSON object.)\n'
         "- set_timer_delay: integer (optional; 30-300 seconds, see TIMED EVENTS SYSTEM below)\n"
@@ -897,6 +897,7 @@ class ZorkEmulator:
         "  * limited: only the acting player plus the listed player_slugs should retain the turn in prompt context.\n"
         "  * IMPORTANT: turn_visibility.player_slugs controls WHO SEES the turn, not who you narrate for. "
         "Including another player's slug in player_slugs does NOT violate the off-limits rule — it simply ensures the turn enters their prompt context. "
+        "player_slugs are NOT limited to PARTY_SNAPSHOT — use `player-<actor_id>` for ANY campaign player you know about from WORLD_SUMMARY, RECENT_TURNS, or context, even if they are in a different room or not in PARTY_SNAPSHOT. "
         "If the acting player's action would be noticed by, directed at, or affect another player character "
         "(knocking on their door, entering their room, shouting within earshot, causing a visible/audible event near them), "
         "you MUST include that player's slug in player_slugs so they are aware of it on their next turn.\n"
