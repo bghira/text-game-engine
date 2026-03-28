@@ -1869,15 +1869,22 @@ class ZorkEmulator:
         if scope in {"", "public"}:
             return True
         if scope == "local":
+            raw_turn_locations = [
+                visibility.get("location_key"),
+                meta.get("location_key"),
+            ]
             turn_location_keys = {
-                k for k in (
-                    cls._normalize_location_key(visibility.get("location_key")),
-                    cls._normalize_location_key(meta.get("location_key")),
-                ) if k
+                cls._normalize_location_key(item)
+                for item in raw_turn_locations
+                if cls._normalize_location_key(item)
             }
             viewer_loc_norm = cls._normalize_location_key(viewer_location_key)
             if viewer_loc_norm and turn_location_keys and viewer_loc_norm in turn_location_keys:
                 return True
+            if viewer_location_key:
+                for raw_location in raw_turn_locations:
+                    if cls._state_container_matches_location(viewer_location_key, str(raw_location or "")):
+                        return True
             if cls._viewer_participated_in_turn_scene_output(
                 turn,
                 viewer_actor_id=viewer_actor_id,
@@ -20367,6 +20374,18 @@ class ZorkEmulator:
                         viewer_location_key_norm
                         and beat_location_keys
                         and viewer_location_key_norm in beat_location_keys
+                    )
+                    or any(
+                        self._state_container_matches_location(
+                            viewer_location_key,
+                            str(raw_location or ""),
+                        )
+                        for raw_location in (
+                            beat.get("location_key"),
+                            scene_output.get("location_key"),
+                            meta.get("location_key"),
+                        )
+                        if viewer_location_key and str(raw_location or "").strip()
                     )
                 )
             elif beat_visibility in {"private", "limited"}:
