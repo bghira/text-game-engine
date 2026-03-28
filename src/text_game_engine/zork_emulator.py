@@ -1302,7 +1302,7 @@ class ZorkEmulator:
         "Set period based on hour: 5-11=morning, 12-16=afternoon, 17-20=evening, 21-4=night.\n\n"
         "You may also return a calendar_update key (object) to manage scheduled events:\n"
         '- "calendar_update": {"add": [...], "remove": [...]} where each add entry is '
-        '{"name": str, "time_remaining": int, "time_unit": "hours"|"days", "description": str, "known_by": [str, ...], "target_player": str|int (optional), "target_players": [str|int, ...] (optional)} '
+        '{"name": str, "time_remaining": int, "time_unit": "hours"|"days", "description": str, "known_by": [str, ...], "recurring": bool (optional; daily recurring at the given time), "target_player": str|int (optional), "target_players": [str|int, ...] (optional)} '
         "and each remove entry is a string matching an event name.\n"
         "HARNESS BEHAVIOR:\n"
         "- The harness converts add entries into absolute due dates and stores fire_day + fire_hour (the exact in-game deadline).\n"
@@ -1310,6 +1310,7 @@ class ZorkEmulator:
         "- Keep known_by to character names from PARTY_SNAPSHOT / CHARACTER_INDEX. Omit known_by for globally-known events.\n"
         "- target_player / target_players are optional player-specific targets. These may be a Discord ID, a Discord mention, a player slug, or a PARTY_SNAPSHOT-style string such as '<@123> (Rigby)'.\n"
         "- If no target_player(s) are provided, the event is treated as global.\n"
+        "- recurring=true means a daily recurring event. It does not expire into overdue/missed; the harness rolls it onto the active day at the given hour and marks status as recurring.\n"
         "- In shared_clock + loose mode, overdue player-targeted appointments may slide forward instead of being lost.\n"
         "- In shared_clock + consequential mode, overdue player-targeted appointments remain visible as missed/unresolved until the player deals with them.\n"
         "- In individual_clocks mode, player-targeted appointments are judged against that player's own game_time, not another player's pace.\n"
@@ -8467,7 +8468,14 @@ class ZorkEmulator:
                         fire_day = int(event.get("fire_day", 1))
                         fire_hour = max(0, min(23, int(event.get("fire_hour", 23))))
                         desc = str(event.get("description", "") or "")
-                        if hours_remaining < 0:
+                        recurring = bool(event.get("recurring"))
+                        if recurring and hours_remaining < 0:
+                            eta = f"recurs daily at {fire_hour:02d}:00"
+                        elif recurring and hours_remaining == 0:
+                            eta = "recurs now"
+                        elif recurring:
+                            eta = f"recurs in {hours_remaining} hour(s)"
+                        elif hours_remaining < 0:
                             if str(event.get("status") or "").strip().lower() == "missed":
                                 eta = "missed and still unresolved"
                             else:
@@ -10754,6 +10762,8 @@ class ZorkEmulator:
                 time_remaining=event.get("time_remaining", 1),
                 time_unit=event.get("time_unit", "days"),
             )
+        if cls._calendar_event_is_recurring(event):
+            fire_day = max(1, int(current_day))
         normalized: dict[str, object] = {
             "name": name,
             "fire_day": fire_day,
@@ -10761,6 +10771,8 @@ class ZorkEmulator:
             "description": str(event.get("description") or "")[:200],
             "known_by": cls._calendar_known_by_from_event(event),
         }
+        if cls._calendar_event_is_recurring(event):
+            normalized["recurring"] = True
         target_players = cls._calendar_target_tokens_from_event(event)
         if target_players:
             normalized["target_players"] = target_players
@@ -10777,6 +10789,22 @@ class ZorkEmulator:
             elif isinstance(raw, str):
                 normalized[key] = raw[:160]
         return normalized
+
+    @staticmethod
+    def _calendar_event_is_recurring(event: object) -> bool:
+        if not isinstance(event, dict):
+            return False
+        recurring = event.get("recurring")
+        if isinstance(recurring, bool):
+            return recurring
+        recurring_text = " ".join(str(recurring or "").strip().lower().split())
+        if recurring_text in {"1", "true", "yes", "y", "daily", "recurring", "rolling"}:
+            return True
+        for key in ("status", "_status", "recurrence", "repeat"):
+            value_text = " ".join(str(event.get(key) or "").strip().lower().split())
+            if value_text in {"daily", "recurring", "rolling"}:
+                return True
+        return False
 
     @classmethod
     def _calendar_for_prompt(
@@ -10832,6 +10860,9 @@ class ZorkEmulator:
                 normalized.get("fire_hour", 23), default=23
             )
             fire_hour = min(23, max(0, fire_hour))
+            recurring = bool(normalized.get("recurring"))
+            if recurring:
+                fire_day = current_day
             if isinstance(raw, dict):
                 raw_fire_day = raw.get("fire_day")
                 raw_fire_hour = raw.get("fire_hour")
@@ -10841,7 +10872,10 @@ class ZorkEmulator:
                 has_fire_hour = isinstance(raw_fire_hour, (int, float)) and not isinstance(
                     raw_fire_hour, bool
                 )
-                if (not has_fire_day) or int(raw_fire_day) != fire_day:
+                if recurring and raw.get("recurring") is not True:
+                    raw["recurring"] = True
+                    calendar_changed = True
+                if (not recurring) and ((not has_fire_day) or int(raw_fire_day) != fire_day):
                     raw["fire_day"] = fire_day
                     calendar_changed = True
                 if (not has_fire_hour) or int(raw_fire_hour) != fire_hour:
@@ -10859,6 +10893,8 @@ class ZorkEmulator:
                 player_state=player_state,
             )
             if (
+                not recurring
+                and
                 time_model == cls.TIME_MODEL_SHARED_CLOCK
                 and calendar_policy == cls.CALENDAR_POLICY_LOOSE
                 and event_targets_viewer
@@ -10875,7 +10911,9 @@ class ZorkEmulator:
                     raw["fire_hour"] = fire_hour
             hours_remaining = ((fire_day - current_day) * 24) + (fire_hour - current_hour)
             days_remaining = fire_day - current_day
-            if (
+            if recurring:
+                status = "recurring"
+            elif (
                 hours_remaining < 0
                 and event_targets_viewer
                 and calendar_policy == cls.CALENDAR_POLICY_CONSEQUENTIAL
@@ -10895,6 +10933,8 @@ class ZorkEmulator:
             view["days_remaining"] = days_remaining
             view["hours_remaining"] = hours_remaining
             view["status"] = status
+            if recurring:
+                view["recurring"] = True
             if event_targets_viewer:
                 view["targeted_to_active_player"] = True
             entries.append(view)
@@ -11019,6 +11059,11 @@ class ZorkEmulator:
             name = str(event.get("name", "Unknown"))
             fire_day = int(event.get("fire_day", 1))
             fire_hour = max(0, min(23, int(event.get("fire_hour", 23))))
+            recurring = bool(event.get("recurring"))
+            status = str(event.get("status") or "").strip().lower()
+            if recurring and hours < 0:
+                current_event_keys.add(_event_key(event))
+                continue
             bucket = _reminder_bucket(hours)
             if not bucket:
                 continue
@@ -11026,8 +11071,16 @@ class ZorkEmulator:
             current_event_keys.add(event_key)
             if reminder_state.get(event_key) == bucket:
                 continue
-            status = str(event.get("status") or "").strip().lower()
-            if hours < 0:
+            if recurring:
+                if hours == 0:
+                    alerts.append(
+                        f"- NOW: {name} (recurs today at Day {fire_day}, {fire_hour:02d}:00)"
+                    )
+                else:
+                    alerts.append(
+                        f"- SOON: {name} (recurs today in {hours} hour(s) at Day {fire_day}, {fire_hour:02d}:00)"
+                    )
+            elif hours < 0:
                 if status == "missed":
                     alerts.append(
                         f"- MISSED: {name} (was Day {fire_day}, {fire_hour:02d}:00; still unresolved)"
@@ -12093,6 +12146,8 @@ class ZorkEmulator:
                     if not isinstance(entry, dict):
                         continue
                     row = dict(entry)
+                    if cls._calendar_event_is_recurring(row):
+                        row["recurring"] = True
                     if "time_remaining" not in row:
                         if "hours_remaining" in row:
                             row["time_remaining"] = row.pop("hours_remaining")
@@ -12258,6 +12313,8 @@ class ZorkEmulator:
                         fire_day_int < int(current_day)
                         or (fire_day_int == int(current_day) and fire_hour_int <= int(current_hour))
                     )
+                if self._calendar_event_is_recurring(event):
+                    event_is_past = False
                 if event_is_past or (
                     name_mentioned and not has_premature and (has_completion or has_cleanup_intent)
                 ):
@@ -12345,6 +12402,8 @@ class ZorkEmulator:
                     )[:200],
                     "known_by": self._calendar_known_by_from_event(entry),
                 }
+                if self._calendar_event_is_recurring(entry):
+                    event["recurring"] = True
                 location_text = str(entry.get("location") or "").strip()
                 if location_text and not str(event.get("description") or "").strip():
                     event["description"] = f"Location: {location_text}"[:200]
@@ -16606,6 +16665,8 @@ class ZorkEmulator:
     ) -> bool:
         if not isinstance(event, dict):
             return False
+        if cls._calendar_event_is_recurring(event):
+            return False
         if hours_remaining >= 0:
             return False
         overdue_hours = abs(int(hours_remaining))
@@ -18360,6 +18421,8 @@ class ZorkEmulator:
     # Probability constants for per-turn nudge rolls.
     NPC_NUDGE_CHANCE = 0.30       # 30% chance to nudge NPC reuse
     SMS_REPLY_NUDGE_CHANCE = 0.40  # 40% chance to nudge SMS reply when unanswered threads exist
+    SMS_REPLY_NUDGE_STATE_KEY = "_sms_reply_nudge_state"
+    SMS_REPLY_NUDGE_MAX_PER_THREAD = 3
 
     def _passive_npc_sms_nudge_lines(
         self,
@@ -18392,7 +18455,28 @@ class ZorkEmulator:
             sms_threads = self._sms_threads_from_state(campaign_state)
             player_aliases = self._sms_player_aliases(actor_id=actor_id, player_state=player_state)
             contact_roster = self._sms_contact_roster(campaign)
-            unanswered_by_npc: list[str] = []
+            current_location_key = self._room_key_from_player_state(player_state).lower()
+            present_npc_keys: set[str] = set()
+            for slug, payload in (self.get_campaign_characters(campaign) or {}).items():
+                if not isinstance(payload, dict):
+                    continue
+                if str(payload.get("location") or "").strip().lower() != current_location_key:
+                    continue
+                if payload.get("deceased_reason"):
+                    continue
+                slug_key = self._sms_normalize_thread_key(slug)
+                name_key = self._sms_normalize_thread_key(payload.get("name") or slug)
+                if slug_key:
+                    present_npc_keys.add(slug_key)
+                if name_key:
+                    present_npc_keys.add(name_key)
+            raw_nudge_state = campaign_state.get(self.SMS_REPLY_NUDGE_STATE_KEY)
+            if isinstance(raw_nudge_state, dict):
+                nudge_state = raw_nudge_state
+            else:
+                nudge_state = {}
+                campaign_state[self.SMS_REPLY_NUDGE_STATE_KEY] = nudge_state
+            unanswered_by_npc: list[tuple[str, str, str]] = []
             merged_threads: dict[str, dict[str, Any]] = {}
             for thread_order, (thread_key, thread_data) in enumerate(sms_threads.items()):
                 if not isinstance(thread_data, dict):
@@ -18421,11 +18505,16 @@ class ZorkEmulator:
                 merged_entry = merged_threads.setdefault(
                     canonical_thread,
                     {
+                        "thread": canonical_thread,
                         "label": str(
                             resolved_contact.get("label")
                             or thread_data.get("label")
                             or thread_key
                         ).strip()[:40],
+                        "resolved_thread": str(
+                            resolved_contact.get("thread")
+                            or canonical_thread
+                        ).strip(),
                         "messages": [],
                     },
                 )
@@ -18456,18 +18545,64 @@ class ZorkEmulator:
                     continue
                 from_norm = self._sms_normalize_thread_key(last_msg.get("from"))
                 if from_norm and from_norm in player_aliases:
+                    counterpart_keys = {
+                        self._sms_normalize_thread_key(merged_entry.get("thread")),
+                        self._sms_normalize_thread_key(merged_entry.get("resolved_thread")),
+                        self._sms_normalize_thread_key(merged_entry.get("label")),
+                    }
+                    counterpart_keys = {key for key in counterpart_keys if key}
+                    if counterpart_keys & present_npc_keys:
+                        continue
+                    thread_key_norm = self._sms_normalize_thread_key(
+                        merged_entry.get("thread") or merged_entry.get("resolved_thread")
+                    )
+                    if not thread_key_norm:
+                        continue
+                    signature = "|".join(
+                        [
+                            str(self._coerce_non_negative_int(last_msg.get("turn_id", 0), default=0)),
+                            str(self._coerce_non_negative_int(last_msg.get("day", 0), default=0)),
+                            str(self._coerce_non_negative_int(last_msg.get("hour", 0), default=0)),
+                            str(self._coerce_non_negative_int(last_msg.get("minute", 0), default=0)),
+                            str(self._coerce_non_negative_int(last_msg.get("seq", 0), default=0)),
+                            str(from_norm or ""),
+                            str(self._sms_normalize_thread_key(last_msg.get("to")) or ""),
+                            " ".join(str(last_msg.get("message") or "").split())[:160],
+                        ]
+                    )
+                    prior_state = nudge_state.get(thread_key_norm)
+                    if isinstance(prior_state, dict):
+                        prior_signature = str(prior_state.get("last_signature") or "")
+                        prior_count = self._coerce_non_negative_int(prior_state.get("count", 0), default=0)
+                    else:
+                        prior_signature = ""
+                        prior_count = 0
+                    if prior_signature != signature:
+                        prior_count = 0
+                    if prior_count >= self.SMS_REPLY_NUDGE_MAX_PER_THREAD:
+                        continue
                     label = str(merged_entry.get("label") or "").strip()[:40]
                     if label:
-                        unanswered_by_npc.append(label)
+                        unanswered_by_npc.append((label, thread_key_norm, signature))
             if unanswered_by_npc:
                 picks = unanswered_by_npc[:2]
-                names_str = " and ".join(picks)
+                names_str = " and ".join(label for label, _thread_key, _signature in picks)
                 lines.append(
                     f"SMS_REPLY_NUDGE: The player has unanswered outgoing SMS to {names_str}. "
                     f"Consider having the NPC reply via sms_write during this turn — "
                     f"people generally respond to texts, and silence without narrative reason feels like a dropped thread. "
                     f"If the NPC would plausibly delay, narrate a brief reason (busy, thinking, ignoring)."
                 )
+                for _label, thread_key_norm, signature in picks:
+                    prior_state = nudge_state.get(thread_key_norm)
+                    if isinstance(prior_state, dict) and str(prior_state.get("last_signature") or "") == signature:
+                        next_count = self._coerce_non_negative_int(prior_state.get("count", 0), default=0) + 1
+                    else:
+                        next_count = 1
+                    nudge_state[thread_key_norm] = {
+                        "last_signature": signature,
+                        "count": next_count,
+                    }
             elif unread_threads > 0:
                 labels = unread_summary.get("labels", [])
                 if labels:

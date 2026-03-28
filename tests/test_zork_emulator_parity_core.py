@@ -2557,6 +2557,234 @@ def test_sms_reply_nudge_clears_when_reply_arrives_on_canonical_alias_thread(
     assert "Caitlin Ward" not in joined
 
 
+def test_sms_reply_nudge_stops_after_three_identical_suggestions(
+    session_factory,
+    seed_campaign_and_actor,
+):
+    compat = _build_compat(session_factory)
+    compat.NPC_NUDGE_CHANCE = 0.0
+    compat.SMS_REPLY_NUDGE_CHANCE = 1.0
+    campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
+    compat.get_or_create_player(campaign.id, seed_campaign_and_actor["actor_id"])
+
+    with session_factory() as session:
+        player = (
+            session.query(Player)
+            .filter(Player.campaign_id == campaign.id)
+            .filter(Player.actor_id == seed_campaign_and_actor["actor_id"])
+            .first()
+        )
+        assert player is not None
+        player_state = json.loads(player.state_json or "{}")
+        player_state["character_name"] = "Chris"
+        player.state_json = compat._dump_json(player_state)
+
+        row = session.get(Campaign, campaign.id)
+        characters = json.loads(row.characters_json or "{}")
+        characters["caitlin-ward"] = {"name": "Caitlin Ward"}
+        row.characters_json = compat._dump_json(characters)
+        session.commit()
+
+    ok, status = compat.write_sms_thread(
+        campaign.id,
+        thread="caitlin",
+        sender="Chris",
+        recipient="Caitlin Ward",
+        message="you there?",
+        owner_actor_id=seed_campaign_and_actor["actor_id"],
+    )
+    assert ok is True and status == "stored"
+
+    with session_factory() as session:
+        player = (
+            session.query(Player)
+            .filter(Player.campaign_id == campaign.id)
+            .filter(Player.actor_id == seed_campaign_and_actor["actor_id"])
+            .first()
+        )
+        assert player is not None
+        player_state = compat.get_player_state(player)
+        row = session.get(Campaign, campaign.id)
+        campaign_state = compat.get_campaign_state(row)
+
+    for _ in range(3):
+        joined = "\n".join(
+            compat._passive_npc_sms_nudge_lines(
+                campaign,
+                campaign_state,
+                player,
+                player_state,
+            )
+        )
+        assert "SMS_REPLY_NUDGE:" in joined
+        assert "Caitlin Ward" in joined
+
+    joined = "\n".join(
+        compat._passive_npc_sms_nudge_lines(
+            campaign,
+            campaign_state,
+            player,
+            player_state,
+        )
+    )
+    assert "SMS_REPLY_NUDGE:" not in joined
+
+
+def test_sms_reply_nudge_resets_after_new_thread_entry(
+    session_factory,
+    seed_campaign_and_actor,
+):
+    compat = _build_compat(session_factory)
+    compat.NPC_NUDGE_CHANCE = 0.0
+    compat.SMS_REPLY_NUDGE_CHANCE = 1.0
+    campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
+    compat.get_or_create_player(campaign.id, seed_campaign_and_actor["actor_id"])
+
+    with session_factory() as session:
+        player = (
+            session.query(Player)
+            .filter(Player.campaign_id == campaign.id)
+            .filter(Player.actor_id == seed_campaign_and_actor["actor_id"])
+            .first()
+        )
+        assert player is not None
+        player_state = json.loads(player.state_json or "{}")
+        player_state["character_name"] = "Chris"
+        player.state_json = compat._dump_json(player_state)
+
+        row = session.get(Campaign, campaign.id)
+        characters = json.loads(row.characters_json or "{}")
+        characters["caitlin-ward"] = {"name": "Caitlin Ward"}
+        row.characters_json = compat._dump_json(characters)
+        session.commit()
+
+    ok, status = compat.write_sms_thread(
+        campaign.id,
+        thread="caitlin",
+        sender="Chris",
+        recipient="Caitlin Ward",
+        message="first ping",
+        owner_actor_id=seed_campaign_and_actor["actor_id"],
+    )
+    assert ok is True and status == "stored"
+
+    with session_factory() as session:
+        player = (
+            session.query(Player)
+            .filter(Player.campaign_id == campaign.id)
+            .filter(Player.actor_id == seed_campaign_and_actor["actor_id"])
+            .first()
+        )
+        assert player is not None
+        player_state = compat.get_player_state(player)
+        row = session.get(Campaign, campaign.id)
+        campaign_state = compat.get_campaign_state(row)
+
+    for _ in range(3):
+        compat._passive_npc_sms_nudge_lines(campaign, campaign_state, player, player_state)
+
+    joined = "\n".join(
+        compat._passive_npc_sms_nudge_lines(
+            campaign,
+            campaign_state,
+            player,
+            player_state,
+        )
+    )
+    assert "SMS_REPLY_NUDGE:" not in joined
+
+    ok, status = compat.write_sms_thread(
+        campaign.id,
+        thread="caitlin",
+        sender="Chris",
+        recipient="Caitlin Ward",
+        message="second ping",
+        owner_actor_id=seed_campaign_and_actor["actor_id"],
+    )
+    assert ok is True and status == "stored"
+
+    with session_factory() as session:
+        row = session.get(Campaign, campaign.id)
+        campaign_state = compat.get_campaign_state(row)
+
+    joined = "\n".join(
+        compat._passive_npc_sms_nudge_lines(
+            campaign,
+            campaign_state,
+            player,
+            player_state,
+        )
+    )
+    assert "SMS_REPLY_NUDGE:" in joined
+    assert "Caitlin Ward" in joined
+
+
+def test_sms_reply_nudge_suppressed_when_counterpart_is_in_scene(
+    session_factory,
+    seed_campaign_and_actor,
+):
+    compat = _build_compat(session_factory)
+    compat.NPC_NUDGE_CHANCE = 0.0
+    compat.SMS_REPLY_NUDGE_CHANCE = 1.0
+    campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
+    compat.get_or_create_player(campaign.id, seed_campaign_and_actor["actor_id"])
+
+    with session_factory() as session:
+        player = (
+            session.query(Player)
+            .filter(Player.campaign_id == campaign.id)
+            .filter(Player.actor_id == seed_campaign_and_actor["actor_id"])
+            .first()
+        )
+        assert player is not None
+        player_state = json.loads(player.state_json or "{}")
+        player_state["character_name"] = "Chris"
+        player_state["location"] = "editing-bay"
+        player.state_json = compat._dump_json(player_state)
+
+        row = session.get(Campaign, campaign.id)
+        characters = json.loads(row.characters_json or "{}")
+        characters["caitlin-ward"] = {
+            "name": "Caitlin Ward",
+            "location": "editing-bay",
+        }
+        row.characters_json = compat._dump_json(characters)
+        session.commit()
+
+    ok, status = compat.write_sms_thread(
+        campaign.id,
+        thread="caitlin",
+        sender="Chris",
+        recipient="Caitlin Ward",
+        message="you here?",
+        owner_actor_id=seed_campaign_and_actor["actor_id"],
+    )
+    assert ok is True and status == "stored"
+
+    with session_factory() as session:
+        player = (
+            session.query(Player)
+            .filter(Player.campaign_id == campaign.id)
+            .filter(Player.actor_id == seed_campaign_and_actor["actor_id"])
+            .first()
+        )
+        assert player is not None
+        player_state = compat.get_player_state(player)
+        row = session.get(Campaign, campaign.id)
+        campaign_state = compat.get_campaign_state(row)
+
+    joined = "\n".join(
+        compat._passive_npc_sms_nudge_lines(
+            campaign,
+            campaign_state,
+            player,
+            player_state,
+        )
+    )
+    assert "SMS_REPLY_NUDGE:" not in joined
+    assert "Caitlin Ward" not in joined
+
+
 def test_sms_list_merges_alias_threads_to_canonical_contact(
     session_factory,
     seed_campaign_and_actor,
@@ -4824,6 +5052,79 @@ def test_calendar_for_prompt_individual_clocks_uses_personal_time_for_targeted_e
     assert len(entries) == 1
     assert entries[0]["status"] in {"today", "imminent", "upcoming"}
     assert entries[0]["hours_remaining"] > 0
+
+
+def test_calendar_for_prompt_recurring_event_rolls_to_current_day_without_overdue(session_factory):
+    compat = _build_compat(session_factory)
+    campaign_state = {
+        "time_model": "shared_clock",
+        "calendar_policy": "consequential",
+        "game_time": {"day": 20, "hour": 18},
+        "calendar": [
+            {
+                "name": "Take prenatal vitamins",
+                "fire_day": 4,
+                "fire_hour": 9,
+                "recurring": True,
+                "target_players": ["actor-1"],
+            }
+        ],
+    }
+
+    entries = compat._calendar_for_prompt(
+        campaign_state,
+        player_state={"character_name": "Rigby Krinkle"},
+        viewer_actor_id="actor-1",
+    )
+
+    assert len(entries) == 1
+    assert entries[0]["fire_day"] == 20
+    assert entries[0]["status"] == "recurring"
+    assert entries[0]["recurring"] is True
+    assert entries[0]["hours_remaining"] == -9
+    assert campaign_state["calendar"][0]["fire_day"] == 4
+
+
+def test_calendar_reminders_treat_recurring_event_as_non_overdue(session_factory):
+    compat = _build_compat(session_factory)
+    text = compat._calendar_reminder_text(
+        [
+            {
+                "name": "Take prenatal vitamins",
+                "hours_remaining": -9,
+                "fire_day": 20,
+                "fire_hour": 9,
+                "status": "recurring",
+                "recurring": True,
+            }
+        ]
+    )
+    assert text == "None"
+
+
+def test_game_engine_calendar_update_accepts_recurring_entry_flag(session_factory):
+    engine = GameEngine(
+        uow_factory=lambda: SQLAlchemyUnitOfWork(session_factory),
+        llm=StubLLM(LLMTurnOutput(narration="unused")),
+    )
+    updated = engine._apply_calendar_update(
+        {"game_time": {"day": 3656, "hour": 14}},
+        {
+            "add": [
+                {
+                    "title": "Take prenatal vitamins",
+                    "day": 3656,
+                    "hour": 9,
+                    "recurring": True,
+                    "context": "Daily recurring reminder.",
+                }
+            ]
+        },
+    )
+    calendar = updated.get("calendar", [])
+    assert len(calendar) == 1
+    assert calendar[0]["name"] == "Take prenatal vitamins"
+    assert calendar[0]["recurring"] is True
 
 
 def test_legacy_setup_signatures(session_factory, seed_campaign_and_actor):

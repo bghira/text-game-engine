@@ -2764,6 +2764,8 @@ class GameEngine:
         fire_hour = cls._calendar_fix_ampm(fire_hour, description)
         # Cross-check fire_day against "tomorrow"/"today" in description.
         fire_day = cls._calendar_fix_relative_day(fire_day, description, current_day)
+        if cls._calendar_event_is_recurring(event):
+            fire_day = max(1, int(current_day))
 
         normalized: dict[str, Any] = {
             "name": name,
@@ -2772,6 +2774,8 @@ class GameEngine:
             "description": description,
             "known_by": cls._calendar_known_by_from_event(event),
         }
+        if cls._calendar_event_is_recurring(event):
+            normalized["recurring"] = True
         target_players = cls._calendar_target_tokens_from_event(event)
         if target_players:
             normalized["target_players"] = target_players
@@ -2788,6 +2792,22 @@ class GameEngine:
             elif isinstance(raw, str):
                 normalized[key] = raw[:160]
         return normalized
+
+    @staticmethod
+    def _calendar_event_is_recurring(event: Any) -> bool:
+        if not isinstance(event, dict):
+            return False
+        recurring = event.get("recurring")
+        if isinstance(recurring, bool):
+            return recurring
+        recurring_text = " ".join(str(recurring or "").strip().lower().split())
+        if recurring_text in {"1", "true", "yes", "y", "daily", "recurring", "rolling"}:
+            return True
+        for key in ("status", "_status", "recurrence", "repeat"):
+            value_text = " ".join(str(event.get(key) or "").strip().lower().split())
+            if value_text in {"daily", "recurring", "rolling"}:
+                return True
+        return False
 
     def _apply_calendar_update(
         self,
@@ -2885,6 +2905,8 @@ class GameEngine:
                         fire_day_int < day_int
                         or (fire_day_int == day_int and fire_hour_int <= hour_int)
                     )
+                if self._calendar_event_is_recurring(event):
+                    event_is_past = False
                 if event_is_past or (
                     name_mentioned and not has_premature and (has_completion or has_cleanup_intent)
                 ):
@@ -2981,6 +3003,8 @@ class GameEngine:
                     )[:200],
                     "known_by": self._calendar_known_by_from_event(entry),
                 }
+                if self._calendar_event_is_recurring(entry):
+                    event["recurring"] = True
                 location_text = str(entry.get("location") or "").strip()
                 if location_text and not str(event.get("description") or "").strip():
                     event["description"] = f"Location: {location_text}"[:200]
