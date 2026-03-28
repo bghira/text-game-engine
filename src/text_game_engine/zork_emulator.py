@@ -10796,9 +10796,15 @@ class ZorkEmulator:
         global_hour = min(23, max(0, global_hour))
         current_day = global_day
         current_hour = global_hour
-        if time_model == cls.TIME_MODEL_INDIVIDUAL_CLOCKS and isinstance(player_state, dict):
+        if isinstance(player_state, dict):
             player_game_time = player_state.get("game_time")
-            if isinstance(player_game_time, dict) and player_game_time:
+            if isinstance(player_game_time, dict) and player_game_time and (
+                time_model == cls.TIME_MODEL_INDIVIDUAL_CLOCKS
+                or (
+                    time_model == cls.TIME_MODEL_SHARED_CLOCK
+                    and calendar_policy == cls.CALENDAR_POLICY_LOOSE
+                )
+            ):
                 current_day = cls._coerce_non_negative_int(
                     player_game_time.get("day", global_day),
                     default=global_day,
@@ -18137,13 +18143,18 @@ class ZorkEmulator:
         )
         time_model = self._time_model_from_state(campaign_state)
         calendar_policy = self._calendar_policy_from_state(campaign_state)
-        if time_model == self.TIME_MODEL_INDIVIDUAL_CLOCKS:
-            raw_player_time = player_state.get("game_time") if isinstance(player_state, dict) else None
-            if isinstance(raw_player_time, dict) and raw_player_time:
-                player_game_time = self._game_time_from_total_minutes(
-                    self._game_time_to_total_minutes(raw_player_time),
-                    start_day_of_week=self._campaign_start_day_of_week(campaign_state),
-                )
+        raw_player_time = player_state.get("game_time") if isinstance(player_state, dict) else None
+        if isinstance(raw_player_time, dict) and raw_player_time:
+            player_game_time = self._game_time_from_total_minutes(
+                self._game_time_to_total_minutes(raw_player_time),
+                start_day_of_week=self._campaign_start_day_of_week(campaign_state),
+            )
+            if time_model == self.TIME_MODEL_INDIVIDUAL_CLOCKS:
+                return player_game_time, global_game_time, time_model, calendar_policy
+            if (
+                time_model == self.TIME_MODEL_SHARED_CLOCK
+                and calendar_policy == self.CALENDAR_POLICY_LOOSE
+            ):
                 return player_game_time, global_game_time, time_model, calendar_policy
         return global_game_time, global_game_time, time_model, calendar_policy
 

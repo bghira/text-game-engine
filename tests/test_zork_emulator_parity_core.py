@@ -3253,6 +3253,51 @@ def test_build_prompt_individual_clocks_uses_player_time_and_exposes_global_time
     assert '"game_time": {"day": 11, "hour": 20, "minute": 15}' in user_prompt
 
 
+def test_build_prompt_loose_calendar_uses_player_time_as_current_game_time(
+    session_factory, seed_campaign_and_actor
+):
+    compat = _build_compat(session_factory)
+    campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
+    player = compat.get_or_create_player(seed_campaign_and_actor["campaign_id"], seed_campaign_and_actor["actor_id"])
+    turns = compat.get_recent_turns(seed_campaign_and_actor["campaign_id"])
+
+    with session_factory() as session:
+        campaign_row = session.get(Campaign, campaign.id)
+        campaign_row.state_json = compat._dump_json(
+            {
+                "clock_start_day_of_week": "monday",
+                "time_model": "shared_clock",
+                "calendar_policy": "loose",
+                "game_time": {"day": 70, "hour": 0, "minute": 0},
+                "calendar": [
+                    {
+                        "name": "Sixteen-week ultrasound follow-up",
+                        "fire_day": 97,
+                        "fire_hour": 18,
+                        "target_players": [seed_campaign_and_actor["actor_id"]],
+                    }
+                ],
+            }
+        )
+        player_row = (
+            session.query(Player)
+            .filter(Player.campaign_id == campaign.id)
+            .filter(Player.actor_id == seed_campaign_and_actor["actor_id"])
+            .one()
+        )
+        player_state = json.loads(player_row.state_json or "{}")
+        player_state["game_time"] = {"day": 97, "hour": 18, "minute": 0}
+        player_row.state_json = compat._dump_json(player_state)
+        session.commit()
+
+    _, user_prompt = compat.build_prompt(campaign, player, "check calendar", turns)
+
+    assert 'TIME_MODEL: shared_clock' in user_prompt
+    assert 'CALENDAR_POLICY: loose' in user_prompt
+    assert 'CURRENT_GAME_TIME: {"day": 97, "hour": 18, "minute": 0' in user_prompt
+    assert "fires in 666 hour(s)" not in user_prompt
+
+
 def test_story_context_includes_next_three_and_coerces_progress_indices(session_factory, seed_campaign_and_actor):
     compat = _build_compat(session_factory)
 
@@ -4716,6 +4761,38 @@ def test_calendar_for_prompt_loose_policy_rolls_personal_event_forward(session_f
     assert stale_entries[0]["fire_day"] == 400
     assert stale_entries[0]["hours_remaining"] >= 0
     assert stale_state["calendar"][0]["fire_day"] == 400
+
+
+def test_calendar_for_prompt_loose_policy_uses_player_time_for_targeted_event(session_factory):
+    compat = _build_compat(session_factory)
+    campaign_state = {
+        "time_model": "shared_clock",
+        "calendar_policy": "loose",
+        "game_time": {"day": 70, "hour": 0},
+        "calendar": [
+            {
+                "name": "Sixteen-week ultrasound follow-up",
+                "fire_day": 97,
+                "fire_hour": 18,
+                "target_players": ["actor-1"],
+            }
+        ],
+    }
+    player_state = {
+        "character_name": "Rigby Krinkle",
+        "game_time": {"day": 97, "hour": 18},
+    }
+
+    entries = compat._calendar_for_prompt(
+        campaign_state,
+        player_state=player_state,
+        viewer_actor_id="actor-1",
+    )
+
+    assert len(entries) == 1
+    assert entries[0]["fire_day"] == 97
+    assert entries[0]["hours_remaining"] == 0
+    assert entries[0]["status"] == "today"
 
 
 def test_calendar_for_prompt_individual_clocks_uses_personal_time_for_targeted_event(session_factory):
