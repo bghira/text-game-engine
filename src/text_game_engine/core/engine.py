@@ -572,6 +572,7 @@ class GameEngine:
         actor_id: str,
         actor_slug: str,
         viewer_location_key: str,
+        viewer_arrived_turn_id: int | None = None,
     ) -> bool:
         meta = parse_json_dict(getattr(turn, "meta_json", "{}"))
         if bool(meta.get("suppress_context")):
@@ -608,12 +609,47 @@ class GameEngine:
                 visibility.get("location_key") or meta.get("location_key") or ""
             ).strip().lower()
             if viewer_location_key and turn_location_key and viewer_location_key == turn_location_key:
+                # Only show local turns that happened after the viewer arrived
+                turn_id = getattr(turn, "id", None)
+                if viewer_arrived_turn_id is not None and turn_id is not None and turn_id < viewer_arrived_turn_id:
+                    return False
                 return True
         if str(actor_id or "").strip() in actor_ids:
             return True
         if actor_slug and actor_slug in player_slugs:
             return True
         return False
+
+    @staticmethod
+    def _find_viewer_arrived_turn_id(
+        turns: list[Any],
+        actor_id: str,
+        viewer_location_key: str,
+    ) -> int | None:
+        """Find the earliest turn ID at which the viewer was already at their current location.
+
+        Scans backwards through the viewer's own turns. The first turn (going back)
+        where the location_key differs marks the boundary — the viewer arrived on the
+        turn after that. If all viewer turns are at the current location, returns None
+        (no floor needed).
+        """
+        if not viewer_location_key:
+            return None
+        viewer_turns = [
+            t for t in turns
+            if str(getattr(t, "actor_id", "") or "").strip() == str(actor_id or "").strip()
+        ]
+        if not viewer_turns:
+            return None
+        # Walk backwards; find the first turn where the viewer was somewhere else
+        for t in reversed(viewer_turns):
+            meta = parse_json_dict(getattr(t, "meta_json", "{}"))
+            turn_loc = str(meta.get("location_key") or "").strip().lower()
+            if turn_loc and turn_loc != viewer_location_key:
+                # Viewer was somewhere else on this turn — they arrived after it
+                return getattr(t, "id", 0) + 1
+        # All viewer turns in the window are at this location — no floor needed
+        return None
 
     def _phase_a(self, turn_input: ResolveTurnInput, claim_token: str) -> TurnContext:
         now = self._clock()
@@ -643,6 +679,9 @@ class GameEngine:
             actor_slug = self._player_visibility_slug(turn_input.actor_id)
             viewer_location_key = self._room_key_from_state(player_state)
             turns = uow.turns.recent(turn_input.campaign_id, limit=24)
+            viewer_arrived_turn_id = self._find_viewer_arrived_turn_id(
+                turns, turn_input.actor_id, viewer_location_key,
+            )
             def _turn_meta_payload(turn_obj):
                 meta = parse_json_dict(getattr(turn_obj, "meta_json", "{}"))
                 if not isinstance(meta, dict):
@@ -676,6 +715,7 @@ class GameEngine:
                         turn_input.actor_id,
                         actor_slug,
                         viewer_location_key,
+                        viewer_arrived_turn_id,
                     )
                 ],
                 start_row_version=campaign.row_version,
