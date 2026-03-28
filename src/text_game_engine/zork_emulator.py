@@ -6597,8 +6597,6 @@ class ZorkEmulator:
             )
             for entry in players:
                 state = parse_json_dict(entry.state_json)
-                if entry.actor_id != actor.actor_id and not self._same_scene(actor_state, state):
-                    continue
                 fallback_name = f"Adventurer-{entry.actor_id[-4:]}" if entry.actor_id else "Adventurer"
                 display_name = str(state.get("character_name") or fallback_name).strip()
                 player_slug = self._player_visibility_slug(entry.actor_id)
