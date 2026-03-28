@@ -10891,6 +10891,12 @@ class ZorkEmulator:
             )
             if normalized is None:
                 continue
+            if viewer_actor_id and not cls._calendar_event_known_to_player(
+                normalized,
+                actor_id=viewer_actor_id,
+                player_state=player_state,
+            ):
+                continue
             fire_day = int(normalized.get("fire_day", current_day))
             fire_hour = cls._coerce_non_negative_int(
                 normalized.get("fire_hour", 23), default=23
@@ -13969,6 +13975,44 @@ class ZorkEmulator:
             if len(out) >= 12:
                 break
         return out
+
+    @classmethod
+    def _calendar_event_known_to_player(
+        cls,
+        event: object,
+        *,
+        actor_id: object = None,
+        player_state: dict[str, object] | None = None,
+    ) -> bool:
+        known_by = cls._calendar_known_by_from_event(event)
+        if not known_by:
+            return True
+        global_tokens = {"all", "any", "everyone", "global", "scene", "party"}
+        known_keys = {
+            cls._calendar_name_key(name)
+            for name in known_by
+            if cls._calendar_name_key(name)
+        }
+        if known_keys & global_tokens:
+            return True
+        aliases: set[str] = set()
+
+        def _add(raw: object) -> None:
+            text = str(raw or "").strip()
+            if not text:
+                return
+            key = cls._calendar_name_key(text)
+            if key:
+                aliases.add(key)
+            slug_key = cls._player_slug_key(text)
+            if slug_key:
+                aliases.add(cls._calendar_name_key(slug_key))
+
+        _add(actor_id)
+        _add(cls._player_visibility_slug(actor_id))
+        if isinstance(player_state, dict):
+            _add(player_state.get("character_name"))
+        return bool(known_keys & aliases)
 
     def _active_scene_character_names(
         self,

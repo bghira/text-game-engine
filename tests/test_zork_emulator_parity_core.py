@@ -4716,6 +4716,52 @@ def test_calendar_reminders_surface_when_known_character_present(session_factory
     assert "fires in 24 hour(s)" in text
 
 
+def test_calendar_for_prompt_hides_events_unknown_to_viewer(session_factory):
+    events = ZorkEmulator._calendar_for_prompt(
+        {
+            "game_time": {"day": 5, "hour": 10, "minute": 0},
+            "calendar": [
+                {
+                    "name": "Blood Test",
+                    "fire_day": 5,
+                    "fire_hour": 11,
+                    "known_by": ["Elizabeth"],
+                },
+                {
+                    "name": "Open Hearing",
+                    "fire_day": 5,
+                    "fire_hour": 12,
+                },
+            ],
+        },
+        player_state={"character_name": "Rigby"},
+        viewer_actor_id="123",
+    )
+    names = [str(row.get("name") or "") for row in events if isinstance(row, dict)]
+    assert "Blood Test" not in names
+    assert "Open Hearing" in names
+
+
+def test_calendar_for_prompt_keeps_events_known_to_viewer(session_factory):
+    events = ZorkEmulator._calendar_for_prompt(
+        {
+            "game_time": {"day": 5, "hour": 10, "minute": 0},
+            "calendar": [
+                {
+                    "name": "Blood Test",
+                    "fire_day": 5,
+                    "fire_hour": 11,
+                    "known_by": ["Rigby"],
+                }
+            ],
+        },
+        player_state={"character_name": "Rigby"},
+        viewer_actor_id="123",
+    )
+    names = [str(row.get("name") or "") for row in events if isinstance(row, dict)]
+    assert names == ["Blood Test"]
+
+
 def test_main_party_location_sync_updates_other_players(
     uow_factory,
     session_factory,
