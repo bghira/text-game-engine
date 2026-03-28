@@ -6597,30 +6597,33 @@ class ZorkEmulator:
             )
             for entry in players:
                 state = parse_json_dict(entry.state_json)
+                is_co_located = entry.actor_id == actor.actor_id or self._same_scene(actor_state, state)
                 fallback_name = f"Adventurer-{entry.actor_id[-4:]}" if entry.actor_id else "Adventurer"
                 display_name = str(state.get("character_name") or fallback_name).strip()
                 player_slug = self._player_visibility_slug(entry.actor_id)
-                persona = str(state.get("persona") or "").strip()
-                if persona:
-                    persona = self._trim_text(persona, self.MAX_PERSONA_PROMPT_CHARS)
-                    persona = " ".join(persona.split()[:18])
-                attributes = self.get_player_attributes(entry)
-                attribute_cues = self._build_attribute_cues(attributes)
-                out.append(
-                    {
-                        "actor_id": entry.actor_id,
-                        "discord_mention": f"<@{entry.actor_id}>",
-                        "name": display_name,
-                        "player_slug": player_slug,
-                        "is_actor": entry.actor_id == actor.actor_id,
+                record: Dict[str, object] = {
+                    "actor_id": entry.actor_id,
+                    "discord_mention": f"<@{entry.actor_id}>",
+                    "name": display_name,
+                    "player_slug": player_slug,
+                    "is_actor": entry.actor_id == actor.actor_id,
+                }
+                record["location"] = state.get("location")
+                record["room_title"] = state.get("room_title")
+                if is_co_located:
+                    persona = str(state.get("persona") or "").strip()
+                    if persona:
+                        persona = self._trim_text(persona, self.MAX_PERSONA_PROMPT_CHARS)
+                        persona = " ".join(persona.split()[:18])
+                    attributes = self.get_player_attributes(entry)
+                    attribute_cues = self._build_attribute_cues(attributes)
+                    record.update({
                         "level": entry.level,
                         "persona": persona,
                         "attribute_cues": attribute_cues,
-                        "location": state.get("location"),
-                        "room_title": state.get("room_title"),
                         "game_time": state.get("game_time") if isinstance(state.get("game_time"), dict) else None,
-                    }
-                )
+                    })
+                out.append(record)
                 if len(out) >= self.MAX_PARTY_CONTEXT_PLAYERS:
                     break
         return out
@@ -18536,6 +18539,20 @@ class ZorkEmulator:
             sms_threads = self._sms_threads_from_state(campaign_state)
             player_aliases = self._sms_player_aliases(actor_id=actor_id, player_state=player_state)
             contact_roster = self._sms_contact_roster(campaign)
+            player_registry = self._campaign_player_registry(campaign.id, self._session_factory)
+            player_identity_keys: set[str] = set()
+            for registry_row in (player_registry.get("by_actor_id", {}) or {}).values():
+                if not isinstance(registry_row, dict):
+                    continue
+                for raw_value in (
+                    registry_row.get("actor_id"),
+                    registry_row.get("name"),
+                    registry_row.get("slug"),
+                    registry_row.get("discord_mention"),
+                ):
+                    key = self._sms_normalize_thread_key(raw_value)
+                    if key:
+                        player_identity_keys.add(key)
             current_location_key = self._room_key_from_player_state(player_state).lower()
             present_npc_keys: set[str] = set()
             for slug, payload in (self.get_campaign_characters(campaign) or {}).items():
@@ -18559,6 +18576,17 @@ class ZorkEmulator:
                 campaign_state[self.SMS_REPLY_NUDGE_STATE_KEY] = nudge_state
             unanswered_by_npc: list[tuple[str, str, str]] = []
             merged_threads: dict[str, dict[str, Any]] = {}
+
+            def _thread_is_other_player_contact(*raw_values: object) -> bool:
+                normalized_values = {
+                    self._sms_normalize_thread_key(raw)
+                    for raw in raw_values
+                }
+                normalized_values = {
+                    value for value in normalized_values if value and value not in player_aliases
+                }
+                return bool(normalized_values & player_identity_keys)
+
             for thread_order, (thread_key, thread_data) in enumerate(sms_threads.items()):
                 if not isinstance(thread_data, dict):
                     continue
@@ -18632,6 +18660,8 @@ class ZorkEmulator:
                         self._sms_normalize_thread_key(merged_entry.get("label")),
                     }
                     counterpart_keys = {key for key in counterpart_keys if key}
+                    if _thread_is_other_player_contact(*counterpart_keys):
+                        continue
                     if counterpart_keys & present_npc_keys:
                         continue
                     thread_key_norm = self._sms_normalize_thread_key(
@@ -18687,7 +18717,16 @@ class ZorkEmulator:
             elif unread_threads > 0:
                 labels = unread_summary.get("labels", [])
                 if labels:
-                    names_str = ", ".join(str(l) for l in labels[:2])
+                    filtered_labels = [
+                        str(label)
+                        for label in labels
+                        if not _thread_is_other_player_contact(
+                            *[part.strip() for part in str(label).split("↔") if part.strip()]
+                        )
+                    ]
+                    names_str = ", ".join(filtered_labels[:2])
+                    if not names_str:
+                        return lines
                     lines.append(
                         f"SMS_ACTIVITY_NUDGE: There are unread SMS threads from {names_str}. "
                         f"If narratively appropriate, the character's phone could buzz, "
