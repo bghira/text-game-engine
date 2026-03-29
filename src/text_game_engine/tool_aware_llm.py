@@ -3230,6 +3230,15 @@ class ToolAwareZorkLLM:
                 "memory_search",
             ):
                 memory_obligation_met = True
+                # Strip MEMORY_RECALL_NEXT_ACTIONS from the tool result we just
+                # appended — the memory-tool JSON examples tempt the model into
+                # calling them again instead of proceeding to ready_to_write.
+                for entry in tool_history_entries:
+                    text = str(entry.get("text") or "")
+                    marker = "MEMORY_RECALL_NEXT_ACTIONS:"
+                    if marker in text:
+                        entry["text"] = text[: text.index(marker)].rstrip()
+                _refresh_tool_history()
                 _append_tool_history_entry(
                     "system_note",
                     "\n\n[MEMORY OBLIGATION MET — you have satisfied the mandatory memory lookup for this turn. "
