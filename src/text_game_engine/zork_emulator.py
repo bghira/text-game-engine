@@ -1102,7 +1102,8 @@ class ZorkEmulator:
         'Narrow within the previous turn hits: {"tool_call": "memory_search", "search_within": "last_results", "queries": ["confession", "deal"]}\n'
         'After narrowing, request expanded turn text only if you still need it: {"tool_call": "memory_search", "search_within": "last_results", "queries": ["exact wording"], "full_text": true}\n'
         'Use keep_memory_turns to prune stale turn hits from tool context: {"tool_call": "memory_search", "search_within": "last_results", "queries": ["keyword"], "keep_memory_turns": [123, 456]}\n'
-        'Optional source scope: {"tool_call": "memory_search", "category": "source", "queries": ["description of the character or event you need"]}\n'
+        'Source-only scope (excludes all turn hits): {"tool_call": "memory_search", "category": "source", "queries": ["description of the character or event you need"]}\n'
+        "If you need both source canon AND turn recall, make two separate memory_search calls (one with category='source', one without).\n"
         'Rulebook key browsing: {"tool_call": "source_browse", "document_key": "document-key"}\n'
         'Exact turn retrieval after a hit: {"tool_call": "memory_turn", "turn_id": 1234}\n'
     )
@@ -1178,6 +1179,9 @@ class ZorkEmulator:
         "Each source doc has one format: story, rulebook, or generic.\n"
         "Use memory_search with category 'source' for canon facts before narration. On normal turns, include only the relevant subset of source canon for this turn rather than trying to fetch every document:\n"
         '{"tool_call": "memory_search", "category": "source", "queries": ["description of the character or event you need"]}\n'
+        "IMPORTANT: category='source' returns ONLY source-material hits — no turn history, no curated memories. "
+        "If you need BOTH source canon AND turn recall on the same turn, make two separate memory_search calls: "
+        "one with category='source' and one without (or with a char: category). Each call is independent.\n"
         "You can scope one source document with category 'source:<document_key>' when SOURCE_MATERIAL_DOCS provides keys.\n"
         "Format notes: rulebook = line facts in KEY: value form; story = prose/scripted scenes; generic = mixed notes.\n"
         "Default return is one snippet. For surrounding context use before_lines and after_lines (defaults 0/0).\n"
