@@ -13150,18 +13150,21 @@ class ZorkEmulator:
                     if value in (None, "", [], {}):
                         continue
                     expanded[key] = value
-            rows.append(
-                {
-                    "slug": slug,
-                    "name": str(source.get("name") or entry.get("name") or slug).strip(),
-                    "location": source.get("location"),
-                    "location_last_updated": source.get("location_last_updated"),
-                    "current_status": source.get("current_status"),
-                    "available_keys": sorted(available_keys),
-                    "compact": compact,
-                    "expanded": expanded,
-                }
-            )
+            for key in list(expanded.keys()):
+                compact.pop(key, None)
+            row: dict[str, object] = {
+                "slug": slug,
+                "name": str(source.get("name") or entry.get("name") or slug).strip(),
+                "location": source.get("location"),
+                "location_last_updated": source.get("location_last_updated"),
+                "current_status": source.get("current_status"),
+                "available_keys": sorted(available_keys),
+            }
+            for key, value in expanded.items():
+                row[key] = value
+            if compact:
+                row["compact"] = compact
+            rows.append(row)
         return rows
 
     def _player_character_prompt_keys(
