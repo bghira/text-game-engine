@@ -1164,6 +1164,10 @@ class ZorkEmulator:
         "- Only skip tools for trivial immediate physical follow-ups where continuity risk is near zero.\n"
         "- If unsure what to query, describe the situation: combine current location, active NPC names, and what the player is doing into a phrase.\n"
         "- Prefer this memory flow: recent_turns -> broad memory_search summary -> narrow memory_search with search_within -> full_text only after narrowing.\n"
+        "- EMOTIONAL TONE CHECK: when the player's action carries an emotional tone that seems sudden, out of context, or uncharacteristic "
+        "(anger, grief, affection, withdrawal, fear, urgency), do a memory_search for relevant prior interactions before responding. "
+        "People carry emotional weight from things that happened before this scene. The player may be reacting to something the current context doesn't show. "
+        "What memory reveals overrules what the character profile says they 'should' feel — lived experience reshapes people, just like in real life.\n"
         "\nYou also have a memory_terms tool for wildcard term/category listing. Use it BEFORE storing memories:\n"
         '{"tool_call": "memory_terms", "wildcard": "marcus*"}\n'
         "This returns existing category/term buckets so you can avoid duplicates.\n"
