@@ -2125,6 +2125,14 @@ def test_memory_search_supports_last_results_full_text_and_context_pruning(
             action_text="remember beta elsewhere",
             narration=("beta outside " + ("outside " * 240) + outside_tail),
         )
+        for index in range(30):
+            compat._record_simple_turn_pair(
+                campaign_id=campaign.id,
+                actor_id=seed_campaign_and_actor["actor_id"],
+                session_id=None,
+                action_text=f"filler {index}",
+                narration=f"filler narration {index}",
+            )
 
         with session_factory() as session:
             narrator_turns = (
@@ -2178,6 +2186,109 @@ def test_memory_search_supports_last_results_full_text_and_context_pruning(
         assert outside_tail not in second_augmented_prompt
 
     asyncio.run(run_test())
+
+
+def test_memory_search_excludes_recent_turns_already_in_prompt_context(
+    session_factory,
+    seed_campaign_and_actor,
+):
+    compat = _build_compat(session_factory)
+    campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
+    compat.get_or_create_player(campaign.id, seed_campaign_and_actor["actor_id"])
+
+    older_turn_id = 0
+    newest_turn_id = 0
+    with session_factory() as session:
+        for index in range(30):
+            turn = Turn(
+                campaign_id=campaign.id,
+                session_id=None,
+                actor_id=seed_campaign_and_actor["actor_id"],
+                kind="narrator",
+                content=f"Shared secret marker turn {index}",
+                meta_json=json.dumps(
+                    {
+                        "visibility": {"scope": "public"},
+                        "game_time": {"day": 1, "hour": 9, "minute": index},
+                    }
+                ),
+            )
+            session.add(turn)
+            session.flush()
+            if index == 1:
+                older_turn_id = int(turn.id)
+            if index == 29:
+                newest_turn_id = int(turn.id)
+        session.commit()
+
+    tool_llm = ToolAwareZorkLLM(
+        session_factory=session_factory,
+        completion_port=StubCompletionPort(),
+        temperature=0.8,
+        max_tokens=512,
+    )
+    tool_llm.bind_emulator(compat)
+
+    output = tool_llm._tool_memory_search(
+        campaign.id,
+        {"queries": ["shared secret marker"]},
+        actor_id=seed_campaign_and_actor["actor_id"],
+    )
+
+    assert f'"turn_id":{older_turn_id}' in output
+    assert f'"turn_id":{newest_turn_id}' not in output
+    assert '"excluded_recent_turn_count":24' in output
+
+
+def test_memory_search_explicit_turn_scope_overrides_recent_context_exclusion(
+    session_factory,
+    seed_campaign_and_actor,
+):
+    compat = _build_compat(session_factory)
+    campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
+    compat.get_or_create_player(campaign.id, seed_campaign_and_actor["actor_id"])
+
+    target_turn_id = 0
+    with session_factory() as session:
+        for index in range(3):
+            turn = Turn(
+                campaign_id=campaign.id,
+                session_id=None,
+                actor_id=seed_campaign_and_actor["actor_id"],
+                kind="narrator",
+                content=f"Scoped lookup marker {index}",
+                meta_json=json.dumps(
+                    {
+                        "visibility": {"scope": "public"},
+                        "game_time": {"day": 1, "hour": 10, "minute": index},
+                    }
+                ),
+            )
+            session.add(turn)
+            session.flush()
+            if index == 2:
+                target_turn_id = int(turn.id)
+        session.commit()
+
+    tool_llm = ToolAwareZorkLLM(
+        session_factory=session_factory,
+        completion_port=StubCompletionPort(),
+        temperature=0.8,
+        max_tokens=512,
+    )
+    tool_llm.bind_emulator(compat)
+
+    output = tool_llm._tool_memory_search(
+        campaign.id,
+        {
+            "queries": ["scoped lookup marker"],
+            "search_within_turn_ids": [target_turn_id],
+        },
+        actor_id=seed_campaign_and_actor["actor_id"],
+    )
+
+    assert f'"turn_id":{target_turn_id}' in output
+    assert '"excluded_recent_turn_count":0' in output
 
 
 def test_attachment_setup_length_error_for_short_upload(session_factory):

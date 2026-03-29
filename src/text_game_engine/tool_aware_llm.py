@@ -462,6 +462,56 @@ class ToolAwareZorkLLM:
             out.append(row_turn_id)
         return out
 
+    def _memory_tool_excluded_turn_ids_from_recent_context(
+        self,
+        campaign_id: str,
+        actor_id: str | None,
+    ) -> set[int]:
+        emulator = self._emulator
+        actor_id_text = str(actor_id or "").strip()
+        if emulator is None or not actor_id_text:
+            return set()
+        with emulator._session_factory() as session:  # noqa: SLF001
+            campaign = session.get(Campaign, str(campaign_id))
+            actor_row = (
+                session.query(Player)
+                .filter(Player.campaign_id == str(campaign_id))
+                .filter(Player.actor_id == actor_id_text)
+                .first()
+            )
+        if campaign is None or actor_row is None:
+            return set()
+        actor_state = self._parse_json(getattr(actor_row, "state_json", "") or "{}", {})
+        registry = emulator._campaign_player_registry(str(campaign_id), emulator._session_factory)  # noqa: SLF001
+        viewer_slug = str(
+            (registry.get("by_actor_id", {}).get(actor_id_text) or {}).get("slug")
+            or emulator._player_visibility_slug(actor_id_text)  # noqa: SLF001
+        ).strip()
+        viewer_location_key = emulator._room_key_from_player_state(actor_state)  # noqa: SLF001
+        viewer_private_context = emulator._active_private_context_from_state(actor_state)  # noqa: SLF001
+        viewer_private_context_key = str(
+            (viewer_private_context or {}).get("context_key") or ""
+        ).strip()
+        recent_turn_limit = max(int(getattr(emulator, "MAX_RECENT_TURNS", 24) or 24), 1)
+        turns = emulator.get_recent_turns(str(campaign_id), limit=recent_turn_limit)
+        excluded: set[int] = set()
+        for turn in turns:
+            try:
+                turn_id = int(getattr(turn, "id", 0) or 0)
+            except Exception:
+                turn_id = 0
+            if turn_id <= 0 or str(getattr(turn, "kind", "") or "").strip().lower() != "narrator":
+                continue
+            if emulator._turn_visible_in_recent_turns_context(  # noqa: SLF001
+                turn,
+                viewer_actor_id=actor_id_text,
+                viewer_slug=viewer_slug,
+                viewer_location_key=viewer_location_key,
+                viewer_private_context_key=viewer_private_context_key,
+            ):
+                excluded.add(turn_id)
+        return excluded
+
     @classmethod
     def _pruned_memory_tool_text(
         cls,
@@ -1237,6 +1287,7 @@ class ToolAwareZorkLLM:
             raw_turn_id_scope = payload.get("turn_ids")
         search_within_turn_ids = self._memory_tool_turn_id_list(raw_turn_id_scope)
         search_within_turn_id_set = set(search_within_turn_ids)
+        excluded_recent_turn_ids: set[int] = set()
 
         curated_hits: list[tuple[str, str, float]] = []
         source_docs: list[dict[str, Any]] = []
@@ -1288,6 +1339,12 @@ class ToolAwareZorkLLM:
             include_manual_hits = True
             include_source_hits = not category_scope
 
+        if include_turn_hits and not search_within_turn_id_set:
+            excluded_recent_turn_ids = self._memory_tool_excluded_turn_ids_from_recent_context(
+                campaign_id,
+                actor_id,
+            )
+
         roster_hints: list[dict[str, Any]] = []
         if self._emulator is not None and hasattr(
             self._emulator, "record_memory_search_usage"
@@ -1333,7 +1390,10 @@ class ToolAwareZorkLLM:
                 q = query.lower().strip()
                 parts = [token for token in re.split(r"\W+", q) if token]
                 for turn in turns:
-                    if search_within_turn_id_set and int(turn.id or 0) not in search_within_turn_id_set:
+                    turn_id = int(turn.id or 0)
+                    if search_within_turn_id_set and turn_id not in search_within_turn_id_set:
+                        continue
+                    if excluded_recent_turn_ids and turn_id in excluded_recent_turn_ids:
                         continue
                     content = str(turn.content or "")
                     if not content:
@@ -1396,8 +1456,8 @@ class ToolAwareZorkLLM:
                         continue
                     prior = narrator_hits.get(int(turn.id))
                     if prior is None or score > float(prior.get("score", 0.0)):
-                        narrator_hits[int(turn.id)] = {
-                            "turn_id": int(turn.id),
+                        narrator_hits[turn_id] = {
+                            "turn_id": turn_id,
                             "score": score,
                             "content": content,
                             "visibility_scope": str(
@@ -1424,6 +1484,8 @@ class ToolAwareZorkLLM:
                     for turn_id, kind, content, score in embed_hits:
                         tid = int(turn_id)
                         if search_within_turn_id_set and tid not in search_within_turn_id_set:
+                            continue
+                        if excluded_recent_turn_ids and tid in excluded_recent_turn_ids:
                             continue
                         if tid in narrator_hits:
                             # Already found by keyword — boost score if embedding is higher.
@@ -1550,6 +1612,7 @@ class ToolAwareZorkLLM:
                 "hit_count": total_hits,
                 "full_text": full_text,
                 "search_within_turn_ids": search_within_turn_ids,
+                "excluded_recent_turn_count": len(excluded_recent_turn_ids),
             },
         )
         if has_source_material:
@@ -1602,7 +1665,7 @@ class ToolAwareZorkLLM:
             f"MEMORY_SEARCH RESULT campaign={campaign_id}",
             f"hits={hit_count}  curated={len(curated_hits)}  "
             f"narrator={len(ordered_narrator)}  source={len(source_hits_unique)}  "
-            f"roster_hints={len(roster_hints)}",
+            f"roster_hints={len(roster_hints)}  excluded_recent={len(excluded_recent_turn_ids)}",
         )
         next_actions = [
             "MEMORY_RECALL_NEXT_ACTIONS:",
