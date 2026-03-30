@@ -2556,6 +2556,10 @@ class ToolAwareZorkLLM:
         )
         message = message_raw.strip() if isinstance(message_raw, str) and message_raw.strip() else ""
 
+        # LLMs sometimes omit the thread field; default to recipient (standard pattern).
+        if not thread:
+            thread = recipient or sender
+
         if not thread or not sender or not recipient or not message:
             return "SMS_WRITE_RESULT: invalid payload"
 
@@ -2604,6 +2608,10 @@ class ToolAwareZorkLLM:
             else ""
         )
         message = message_raw.strip() if isinstance(message_raw, str) and message_raw.strip() else ""
+
+        # LLMs sometimes omit the thread field; default to recipient (standard pattern).
+        if not thread:
+            thread = recipient or sender
 
         if not thread or not sender or not recipient or not message:
             return "SMS_SCHEDULE_RESULT: invalid payload"
