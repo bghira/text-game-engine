@@ -11,6 +11,7 @@ from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable
 
+from .ascii_map import update_room_map_graph
 from .dice import format_dice_result, resolve_dice_check
 from .errors import StaleClaimError, TurnBusyError
 from .minigames import MinigameEngine, MinigameState
@@ -24,6 +25,7 @@ class GameEngine:
     AUTO_FIX_COUNTERS_KEY = "_auto_fix_counters"
     LOCATION_CARDS_STATE_KEY = "_location_cards"
     LOCATION_FACT_PRIORITIES_KEY = "_fact_priorities"
+    ROOM_MAP_GRAPH_STATE_KEY = "_room_map_graph"
     MIN_TURN_ADVANCE_MINUTES = 20
     DEFAULT_TURN_ADVANCE_MINUTES = 20
     MAX_TURN_ADVANCE_MINUTES = 180
@@ -938,6 +940,25 @@ class GameEngine:
                 player_state["character_name"] = str(
                     _cn.get("name") or _cn.get("character_name") or ""
                 ).strip() or str(_cn)
+            # Update the deterministic room map graph from exits
+            try:
+                _known_locs = campaign_state.get(self.LOCATION_CARDS_STATE_KEY)
+                if not isinstance(_known_locs, dict):
+                    _known_locs = None
+                _turn_id = 0
+                try:
+                    _turn_id = int(getattr(context, "turn_count", 0) or 0)
+                except (TypeError, ValueError):
+                    pass
+                update_room_map_graph(
+                    campaign_state,
+                    player_state,
+                    graph_key=self.ROOM_MAP_GRAPH_STATE_KEY,
+                    turn_number=_turn_id,
+                    known_locations=_known_locs,
+                )
+            except Exception:
+                logger.debug("room_map_graph update failed", exc_info=True)
             if time_model == self.TIME_MODEL_INDIVIDUAL_CLOCKS:
                 post_turn_game_time = self._extract_game_time_snapshot(
                     {"game_time": player_state.get("game_time") or campaign_state.get("game_time") or {}}

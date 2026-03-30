@@ -4009,7 +4009,8 @@ def test_inventory_origin_for_prompt_preserves_receipt_suffix_when_truncating(se
     assert normalized.startswith("Received from <@1>")
 
 
-def test_generate_map_prompt_uses_authoritative_location_keys(session_factory, seed_campaign_and_actor):
+def test_generate_map_renders_deterministic_ascii(session_factory, seed_campaign_and_actor):
+    """Deterministic map renderer produces ASCII output without LLM calls."""
     async def run_test():
         map_port = CaptureMapCompletionPort()
         compat = _build_compat(session_factory, completion_port=map_port)
@@ -4046,12 +4047,11 @@ def test_generate_map_prompt_uses_authoritative_location_keys(session_factory, s
 
         map_text = await compat.generate_map(campaign.id, actor_id=seed_campaign_and_actor["actor_id"])
         assert map_text
-        assert map_port.calls
-        prompt = map_port.calls[-1]["prompt"]
-        assert "PLAYER_LOCATION_KEY:" in prompt
-        assert "WORLD_CHARACTER_LOCATIONS:" in prompt
-        assert '"location_key"' in prompt
-        assert "MAP_SPATIAL_RULES:" in prompt
+        # Deterministic renderer produces ASCII with @ marker and legend
+        assert "@" in map_text
+        assert "Legend:" in map_text
+        # No LLM calls should have been made for the map
+        assert not map_port.calls
 
     asyncio.run(run_test())
 

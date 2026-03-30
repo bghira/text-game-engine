@@ -27,6 +27,7 @@ from .core.attachments import (
     extract_attachment_text,
     extract_attachment_texts,
 )
+from .core.ascii_map import render_ascii_map, render_single_room_box, update_room_map_graph
 from .core.source_material_memory import SourceMaterialMemory
 from .core.emulator_ports import (
     IMDBLookupPort,
@@ -258,6 +259,7 @@ class ZorkEmulator:
     NEW_PATH_TOKEN = "new path"
 
     ROOM_IMAGE_STATE_KEY = "room_scene_images"
+    ROOM_MAP_GRAPH_STATE_KEY = "_room_map_graph"
     PLAYER_STATS_KEY = "zork_stats"
     PLAYER_STATS_MESSAGES_KEY = "messages_sent"
     PLAYER_STATS_TIMERS_AVERTED_KEY = "timers_averted"
@@ -469,6 +471,7 @@ class ZorkEmulator:
         CHAPTER_PLAN_STATE_KEY,
         CONSEQUENCE_STATE_KEY,
         PRIVATE_CONTEXT_STATE_KEY,
+        ROOM_MAP_GRAPH_STATE_KEY,
     }
     PLAYER_STATE_EXCLUDE_KEYS = {"inventory", "room_description", PLAYER_STATS_KEY}
     _STALE_VALUE_PATTERNS = _COMPLETED_VALUES | {
@@ -846,7 +849,7 @@ class ZorkEmulator:
         "- Use player_state_update.room_description for a full room description only when location changes.\n"
         "- Use player_state_update.room_summary for a short one-line room summary for future context.\n"
         "- MULTI-PLAYER LOCATION SYNC: if another real player character from PARTY_SNAPSHOT is still physically with the acting player after this turn, include their exact PARTY_SNAPSHOT slug in co_located_player_slugs. The harness will mirror the acting player's room fields to them without inventing new behavior.\n"
-        'Example: {"player_state_update":{"location":"side-room-b","room_title":"Side Room B","room_summary":"Private side room off Fellowship Hall.","room_description":"A narrow side room with a low lamp and one upholstered bench.","exits":["Fellowship Hall"]},"co_located_player_slugs":["player-249794335095128065"]}\n'
+        'Example: {"player_state_update":{"location":"side-room-b","room_title":"Side Room B","room_summary":"Private side room off Fellowship Hall.","room_description":"A narrow side room with a low lamp and one upholstered bench.","exits":[{"name":"Fellowship Hall","location":"fellowship-hall","direction":"w","door":"archway"}]},"co_located_player_slugs":["player-249794335095128065"]}\n'
         "- PLAYER CONSEQUENCE SYNC: real player characters are allowed to suffer lasting consequences, including death, through normal play when the fiction supports it. "
         "For the acting player, use player_state_update. For OTHER real players, use other_player_state_updates keyed by PARTY_SNAPSHOT slug.\n"
         'Example: {"other_player_state_updates":{"dawn-preston-the-androgynous-sibling-of-chace-preston":{"deceased_reason":"Shot during the sanctuary ambush.","current_status":"Dead on the sanctuary floor.","location":"oakhaven-sanctuary"}}}\n'
@@ -855,7 +858,11 @@ class ZorkEmulator:
         "location, room_title, room_summary, room_description, and exits in player_state_update. "
         "RAILS_CONTEXT and SCENE_STATE reflect the CURRENT stored scene state — if they are stale/wrong because the player moved, your response MUST correct that through player_state_update. "
         "Narration alone does NOT move the player; only player_state_update changes their actual location.\n"
-        "- Use player_state_update.exits as a short list of exits if applicable.\n"
+        "- Use player_state_update.exits as a short list of exits. "
+        "Each exit may be a plain string OR a structured object: "
+        '{"name": "display name", "location": "target-location-slug", "direction": "n|s|e|w|ne|nw|se|sw", "door": "open|locked|hidden|archway"}. '
+        "When an exit leads to a known or named room, prefer the object form with a stable location slug matching the target room's location key. "
+        "Plain strings are still accepted for vague or unnamed exits.\n"
         "- Use player_state_update for inventory, hp, conditions, deceased_reason, and other durable player-state consequences.\n"
         "- Treat each player's inventory as private and never copy items from other players.\n"
         "- For inventory changes, ONLY use player_state_update.inventory_add and player_state_update.inventory_remove arrays.\n"
@@ -14706,22 +14713,8 @@ class ZorkEmulator:
 
         player_name = player_state.get("character_name") or f"Adventurer-{str(resolved_actor_id)[-4:]}"
         campaign_state = self.get_campaign_state(campaign)
-        model_state = self._build_model_state(campaign_state)
-        model_state = self._fit_state_to_budget(model_state, 800)
-        landmarks = campaign_state.get("landmarks", [])
-        if isinstance(landmarks, list) and landmarks:
-            parts = []
-            for lm in landmarks:
-                if isinstance(lm, dict):
-                    name = str(lm.get("name") or "")
-                    role = str(lm.get("role") or "")
-                    parts.append(f"{name} ({role})" if name and role else name or str(lm))
-                else:
-                    parts.append(str(lm))
-            landmarks_text = ", ".join(parts)
-        else:
-            landmarks_text = "none"
 
+        # Build NPC location entries for the renderer
         characters = self.get_campaign_characters(campaign)
         char_entries: list[dict[str, str]] = []
         if isinstance(characters, dict):
@@ -14743,65 +14736,22 @@ class ZorkEmulator:
                         "location_display": char_loc["display"] or "Unknown",
                     }
                 )
-        chars_text = self._dump_json(char_entries) if char_entries else "[]"
 
-        story_progress = ""
-        outline = campaign_state.get("story_outline")
-        if isinstance(outline, dict):
-            chapters = outline.get("chapters", [])
-            try:
-                cur_ch = int(campaign_state.get("current_chapter", 0))
-            except (ValueError, TypeError):
-                cur_ch = 0
-            try:
-                cur_sc = int(campaign_state.get("current_scene", 0))
-            except (ValueError, TypeError):
-                cur_sc = 0
-            if isinstance(chapters, list) and 0 <= cur_ch < len(chapters):
-                chapter = chapters[cur_ch]
-                chapter_title = chapter.get("title", "")
-                scenes = chapter.get("scenes", [])
-                scene_title = ""
-                if isinstance(scenes, list) and 0 <= cur_sc < len(scenes):
-                    scene_title = scenes[cur_sc].get("title", "")
-                story_progress = f"{chapter_title} / {scene_title}" if scene_title else chapter_title
+        # Use the deterministic ASCII map renderer
+        graph = campaign_state.get(self.ROOM_MAP_GRAPH_STATE_KEY)
+        if not isinstance(graph, dict) or not graph.get("rooms"):
+            return render_single_room_box(
+                room_title=player_loc["display"],
+                player_name=player_name,
+                other_players=other_entries,
+            )
 
-        map_prompt = (
-            f"CAMPAIGN: {campaign.name}\n"
-            f"PLAYER_NAME: {player_name}\n"
-            f"PLAYER_LOCATION_KEY: {player_loc['key']}\n"
-            f"PLAYER_LOCATION_DISPLAY: {player_loc['display']}\n"
-            f"PLAYER_ROOM_TITLE: {room_title or 'Unknown'}\n"
-            f"PLAYER_ROOM_SUMMARY: {room_summary or ''}\n"
-            f"PLAYER_EXITS: {exits or []}\n"
-            f"WORLD_SUMMARY: {self._compose_world_summary(campaign, campaign_state, max_chars=6000)}\n"
-            f"WORLD_STATE: {self._dump_json(model_state)}\n"
-            f"LANDMARKS: {landmarks_text}\n"
-            f"WORLD_CHARACTER_LOCATIONS: {chars_text}\n"
+        return render_ascii_map(
+            graph=graph,
+            player_location=player_loc["key"],
+            other_players=other_entries,
+            npcs=char_entries,
         )
-        if story_progress:
-            map_prompt += f"STORY_PROGRESS: {story_progress}\n"
-        map_prompt += (
-            f"OTHER_PLAYERS: {self._dump_json(other_entries)}\n"
-            "MAP_SPATIAL_RULES:\n"
-            "- location_key is authoritative for grouping entities.\n"
-            "- Same location_key means same room/area.\n"
-            "- Different location_key means separate rooms/areas; never nest them.\n"
-            "Draw a compact map with @ marking the player's location.\n"
-        )
-
-        if self._map_completion_port is None:
-            return "Map unavailable."
-        response = await self._map_completion_port.complete(
-            self.MAP_SYSTEM_PROMPT,
-            map_prompt,
-            temperature=0.2,
-            max_tokens=600,
-        )
-        ascii_map = self._extract_ascii_map(response or "")
-        if not ascii_map:
-            return "Map is foggy. Try again."
-        return ascii_map
 
     # ------------------------------------------------------------------
     # Memory tool compatibility
