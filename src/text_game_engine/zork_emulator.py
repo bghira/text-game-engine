@@ -7720,6 +7720,13 @@ class ZorkEmulator:
                         if campaign_row is not None:
                             campaign_state = parse_json_dict(campaign_row.state_json)
                             game_time = self._extract_game_time_snapshot(campaign_state)
+                            # Prefer player's individual clock over global time.
+                            if row is not None:
+                                player_time = self._player_known_game_time(
+                                    row, fallback_time=game_time
+                                )
+                                if player_time:
+                                    game_time = player_time
                             self._sms_write(
                                 campaign_state,
                                 thread=self._sms_normalize_thread_key(sms_recipient) or sms_recipient,
@@ -15335,6 +15342,21 @@ class ZorkEmulator:
                 return False, "campaign_not_found"
             campaign_state = self.get_campaign_state(campaign)
             game_time = self._extract_game_time_snapshot(campaign_state)
+            # In individual_clocks mode, use the player's personal game_time.
+            owner_text = str(owner_actor_id or "").strip()
+            if owner_text:
+                player_row = (
+                    session.query(Player)
+                    .filter(Player.campaign_id == campaign_id)
+                    .filter(Player.actor_id == owner_text)
+                    .first()
+                )
+                if player_row is not None:
+                    player_time = self._player_known_game_time(
+                        player_row, fallback_time=game_time
+                    )
+                    if player_time:
+                        game_time = player_time
             self._sms_write(
                 campaign_state,
                 thread=thread,

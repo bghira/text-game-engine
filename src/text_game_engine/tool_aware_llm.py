@@ -3502,6 +3502,16 @@ class ToolAwareZorkLLM:
                 _ready_speakers = [_ready_speakers]
             if isinstance(_ready_listeners, str):
                 _ready_listeners = [_ready_listeners]
+            # Auto-inject SMS recipient as speaker when action is an SMS.
+            _sms_intent = emulator._extract_inline_sms_intent(action_text)  # noqa: SLF001
+            if _sms_intent is not None:
+                _sms_recipient_slug = emulator._player_slug_key(_sms_intent[0])  # noqa: SLF001
+                if _sms_recipient_slug:
+                    _all_ready = [
+                        emulator._player_slug_key(s) for s in list(_ready_speakers) + list(_ready_listeners)  # noqa: SLF001
+                    ]
+                    if _sms_recipient_slug not in _all_ready:
+                        _ready_speakers = list(_ready_speakers) + [_sms_intent[0]]
             _shared_context_block = ""
             _speaker_continuity_block = ""
             _final_character_cards_block = ""
