@@ -9360,14 +9360,17 @@ class ZorkEmulator:
                 f"Style direction: {style}.",
                 cls._difficulty_response_note(difficulty),
                 (
-                    "RECENT_TURNS is loaded. Do not call recent_turns again this turn."
+                    "RECENT_TURNS is pre-loaded for research reference — do not call recent_turns again this turn."
                 ),
                 (
                     "Use memory/source/SMS/planning tools only when they materially improve continuity."
                 ),
                 (
-                    'When research is sufficient, return {"tool_call": "ready_to_write", "speakers": [...], "listeners": [...]} '
-                    'with only the characters who will actually speak/act and the listeners who materially constrain shared knowledge. Do not narrate yet.'
+                    "You MUST return ready_to_write to proceed — it triggers a separate writing prompt with "
+                    "scene-filtered RECENT_TURNS_LCD context, character cards, and location cards that are NOT available yet. "
+                    'Return {"tool_call": "ready_to_write", "speakers": [...], "listeners": [...]} '
+                    "with only the characters who will actually speak/act and the listeners who materially constrain shared knowledge. "
+                    "Do NOT write narration or final JSON during research."
                 ),
                 (
                     "No planning prose or self-talk in research phase. Do not write 'I need to...', 'Let me...', or explanation outside the JSON."
