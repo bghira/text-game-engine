@@ -15348,6 +15348,86 @@ class ZorkEmulator:
             session.commit()
         return True, "stored"
 
+    def delete_sms_thread(
+        self,
+        campaign_id: str,
+        thread: str,
+    ) -> tuple[bool, str]:
+        """Delete an entire SMS thread by key."""
+        with self._session_factory() as session:
+            campaign = session.get(Campaign, str(campaign_id))
+            if campaign is None:
+                return False, "campaign_not_found"
+            campaign_state = self.get_campaign_state(campaign)
+            threads = self._sms_threads_from_state(campaign_state)
+            normalized = self._sms_normalize_thread_key(thread)
+            if not normalized or normalized not in threads:
+                return False, "thread_not_found"
+            del threads[normalized]
+            campaign_state[self.SMS_STATE_KEY] = threads
+            campaign.state_json = self._dump_json(campaign_state)
+            campaign.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
+            session.commit()
+        return True, "deleted"
+
+    def delete_sms_message(
+        self,
+        campaign_id: str,
+        thread: str,
+        message_index: int,
+    ) -> tuple[bool, str]:
+        """Delete a single message from an SMS thread by its index."""
+        with self._session_factory() as session:
+            campaign = session.get(Campaign, str(campaign_id))
+            if campaign is None:
+                return False, "campaign_not_found"
+            campaign_state = self.get_campaign_state(campaign)
+            threads = self._sms_threads_from_state(campaign_state)
+            normalized = self._sms_normalize_thread_key(thread)
+            if not normalized or normalized not in threads:
+                return False, "thread_not_found"
+            messages = threads[normalized].get("messages", [])
+            if not isinstance(messages, list) or message_index < 0 or message_index >= len(messages):
+                return False, "message_not_found"
+            messages.pop(message_index)
+            if not messages:
+                del threads[normalized]
+            else:
+                threads[normalized]["messages"] = messages
+            campaign_state[self.SMS_STATE_KEY] = threads
+            campaign.state_json = self._dump_json(campaign_state)
+            campaign.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
+            session.commit()
+        return True, "deleted"
+
+    def edit_sms_message(
+        self,
+        campaign_id: str,
+        thread: str,
+        message_index: int,
+        new_text: str,
+    ) -> tuple[bool, str]:
+        """Edit the text of a single message in an SMS thread."""
+        with self._session_factory() as session:
+            campaign = session.get(Campaign, str(campaign_id))
+            if campaign is None:
+                return False, "campaign_not_found"
+            campaign_state = self.get_campaign_state(campaign)
+            threads = self._sms_threads_from_state(campaign_state)
+            normalized = self._sms_normalize_thread_key(thread)
+            if not normalized or normalized not in threads:
+                return False, "thread_not_found"
+            messages = threads[normalized].get("messages", [])
+            if not isinstance(messages, list) or message_index < 0 or message_index >= len(messages):
+                return False, "message_not_found"
+            messages[message_index]["message"] = str(new_text or "").strip()[:500]
+            threads[normalized]["messages"] = messages
+            campaign_state[self.SMS_STATE_KEY] = threads
+            campaign.state_json = self._dump_json(campaign_state)
+            campaign.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
+            session.commit()
+        return True, "updated"
+
     # ------------------------------------------------------------------
     # Memory visibility compatibility
     # ------------------------------------------------------------------
