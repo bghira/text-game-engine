@@ -3956,6 +3956,7 @@ class ToolAwareZorkLLM:
             _research_sms_set: set[tuple[str, str]] = set()
             if _research_sms:
                 _research_sms_set = {(r, c) for r, c in _research_sms}
+            _executed_sms = False
             for tc in output.tool_calls:
                 try:
                     tc_name = str(tc.get("tool_call") or "").strip().lower()
@@ -3966,8 +3967,21 @@ class ToolAwareZorkLLM:
                             logger.debug("complete_turn: skipping duplicate sms_write to=%s (already sent in research)", _tc_recip)
                             continue
                     await self._execute_tool_call(context.campaign_id, tc, actor_id=context.actor_id)
+                    if tc_name in ("sms_write",):
+                        _executed_sms = True
                 except Exception:
                     pass  # best-effort; don't break the turn
+            # Notify player that new SMS messages were stored so the UI
+            # refreshes the inbox (narration already shows the text, but the
+            # SMS tab won't update without a push event).
+            if _executed_sms and context.actor_id and emulator and emulator.notification_port is not None:
+                try:
+                    await emulator.notification_port.send_dm(
+                        actor_id=context.actor_id,
+                        message="\U0001f4f1 New SMS received.",
+                    )
+                except Exception:
+                    pass
             return output
         except Exception:
             logger.exception("complete_turn: unhandled exception → DeterministicLLM fallback (campaign=%s action=%s)", context.campaign_id, (context.action or "")[:100])

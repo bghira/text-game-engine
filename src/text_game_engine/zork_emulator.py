@@ -12159,6 +12159,17 @@ class ZorkEmulator:
             campaign.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
             session.commit()
 
+        # Notify the owning player that a scheduled SMS has arrived.
+        if owner_actor_id and self._notification_port is not None:
+            preview = message[:120] + "\u2026" if len(message) > 120 else message
+            try:
+                await self._notification_port.send_dm(
+                    actor_id=owner_actor_id,
+                    message=f"\U0001f4f1 SMS from {sender}: {preview}",
+                )
+            except Exception:
+                pass  # best-effort; don't break delivery
+
     def schedule_sms_thread_delivery(
         self,
         campaign_id: str,
