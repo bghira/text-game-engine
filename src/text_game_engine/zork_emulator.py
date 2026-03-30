@@ -15402,26 +15402,45 @@ class ZorkEmulator:
             session.commit()
         return True, "deleted"
 
+    def _sms_find_message_by_seq(
+        self,
+        threads: Dict[str, dict],
+        thread: str,
+        message_seq: int,
+    ) -> tuple[str | None, int]:
+        """Find a message by seq number.  Returns (storage_key, index) or
+        (None, -1) if not found."""
+        storage_key = self._sms_resolve_storage_key(threads, thread)
+        if storage_key is None:
+            return None, -1
+        messages = threads[storage_key].get("messages", [])
+        if not isinstance(messages, list):
+            return storage_key, -1
+        for idx, msg in enumerate(messages):
+            if isinstance(msg, dict) and self._coerce_non_negative_int(msg.get("seq", 0), default=0) == message_seq:
+                return storage_key, idx
+        return storage_key, -1
+
     def delete_sms_message(
         self,
         campaign_id: str,
         thread: str,
-        message_index: int,
+        message_seq: int,
     ) -> tuple[bool, str]:
-        """Delete a single message from an SMS thread by its index."""
+        """Delete a single message from an SMS thread by its seq number."""
         with self._session_factory() as session:
             campaign = session.get(Campaign, str(campaign_id))
             if campaign is None:
                 return False, "campaign_not_found"
             campaign_state = self.get_campaign_state(campaign)
             threads = self._sms_threads_from_state(campaign_state)
-            storage_key = self._sms_resolve_storage_key(threads, thread)
+            storage_key, idx = self._sms_find_message_by_seq(threads, thread, message_seq)
             if storage_key is None:
                 return False, "thread_not_found"
-            messages = threads[storage_key].get("messages", [])
-            if not isinstance(messages, list) or message_index < 0 or message_index >= len(messages):
+            if idx < 0:
                 return False, "message_not_found"
-            messages.pop(message_index)
+            messages = threads[storage_key].get("messages", [])
+            messages.pop(idx)
             if not messages:
                 del threads[storage_key]
             else:
@@ -15436,23 +15455,23 @@ class ZorkEmulator:
         self,
         campaign_id: str,
         thread: str,
-        message_index: int,
+        message_seq: int,
         new_text: str,
     ) -> tuple[bool, str]:
-        """Edit the text of a single message in an SMS thread."""
+        """Edit the text of a single message in an SMS thread by its seq number."""
         with self._session_factory() as session:
             campaign = session.get(Campaign, str(campaign_id))
             if campaign is None:
                 return False, "campaign_not_found"
             campaign_state = self.get_campaign_state(campaign)
             threads = self._sms_threads_from_state(campaign_state)
-            storage_key = self._sms_resolve_storage_key(threads, thread)
+            storage_key, idx = self._sms_find_message_by_seq(threads, thread, message_seq)
             if storage_key is None:
                 return False, "thread_not_found"
-            messages = threads[storage_key].get("messages", [])
-            if not isinstance(messages, list) or message_index < 0 or message_index >= len(messages):
+            if idx < 0:
                 return False, "message_not_found"
-            messages[message_index]["message"] = str(new_text or "").strip()[:500]
+            messages = threads[storage_key].get("messages", [])
+            messages[idx]["message"] = str(new_text or "").strip()[:500]
             threads[storage_key]["messages"] = messages
             campaign_state[self.SMS_STATE_KEY] = threads
             campaign.state_json = self._dump_json(campaign_state)
