@@ -1852,9 +1852,11 @@ class ZorkEmulator:
         viewer_actor_id: str,
         viewer_slug: str,
         viewer_location_key: str,
+        *,
+        for_display: bool = False,
     ) -> bool:
         meta = cls._safe_turn_meta(turn)
-        if bool(meta.get("suppress_context")):
+        if bool(meta.get("suppress_context")) and not for_display:
             return False
         visibility = meta.get("visibility")
         if not isinstance(visibility, dict):
