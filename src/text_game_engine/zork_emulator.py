@@ -15348,6 +15348,38 @@ class ZorkEmulator:
             session.commit()
         return True, "stored"
 
+    @classmethod
+    def _sms_resolve_storage_key(
+        cls,
+        threads: Dict[str, dict],
+        thread: str,
+    ) -> str | None:
+        """Resolve a thread identifier (possibly a resolved/display key) to
+        the actual storage key in *threads*.  Mirrors the fuzzy matching used
+        by ``_sms_read_thread``."""
+        normalized = cls._sms_normalize_thread_key(thread)
+        if not normalized:
+            return None
+        # Exact match first.
+        if normalized in threads:
+            return normalized
+        # Substring / contains match (same logic as _sms_read_thread).
+        for key in threads:
+            key_norm = cls._sms_normalize_thread_key(key)
+            if normalized in key_norm:
+                return key
+        # Reverse: check if any storage key is contained in the query.
+        for key in threads:
+            key_norm = cls._sms_normalize_thread_key(key)
+            if key_norm and key_norm in normalized:
+                return key
+        # Label match.
+        for key, row in threads.items():
+            label_norm = cls._sms_normalize_thread_key(row.get("label"))
+            if label_norm and (normalized == label_norm or normalized in label_norm):
+                return key
+        return None
+
     def delete_sms_thread(
         self,
         campaign_id: str,
@@ -15360,10 +15392,10 @@ class ZorkEmulator:
                 return False, "campaign_not_found"
             campaign_state = self.get_campaign_state(campaign)
             threads = self._sms_threads_from_state(campaign_state)
-            normalized = self._sms_normalize_thread_key(thread)
-            if not normalized or normalized not in threads:
+            storage_key = self._sms_resolve_storage_key(threads, thread)
+            if storage_key is None:
                 return False, "thread_not_found"
-            del threads[normalized]
+            del threads[storage_key]
             campaign_state[self.SMS_STATE_KEY] = threads
             campaign.state_json = self._dump_json(campaign_state)
             campaign.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
@@ -15383,17 +15415,17 @@ class ZorkEmulator:
                 return False, "campaign_not_found"
             campaign_state = self.get_campaign_state(campaign)
             threads = self._sms_threads_from_state(campaign_state)
-            normalized = self._sms_normalize_thread_key(thread)
-            if not normalized or normalized not in threads:
+            storage_key = self._sms_resolve_storage_key(threads, thread)
+            if storage_key is None:
                 return False, "thread_not_found"
-            messages = threads[normalized].get("messages", [])
+            messages = threads[storage_key].get("messages", [])
             if not isinstance(messages, list) or message_index < 0 or message_index >= len(messages):
                 return False, "message_not_found"
             messages.pop(message_index)
             if not messages:
-                del threads[normalized]
+                del threads[storage_key]
             else:
-                threads[normalized]["messages"] = messages
+                threads[storage_key]["messages"] = messages
             campaign_state[self.SMS_STATE_KEY] = threads
             campaign.state_json = self._dump_json(campaign_state)
             campaign.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
@@ -15414,14 +15446,14 @@ class ZorkEmulator:
                 return False, "campaign_not_found"
             campaign_state = self.get_campaign_state(campaign)
             threads = self._sms_threads_from_state(campaign_state)
-            normalized = self._sms_normalize_thread_key(thread)
-            if not normalized or normalized not in threads:
+            storage_key = self._sms_resolve_storage_key(threads, thread)
+            if storage_key is None:
                 return False, "thread_not_found"
-            messages = threads[normalized].get("messages", [])
+            messages = threads[storage_key].get("messages", [])
             if not isinstance(messages, list) or message_index < 0 or message_index >= len(messages):
                 return False, "message_not_found"
             messages[message_index]["message"] = str(new_text or "").strip()[:500]
-            threads[normalized]["messages"] = messages
+            threads[storage_key]["messages"] = messages
             campaign_state[self.SMS_STATE_KEY] = threads
             campaign.state_json = self._dump_json(campaign_state)
             campaign.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
