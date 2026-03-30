@@ -2553,7 +2553,8 @@ class ToolAwareZorkLLM:
         thread_raw = payload.get("thread")
         sender_raw = payload.get("from", payload.get("sender"))
         recipient_raw = payload.get("to", payload.get("recipient"))
-        message_raw = payload.get("message")
+        message_raw = payload.get("message") or payload.get("content") or payload.get("text")
+        direction_raw = str(payload.get("direction") or "").strip().lower()
 
         thread = thread_raw.strip() if isinstance(thread_raw, str) and thread_raw.strip() else ""
         sender = sender_raw.strip() if isinstance(sender_raw, str) and sender_raw.strip() else ""
@@ -2563,6 +2564,27 @@ class ToolAwareZorkLLM:
             else ""
         )
         message = message_raw.strip() if isinstance(message_raw, str) and message_raw.strip() else ""
+
+        # Handle "direction: incoming" from final tool_calls — the model puts
+        # the NPC in "recipient" but means the NPC is the *sender*.  Swap and
+        # resolve the actual recipient from actor_id.  Thread key must stay
+        # as the NPC name (the "other party"), not the player slug.
+        if direction_raw == "incoming" and recipient and not sender:
+            sender = recipient
+            if not thread:
+                thread = sender  # NPC name is the thread key
+            if actor_id:
+                emulator = self._emulator
+                if emulator is not None:
+                    player_slug = emulator._player_visibility_slug(actor_id)  # noqa: SLF001
+                    if player_slug:
+                        recipient = player_slug
+                    else:
+                        recipient = str(actor_id)
+                else:
+                    recipient = str(actor_id)
+            else:
+                recipient = ""
 
         # LLMs sometimes omit the thread field; default to recipient (standard pattern).
         if not thread:
@@ -3188,6 +3210,7 @@ class ToolAwareZorkLLM:
         tool_history_entries: list[dict[str, str]] = []
         used_tool_names: set[str] = set()
         seen_tool_signatures: set[str] = set()
+        research_sms_writes: list[tuple[str, str]] = []  # (recipient_norm, content_norm)
         memory_obligation_met = False
         last_memory_turn_ids: list[int] = []
         emulator = self._emulator
@@ -3384,6 +3407,13 @@ class ToolAwareZorkLLM:
                 actor_id=actor_id,
             )
             self._zork_log(f"TOOL RESULT campaign={campaign_id}", f"tool={tool_name}\nresult={str(tool_result)}")
+            # Track sms_write calls executed during research for dedup against
+            # final inline tool_calls (models often re-include the outgoing SMS).
+            if tool_name in ("sms_write", "sms_schedule") and isinstance(tool_result, str) and "stored=True" in tool_result:
+                _sms_recipient = " ".join(str(payload.get("recipient") or payload.get("thread") or payload.get("to") or "").strip().lower().split())
+                _sms_content = " ".join(str(payload.get("content") or payload.get("text") or payload.get("message") or "").strip().lower().split())
+                if _sms_recipient and _sms_content:
+                    research_sms_writes.append((_sms_recipient, _sms_content))
             _append_tool_history_entry(tool_name, tool_result)
             keep_memory_turns = self._memory_tool_turn_id_list(
                 payload.get("keep_memory_turns")
@@ -3826,6 +3856,11 @@ class ToolAwareZorkLLM:
         # substantive turn.  The LLM already has plot_plan /
         # consequence_log / chapter_plan tools available during the
         # normal tool loop and uses them when appropriate.
+
+        # Attach research-phase SMS writes so complete_turn can dedup
+        # against final inline tool_calls.
+        if research_sms_writes:
+            payload["_research_sms_writes"] = research_sms_writes
         return payload
 
     async def complete_turn(self, context, *, progress: ProgressCallback | None = None) -> LLMTurnOutput:
@@ -3915,8 +3950,21 @@ class ToolAwareZorkLLM:
             # Execute any inline tool_calls that the LLM included alongside
             # its final narration. These have already been validated against
             # the allowlist in _payload_to_output.
+            # Dedup: skip sms_write calls that were already executed during
+            # research (models often re-include the player's outgoing SMS).
+            _research_sms = payload.pop("_research_sms_writes", [])
+            _research_sms_set: set[tuple[str, str]] = set()
+            if _research_sms:
+                _research_sms_set = {(r, c) for r, c in _research_sms}
             for tc in output.tool_calls:
                 try:
+                    tc_name = str(tc.get("tool_call") or "").strip().lower()
+                    if tc_name in ("sms_write", "sms_schedule") and _research_sms_set:
+                        _tc_recip = " ".join(str(tc.get("recipient") or tc.get("thread") or tc.get("to") or "").strip().lower().split())
+                        _tc_content = " ".join(str(tc.get("content") or tc.get("text") or tc.get("message") or "").strip().lower().split())
+                        if (_tc_recip, _tc_content) in _research_sms_set:
+                            logger.debug("complete_turn: skipping duplicate sms_write to=%s (already sent in research)", _tc_recip)
+                            continue
                     await self._execute_tool_call(context.campaign_id, tc, actor_id=context.actor_id)
                 except Exception:
                     pass  # best-effort; don't break the turn
