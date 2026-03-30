@@ -3281,7 +3281,9 @@ class ToolAwareZorkLLM:
                 augmented_prompt = (
                     f"{user_prompt}\n"
                     f"{tool_history}\n\n"
-                    "Use the memory results above. Return ONLY the final turn JSON object."
+                    'Use the memory results above. Continue with your next {"tool_call": "..."} or, if research is complete, '
+                    'return {"tool_call": "ready_to_write", "speakers": [...], "listeners": [...]}. '
+                    "Do NOT return final narration/state JSON during research."
                 )
                 self._zork_log(f"FORCED MEMORY SEARCH campaign={campaign_id}", augmented_prompt)
                 nxt = await self._completion.complete(
@@ -3317,7 +3319,9 @@ class ToolAwareZorkLLM:
                 augmented_prompt = (
                     f"{user_prompt}\n"
                     f"{tool_history}\n\n"
-                    "Return ONLY the final turn JSON object."
+                    'Continue with a non-memory {"tool_call": "..."} or, if research is complete, '
+                    'return {"tool_call": "ready_to_write", "speakers": [...], "listeners": [...]}. '
+                    "Do NOT return final narration/state JSON during research."
                 )
                 self._zork_log(f"MEMORY TOOL DISABLED AUGMENTED RESPONSE campaign={campaign_id}", augmented_prompt)
                 nxt = await self._completion.complete(
@@ -3337,12 +3341,15 @@ class ToolAwareZorkLLM:
                 _append_tool_history_entry(
                     "system_note",
                     "\n\nTOOL_DEDUP_RESULT: duplicate tool_call payload already executed this turn; skipped. "
-                    "Do NOT repeat identical tool calls. Use a distinct tool/payload or return final JSON (no tool_call)."
+                    "Do NOT repeat identical tool calls. Use a distinct tool/payload or "
+                    'return {"tool_call": "ready_to_write", "speakers": [...], "listeners": [...]} to proceed.'
                 )
                 augmented_prompt = (
                     f"{user_prompt}\n"
                     f"{tool_history}\n\n"
-                    "Return ONLY the final turn JSON object."
+                    'Use a distinct {"tool_call": "..."} or, if research is complete, '
+                    'return {"tool_call": "ready_to_write", "speakers": [...], "listeners": [...]}. '
+                    "Do NOT return final narration/state JSON during research."
                 )
                 self._zork_log(f"TOOL DEDUP AUGMENTED RESPONSE campaign={campaign_id}", augmented_prompt)
                 nxt = await self._completion.complete(
@@ -3401,12 +3408,14 @@ class ToolAwareZorkLLM:
                     "system_note",
                     "\n\n[MEMORY OBLIGATION MET — you have satisfied the mandatory memory lookup for this turn. "
                     "Do not call additional memory tools unless you genuinely need specific older information. "
-                    "You may now proceed to narration or use non-memory tools.]"
+                    "You may now proceed to ready_to_write or use non-memory tools.]"
                 )
             augmented_prompt = (
                 f"{user_prompt}\n"
                 f"{tool_history}\n\n"
-                "Use the tool results above. Return ONLY the final turn JSON object."
+                'Use the tool results above. Continue with your next {"tool_call": "..."} or, if research is complete, '
+                'return {"tool_call": "ready_to_write", "speakers": [...], "listeners": [...]}. '
+                "Do NOT return final narration/state JSON during research."
             )
             self._zork_log(f"AUGMENTED API REQUEST campaign={campaign_id} tool={tool_name}", augmented_prompt)
             nxt = await self._completion.complete(
