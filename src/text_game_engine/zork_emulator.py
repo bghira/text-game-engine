@@ -1168,9 +1168,10 @@ class ZorkEmulator:
         "(anger, grief, affection, withdrawal, fear, urgency), do a memory_search for relevant prior interactions before responding. "
         "People carry emotional weight from things that happened before this scene. The player may be reacting to something the current context doesn't show. "
         "What memory reveals overrules what the character profile says they 'should' feel — lived experience reshapes people, just like in real life.\n"
-        "\nYou also have a memory_terms tool for wildcard term/category listing. Use it BEFORE storing memories:\n"
+        "\nYou also have a memory_terms tool for wildcard term/category listing:\n"
         '{"tool_call": "memory_terms", "wildcard": "marcus*"}\n'
-        "This returns existing category/term buckets so you can avoid duplicates.\n"
+        "This returns existing category/term buckets so you can avoid duplicates when storing. "
+        "Note: when you search with a category (e.g. category='char:marcus'), the results automatically include available terms for that category — no separate memory_terms call needed.\n"
         "\nYou also have a memory_turn tool for full turn text retrieval by turn number:\n"
         '{"tool_call": "memory_turn", "turn_id": 1234}\n'
         "Use this immediately after memory_search when a hit is relevant and you need exact wording/details.\n"

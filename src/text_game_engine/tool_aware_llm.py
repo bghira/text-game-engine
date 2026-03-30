@@ -1653,6 +1653,26 @@ class ToolAwareZorkLLM:
                     "count": int(hint.get("count") or 0),
                 }
             )
+        # When searching a specific category, proactively append available
+        # terms so the model knows what else is stored without a separate
+        # memory_terms call.
+        if category_scope and self._emulator is not None and not source_scope:
+            try:
+                all_terms = self._emulator.list_memory_terms(campaign_id, wildcard="%", limit=100)
+                category_terms = [
+                    t for t in all_terms
+                    if isinstance(t, dict) and str(t.get("category") or "").strip().lower() == category_scope
+                ]
+                for t in category_terms[:15]:
+                    records.append({
+                        "kind": "category_term",
+                        "category": str(t.get("category") or "").strip(),
+                        "term": str(t.get("term") or "").strip(),
+                        "count": t.get("count"),
+                    })
+            except Exception:
+                pass
+
         if not records:
             self._zork_log(
                 f"MEMORY_SEARCH RESULT campaign={campaign_id}",
