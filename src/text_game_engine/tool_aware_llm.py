@@ -2542,6 +2542,14 @@ class ToolAwareZorkLLM:
         *,
         actor_id: str | None = None,
     ) -> str:
+        # Handle batched messages array format that LLMs sometimes produce:
+        #   {"tool_call": "sms_write", "thread": "elin", "messages": [
+        #       {"from": "player-123", "text": "hello"},
+        #       {"from": "elin-kivi", "text": "hi back"}]}
+        messages_raw = payload.get("messages")
+        if isinstance(messages_raw, list) and messages_raw:
+            return self._tool_sms_write_batch(campaign_id, payload, messages_raw, actor_id=actor_id)
+
         thread_raw = payload.get("thread")
         sender_raw = payload.get("from", payload.get("sender"))
         recipient_raw = payload.get("to", payload.get("recipient"))
@@ -2585,6 +2593,65 @@ class ToolAwareZorkLLM:
             owner_actor_id=actor_id,
         )
         return f"SMS_WRITE_RESULT: stored={bool(ok)} reason={reason} thread={thread}"
+
+    def _tool_sms_write_batch(
+        self,
+        campaign_id: str,
+        payload: dict[str, Any],
+        messages: list[Any],
+        *,
+        actor_id: str | None = None,
+    ) -> str:
+        thread_raw = payload.get("thread")
+        thread = thread_raw.strip() if isinstance(thread_raw, str) and thread_raw.strip() else ""
+        if not thread:
+            return "SMS_WRITE_RESULT: invalid payload (no thread for messages batch)"
+
+        with self._session_factory() as session:
+            latest_turn = (
+                session.query(Turn)
+                .filter(Turn.campaign_id == campaign_id)
+                .order_by(Turn.id.desc())
+                .first()
+            )
+            turn_id = int(latest_turn.id) if latest_turn is not None else 0
+
+        if self._emulator is None:
+            return "SMS_WRITE_RESULT: emulator unavailable"
+
+        # Collect all unique senders to derive recipients when not specified.
+        senders: list[str] = []
+        for msg in messages:
+            if isinstance(msg, dict):
+                f = str(msg.get("from") or msg.get("sender") or "").strip()
+                if f and f not in senders:
+                    senders.append(f)
+
+        stored = 0
+        for msg in messages:
+            if not isinstance(msg, dict):
+                continue
+            sender = str(msg.get("from") or msg.get("sender") or "").strip()
+            text = str(msg.get("text") or msg.get("message") or "").strip()
+            recipient = str(msg.get("to") or msg.get("recipient") or "").strip()
+            if not recipient:
+                # Derive: the other participant, or fall back to thread name.
+                others = [s for s in senders if s != sender]
+                recipient = others[0] if others else thread
+            if not sender or not text:
+                continue
+            ok, _reason = self._emulator.write_sms_thread(
+                campaign_id,
+                thread=thread,
+                sender=sender,
+                recipient=recipient,
+                message=text,
+                turn_id=turn_id,
+                owner_actor_id=actor_id,
+            )
+            if ok:
+                stored += 1
+        return f"SMS_WRITE_RESULT: stored={stored}/{len(messages)} thread={thread}"
 
     def _tool_sms_schedule(
         self,
