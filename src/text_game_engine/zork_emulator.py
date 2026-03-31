@@ -81,6 +81,7 @@ class ZorkEmulator:
     MAX_SUMMARY_CHARS = 10000
     MAX_STATE_CHARS = 10000
     MAX_RECENT_TURNS = 24
+    MAX_LCD_RECENT_TURNS = 8
     MAX_TURN_CHARS = 1200
     MAX_NARRATION_CHARS = 23500
     MAX_PARTY_CONTEXT_PLAYERS = 6
@@ -828,6 +829,7 @@ class ZorkEmulator:
         "- Do not let every emotional beat collapse into the same stock therapeutic or pseudo-profound language.\n"
         "- Avoid contrived emotional shorthand or therapist-speak; examples include phrases like 'be present', 'show up', or 'hold space', unless a specific character would genuinely talk that way.\n"
         "- BAN: THERAPEUTIC RESOLUTION FRAMING. Do not automatically turn encounters into healing arcs, redemptive lessons, consent metaphors, or 'finally asking / learning to stay / learning to feel' revelations. Alien things can stay alien. People can want simple practical answers. Some events are just events.\n"
+        "- SINCERITY BIAS CHECK: the therapeutic resolution ban does not mean NPCs should prosecute indirect communication as deflection. When a player wraps emotional content in humor, flirtation, or practical language, the feeling is present — the packaging is gentle. An NPC who hears 'can we try that, that sounds fun' and responds by demanding a straight answer has failed to hear the want underneath the joke. NPCs in close relationships should be better at this, not worse. If the character would recognize the real thing being said, write them recognizing it. Calling out deflection is only appropriate when the player is genuinely evading, not when they are reaching for connection through the only register they have available.\n"
         "- DELTA MODE: each turn should add NEW developments only. Do not recap unchanged context from WORLD_SUMMARY or RECENT_TURNS.\n"
         "- Do not re-state the player's action in paraphrase unless needed for immediate clarity.\n"
         "- Avoid repetitive recap loops: at most one brief callback sentence to prior events, then move the scene forward.\n"
@@ -14560,6 +14562,10 @@ class ZorkEmulator:
             user_prompt += f"LITERARY_STYLES:\n{literary_styles_text}\n"
         if autobiographies_text:
             user_prompt += f"AUTOBIOGRAPHIES: {autobiographies_text}\n"
+        if stage == self.PROMPT_STAGE_FINAL:
+            comm_lines = self._communication_rulebook_lines()
+            if comm_lines:
+                user_prompt += "GM_COMMUNICATION_RULES:\n" + "\n".join(comm_lines) + "\n"
         _puzzle_text = self._puzzle_system_for_prompt(state)
         if _puzzle_text:
             user_prompt += f"{_puzzle_text}\n"
@@ -17699,6 +17705,46 @@ class ZorkEmulator:
     # JSON repair utilities
     # ------------------------------------------------------------------
 
+    _JSON_ESCAPE_RE = re.compile(r'\\([nrt\\"\/]|u[0-9A-Fa-f]{4})')
+    _JSON_ESCAPE_MAP: dict[str, str] = {
+        "n": "\n",
+        "r": "\r",
+        "t": "\t",
+        "\\": "\\",
+        '"': '"',
+        "/": "/",
+    }
+
+    @classmethod
+    def _decode_json_string_escapes(cls, raw: str) -> str:
+        """Decode JSON-style escape sequences in a raw (unquoted) value.
+
+        The model sometimes writes text values with JSON escapes (``\\n``,
+        ``\\\"``, etc.) but omits the opening quote.  Before re-wrapping
+        with ``json.dumps`` we must decode these so they round-trip
+        correctly.
+        """
+        def _sub(m: re.Match[str]) -> str:
+            ch = m.group(1)
+            if ch.startswith("u") and len(ch) == 5:
+                try:
+                    return chr(int(ch[1:], 16))
+                except ValueError:
+                    return m.group(0)
+            return cls._JSON_ESCAPE_MAP.get(ch, m.group(0))
+        return cls._JSON_ESCAPE_RE.sub(_sub, raw)
+
+    @classmethod
+    def _strip_unescaped_trailing_quote(cls, raw: str) -> str:
+        """Strip a trailing ``\"`` only when it is *not* a ``\\\"`` escape."""
+        if not raw.endswith('"'):
+            return raw
+        prefix = raw[:-1]
+        n_backslashes = len(prefix) - len(prefix.rstrip("\\"))
+        if n_backslashes % 2 == 0:  # even (incl. 0) → unescaped quote
+            return prefix.strip()
+        return raw
+
     @classmethod
     def _repair_unquoted_json_string_fields(cls, text: str) -> str:
         if not text:
@@ -17717,8 +17763,9 @@ class ZorkEmulator:
             raw_value = str(match.group("value") or "").strip()
             if not raw_value:
                 return match.group(0)
-            if raw_value.endswith('"') and not raw_value.startswith('"'):
-                raw_value = raw_value[:-1].strip()
+            if not raw_value.startswith('"'):
+                raw_value = cls._strip_unescaped_trailing_quote(raw_value)
+            raw_value = cls._decode_json_string_escapes(raw_value)
             return f"{prefix}{json.dumps(raw_value, ensure_ascii=False)}"
 
         return pattern.sub(_replace, text)
@@ -17761,8 +17808,9 @@ class ZorkEmulator:
             raw_value = str(match.group("value") or "").strip()
             if not raw_value:
                 return match.group(0)
-            if raw_value.endswith('"') and not raw_value.startswith('"'):
-                raw_value = raw_value[:-1].strip()
+            if not raw_value.startswith('"'):
+                raw_value = cls._strip_unescaped_trailing_quote(raw_value)
+            raw_value = cls._decode_json_string_escapes(raw_value)
             return f"{prefix}{json.dumps(raw_value, ensure_ascii=False)}"
 
         return pattern.sub(_replace, text)

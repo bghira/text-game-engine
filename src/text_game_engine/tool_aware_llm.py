@@ -3653,9 +3653,13 @@ class ToolAwareZorkLLM:
                     recent_turn_window=recent_turn_limit,
                     max_chars=emulator.MAX_SUMMARY_CHARS,  # noqa: SLF001
                 )
+                lcd_recent_limit = max(
+                    int(getattr(emulator, "MAX_LCD_RECENT_TURNS", 8) or 8), 4
+                )
+                lcd_turns = turns[-lcd_recent_limit:] if len(turns) > lcd_recent_limit else turns
                 shared_recent = emulator._recent_turns_text_for_viewer(  # noqa: SLF001
                     campaign,
-                    turns,
+                    lcd_turns,
                     viewer_actor_id=actor_id,
                     viewer_slug=viewer_slug,
                     viewer_location_key=viewer_location_key,
