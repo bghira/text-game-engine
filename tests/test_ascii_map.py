@@ -3,6 +3,7 @@
 import pytest
 
 from text_game_engine.core.ascii_map import (
+    MIN_ROOM_WIDTH,
     add_edge,
     auto_layout,
     ensure_room,
@@ -30,7 +31,7 @@ class TestEnsureRoom:
         r = ensure_room(graph, "lobby", label="Hotel Lobby", turn=1)
         assert "lobby" in graph["rooms"]
         assert r["label"] == "Hotel Lobby"
-        assert r["width"] == 17
+        assert r["width"] >= MIN_ROOM_WIDTH
         assert r["height"] == 5
         assert r["positioned"] is False
 

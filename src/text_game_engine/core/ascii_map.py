@@ -10,12 +10,13 @@ import re
 from typing import Any
 
 # ── Room / connector defaults ──────────────────────────────────────────────
-DEFAULT_ROOM_WIDTH = 17
+MIN_ROOM_WIDTH = 15
+MAX_ROOM_WIDTH = 31
 DEFAULT_ROOM_HEIGHT = 5
 CONNECTOR_H_LEN = 5  # chars between room right-edge and next room left-edge
 CONNECTOR_V_LEN = 1  # lines between room bottom-edge and next room top-edge
-MAX_COLS = 72
-MAX_ROWS = 30
+MAX_COLS = 120
+MAX_ROWS = 40
 MAX_ROOMS = 60
 
 # Direction → (dx, dy) on the grid
@@ -38,6 +39,10 @@ DIRECTION_OFFSETS: dict[str, tuple[int, int]] = {
     "southwest": (-1, 1),
     "up": (0, -1),
     "down": (0, 1),
+    "in": (1, 0),
+    "out": (-1, 0),
+    "inside": (1, 0),
+    "outside": (-1, 0),
 }
 
 # Door type → connector character (horizontal, vertical)
@@ -47,6 +52,10 @@ DOOR_CHARS_H: dict[str, str] = {
     "locked": "#",
     "hidden": "~",
     "passage": "=",
+    "stair": "≡",
+    "stairs": "≡",
+    "standard": "-",
+    "door": "+",
 }
 DOOR_CHARS_V: dict[str, str] = {
     "open": "|",
@@ -54,6 +63,10 @@ DOOR_CHARS_V: dict[str, str] = {
     "locked": "#",
     "hidden": "~",
     "passage": "=",
+    "stair": "≡",
+    "stairs": "≡",
+    "standard": "|",
+    "door": "+",
 }
 
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
@@ -61,6 +74,14 @@ _SLUG_RE = re.compile(r"[^a-z0-9]+")
 
 def slugify(text: str) -> str:
     return _SLUG_RE.sub("-", text.lower()).strip("-")[:80]
+
+
+def _label_width(label: str) -> int:
+    """Compute ideal room box width to fit label without truncation."""
+    # inner_w = width - 2 (for border chars)
+    inner = len(label)
+    width = inner + 4  # 2 border + 2 padding
+    return max(MIN_ROOM_WIDTH, min(MAX_ROOM_WIDTH, width))
 
 
 # ── Graph helpers ──────────────────────────────────────────────────────────
@@ -74,17 +95,24 @@ def ensure_room(graph: dict, slug: str, label: str = "", turn: int = 0) -> dict:
     """Add room to graph if missing, return the room dict."""
     rooms = graph.setdefault("rooms", {})
     if slug not in rooms:
+        display = label or slug
         rooms[slug] = {
-            "label": label or slug,
-            "width": DEFAULT_ROOM_WIDTH,
+            "label": display,
+            "width": _label_width(display),
             "height": DEFAULT_ROOM_HEIGHT,
             "x": None,
             "y": None,
             "positioned": False,
             "first_seen_turn": turn,
         }
-    elif label and rooms[slug].get("label") in (slug, "", None):
-        rooms[slug]["label"] = label
+    else:
+        r = rooms[slug]
+        if label and r.get("label") in (slug, "", None):
+            r["label"] = label
+            # Resize to fit new label if it's wider
+            needed = _label_width(label)
+            if needed > (r.get("width") or MIN_ROOM_WIDTH):
+                r["width"] = needed
     return rooms[slug]
 
 
@@ -126,6 +154,8 @@ def _reverse_direction(d: str | None) -> str | None:
         "northeast": "southwest", "southwest": "northeast",
         "northwest": "southeast", "southeast": "northwest",
         "up": "down", "down": "up",
+        "in": "out", "out": "in",
+        "inside": "outside", "outside": "inside",
     }
     return opposites.get((d or "").lower().strip())
 
@@ -389,48 +419,68 @@ def render_ascii_map(
         if loc:
             entity_map.setdefault(loc, []).append(marker)
 
-    # Determine grid bounds
-    xs = [r["x"] for r in rooms.values() if r.get("x") is not None]
-    ys = [r["y"] for r in rooms.values() if r.get("y") is not None]
-    if not xs or not ys:
+    # Determine grid bounds of all positioned rooms
+    all_positioned = {
+        slug: r for slug, r in rooms.items()
+        if r.get("positioned") and r.get("x") is not None
+    }
+    if not all_positioned:
         return ""
 
-    min_x, max_x = min(xs), max(xs)
-    min_y, max_y = min(ys), max(ys)
+    xs = [r["x"] for r in all_positioned.values()]
+    ys = [r["y"] for r in all_positioned.values()]
+    full_min_x, full_max_x = min(xs), max(xs)
+    full_min_y, full_max_y = min(ys), max(ys)
 
-    # Viewport clipping for large maps
-    center = viewport_center or player_location
-    center_slug = slugify(center)
-    if center_slug in rooms and rooms[center_slug].get("positioned"):
-        cx = rooms[center_slug]["x"]
-        cy = rooms[center_slug]["y"]
-    else:
-        cx = (min_x + max_x) // 2
-        cy = (min_y + max_y) // 2
+    # Compute uniform column width — widest label in the graph
+    # Use label-derived width rather than stored width, since old data
+    # may have narrow stored widths that truncate labels.
+    col_width = MIN_ROOM_WIDTH
+    for r in all_positioned.values():
+        label = r.get("label") or ""
+        needed = _label_width(label)
+        if needed > col_width:
+            col_width = needed
+    col_width = min(col_width, MAX_ROOM_WIDTH)
 
-    # How many grid cells fit in our budget?
-    cell_w = DEFAULT_ROOM_WIDTH + CONNECTOR_H_LEN
+    # Viewport: try to fit all rooms first, clip only if too large
+    grid_w_full = full_max_x - full_min_x + 1
+    grid_h_full = full_max_y - full_min_y + 1
+    cell_w = col_width + CONNECTOR_H_LEN
     cell_h = DEFAULT_ROOM_HEIGHT + CONNECTOR_V_LEN
-    max_gx = max(1, MAX_COLS // cell_w)
-    max_gy = max(1, MAX_ROWS // cell_h)
+    canvas_w_full = grid_w_full * col_width + max(0, grid_w_full - 1) * CONNECTOR_H_LEN
+    canvas_h_full = grid_h_full * DEFAULT_ROOM_HEIGHT + max(0, grid_h_full - 1) * CONNECTOR_V_LEN
 
-    half_gx = max_gx // 2
-    half_gy = max_gy // 2
-    view_x0 = cx - half_gx
-    view_x1 = cx + half_gx
-    view_y0 = cy - half_gy
-    view_y1 = cy + half_gy
+    if canvas_w_full <= MAX_COLS and canvas_h_full <= MAX_ROWS:
+        # Everything fits — show all rooms
+        visible_rooms = dict(all_positioned)
+    else:
+        # Viewport clip centered on player
+        center = viewport_center or player_location
+        center_slug = slugify(center)
+        if center_slug in all_positioned:
+            cx = all_positioned[center_slug]["x"]
+            cy = all_positioned[center_slug]["y"]
+        else:
+            cx = (full_min_x + full_max_x) // 2
+            cy = (full_min_y + full_max_y) // 2
 
-    # Filter rooms to viewport
-    visible_rooms = {
-        slug: r for slug, r in rooms.items()
-        if r.get("positioned")
-        and view_x0 <= r["x"] <= view_x1
-        and view_y0 <= r["y"] <= view_y1
-    }
-    if not visible_rooms:
-        # fallback: show all
-        visible_rooms = {slug: r for slug, r in rooms.items() if r.get("positioned")}
+        max_gx = max(1, MAX_COLS // cell_w)
+        max_gy = max(1, MAX_ROWS // cell_h)
+        half_gx = max_gx // 2
+        half_gy = max_gy // 2
+        view_x0 = cx - half_gx
+        view_x1 = cx + half_gx
+        view_y0 = cy - half_gy
+        view_y1 = cy + half_gy
+
+        visible_rooms = {
+            slug: r for slug, r in all_positioned.items()
+            if view_x0 <= r["x"] <= view_x1
+            and view_y0 <= r["y"] <= view_y1
+        }
+        if not visible_rooms:
+            visible_rooms = dict(all_positioned)
 
     # Recompute bounds for visible rooms
     xs = [r["x"] for r in visible_rooms.values()]
@@ -441,7 +491,7 @@ def render_ascii_map(
     # Canvas dimensions
     grid_w = max_x - min_x + 1
     grid_h = max_y - min_y + 1
-    canvas_w = grid_w * DEFAULT_ROOM_WIDTH + (grid_w - 1) * CONNECTOR_H_LEN
+    canvas_w = grid_w * col_width + (grid_w - 1) * CONNECTOR_H_LEN
     canvas_h = grid_h * DEFAULT_ROOM_HEIGHT + (grid_h - 1) * CONNECTOR_V_LEN
 
     # Create canvas (list of lists of chars)
@@ -449,17 +499,23 @@ def render_ascii_map(
 
     def _room_pixel(gx: int, gy: int) -> tuple[int, int]:
         """Grid coord -> top-left pixel on canvas."""
-        px = (gx - min_x) * (DEFAULT_ROOM_WIDTH + CONNECTOR_H_LEN)
+        px = (gx - min_x) * (col_width + CONNECTOR_H_LEN)
         py = (gy - min_y) * (DEFAULT_ROOM_HEIGHT + CONNECTOR_V_LEN)
         return px, py
 
-    # Draw rooms
+    # Build set of occupied pixel rectangles for collision avoidance
+    room_rects: list[tuple[int, int, int, int]] = []  # (x0, y0, x1, y1) inclusive
+    for slug, room in visible_rooms.items():
+        px, py = _room_pixel(room["x"], room["y"])
+        rh = room.get("height") or DEFAULT_ROOM_HEIGHT
+        room_rects.append((px, py, px + col_width - 1, py + rh - 1))
+
+    # Draw rooms (all rooms use uniform col_width for clean alignment)
     visible_set = set(visible_rooms.keys())
     for slug, room in visible_rooms.items():
-        w = min(room.get("width") or DEFAULT_ROOM_WIDTH, DEFAULT_ROOM_WIDTH)
-        h = min(room.get("height") or DEFAULT_ROOM_HEIGHT, DEFAULT_ROOM_HEIGHT)
+        rh = room.get("height") or DEFAULT_ROOM_HEIGHT
         px, py = _room_pixel(room["x"], room["y"])
-        _draw_room_box(canvas, px, py, w, h, room.get("label") or slug, entity_map.get(slug))
+        _draw_room_box(canvas, px, py, col_width, rh, room.get("label") or slug, entity_map.get(slug))
 
     # Draw connectors
     for edge in edges:
@@ -468,13 +524,16 @@ def render_ascii_map(
             continue
         ra, rb = visible_rooms[a], visible_rooms[b]
         door_type = edge.get("door_type") or "open"
+        rh_a = ra.get("height") or DEFAULT_ROOM_HEIGHT
+        rh_b = rb.get("height") or DEFAULT_ROOM_HEIGHT
         _draw_connector(
             canvas,
             _room_pixel(ra["x"], ra["y"]),
-            (ra.get("width") or DEFAULT_ROOM_WIDTH, ra.get("height") or DEFAULT_ROOM_HEIGHT),
+            (col_width, rh_a),
             _room_pixel(rb["x"], rb["y"]),
-            (rb.get("width") or DEFAULT_ROOM_WIDTH, rb.get("height") or DEFAULT_ROOM_HEIGHT),
+            (col_width, rh_b),
             door_type,
+            room_rects,
         )
 
     # Convert canvas to string, trim trailing whitespace
@@ -492,7 +551,7 @@ def render_ascii_map(
     # Append legend
     map_lines.append("")
     map_lines.append("Legend:")
-    map_lines.append(f"  @ You")
+    map_lines.append("  @ You")
     for op in other_players:
         marker = str(op.get("marker") or "?")
         name = str(op.get("character_name") or op.get("user_id") or "Unknown")
@@ -533,13 +592,10 @@ def _draw_room_box(
         else:
             _put(x, py + height - 1, "-")
 
-    # Side borders
+    # Side borders and interior fill
     for y in range(py + 1, py + height - 1):
         _put(px, y, "|")
         _put(px + width - 1, y, "|")
-
-    # Interior fill (spaces)
-    for y in range(py + 1, py + height - 1):
         for x in range(px + 1, px + width - 1):
             _put(x, y, " ")
 
@@ -561,6 +617,18 @@ def _draw_room_box(
             _put(px + 1 + pad_left + i, mid_y, ch)
 
 
+def _point_in_any_room(
+    x: int,
+    y: int,
+    room_rects: list[tuple[int, int, int, int]],
+) -> bool:
+    """Check if a pixel coordinate falls inside any room rectangle."""
+    for x0, y0, x1, y1 in room_rects:
+        if x0 <= x <= x1 and y0 <= y <= y1:
+            return True
+    return False
+
+
 def _draw_connector(
     canvas: list[list[str]],
     pos_a: tuple[int, int],
@@ -568,14 +636,17 @@ def _draw_connector(
     pos_b: tuple[int, int],
     size_b: tuple[int, int],
     door_type: str,
+    room_rects: list[tuple[int, int, int, int]],
 ) -> None:
-    """Draw a connector between two rooms."""
+    """Draw a connector between two rooms, avoiding room interiors."""
     canvas_h = len(canvas)
     canvas_w = len(canvas[0]) if canvas else 0
 
     def _put(x: int, y: int, ch: str) -> None:
         if 0 <= y < canvas_h and 0 <= x < canvas_w and canvas[y][x] == " ":
-            canvas[y][x] = ch
+            # Don't draw through room interiors
+            if not _point_in_any_room(x, y, room_rects):
+                canvas[y][x] = ch
 
     ax, ay = pos_a
     aw, ah = size_a
@@ -593,7 +664,6 @@ def _draw_connector(
         # Horizontal connector
         door_ch = DOOR_CHARS_H.get(door_type, "-")
         if dx > 0:
-            # A is left, B is right
             start_x = ax + aw
             end_x = bx - 1
         else:
@@ -621,7 +691,10 @@ def _draw_connector(
             _put(mid_x, y, ch)
 
     else:
-        # Diagonal — draw an L-shaped connector (go horizontal then vertical)
+        # Diagonal — draw an L-shaped connector through the gap.
+        # Route: go horizontal from A's edge, then vertical to B's edge.
+        # The _put function already checks room_rects, so stray pixels
+        # that would land inside a room are silently dropped.
         if dx > 0:
             h_start = ax + aw
             h_end = b_cx
