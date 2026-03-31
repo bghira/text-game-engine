@@ -373,6 +373,138 @@ def _fuzzy_match_location(
     return ""
 
 
+# ── Building cluster detection ────────────────────────────────────────────
+
+_CLUSTER_STOP_WORDS = frozenset({
+    "the", "a", "an", "of", "in", "at", "to", "and", "or", "on", "by",
+})
+MIN_CLUSTER_SIZE = 3
+ENVELOPE_MARGIN = 2
+_ENVELOPE_BORDER_CHARS = frozenset("═║╔╗╚╝")
+
+
+def _tokenize_label(label: str) -> list[str]:
+    """Split a room label into word tokens (commas become spaces)."""
+    return [w for w in label.replace(",", " ").split() if w]
+
+
+def _extract_common_terms(
+    labels: dict[str, str],
+    min_count: int = MIN_CLUSTER_SIZE,
+) -> list[tuple[str, set[str]]]:
+    """Find terms shared by multiple room labels.
+
+    Returns ``[(term, set_of_slugs)]`` sorted by word-count desc then coverage
+    desc, so longer (more specific) terms come first.
+    """
+    from collections import defaultdict
+
+    term_to_slugs: dict[str, set[str]] = defaultdict(set)
+
+    for slug, label in labels.items():
+        tokens = _tokenize_label(label)
+        seen: set[str] = set()
+        for n in range(1, min(4, len(tokens) + 1)):
+            for i in range(len(tokens) - n + 1):
+                ngram = " ".join(tokens[i : i + n])
+                key = ngram.lower()
+                if n == 1 and key in _CLUSTER_STOP_WORDS:
+                    continue
+                if key not in seen:
+                    seen.add(key)
+                    term_to_slugs[ngram].add(slug)
+
+    candidates = [
+        (term, slugs)
+        for term, slugs in term_to_slugs.items()
+        if len(slugs) >= min_count
+    ]
+    # Prefer longer phrases (more specific), then higher coverage
+    candidates.sort(key=lambda x: (len(x[0].split()), len(x[1])), reverse=True)
+    return candidates
+
+
+def detect_building_clusters(
+    rooms: dict[str, dict],
+    edges: list[dict],
+    min_cluster_size: int = MIN_CLUSTER_SIZE,
+) -> list[dict]:
+    """Detect groups of connected rooms that share a common building name.
+
+    Returns list of ``{"name": str, "rooms": set[str]}`` dicts.
+    Rooms whose *only* connections lead into an existing cluster are
+    absorbed even if they don't contain the building name in their label
+    (e.g. "Bedroom" connected only to rooms in the "Vana-Kalamaja" cluster).
+    """
+    if len(rooms) < min_cluster_size:
+        return []
+
+    labels = {slug: r.get("label") or slug for slug, r in rooms.items()}
+    common_terms = _extract_common_terms(labels, min_count=min_cluster_size)
+    if not common_terms:
+        return []
+
+    # Build adjacency
+    adj: dict[str, set[str]] = {slug: set() for slug in rooms}
+    for e in edges:
+        a, b = e["from"], e["to"]
+        if a in adj and b in adj:
+            adj[a].add(b)
+            adj[b].add(a)
+
+    used: set[str] = set()
+    clusters: list[dict] = []
+
+    for term, matching_slugs in common_terms:
+        available = matching_slugs - used
+        if len(available) < min_cluster_size:
+            continue
+
+        # Connected components among matching rooms
+        remaining = set(available)
+        while remaining:
+            start = next(iter(remaining))
+            component: set[str] = set()
+            queue = [start]
+            while queue:
+                node = queue.pop(0)
+                if node in component:
+                    continue
+                component.add(node)
+                for nb in adj.get(node, set()):
+                    if nb in available and nb not in component:
+                        queue.append(nb)
+            remaining -= component
+
+            if len(component) < min_cluster_size:
+                continue
+
+            # Expand: include rooms connected *only* to this cluster
+            expanded = set(component)
+            changed = True
+            while changed:
+                changed = False
+                for slug in rooms:
+                    if slug in used or slug in expanded:
+                        continue
+                    nbs = adj.get(slug, set())
+                    if nbs and nbs.issubset(expanded):
+                        expanded.add(slug)
+                        changed = True
+
+            used.update(expanded)
+            clusters.append({"name": term, "rooms": expanded})
+
+    return clusters
+
+
+def _strip_building_name(label: str, building_name: str) -> str:
+    """Remove *building_name* from *label*, cleaning stray punctuation."""
+    result = re.sub(re.escape(building_name), "", label, flags=re.IGNORECASE).strip()
+    result = re.sub(r"^[\s,\-–—]+|[\s,\-–—]+$", "", result)
+    return result if result else label
+
+
 # ── ASCII Renderer ─────────────────────────────────────────────────────────
 
 def render_ascii_map(
@@ -427,35 +559,55 @@ def render_ascii_map(
     if not all_positioned:
         return ""
 
+    # ── Building clusters ──
+    clusters = detect_building_clusters(rooms, edges)
+
+    # Compute display labels (strip building name within clusters)
+    display_labels: dict[str, str] = {}
+    for cluster in clusters:
+        for slug in cluster["rooms"]:
+            if slug in all_positioned:
+                original = all_positioned[slug].get("label") or slug
+                display_labels[slug] = _strip_building_name(original, cluster["name"])
+    for slug in all_positioned:
+        if slug not in display_labels:
+            display_labels[slug] = all_positioned[slug].get("label") or slug
+
+    # Compute uniform column width from display labels
+    col_width = MIN_ROOM_WIDTH
+    for label in display_labels.values():
+        needed = _label_width(label)
+        if needed > col_width:
+            col_width = needed
+    col_width = min(col_width, MAX_ROOM_WIDTH)
+
     xs = [r["x"] for r in all_positioned.values()]
     ys = [r["y"] for r in all_positioned.values()]
     full_min_x, full_max_x = min(xs), max(xs)
     full_min_y, full_max_y = min(ys), max(ys)
 
-    # Compute uniform column width — widest label in the graph
-    # Use label-derived width rather than stored width, since old data
-    # may have narrow stored widths that truncate labels.
-    col_width = MIN_ROOM_WIDTH
-    for r in all_positioned.values():
-        label = r.get("label") or ""
-        needed = _label_width(label)
-        if needed > col_width:
-            col_width = needed
-    col_width = min(col_width, MAX_ROOM_WIDTH)
+    # Tentative margin for building envelopes
+    margin = ENVELOPE_MARGIN if clusters else 0
 
     # Viewport: try to fit all rooms first, clip only if too large
     grid_w_full = full_max_x - full_min_x + 1
     grid_h_full = full_max_y - full_min_y + 1
     cell_w = col_width + CONNECTOR_H_LEN
     cell_h = DEFAULT_ROOM_HEIGHT + CONNECTOR_V_LEN
-    canvas_w_full = grid_w_full * col_width + max(0, grid_w_full - 1) * CONNECTOR_H_LEN
-    canvas_h_full = grid_h_full * DEFAULT_ROOM_HEIGHT + max(0, grid_h_full - 1) * CONNECTOR_V_LEN
+    canvas_w_full = (
+        grid_w_full * col_width
+        + max(0, grid_w_full - 1) * CONNECTOR_H_LEN
+        + 2 * margin
+    )
+    canvas_h_full = (
+        grid_h_full * DEFAULT_ROOM_HEIGHT
+        + max(0, grid_h_full - 1) * CONNECTOR_V_LEN
+        + 2 * margin
+    )
 
     if canvas_w_full <= MAX_COLS and canvas_h_full <= MAX_ROWS:
-        # Everything fits — show all rooms
         visible_rooms = dict(all_positioned)
     else:
-        # Viewport clip centered on player
         center = viewport_center or player_location
         center_slug = slugify(center)
         if center_slug in all_positioned:
@@ -482,25 +634,42 @@ def render_ascii_map(
         if not visible_rooms:
             visible_rooms = dict(all_positioned)
 
+    # Determine which clusters have enough visible rooms for an envelope
+    visible_clusters: list[dict] = []
+    for cluster in clusters:
+        vis = [s for s in cluster["rooms"] if s in visible_rooms]
+        if len(vis) >= 2:
+            visible_clusters.append(cluster)
+
+    # Finalise margin (zero it if no visible envelopes)
+    margin = ENVELOPE_MARGIN if visible_clusters else 0
+
     # Recompute bounds for visible rooms
     xs = [r["x"] for r in visible_rooms.values()]
     ys = [r["y"] for r in visible_rooms.values()]
     min_x, max_x = min(xs), max(xs)
     min_y, max_y = min(ys), max(ys)
 
-    # Canvas dimensions
+    # Canvas dimensions (with margin for envelopes)
     grid_w = max_x - min_x + 1
     grid_h = max_y - min_y + 1
-    canvas_w = grid_w * col_width + (grid_w - 1) * CONNECTOR_H_LEN
-    canvas_h = grid_h * DEFAULT_ROOM_HEIGHT + (grid_h - 1) * CONNECTOR_V_LEN
+    canvas_w = (
+        grid_w * col_width
+        + (grid_w - 1) * CONNECTOR_H_LEN
+        + 2 * margin
+    )
+    canvas_h = (
+        grid_h * DEFAULT_ROOM_HEIGHT
+        + (grid_h - 1) * CONNECTOR_V_LEN
+        + 2 * margin
+    )
 
-    # Create canvas (list of lists of chars)
     canvas: list[list[str]] = [[" "] * canvas_w for _ in range(canvas_h)]
 
     def _room_pixel(gx: int, gy: int) -> tuple[int, int]:
         """Grid coord -> top-left pixel on canvas."""
-        px = (gx - min_x) * (col_width + CONNECTOR_H_LEN)
-        py = (gy - min_y) * (DEFAULT_ROOM_HEIGHT + CONNECTOR_V_LEN)
+        px = margin + (gx - min_x) * (col_width + CONNECTOR_H_LEN)
+        py = margin + (gy - min_y) * (DEFAULT_ROOM_HEIGHT + CONNECTOR_V_LEN)
         return px, py
 
     # Build set of occupied pixel rectangles for collision avoidance
@@ -510,14 +679,35 @@ def render_ascii_map(
         rh = room.get("height") or DEFAULT_ROOM_HEIGHT
         room_rects.append((px, py, px + col_width - 1, py + rh - 1))
 
-    # Draw rooms (all rooms use uniform col_width for clean alignment)
+    # ── Draw building envelopes (first, so rooms & connectors overlay) ──
+    for cluster in visible_clusters:
+        vis_slugs = [s for s in cluster["rooms"] if s in visible_rooms]
+        pxs: list[int] = []
+        pys: list[int] = []
+        for slug in vis_slugs:
+            px, py = _room_pixel(visible_rooms[slug]["x"], visible_rooms[slug]["y"])
+            rh = visible_rooms[slug].get("height") or DEFAULT_ROOM_HEIGHT
+            pxs.extend([px, px + col_width - 1])
+            pys.extend([py, py + rh - 1])
+        _draw_building_envelope(
+            canvas,
+            min(pxs) - 1,
+            min(pys) - 1,
+            max(pxs) + 1,
+            max(pys) + 1,
+            cluster["name"],
+        )
+
+    # ── Draw rooms (uniform col_width, display labels) ──
     visible_set = set(visible_rooms.keys())
     for slug, room in visible_rooms.items():
         rh = room.get("height") or DEFAULT_ROOM_HEIGHT
         px, py = _room_pixel(room["x"], room["y"])
-        _draw_room_box(canvas, px, py, col_width, rh, room.get("label") or slug, entity_map.get(slug))
+        label = display_labels.get(slug, room.get("label") or slug)
+        _draw_room_box(canvas, px, py, col_width, rh, label, entity_map.get(slug))
 
-    # Draw connectors
+    # ── Draw connectors ──
+    passthrough = _ENVELOPE_BORDER_CHARS if visible_clusters else None
     for edge in edges:
         a, b = edge["from"], edge["to"]
         if a not in visible_set or b not in visible_set:
@@ -534,6 +724,7 @@ def render_ascii_map(
             (col_width, rh_b),
             door_type,
             room_rects,
+            passthrough_chars=passthrough,
         )
 
     # Convert canvas to string, trim trailing whitespace
@@ -541,10 +732,8 @@ def render_ascii_map(
     for row in canvas:
         line = "".join(row).rstrip()
         map_lines.append(line)
-    # Remove trailing empty lines
     while map_lines and not map_lines[-1].strip():
         map_lines.pop()
-    # Remove leading empty lines
     while map_lines and not map_lines[0].strip():
         map_lines.pop(0)
 
@@ -617,6 +806,53 @@ def _draw_room_box(
             _put(px + 1 + pad_left + i, mid_y, ch)
 
 
+def _draw_building_envelope(
+    canvas: list[list[str]],
+    x0: int,
+    y0: int,
+    x1: int,
+    y1: int,
+    building_name: str,
+) -> None:
+    """Draw a building envelope (double-line border with centred title)."""
+    canvas_h = len(canvas)
+    canvas_w = len(canvas[0]) if canvas else 0
+
+    def _put(x: int, y: int, ch: str) -> None:
+        if 0 <= y < canvas_h and 0 <= x < canvas_w:
+            canvas[y][x] = ch
+
+    # Corners
+    _put(x0, y0, "╔")
+    _put(x1, y0, "╗")
+    _put(x0, y1, "╚")
+    _put(x1, y1, "╝")
+
+    # Top border with centred title
+    border_inner = x1 - x0 - 1
+    title = f"[ {building_name} ]"
+    if len(title) > border_inner:
+        title = f"[{building_name[: border_inner - 2]}]"
+    if len(title) > border_inner:
+        title = ""
+    pad = max(0, (border_inner - len(title)) // 2)
+    for i in range(border_inner):
+        x = x0 + 1 + i
+        if title and pad <= i < pad + len(title):
+            _put(x, y0, title[i - pad])
+        else:
+            _put(x, y0, "═")
+
+    # Bottom border
+    for x in range(x0 + 1, x1):
+        _put(x, y1, "═")
+
+    # Side borders
+    for y in range(y0 + 1, y1):
+        _put(x0, y, "║")
+        _put(x1, y, "║")
+
+
 def _point_in_any_room(
     x: int,
     y: int,
@@ -637,16 +873,22 @@ def _draw_connector(
     size_b: tuple[int, int],
     door_type: str,
     room_rects: list[tuple[int, int, int, int]],
+    passthrough_chars: frozenset[str] | None = None,
 ) -> None:
-    """Draw a connector between two rooms, avoiding room interiors."""
+    """Draw a connector between two rooms, avoiding room interiors.
+
+    *passthrough_chars*, when provided, lists characters that connectors may
+    overwrite (e.g. building-envelope border chars).
+    """
     canvas_h = len(canvas)
     canvas_w = len(canvas[0]) if canvas else 0
 
     def _put(x: int, y: int, ch: str) -> None:
-        if 0 <= y < canvas_h and 0 <= x < canvas_w and canvas[y][x] == " ":
-            # Don't draw through room interiors
-            if not _point_in_any_room(x, y, room_rects):
-                canvas[y][x] = ch
+        if 0 <= y < canvas_h and 0 <= x < canvas_w:
+            existing = canvas[y][x]
+            if existing == " " or (passthrough_chars and existing in passthrough_chars):
+                if not _point_in_any_room(x, y, room_rects):
+                    canvas[y][x] = ch
 
     ax, ay = pos_a
     aw, ah = size_a

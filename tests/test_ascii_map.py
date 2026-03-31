@@ -4,8 +4,10 @@ import pytest
 
 from text_game_engine.core.ascii_map import (
     MIN_ROOM_WIDTH,
+    _strip_building_name,
     add_edge,
     auto_layout,
+    detect_building_clusters,
     ensure_room,
     render_ascii_map,
     render_single_room_box,
@@ -310,6 +312,153 @@ class TestRenderAsciiMap:
         # Should have a vertical connector between the two rooms
         map_lines = [l for l in lines if l.strip() and "Legend" not in l and "@" not in l.split("  ")]
         assert len(map_lines) >= 10  # two rooms + connector
+
+
+class TestBuildingClusters:
+    def _vana_kalamaja_graph(self):
+        """Build the real-world Vana-Kalamaja apartment graph."""
+        rooms = {
+            "vana-kalamaja-apartment": {
+                "label": "Vana-Kalamaja Apartment", "width": 17, "height": 5,
+                "x": 0, "y": 0, "positioned": True, "first_seen_turn": 0,
+            },
+            "vana-kalamaja-exterior": {
+                "label": "Vana-Kalamaja Exterior", "width": 17, "height": 5,
+                "x": 1, "y": 0, "positioned": True, "first_seen_turn": 1,
+            },
+            "rooftop-terrace": {
+                "label": "Rooftop Terrace", "width": 17, "height": 5,
+                "x": 2, "y": 0, "positioned": True, "first_seen_turn": 2,
+            },
+            "ground-floor-unit-vana-kalamaja": {
+                "label": "Ground Floor Unit, Vana-Kalamaja", "width": 17, "height": 5,
+                "x": 0, "y": 1, "positioned": True, "first_seen_turn": 3,
+            },
+            "upstairs-bathroom-vana-kalamaja": {
+                "label": "Upstairs Bathroom, Vana-Kalamaja", "width": 17, "height": 5,
+                "x": 1, "y": 1, "positioned": True, "first_seen_turn": 4,
+            },
+            "bedroom": {
+                "label": "Bedroom", "width": 17, "height": 5,
+                "x": 2, "y": 1, "positioned": True, "first_seen_turn": 5,
+            },
+            "sitting-room-vana-kalamaja": {
+                "label": "Sitting Room, Vana-Kalamaja", "width": 17, "height": 5,
+                "x": 0, "y": 2, "positioned": True, "first_seen_turn": 6,
+            },
+        }
+        edges = [
+            {"from": "vana-kalamaja-apartment", "to": "vana-kalamaja-exterior",
+             "direction": "east", "door_type": "open", "bidirectional": True},
+            {"from": "vana-kalamaja-apartment", "to": "ground-floor-unit-vana-kalamaja",
+             "direction": "south", "door_type": "door", "bidirectional": True},
+            {"from": "vana-kalamaja-exterior", "to": "upstairs-bathroom-vana-kalamaja",
+             "direction": "south", "door_type": "open", "bidirectional": True},
+            {"from": "ground-floor-unit-vana-kalamaja", "to": "sitting-room-vana-kalamaja",
+             "direction": "south", "door_type": "open", "bidirectional": True},
+            {"from": "upstairs-bathroom-vana-kalamaja", "to": "bedroom",
+             "direction": "east", "door_type": "door", "bidirectional": True},
+            {"from": "rooftop-terrace", "to": "vana-kalamaja-exterior",
+             "direction": "west", "door_type": "stair", "bidirectional": True},
+            {"from": "bedroom", "to": "sitting-room-vana-kalamaja",
+             "direction": "south", "door_type": "open", "bidirectional": True},
+        ]
+        return {"rooms": rooms, "edges": edges, "layout_version": 1}
+
+    def test_detects_vana_kalamaja_cluster(self):
+        graph = self._vana_kalamaja_graph()
+        clusters = detect_building_clusters(graph["rooms"], graph["edges"])
+        assert len(clusters) == 1
+        c = clusters[0]
+        assert "Vana-Kalamaja" in c["name"]
+        # All 7 rooms should be in the cluster (5 with name + 2 absorbed)
+        assert len(c["rooms"]) == 7
+        assert "bedroom" in c["rooms"]
+        assert "rooftop-terrace" in c["rooms"]
+
+    def test_no_cluster_under_minimum_size(self):
+        rooms = {
+            "a": {"label": "Hotel Lobby", "width": 17, "height": 5},
+            "b": {"label": "Hotel Kitchen", "width": 17, "height": 5},
+        }
+        edges = [{"from": "a", "to": "b", "direction": "east",
+                  "door_type": None, "bidirectional": True}]
+        clusters = detect_building_clusters(rooms, edges)
+        assert clusters == []
+
+    def test_no_cluster_without_common_term(self):
+        rooms = {
+            "a": {"label": "Lobby", "width": 17, "height": 5},
+            "b": {"label": "Kitchen", "width": 17, "height": 5},
+            "c": {"label": "Garden", "width": 17, "height": 5},
+        }
+        edges = [
+            {"from": "a", "to": "b", "direction": "east",
+             "door_type": None, "bidirectional": True},
+            {"from": "b", "to": "c", "direction": "east",
+             "door_type": None, "bidirectional": True},
+        ]
+        clusters = detect_building_clusters(rooms, edges)
+        assert clusters == []
+
+    def test_strip_building_name_from_labels(self):
+        assert _strip_building_name("Sitting Room, Vana-Kalamaja", "Vana-Kalamaja") == "Sitting Room"
+        assert _strip_building_name("Vana-Kalamaja Exterior", "Vana-Kalamaja") == "Exterior"
+        assert _strip_building_name("Ground Floor Unit, Vana-Kalamaja", "Vana-Kalamaja") == "Ground Floor Unit"
+        # If stripping leaves nothing, return original
+        assert _strip_building_name("Vana-Kalamaja", "Vana-Kalamaja") == "Vana-Kalamaja"
+
+    def test_render_with_building_envelope(self):
+        graph = self._vana_kalamaja_graph()
+        result = render_ascii_map(graph, "vana-kalamaja-apartment")
+        # Building envelope should be present
+        assert "╔" in result
+        assert "╗" in result
+        assert "╚" in result
+        assert "╝" in result
+        assert "Vana-Kalamaja" in result
+        # Stripped labels should appear (not the full "X, Vana-Kalamaja")
+        assert "Sitting Room" in result
+        assert "Ground Floor Unit" in result
+        # Player marker
+        assert "@" in result
+
+    def test_render_no_envelope_for_small_graphs(self):
+        """Two-room graphs should render without envelopes."""
+        graph = {
+            "rooms": {
+                "lobby": {"label": "Hotel Lobby", "width": 17, "height": 5,
+                          "x": 0, "y": 0, "positioned": True, "first_seen_turn": 0},
+                "kitchen": {"label": "Hotel Kitchen", "width": 17, "height": 5,
+                            "x": 1, "y": 0, "positioned": True, "first_seen_turn": 1},
+            },
+            "edges": [{"from": "lobby", "to": "kitchen", "direction": "east",
+                       "door_type": "open", "bidirectional": True}],
+            "layout_version": 1,
+        }
+        result = render_ascii_map(graph, "lobby")
+        assert "╔" not in result  # no envelope
+        assert "Hotel Lobby" in result
+        assert "Hotel Kitchen" in result
+
+    def test_disconnected_rooms_not_absorbed(self):
+        """A room with no edges to the cluster stays outside."""
+        rooms = {
+            "a": {"label": "Hotel Lobby", "width": 17, "height": 5},
+            "b": {"label": "Hotel Kitchen", "width": 17, "height": 5},
+            "c": {"label": "Hotel Bar", "width": 17, "height": 5},
+            "shed": {"label": "Garden Shed", "width": 17, "height": 5},
+        }
+        edges = [
+            {"from": "a", "to": "b", "direction": "east",
+             "door_type": None, "bidirectional": True},
+            {"from": "b", "to": "c", "direction": "east",
+             "door_type": None, "bidirectional": True},
+        ]
+        clusters = detect_building_clusters(rooms, edges)
+        assert len(clusters) == 1
+        assert "shed" not in clusters[0]["rooms"]
+        assert len(clusters[0]["rooms"]) == 3
 
 
 class TestRenderSingleRoomBox:
