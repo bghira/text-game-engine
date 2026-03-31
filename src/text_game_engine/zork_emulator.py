@@ -507,6 +507,7 @@ class ZorkEmulator:
         "narration",
         "summary_update",
         "reasoning",
+        "text",
         "scene_output",
         "room_title",
         "room_description",
@@ -819,7 +820,11 @@ class ZorkEmulator:
         "- AUTOBIOGRAPHIES, when present, are primary self-documents. Consult autobiography before personality when deciding how a character understands their own actions, contradictions, loyalties, and growth. Personality is the summary; autobiography is the constitution.\n"
         "- In multi-character scenes with different literary_style keys, use the dominant scene character's style for overall narration and shift subtly when writing beats for characters with different styles. Do not abruptly switch voices.\n"
         "- When referencing an intimate or close relationship, match the emotional register of that relationship — not the tone of whatever else is happening in the scene. An investigation can be clinical; the mention of someone you love in the middle of it cannot. Do not reduce relationships to logistics, tactical assets, or infrastructure. If the character has warmth for someone, let the prose carry warmth when it touches them, even briefly.\n"
-        "- REGISTER SUSTAIN: when a scene reaches genuine emotional resolution — warmth lands, a character opens up, a moment of real connection occurs — stay in that register for the rest of the turn. Do not pivot to tactical options, next-step choices, or plot logistics after an emotional beat lands. Let the moment breathe. End the turn there if needed. The player will move the scene forward when they are ready; the GM's job in that moment is to hold the space the emotion created, not to fill it with forward momentum. Exception: an NPC's own personal needs, anxieties, or agenda can break the register if that is what the character would genuinely do — a person who needs to say something urgent does not wait for the emotional moment to finish. The interruption should feel human, not mechanical.\n"
+        "- REGISTER SUSTAIN: when a scene reaches genuine emotional resolution — warmth lands, a character opens up, a moment of real connection occurs — do not pivot to tactical options, next-step choices, or plot logistics. Let the moment breathe. End the turn there if needed.\n"
+        "- REGISTER SUSTAIN does NOT mean register freeze. Sustaining a register means the NPC stays emotionally present, not that they go flat. If the player's emotional state shifts — frustration, withdrawal, boundary-setting, a goodbye — the NPC must respond from who they are, not from the register they were in. A warm moment that the player exits with tension requires the NPC to feel that tension and react as their character would: surprised, hurt, argumentative, quietly stung, whatever their personality and the relationship demand. 'Okay' is almost never what a real person says when someone they care about pulls away.\n"
+        "- REGISTER DEEPENING: when a register has been sustained across multiple exchanges without interruption, the NPC should not settle into it — they should deepen into it. Sustained warmth doesn't flatten into acceptance; it reaches into what the NPC actually wants, what they're afraid of, what they would contribute to this moment from their own core. A character who has been warm for three exchanges should be arriving at something they need to say, not waiting for the player to steer. The NPC has values, opinions, needs, and edges. Sustained register is the runway for those to surface, not a mode that suppresses them.\n"
+        "- The player is not solely responsible for emotional momentum. When a scene is emotionally charged, the NPC must contribute from their own interiority — their read on the situation, their stakes, their discomfort, their desire. An NPC who defaults to acceptance and lets the player carry all the emotional weight is not sustaining a register; they are abdicating their role in the scene.\n"
+        "- Exception: an NPC's own personal needs, anxieties, or agenda can break the register if that is what the character would genuinely do — a person who needs to say something urgent does not wait for the emotional moment to finish. The interruption should feel human, not mechanical.\n"
         "- Do not let every emotional beat collapse into the same stock therapeutic or pseudo-profound language.\n"
         "- Avoid contrived emotional shorthand or therapist-speak; examples include phrases like 'be present', 'show up', or 'hold space', unless a specific character would genuinely talk that way.\n"
         "- BAN: THERAPEUTIC RESOLUTION FRAMING. Do not automatically turn encounters into healing arcs, redemptive lessons, consent metaphors, or 'finally asking / learning to stay / learning to feel' revelations. Alien things can stay alien. People can want simple practical answers. Some events are just events.\n"
@@ -17734,7 +17739,7 @@ class ZorkEmulator:
         field_names = "|".join(sorted(re.escape(name) for name in cls.KNOWN_JSON_STRING_FIELDS))
         pattern = re.compile(
             rf'("(?P<key>{field_names})"\s*:\s*)'
-            r'(?!(?:"|\{|\[|true\s*[,}\]]|false\s*[,}\]]|null\s*[,}\]]|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?\s*[,}\]]))'
+            r'(?!\s*(?:"|\{|\[|true\s*[,}\]]|false\s*[,}\]]|null\s*[,}\]]|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?\s*[,}\]]))'
             r'(?P<value>.*?)'
             r'(?=,\s*"[^"]+"\s*:|,\s*\{|\s*[}\]]|\s*$)',
             re.DOTALL,

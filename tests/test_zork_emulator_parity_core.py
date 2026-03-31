@@ -3494,7 +3494,7 @@ def test_ready_to_write_strips_reasoning_from_recent_turns_lcd_and_speaker_conti
         assert "SPEAKER_CONTINUITY[simone-ashworth]:" in final_prompt
         recent_final_block = final_prompt.split("RECENT_TURNS_LCD:\n", 1)[1].split("\n\n", 1)[0]
         speaker_block = final_prompt.split("SPEAKER_CONTINUITY[simone-ashworth]:\n", 1)[1].split("\n\n", 1)[0]
-        assert '"reasoning":' not in recent_final_block
+        assert '"reasoning":' in recent_final_block
         assert '"reasoning":' not in speaker_block
         assert "Shared room beat." in recent_final_block
         assert "Private Simone continuity." in speaker_block

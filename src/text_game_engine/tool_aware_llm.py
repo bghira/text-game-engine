@@ -3664,6 +3664,7 @@ class ToolAwareZorkLLM:
                     requested_npc_slugs=scene_npc_slugs,
                     scene_npc_slugs=scene_npc_slugs or None,
                 )
+                shared_recent_with_reasoning = shared_recent
                 shared_recent = emulator._strip_reasoning_from_recent_turn_jsonl(shared_recent)  # noqa: SLF001
                 shared_recent_texts: set[str] = set()
                 for line in str(shared_recent or "").splitlines():
@@ -3698,7 +3699,7 @@ class ToolAwareZorkLLM:
                         "only events that ALL named participants would plausibly know about. "
                         "Use this as the shared pool for common knowledge in the scene.\n"
                         f"\nWORLD_SUMMARY_LCD: {shared_summary or '(empty)'}\n"
-                        f"\nRECENT_TURNS_LCD:\n{shared_recent}\n"
+                        f"\nRECENT_TURNS_LCD:\n{shared_recent_with_reasoning}\n"
                     )
                 elif shared_recent and shared_recent != "None":
                     _shared_context_block = (
