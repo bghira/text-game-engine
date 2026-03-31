@@ -2965,6 +2965,98 @@ def test_sms_activity_nudge_hidden_for_player_to_player_threads(
     assert "Sultan↔Baghira" not in joined
 
 
+def test_sms_unread_thread_display_label_omits_self_only_resolution(session_factory):
+    compat = _build_compat(session_factory)
+    row = {
+        "label": "baghira",
+        "messages": [
+            {
+                "from": "Baghira",
+                "to": "Baghira",
+                "message": "test",
+                "day": 1,
+                "hour": 9,
+                "minute": 0,
+                "turn_id": 1,
+                "seq": 1,
+                "owner_actor_id": "actor-2",
+            }
+        ],
+        "owner_actor_id": "actor-2",
+    }
+
+    label = compat._sms_unread_thread_display_label(
+        "baghira",
+        row,
+        actor_id="actor-2",
+        player_state={"character_name": "Baghira"},
+        contact_roster=None,
+    )
+
+    assert label == ""
+
+
+def test_sms_activity_nudge_skips_self_labeled_unread_thread(
+    session_factory,
+    seed_campaign_and_actor,
+):
+    compat = _build_compat(session_factory)
+    compat.NPC_NUDGE_CHANCE = 0.0
+    compat.SMS_REPLY_NUDGE_CHANCE = 1.0
+    campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
+    compat.get_or_create_player(campaign.id, "actor-2")
+
+    with session_factory() as session:
+        player_two = (
+            session.query(Player)
+            .filter(Player.campaign_id == campaign.id)
+            .filter(Player.actor_id == "actor-2")
+            .first()
+        )
+        assert player_two is not None
+        state_two = json.loads(player_two.state_json or "{}")
+        state_two["character_name"] = "Baghira"
+        player_two.state_json = compat._dump_json(state_two)
+
+        row = session.get(Campaign, campaign.id)
+        campaign_state = compat.get_campaign_state(row)
+        compat._sms_write(
+            campaign_state,
+            thread="baghira",
+            sender="Baghira",
+            recipient="Baghira",
+            message="test",
+            game_time={"day": 1, "hour": 9, "minute": 0},
+            turn_id=1,
+            owner_actor_id="actor-2",
+        )
+        row.state_json = compat._dump_json(campaign_state)
+        session.commit()
+
+    with session_factory() as session:
+        player_two = (
+            session.query(Player)
+            .filter(Player.campaign_id == campaign.id)
+            .filter(Player.actor_id == "actor-2")
+            .first()
+        )
+        assert player_two is not None
+        player_state = compat.get_player_state(player_two)
+        row = session.get(Campaign, campaign.id)
+        campaign_state = compat.get_campaign_state(row)
+
+    joined = "\n".join(
+        compat._passive_npc_sms_nudge_lines(
+            campaign,
+            campaign_state,
+            player_two,
+            player_state,
+        )
+    )
+    assert "SMS_ACTIVITY_NUDGE:" not in joined
+    assert "baghira" not in joined.lower()
+
+
 def test_sms_list_merges_alias_threads_to_canonical_contact(
     session_factory,
     seed_campaign_and_actor,

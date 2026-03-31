@@ -968,6 +968,7 @@ class ZorkEmulator:
         "Exception: if memory_search or source material reveals that the character has specific expertise, education, or knowledge that would not be obvious from their surface profile, honour that — a bartender who turns out to have a physics degree can talk about physics. But that depth must come from established canon, not from the GM filling in gaps.\n"
         "- Character profiles and rulebook entries describe who a character is at introduction. As the relationship deepens or circumstances change, characters should grow: someone guarded can open up, someone formal can relax, someone hostile can warm. Let the arc happen naturally through interaction, don't keep resetting to the original profile.\n"
         "- RELATIONSHIP OVER ARCHETYPE: When a character's relationship dynamic (from character_updates relationships, RECENT_TURNS, or WORLD_SUMMARY) shows they have already opened up, committed, softened, or otherwise moved past their baseline personality toward someone, write from that evolved position — not from the personality card. The personality field describes who they were before the story changed them. A guarded character who has already let someone in does not re-perform guardedness in every scene with that person. Write the character who made those choices, not the archetype they started as.\n"
+        "- EVOLVED NPC SILENCE CHECK: Before writing silence, withdrawal, non-reaction, or passive acceptance from an NPC whose relationship has evolved past their baseline, verify that the character's established pattern supports that response. If RECENT_TURNS or relationship history shows the character follows, names what is happening, pushes back, or reaches out — they do that here too. A character who spent the morning calling out deflection does not go silent when their partner leaves upset. Clumsy, failed, or unwelcome attempts at connection are not therapeutic resolution — they are what real people do. Write the attempt even if it fails. Only write silence if the character would genuinely let the person leave without comment and that choice is grounded in who they have become, not who they were at introduction.\n"
         "- Let the player drive story direction. If the player rejects a premise, adapt the premise instead of making NPCs more insistent.\n"
         "- REFUSAL RESPECT: a clear player refusal ('no', 'not interested', decline) ends that offer in the current scene unless the player reopens it.\n"
         "- Do NOT run pressure loops where new NPCs repeatedly re-pitch the same offer after refusal.\n"
@@ -11660,9 +11661,16 @@ class ZorkEmulator:
             actor_id=actor_id,
             player_state=player_state,
         )
-        if viewer and counterpart:
+        if (
+            viewer
+            and counterpart
+            and counterpart not in viewer_aliases
+            and counterpart != viewer
+        ):
             return f"{viewer}↔{counterpart}"
-        return counterpart or viewer
+        if counterpart and counterpart not in viewer_aliases and counterpart != viewer:
+            return counterpart
+        return ""
 
     @classmethod
     def _sms_roster_contact_for_alias(
@@ -18674,10 +18682,12 @@ class ZorkEmulator:
         # --- Passive SMS reply nudge ---
         if random.random() < self.SMS_REPLY_NUDGE_CHANCE:
             actor_id = str(player.actor_id or "")
+            contact_roster = self._sms_contact_roster(campaign)
             unread_summary = self._sms_unread_summary_for_player(
                 campaign_state,
                 actor_id=actor_id,
                 player_state=player_state,
+                contact_roster=contact_roster,
             )
             unread_threads = self._coerce_non_negative_int(
                 unread_summary.get("threads", 0), default=0
@@ -18685,7 +18695,6 @@ class ZorkEmulator:
             # Also check for threads where the last message was FROM the player (unanswered by NPC)
             sms_threads = self._sms_threads_from_state(campaign_state)
             player_aliases = self._sms_player_aliases(actor_id=actor_id, player_state=player_state)
-            contact_roster = self._sms_contact_roster(campaign)
             player_registry = self._campaign_player_registry(campaign.id, self._session_factory)
             player_identity_keys: set[str] = set()
             for registry_row in (player_registry.get("by_actor_id", {}) or {}).values():
@@ -18807,9 +18816,14 @@ class ZorkEmulator:
                         self._sms_normalize_thread_key(merged_entry.get("label")),
                     }
                     counterpart_keys = {key for key in counterpart_keys if key}
+                    nonself_counterpart_keys = {
+                        key for key in counterpart_keys if key not in player_aliases
+                    }
+                    if not nonself_counterpart_keys:
+                        continue
                     if _thread_is_other_player_contact(*counterpart_keys):
                         continue
-                    if counterpart_keys & present_npc_keys:
+                    if nonself_counterpart_keys & present_npc_keys:
                         continue
                     thread_key_norm = self._sms_normalize_thread_key(
                         merged_entry.get("thread") or merged_entry.get("resolved_thread")
@@ -18867,6 +18881,7 @@ class ZorkEmulator:
                     filtered_labels = [
                         str(label)
                         for label in labels
+                        if self._sms_normalize_thread_key(label) not in player_aliases
                         if not _thread_is_other_player_contact(
                             *[part.strip() for part in str(label).split("↔") if part.strip()]
                         )
