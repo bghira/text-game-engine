@@ -3623,6 +3623,7 @@ class ToolAwareZorkLLM:
                 final_location_cards = emulator._build_location_cards_for_prompt(  # noqa: SLF001
                     location_cards_map,
                     player_state=player_state,
+                    include_active_location=True,
                 )
                 if final_location_cards:
                     active_location = str(player_state.get("location") or "").strip().lower()

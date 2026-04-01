@@ -844,7 +844,7 @@ class ZorkEmulator:
         "- RECENT_TURNS is already filtered to what the acting player plausibly knows. Hidden/private turns from other players are omitted.\n"
         "- TURN_VISIBILITY_DEFAULT tells you whether this turn should default to public, local, or private context.\n"
         "- SCENE_STATE is the immediate actionable scene: who is present, what is visible, and what tensions are active right now. Use it first for immediate staging.\n"
-        "- CHARACTER_INDEX is the roster-wide NPC continuity block: name/location/current_status plus other critical fields for all known NPCs.\n"
+        "- CHARACTER_INDEX is the slim roster-wide NPC locator block, grouped by shared location. CHARACTER_INDEX_COMMON_KEYS lists the shared deeper fields many roster entries carry.\n"
         "- CHARACTER_CARDS are the deeper scene NPC cards: use them for local-scene depth, voice, appearance, and other non-critical texture.\n"
         "- LOCATION_INDEX lists known place slugs and available_keys. LOCATION_CARDS are the primary place fact store: critical location facts persist across scenes; non-critical location facts surface when that location is active.\n"
         "- WORLD_STATE is for world facts, investigations, event threads, and cross-entity facts. Do not treat it as a backup character sheet or location encyclopedia.\n"
@@ -13052,7 +13052,58 @@ class ZorkEmulator:
         characters: Dict[str, dict] | None = None,
         campaign_state: Dict[str, object] | None = None,
     ) -> list[dict[str, object]]:
+        grouped_rows: dict[str, dict[str, object]] = {}
+        characters = characters or {}
+        for entry in characters_for_prompt or []:
+            if not isinstance(entry, dict):
+                continue
+            slug = str(entry.get("_slug") or "").strip()
+            if not slug:
+                continue
+            source = characters.get(slug) if isinstance(characters.get(slug), dict) else entry
+            location = str(source.get("location") or "").strip()
+            bucket_key = location or "__unknown__"
+            bucket = grouped_rows.setdefault(
+                bucket_key,
+                {
+                    "location": location or None,
+                    "characters": [],
+                },
+            )
+            row = {
+                "slug": slug,
+                "name": str(entry.get("name") or slug).strip(),
+                "location_last_updated": source.get("location_last_updated"),
+            }
+            bucket["characters"].append(row)
+
         rows: list[dict[str, object]] = []
+        for bucket_key in sorted(grouped_rows.keys(), key=lambda value: (value == "__unknown__", value)):
+            bucket = grouped_rows.get(bucket_key) or {}
+            characters_in_bucket = bucket.get("characters")
+            if not isinstance(characters_in_bucket, list) or not characters_in_bucket:
+                continue
+            characters_in_bucket.sort(
+                key=lambda row: (
+                    str(row.get("name") or "").lower(),
+                    str(row.get("slug") or "").lower(),
+                )
+            )
+            rows.append(
+                {
+                    "location": bucket.get("location"),
+                    "characters": characters_in_bucket,
+                }
+            )
+        return rows
+
+    def _character_index_common_keys_for_prompt(
+        self,
+        characters_for_prompt: list[dict[str, object]],
+        *,
+        characters: Dict[str, dict] | None = None,
+        campaign_state: Dict[str, object] | None = None,
+    ) -> list[str]:
         characters = characters or {}
         hidden_keys = {
             self.AUTOBIOGRAPHY_FIELD,
@@ -13068,6 +13119,8 @@ class ZorkEmulator:
             self._extract_game_time_snapshot(campaign_state or {}).get("day"),
             default=0,
         )
+        top_level_keys = {"name", "location", "location_last_updated", "current_status"}
+        common_keys: set[str] | None = None
         for entry in characters_for_prompt or []:
             if not isinstance(entry, dict):
                 continue
@@ -13082,33 +13135,19 @@ class ZorkEmulator:
             if birthday_hint:
                 source = dict(source)
                 source["birthday_hint"] = birthday_hint
-            available_keys = sorted(
+            available_keys = {
                 key
                 for key in (source or {}).keys()
-                if key not in hidden_keys and not str(key).startswith("_")
-            )
-            critical: dict[str, object] = {}
-            for key in available_keys:
-                if key in {"name", "location", "current_status"}:
-                    continue
-                if self._character_field_priority(key) != "critical":
-                    continue
-                value = source.get(key)
-                if value in (None, "", [], {}):
-                    continue
-                critical[key] = value
-            rows.append(
-                {
-                    "slug": slug,
-                    "name": str(entry.get("name") or slug).strip(),
-                    "location": source.get("location"),
-                    "location_last_updated": source.get("location_last_updated"),
-                    "current_status": source.get("current_status"),
-                    "available_keys": available_keys,
-                    "critical": critical,
-                }
-            )
-        return rows
+                if key not in hidden_keys
+                and key not in top_level_keys
+                and not str(key).startswith("_")
+                and source.get(key) not in (None, "", [], {})
+            }
+            if common_keys is None:
+                common_keys = set(available_keys)
+            else:
+                common_keys &= available_keys
+        return sorted(common_keys or set())
 
     def _build_world_characters_for_prompt(
         self,
@@ -13370,6 +13409,7 @@ class ZorkEmulator:
         location_cards: Dict[str, dict],
         *,
         player_state: Dict[str, object] | None = None,
+        include_active_location: bool = False,
     ) -> list[dict[str, object]]:
         rows: list[dict[str, object]] = []
         active_location = str((player_state or {}).get("location") or "").strip().lower()
@@ -13378,12 +13418,14 @@ class ZorkEmulator:
         for slug, payload in sorted(location_cards.items()):
             if not isinstance(payload, dict):
                 continue
+            is_active_location = slug.lower() == active_location
+            if is_active_location and not include_active_location:
+                continue
             payload_keys = [
                 key
                 for key in payload.keys()
                 if key != self.LOCATION_FACT_PRIORITIES_KEY and not str(key).startswith("_")
             ]
-            is_active_location = slug.lower() == active_location
             location_name = str(payload.get("name") or "").strip()
             summary = self._compact_prompt_fact_value(
                 payload.get("summary") or payload.get("description"),
@@ -14430,6 +14472,11 @@ class ZorkEmulator:
             characters=characters,
             campaign_state=state,
         )
+        character_index_common_keys = self._character_index_common_keys_for_prompt(
+            character_index_source,
+            characters=characters,
+            campaign_state=state,
+        )
         world_characters = self._build_world_characters_for_prompt(
             character_index_source,
             characters=characters,
@@ -14587,6 +14634,7 @@ class ZorkEmulator:
         )
         user_prompt += (
             f"SCENE_STATE: {self._dump_json(scene_state)}\n"
+            f"CHARACTER_INDEX_COMMON_KEYS: {self._dump_json(character_index_common_keys)}\n"
             f"CHARACTER_INDEX: {self._dump_json(character_index)}\n"
             f"CHARACTER_CARDS: {self._dump_json(character_cards)}\n"
             f"LOCATION_INDEX: {self._dump_json(location_index)}\n"

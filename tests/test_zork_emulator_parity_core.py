@@ -971,7 +971,7 @@ def test_build_prompt_keeps_autobiography_out_of_character_cards(
     assert "She writes herself as flint wrapped in velvet." in user_prompt
 
 
-def test_build_prompt_character_index_carries_roster_criticals_while_cards_stay_scene_local(
+def test_build_prompt_character_index_is_slim_and_moves_shared_schema_to_common_keys(
     session_factory,
     seed_campaign_and_actor,
 ):
@@ -1021,20 +1021,30 @@ def test_build_prompt_character_index_carries_roster_criticals_while_cards_stay_
     turns = compat.get_recent_turns(seed_campaign_and_actor["campaign_id"])
     _system_prompt, user_prompt = compat.build_prompt(campaign, player, "look", turns)
 
+    common_keys_match = re.search(r"CHARACTER_INDEX_COMMON_KEYS:\s*(\[.*?\])\nCHARACTER_INDEX:", user_prompt, re.DOTALL)
+    assert common_keys_match is not None
+    common_keys = json.loads(common_keys_match.group(1))
+    assert "age" in common_keys
+    assert "gender" in common_keys
+    assert "speech_style" in common_keys
+
     character_index_match = re.search(r"CHARACTER_INDEX:\s*(\[.*?\])\nCHARACTER_CARDS:", user_prompt, re.DOTALL)
     assert character_index_match is not None
     character_index = json.loads(character_index_match.group(1))
-    gwen_index = next(row for row in character_index if row.get("slug") == "gwen")
-    yasmin_index = next(row for row in character_index if row.get("slug") == "yasmin-devereaux")
+    hotel_bucket = next(row for row in character_index if row.get("location") == "hotel-lobby")
+    rosedale_bucket = next(row for row in character_index if row.get("location") == "rosedale-apartment-4c")
+    gwen_index = next(row for row in hotel_bucket["characters"] if row.get("slug") == "gwen")
+    yasmin_index = next(row for row in rosedale_bucket["characters"] if row.get("slug") == "yasmin-devereaux")
 
-    assert gwen_index["critical"]["speech_style"] == "Short sentences."
-    assert gwen_index["critical"]["allegiance"] == "The configuration."
-    assert gwen_index["critical"]["age"] == "34"
-    assert gwen_index["critical"]["gender"] == "cis-female"
+    assert gwen_index["name"] == "Gwen"
     assert gwen_index["location_last_updated"] == {"day": 12, "hour": 14, "minute": 20, "loc": "hotel-lobby"}
-    assert yasmin_index["critical"]["relationship"] == "Engaged."
-    assert yasmin_index["critical"]["speech_style"] == "Sharp and quick."
-    assert yasmin_index["critical"]["gender"] == "cis-female"
+    assert gwen_index.get("current_status") is None
+    assert gwen_index.get("available_keys") is None
+    assert gwen_index.get("critical") is None
+    assert yasmin_index["name"] == "Yasmin Devereaux"
+    assert yasmin_index.get("current_status") is None
+    assert yasmin_index.get("available_keys") is None
+    assert yasmin_index.get("critical") is None
 
     world_characters_match = re.search(r"WORLD_CHARACTERS:\s*(\[.*?\])\nPLAYER_CARD:", user_prompt, re.DOTALL)
     assert world_characters_match is not None
@@ -1061,9 +1071,9 @@ def test_build_prompt_character_index_carries_roster_criticals_while_cards_stay_
     gwen_card = character_cards[0]
     assert "priority" not in gwen_card
     assert gwen_card["location_last_updated"] == {"day": 12, "hour": 14, "minute": 20, "loc": "hotel-lobby"}
-    assert gwen_card["expanded"]["personality"] == "Professional, observant, wry."
-    assert gwen_card["compact"].get("speech_style") is None
-    assert gwen_card["expanded"].get("speech_style") is None
+    assert gwen_card["personality"] == "Professional, observant, wry."
+    assert gwen_card.get("compact") is None or gwen_card["compact"].get("speech_style") is None
+    assert gwen_card.get("expanded") is None or gwen_card["expanded"].get("speech_style") is None
 
 
 def test_build_prompt_hides_internal_card_shape_keys_from_character_cards(
@@ -1321,15 +1331,10 @@ def test_build_prompt_cards_use_top_level_scan_fields_without_compact_duplicatio
     location_match = re.search(r"LOCATION_CARDS:\s*(\[.*?\])\nWORLD_CHARACTERS:", user_prompt, re.DOTALL)
     assert location_match is not None
     location_cards = json.loads(location_match.group(1))
-    room_card = next(
-        row for row in location_cards if row.get("slug") == "washington-ranch-basement-media-room"
+    assert not any(
+        row.get("slug") == "washington-ranch-basement-media-room"
+        for row in location_cards
     )
-    assert room_card["name"] == "Basement Media Room"
-    assert room_card["summary"] == "Low lamps, leather couch, humming projector."
-    assert room_card.get("compact") is None
-    assert room_card.get("available_keys") is None
-    assert "priority" not in room_card
-    assert room_card["layout"] == "Screen wall opposite the bar cart."
 
     projection_booth = next(
         row for row in location_cards if row.get("slug") == "oakhaven-projection-booth"
