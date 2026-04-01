@@ -13185,6 +13185,7 @@ class ZorkEmulator:
         campaign_state: Dict[str, object] | None = None,
         player_state: Dict[str, object] | None = None,
         include_critical_fields: bool = False,
+        fully_expand: bool = False,
     ) -> list[dict[str, object]]:
         rows: list[dict[str, object]] = []
         characters = characters or {}
@@ -13248,6 +13249,8 @@ class ZorkEmulator:
                     continue
                 priority = priorities.get(key, "low")
                 if (
+                    fully_expand
+                    or
                     (include_critical_fields and priority == "critical")
                     or (priority == "scene" and expand_scene_fields)
                 ):
@@ -13267,7 +13270,7 @@ class ZorkEmulator:
             }
             for key, value in expanded.items():
                 row[key] = value
-            if compact:
+            if compact and not fully_expand:
                 row["compact"] = compact
             rows.append(row)
         return rows
@@ -14369,6 +14372,7 @@ class ZorkEmulator:
             "a hollow silence answers",
             "the world shifts, but nothing clear emerges",
         )
+        is_individual_clocks = time_model == self.TIME_MODEL_INDIVIDUAL_CLOCKS
         for turn in turns:
             content = (turn.content or "").strip()
             if not content:
@@ -14380,6 +14384,12 @@ class ZorkEmulator:
                 viewer_location_key,
             ):
                 continue
+            # In individual_clocks mode, strip time from other players' turns
+            # so the model doesn't see conflicting day/hour values.
+            _strip_time = (
+                is_individual_clocks
+                and str(getattr(turn, "actor_id", "") or "").strip() != str(player.actor_id or "").strip()
+            )
             meta = self._safe_turn_meta(turn)
             scene_output = meta.get("scene_output")
             if isinstance(scene_output, dict) and scene_output.get("beats"):
@@ -14391,6 +14401,7 @@ class ZorkEmulator:
                     viewer_slug=viewer_slug,
                     viewer_location_key=viewer_location_key,
                     viewer_private_context_key=viewer_private_context_key,
+                    strip_time=_strip_time,
                 )
                 if jsonl_lines and turn.kind == "narrator":
                     recent_lines.extend(jsonl_lines)
@@ -14409,6 +14420,7 @@ class ZorkEmulator:
                         state,
                         content_text=clipped,
                         player_name=name,
+                        strip_time=_strip_time,
                     )
                 )
             elif turn.kind == "narrator":
@@ -14430,6 +14442,7 @@ class ZorkEmulator:
                         turn,
                         state,
                         content_text=clipped,
+                        strip_time=_strip_time,
                     )
                 )
         recent_text = "\n".join(recent_lines) if recent_lines else "None"
@@ -20137,6 +20150,9 @@ class ZorkEmulator:
             if name:
                 player_names[actor_id] = name
 
+        _is_individual_clocks = self._time_model_from_state(
+            self.get_campaign_state(campaign)
+        ) == self.TIME_MODEL_INDIVIDUAL_CLOCKS
         for turn in turns:
             content = (turn.content or "").strip()
             if not content:
@@ -20184,6 +20200,10 @@ class ZorkEmulator:
             ):
                 continue
 
+            _strip_time = (
+                _is_individual_clocks
+                and str(getattr(turn, "actor_id", "") or "").strip() != str(viewer_actor_id or "").strip()
+            )
             scene_output_lines = self._scene_output_recent_lines(
                 turn,
                 self.get_campaign_state(campaign),
@@ -20194,6 +20214,7 @@ class ZorkEmulator:
                 viewer_private_context_key=viewer_private_context_key,
                 requested_npc_slugs=requested_npc_slugs,
                 scene_npc_slugs=scene_npc_slugs,
+                strip_time=_strip_time,
             )
             if scene_output_lines and turn.kind == "narrator":
                 recent_lines.extend(scene_output_lines)
@@ -20213,6 +20234,7 @@ class ZorkEmulator:
                         campaign_state,
                         content_text=clipped,
                         player_name=name,
+                        strip_time=_strip_time,
                     )
                 )
             elif turn.kind == "narrator":
@@ -20226,6 +20248,7 @@ class ZorkEmulator:
                         turn,
                         campaign_state,
                         content_text=clipped,
+                        strip_time=_strip_time,
                     )
                 )
         return "\n".join(recent_lines) if recent_lines else "None"
@@ -20274,6 +20297,7 @@ class ZorkEmulator:
         *,
         content_text: str,
         player_name: str = "",
+        strip_time: bool = False,
     ) -> List[str]:
         text = str(content_text or "").strip()
         if not text:
@@ -20343,7 +20367,7 @@ class ZorkEmulator:
             "context_key": context_key,
             "text": text,
         }
-        if isinstance(time_source, dict):
+        if isinstance(time_source, dict) and not strip_time:
             beat["day"] = (
                 self._coerce_non_negative_int(time_source.get("day", 1), default=1) or 1
             )
@@ -20702,6 +20726,7 @@ class ZorkEmulator:
         viewer_private_context_key: str = "",
         requested_npc_slugs: Optional[set[str]] = None,
         scene_npc_slugs: Optional[set[str]] = None,
+        strip_time: bool = False,
     ) -> List[str]:
         if not isinstance(scene_output, dict):
             return []
@@ -20830,7 +20855,7 @@ class ZorkEmulator:
                 "context_key": beat.get("context_key"),
                 "text": str(beat.get("text") or "").strip(),
             }
-            if isinstance(time_source, dict):
+            if isinstance(time_source, dict) and not strip_time:
                 beat_row["day"] = self._coerce_non_negative_int(time_source.get("day", 1), default=1) or 1
                 beat_row["hour"] = min(23, max(0, self._coerce_non_negative_int(time_source.get("hour", 0), default=0)))
                 beat_row["minute"] = min(59, max(0, self._coerce_non_negative_int(time_source.get("minute", 0), default=0)))

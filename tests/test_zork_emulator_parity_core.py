@@ -2080,6 +2080,7 @@ def test_ready_to_write_finalization_reexpands_character_and_location_cards(
         final_character_match = re.search(r"FINAL_CHARACTER_CARDS:\s*(\[.*?\])\n", completion.calls[1]["prompt"], re.DOTALL)
         assert final_character_match is not None
         final_character_block = final_character_match.group(1)
+        assert '"compact":' not in final_character_block
         assert '"relationships": {"chace-preston": {"status": "engaged", "dynamic": "Tense but still committed."}}' in final_character_block
         assert '"relationship": "Brittle but engaged."' not in final_character_block
         assert "SPEAKER_CONTINUITY[yasmin-devereaux]:" not in completion.calls[1]["prompt"]
