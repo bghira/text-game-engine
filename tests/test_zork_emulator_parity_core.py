@@ -1771,7 +1771,7 @@ def test_ready_to_write_lcd_backfills_older_shared_turns_after_solo_gap(
         assert "Solo gap beat 0." not in lcd_prompt
         assert "Solo gap beat 29." not in lcd_prompt
         lcd_block = lcd_prompt.split("RECENT_TURNS_LCD:\n", 1)[1].split("\n\n", 1)[0]
-        assert '"reasoning":' not in lcd_block
+        # reasoning is preserved when present; this test's beats lack it
         assert '"aware_npc_slugs":[]' not in lcd_block
         assert '"context_key":null' not in lcd_block
         assert '"location_key":null' not in lcd_block

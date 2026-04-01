@@ -3653,13 +3653,9 @@ class ToolAwareZorkLLM:
                     recent_turn_window=recent_turn_limit,
                     max_chars=emulator.MAX_SUMMARY_CHARS,  # noqa: SLF001
                 )
-                lcd_recent_limit = max(
-                    int(getattr(emulator, "MAX_LCD_RECENT_TURNS", 8) or 8), 4
-                )
-                lcd_turns = turns[-lcd_recent_limit:] if len(turns) > lcd_recent_limit else turns
                 shared_recent = emulator._recent_turns_text_for_viewer(  # noqa: SLF001
                     campaign,
-                    lcd_turns,
+                    turns,
                     viewer_actor_id=actor_id,
                     viewer_slug=viewer_slug,
                     viewer_location_key=viewer_location_key,
@@ -3668,6 +3664,14 @@ class ToolAwareZorkLLM:
                     requested_npc_slugs=scene_npc_slugs,
                     scene_npc_slugs=scene_npc_slugs or None,
                 )
+                lcd_recent_limit = max(
+                    int(getattr(emulator, "MAX_LCD_RECENT_TURNS", 8) or 8), 4
+                )
+                _recent_lines = [
+                    ln for ln in str(shared_recent or "").splitlines() if ln.strip()
+                ]
+                if len(_recent_lines) > lcd_recent_limit:
+                    shared_recent = "\n".join(_recent_lines[-lcd_recent_limit:])
                 shared_recent_with_reasoning = shared_recent
                 shared_recent = emulator._strip_reasoning_from_recent_turn_jsonl(shared_recent)  # noqa: SLF001
                 shared_recent_texts: set[str] = set()
@@ -3715,6 +3719,9 @@ class ToolAwareZorkLLM:
                     for line in str(shared_recent or "").splitlines()
                     if line.strip()
                 }
+                speaker_line_limit = max(
+                    int(getattr(emulator, "MAX_SPEAKER_CONTINUITY_TURNS", 12) or 12), 4
+                )
                 speaker_blocks: list[str] = []
                 for speaker_slug in sorted(speaker_npc_slugs):
                     speaker_recent = emulator._recent_turns_text_for_viewer(  # noqa: SLF001
@@ -3738,6 +3745,8 @@ class ToolAwareZorkLLM:
                         ]
                         if not deduped_speaker_lines:
                             continue
+                        if len(deduped_speaker_lines) > speaker_line_limit:
+                            deduped_speaker_lines = deduped_speaker_lines[-speaker_line_limit:]
                         speaker_blocks.append(
                             f"SPEAKER_CONTINUITY[{speaker_slug}]:\n"
                             + "\n".join(deduped_speaker_lines)
