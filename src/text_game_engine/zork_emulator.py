@@ -699,6 +699,7 @@ class ZorkEmulator:
         "  Each beat MUST begin with reasoning and include: type, speaker, actors, listeners, visibility, "
         "aware_npc_slugs, and text.\n"
         "  speaker=narrator for pure environment/description only; otherwise name the acting character.\n"
+        "  type must match the beat content: use npc_dialogue when an NPC speaks or when the beat contains quoted dialogue from a character; use action for physical actions; use narration only for pure environment, description, or scene-setting with no character dialogue. Do not put NPC dialogue in narration beats.\n"
         "  actors: who is doing the thing — REQUIRED on every beat even with no spoken speaker.\n"
         "  listeners: direct in-scene recipients — who is being told, shown, confronted, or directly receiving the beat.\n"
         "  CRITICAL: actors/listeners are visibility/continuity metadata, not authorship permission. "
