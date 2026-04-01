@@ -13331,21 +13331,37 @@ class ZorkEmulator:
             if not isinstance(payload, dict):
                 continue
             is_active_location = slug.lower() == active_location
-            available_keys = sorted(
-                key
-                for key in payload.keys()
-                if key != self.LOCATION_FACT_PRIORITIES_KEY and not str(key).startswith("_")
-            )
+            location_name = str(payload.get("name") or "").strip()
+            row = {"slug": slug}
+            shown_keys: set[str] = set()
+            if location_name and location_name != slug:
+                row["name"] = location_name
+                shown_keys.add("name")
             row = {
-                "slug": slug,
-                "name": str(payload.get("name") or slug).strip(),
+                **row,
             }
             if not is_active_location:
-                row["summary"] = self._compact_prompt_fact_value(
+                summary = self._compact_prompt_fact_value(
                     payload.get("summary") or payload.get("description"),
                     max_chars=120,
                 )
-                row["available_keys"] = available_keys
+                if summary:
+                    row["summary"] = summary
+                    shown_keys.add("summary")
+                available_keys = sorted(
+                    key
+                    for key in payload.keys()
+                    if key != self.LOCATION_FACT_PRIORITIES_KEY
+                    and not str(key).startswith("_")
+                    and not (
+                        key == "name"
+                        and location_name
+                        and location_name == slug
+                    )
+                    and key not in shown_keys
+                )
+                if available_keys:
+                    row["available_keys"] = available_keys
             rows.append(row)
         return rows
 
@@ -13362,14 +13378,24 @@ class ZorkEmulator:
         for slug, payload in sorted(location_cards.items()):
             if not isinstance(payload, dict):
                 continue
-            available_keys = [
+            payload_keys = [
                 key
                 for key in payload.keys()
                 if key != self.LOCATION_FACT_PRIORITIES_KEY and not str(key).startswith("_")
             ]
             is_active_location = slug.lower() == active_location
+            location_name = str(payload.get("name") or "").strip()
+            summary = self._compact_prompt_fact_value(
+                payload.get("summary") or payload.get("description"),
+                max_chars=120,
+            )
             compact: dict[str, object] = {}
-            for key in available_keys:
+            displayed_keys: set[str] = set()
+            if location_name and location_name != slug:
+                displayed_keys.add("name")
+            if summary:
+                displayed_keys.add("summary")
+            for key in payload_keys:
                 if key in top_level_keys or key in suppressed_card_keys:
                     continue
                 priority = self._stored_location_field_priority(payload, key)
@@ -13378,8 +13404,9 @@ class ZorkEmulator:
                 compact_value = self._compact_prompt_fact_value(payload.get(key))
                 if compact_value:
                     compact[key] = compact_value
+                    displayed_keys.add(key)
             expanded: dict[str, object] = {}
-            for key in available_keys:
+            for key in payload_keys:
                 if key in top_level_keys or key in suppressed_card_keys:
                     continue
                 priority = self._stored_location_field_priority(payload, key)
@@ -13389,21 +13416,30 @@ class ZorkEmulator:
                 if value in (None, "", [], {}):
                     continue
                 expanded[key] = value
-            row = {
-                "slug": slug,
-                "name": str(payload.get("name") or slug).strip(),
-                "summary": self._compact_prompt_fact_value(
-                    payload.get("summary") or payload.get("description"),
-                    max_chars=120,
-                ),
-                "available_keys": sorted(available_keys),
-            }
+                displayed_keys.add(key)
+            row = {"slug": slug}
+            if location_name and location_name != slug:
+                row["name"] = location_name
+            if summary:
+                row["summary"] = summary
             for key in list(expanded.keys()):
                 compact.pop(key, None)
             for key, value in expanded.items():
                 row[key] = value
             if compact:
                 row["compact"] = compact
+            available_keys = sorted(
+                key
+                for key in payload_keys
+                if key not in displayed_keys
+                and not (
+                    key == "name"
+                    and location_name
+                    and location_name == slug
+                )
+            )
+            if available_keys:
+                row["available_keys"] = available_keys
             rows.append(row)
         return rows
 

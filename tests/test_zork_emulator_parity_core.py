@@ -1316,12 +1316,7 @@ def test_build_prompt_cards_use_top_level_scan_fields_without_compact_duplicatio
     assert active_location_index.get("summary") is None
     assert active_location_index.get("available_keys") is None
     assert projection_booth_index["summary"] == "Dust in the booth light."
-    assert projection_booth_index["available_keys"] == [
-        "channel_seven",
-        "monitoring_station",
-        "name",
-        "summary",
-    ]
+    assert projection_booth_index["available_keys"] == ["channel_seven", "monitoring_station"]
 
     location_match = re.search(r"LOCATION_CARDS:\s*(\[.*?\])\nWORLD_CHARACTERS:", user_prompt, re.DOTALL)
     assert location_match is not None
@@ -1332,6 +1327,7 @@ def test_build_prompt_cards_use_top_level_scan_fields_without_compact_duplicatio
     assert room_card["name"] == "Basement Media Room"
     assert room_card["summary"] == "Low lamps, leather couch, humming projector."
     assert room_card.get("compact") is None
+    assert room_card.get("available_keys") is None
     assert "priority" not in room_card
     assert room_card["layout"] == "Screen wall opposite the bar cart."
 
@@ -1342,9 +1338,55 @@ def test_build_prompt_cards_use_top_level_scan_fields_without_compact_duplicatio
     assert projection_booth["monitoring_station"] == "recording"
     assert projection_booth.get("channel_seven") is None
     assert projection_booth.get("compact") is None
+    assert projection_booth["available_keys"] == ["channel_seven"]
     assert compat.LOCATION_FACT_PRIORITIES_KEY not in projection_booth["available_keys"]
     assert '"compact": {}' not in location_match.group(1)
     assert '"expanded":' not in location_match.group(1)
+
+
+def test_location_cards_omit_redundant_name_and_remove_displayed_keys_from_available_keys(
+    session_factory,
+    seed_campaign_and_actor,
+):
+    compat = _build_compat(session_factory)
+    campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
+    player = compat.get_or_create_player(campaign.id, seed_campaign_and_actor["actor_id"])
+
+    with session_factory() as session:
+        row = session.get(Campaign, seed_campaign_and_actor["campaign_id"])
+        state = json.loads(row.state_json or "{}")
+        state[compat.LOCATION_CARDS_STATE_KEY] = {
+            "warehouse": {
+                "name": "warehouse",
+                "summary": "Cold concrete and stacked crates.",
+                "security": "Padlock on the cage.",
+                compat.LOCATION_FACT_PRIORITIES_KEY: {
+                    "security": "critical",
+                },
+            }
+        }
+        row.state_json = json.dumps(state)
+        session.commit()
+
+    turns = compat.get_recent_turns(seed_campaign_and_actor["campaign_id"])
+    _system_prompt, user_prompt = compat.build_prompt(campaign, player, "look", turns)
+
+    location_index_match = re.search(r"LOCATION_INDEX:\s*(\[.*?\])\nLOCATION_CARDS:", user_prompt, re.DOTALL)
+    assert location_index_match is not None
+    location_index = json.loads(location_index_match.group(1))
+    warehouse_index = next(row for row in location_index if row.get("slug") == "warehouse")
+    assert warehouse_index.get("name") is None
+    assert warehouse_index["summary"] == "Cold concrete and stacked crates."
+    assert warehouse_index["available_keys"] == ["security"]
+
+    location_match = re.search(r"LOCATION_CARDS:\s*(\[.*?\])\nWORLD_CHARACTERS:", user_prompt, re.DOTALL)
+    assert location_match is not None
+    location_cards = json.loads(location_match.group(1))
+    warehouse_card = next(row for row in location_cards if row.get("slug") == "warehouse")
+    assert warehouse_card.get("name") is None
+    assert warehouse_card["summary"] == "Cold concrete and stacked crates."
+    assert warehouse_card["security"] == "Padlock on the cage."
+    assert warehouse_card.get("available_keys") is None
 
 
 def test_location_update_priority_wrapper_persists_hidden_fact_priority_metadata():
