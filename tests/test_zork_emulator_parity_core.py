@@ -1713,7 +1713,7 @@ def test_ready_to_write_lcd_backfills_older_shared_turns_after_solo_gap(
                 )
             )
 
-            for idx in range(30):
+            for idx in range(130):
                 session.add(
                     Turn(
                         campaign_id=campaign.id,
@@ -1817,7 +1817,7 @@ def test_ready_to_write_lcd_backfills_older_shared_turns_after_solo_gap(
         assert "Older shared beat with Penny." in lcd_prompt
         assert "Recent shared beat with Penny." in lcd_prompt
         assert "Solo gap beat 0." not in lcd_prompt
-        assert "Solo gap beat 29." not in lcd_prompt
+        assert "Solo gap beat 129." not in lcd_prompt
         lcd_block = lcd_prompt.split("RECENT_TURNS_LCD:\n", 1)[1].split("\n\n", 1)[0]
         # reasoning is preserved when present; this test's beats lack it
         assert '"aware_npc_slugs":[]' not in lcd_block
@@ -2286,6 +2286,7 @@ def test_memory_search_excludes_recent_turns_already_in_prompt_context(
     assert f'"turn_id":{older_turn_id}' in output
     assert f'"turn_id":{newest_turn_id}' not in output
     assert '"excluded_recent_turn_count":24' in output
+    assert '"index":' not in output
 
 
 def test_memory_search_explicit_turn_scope_overrides_recent_context_exclusion(
@@ -3635,7 +3636,9 @@ def test_ready_to_write_strips_reasoning_from_recent_turns_lcd_and_speaker_conti
         recent_final_block = final_prompt.split("RECENT_TURNS_LCD:\n", 1)[1].split("\n\n", 1)[0]
         speaker_block = final_prompt.split("SPEAKER_CONTINUITY[simone-ashworth]:\n", 1)[1].split("\n\n", 1)[0]
         assert '"reasoning":' in recent_final_block
+        assert '"index":' not in recent_final_block
         assert '"reasoning":' not in speaker_block
+        assert '"index":' not in speaker_block
         assert "Shared room beat." in recent_final_block
         assert "Private Simone continuity." in speaker_block
 

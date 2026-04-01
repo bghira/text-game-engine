@@ -349,6 +349,8 @@ class ToolAwareZorkLLM:
             return {}
         cleaned: dict[str, Any] = {}
         for key, value in row.items():
+            if str(key) == "index":
+                continue
             normalized = value
             if isinstance(normalized, str):
                 normalized = normalized.strip()
@@ -3637,11 +3639,7 @@ class ToolAwareZorkLLM:
                         "\nFINAL_LOCATION_CARDS: "
                         f"{emulator._dump_json(narrowed_location_cards)}\n"  # noqa: SLF001
                     )
-                recent_turn_limit = max(
-                    int(getattr(emulator, "MAX_RECENT_TURNS", 24) or 24) * 4,
-                    64,
-                )
-                turns = emulator.get_recent_turns(campaign_id, limit=recent_turn_limit)
+                turns = emulator.get_recent_turns(campaign_id, limit=0)
                 shared_summary = emulator._compose_world_summary(  # noqa: SLF001
                     campaign,
                     campaign_state,
@@ -3651,7 +3649,7 @@ class ToolAwareZorkLLM:
                     viewer_location_key=viewer_location_key,
                     viewer_private_context_key=viewer_private_context_key,
                     scene_npc_slugs=scene_npc_slugs or None,
-                    recent_turn_window=recent_turn_limit,
+                    recent_turn_window=0,
                     max_chars=emulator.MAX_SUMMARY_CHARS,  # noqa: SLF001
                 )
                 shared_recent = emulator._recent_turns_text_for_viewer(  # noqa: SLF001

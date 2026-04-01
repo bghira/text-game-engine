@@ -7515,13 +7515,14 @@ class ZorkEmulator:
         if limit is None:
             limit = self.MAX_RECENT_TURNS
         with self._session_factory() as session:
-            rows = (
+            query = (
                 session.query(Turn)
                 .filter(Turn.campaign_id == campaign_id)
                 .order_by(Turn.id.desc())
-                .limit(limit)
-                .all()
             )
+            if int(limit or 0) > 0:
+                query = query.limit(limit)
+            rows = query.all()
             rows.reverse()
             return rows
 
@@ -9784,7 +9785,10 @@ class ZorkEmulator:
         for raw_line in str(summary or "").splitlines():
             _append_if_relevant(persisted_lines, raw_line)
 
-        summary_turn_window = max(1, int(recent_turn_window or 24))
+        summary_turn_window = int(recent_turn_window or 0)
+        if summary_turn_window <= 0:
+            summary_turn_window = len(turns or []) if isinstance(turns, list) else 24
+        summary_turn_window = max(1, summary_turn_window)
         if isinstance(turns, list) and viewer_actor_id and turns:
             for turn in turns[-summary_turn_window:]:
                 if not isinstance(turn, Turn) or turn.kind != "narrator":
@@ -20368,6 +20372,8 @@ class ZorkEmulator:
             return {}
         cleaned: dict[str, object] = {}
         for key, value in row.items():
+            if str(key) == "index":
+                continue
             normalized = value
             if isinstance(normalized, str):
                 normalized = normalized.strip()
