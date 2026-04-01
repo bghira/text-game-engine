@@ -1037,11 +1037,12 @@ def test_build_prompt_character_index_is_slim_and_moves_shared_schema_to_common_
     yasmin_index = next(row for row in rosedale_bucket["characters"] if row.get("slug") == "yasmin-devereaux")
 
     assert gwen_index["name"] == "Gwen"
-    assert gwen_index["location_last_updated"] == {"day": 12, "hour": 14, "minute": 20, "loc": "hotel-lobby"}
+    assert gwen_index["age"] == "34"
     assert gwen_index.get("current_status") is None
     assert gwen_index.get("available_keys") is None
     assert gwen_index.get("critical") is None
     assert yasmin_index["name"] == "Yasmin Devereaux"
+    assert yasmin_index["age"] == "29"
     assert yasmin_index.get("current_status") is None
     assert yasmin_index.get("available_keys") is None
     assert yasmin_index.get("critical") is None

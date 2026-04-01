@@ -13073,7 +13073,7 @@ class ZorkEmulator:
             row = {
                 "slug": slug,
                 "name": str(entry.get("name") or slug).strip(),
-                "location_last_updated": source.get("location_last_updated"),
+                "age": source.get("age"),
             }
             bucket["characters"].append(row)
 
