@@ -14372,7 +14372,7 @@ class ZorkEmulator:
             "a hollow silence answers",
             "the world shifts, but nothing clear emerges",
         )
-        is_individual_clocks = time_model == self.TIME_MODEL_INDIVIDUAL_CLOCKS
+        is_individual_clocks = self._time_model_from_state(state) == self.TIME_MODEL_INDIVIDUAL_CLOCKS
         for turn in turns:
             content = (turn.content or "").strip()
             if not content:
