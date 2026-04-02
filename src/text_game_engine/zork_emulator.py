@@ -9723,11 +9723,17 @@ class ZorkEmulator:
         finally:
             self._clear_timed_event_inflight(campaign_id, active_actor_id)
 
-    def _trim_text(self, text: str, max_chars: int) -> str:
+    def _trim_text(self, text: str, max_chars: int, *, keep_end: bool = False) -> str:
         if text is None:
             return ""
         if len(text) <= max_chars:
             return text
+        if keep_end:
+            # Drop whole lines from the front to stay under budget.
+            lines = text.splitlines()
+            while lines and sum(len(ln) + 1 for ln in lines) - 1 > max_chars:
+                lines.pop(0)
+            return "\n".join(lines)
         return text[:max_chars]
 
     def _append_summary(self, existing: str, update: str) -> str:
@@ -9827,7 +9833,7 @@ class ZorkEmulator:
         lines = recent_lines if recent_lines else persisted_lines
         text = "\n".join(lines).strip()
         if text:
-            return self._trim_text(text, max_chars)
+            return self._trim_text(text, max_chars, keep_end=True)
 
         story_context = self._build_story_context(campaign_state)
         if story_context:
