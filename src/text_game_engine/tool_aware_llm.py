@@ -3121,9 +3121,13 @@ class ToolAwareZorkLLM:
             return self._tool_memory_terms(campaign_id, payload)
         if name == "source_browse":
             return self._tool_source_browse(campaign_id, payload)
-        if name in {"source_material_search", "source_search", "source_lookup"}:
-            # Common hallucinated tool names — redirect to memory_search with source scope.
-            queries = payload.get("queries") or payload.get("query")
+        if name.startswith("source") and name != "source_browse":
+            # Catch all hallucinated source_* tool names and redirect to the real tools.
+            # If the payload has a document_key, treat it as a source_browse.
+            if payload.get("document_key"):
+                return self._tool_source_browse(campaign_id, payload)
+            # Otherwise treat as memory_search with source scope.
+            queries = payload.get("queries") or payload.get("query") or payload.get("key")
             if isinstance(queries, str):
                 queries = [queries]
             if not isinstance(queries, list) or not queries:
