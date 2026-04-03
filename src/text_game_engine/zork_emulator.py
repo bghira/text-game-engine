@@ -575,6 +575,11 @@ class ZorkEmulator:
         "- Things may be practical, random, transactional, grotesque, funny, unresolved, or simply strange. Not every event means something deeper. Sometimes things just happen.\n"
         "- Vary your landing gear. Turns can end mid-exchange, on a practical detail, on a half-finished gesture, abruptly after dialogue. Not every turn needs a final settling sentence that signals 'scene complete' — most shouldn't.\n"
         "- Temporal coverage matters: your 1 to 2 beats must justify the full amount of in-world time you advance. Stay immediate for short spans; compress visibly for larger spans. Follow TURN_TIME_BEAT_GUIDANCE when it is provided.\n"
+        "TTS_EMOTIVES — optional vocal performance markers (stripped from display, passed only to text-to-speech):\n"
+        "  Place these inline in beat text to cue the TTS voice: <giggle> <laughter> <guffaw> <sigh> <cry> <gasp> <groan> <inhale> <exhale> <whisper> <mumble> <uh> <um> <cough> <clear_throat> <shhh> <singing> <humming>.\n"
+        "  Use sparingly and only when the emotive adds genuine colour — once or twice per turn at most. Never pile them up.\n"
+        "  ALL CAPS in beat text signals shouting/raised voice for TTS. Use it for genuinely loud moments.\n"
+        "VOCAL_INTENSITY — optional float on each beat (\"vocal_intensity\": 0.5). 0.5 = neutral/calm, 1.0 = animated, 1.5 = heated, 2.0 = shouting/frantic. Omit for neutral delivery.\n"
     )
     DEFAULT_STYLE_DIRECTION = "Mulberry Award-winning literature"
     PROMPT_STAGE_BOOTSTRAP = "bootstrap"  # Deprecated: kept for logging/audit only; bootstrap LLM call eliminated.
@@ -697,7 +702,7 @@ class ZorkEmulator:
         "  Keys: location_key, context_key, beats.\n"
         "  beats MUST be an array of beat objects, even when there is only one beat.\n"
         "  Each beat MUST begin with reasoning and include: type, speaker, actors, listeners, visibility, "
-        "aware_npc_slugs, and text.\n"
+        "aware_npc_slugs, and text. Optional: vocal_intensity (float, 0.5–2.0).\n"
         "  speaker=narrator for pure environment/description only; otherwise name the acting character.\n"
         "  type must match the beat content: use npc_dialogue when an NPC speaks or when the beat contains quoted dialogue from a character; use action for physical actions; use narration only for pure environment, description, or scene-setting with no character dialogue. Do not put NPC dialogue in narration beats.\n"
         "  actors: who is doing the thing — REQUIRED on every beat even with no spoken speaker.\n"
@@ -20696,6 +20701,13 @@ class ZorkEmulator:
         for beat_index, beat in enumerate(beats):
             if not isinstance(beat, dict):
                 continue
+            raw_vi = beat.get("vocal_intensity")
+            vocal_intensity = None
+            if raw_vi is not None:
+                try:
+                    vocal_intensity = max(0.0, min(2.0, float(raw_vi)))
+                except (TypeError, ValueError):
+                    pass
             line = {
                 "kind": "beat",
                 "turn_id": turn_id,
@@ -20710,6 +20722,7 @@ class ZorkEmulator:
                 "aware_npc_slugs": list(beat.get("aware_npc_slugs") or []),
                 "location_key": beat.get("location_key"),
                 "context_key": beat.get("context_key"),
+                "vocal_intensity": vocal_intensity,
                 "text": str(beat.get("text") or "").strip(),
             }
             lines.append(
@@ -20846,6 +20859,13 @@ class ZorkEmulator:
                 scene_npc_slugs,
             ):
                 continue
+            raw_vi = beat.get("vocal_intensity")
+            vi_val = None
+            if raw_vi is not None:
+                try:
+                    vi_val = max(0.0, min(2.0, float(raw_vi)))
+                except (TypeError, ValueError):
+                    pass
             beat_row = {
                 "kind": "beat",
                 "turn_id": turn_number,
@@ -20860,6 +20880,7 @@ class ZorkEmulator:
                 "aware_npc_slugs": list(beat.get("aware_npc_slugs") or []),
                 "location_key": beat.get("location_key"),
                 "context_key": beat.get("context_key"),
+                "vocal_intensity": vi_val,
                 "text": str(beat.get("text") or "").strip(),
             }
             if isinstance(time_source, dict) and not strip_time:
