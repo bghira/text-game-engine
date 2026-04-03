@@ -3121,6 +3121,15 @@ class ToolAwareZorkLLM:
             return self._tool_memory_terms(campaign_id, payload)
         if name == "source_browse":
             return self._tool_source_browse(campaign_id, payload)
+        if name in {"source_material_search", "source_search", "source_lookup"}:
+            # Common hallucinated tool names — redirect to memory_search with source scope.
+            queries = payload.get("queries") or payload.get("query")
+            if isinstance(queries, str):
+                queries = [queries]
+            if not isinstance(queries, list) or not queries:
+                queries = [str(payload.get("keyword") or payload.get("term") or "")]
+            redirected = {"tool_call": "memory_search", "category": "source", "queries": queries}
+            return self._tool_memory_search(campaign_id, redirected, actor_id=actor_id)
         if name == "communication_rules":
             return self._tool_communication_rules(payload)
         if name in {"autobiography_append", "autobiography_update"}:
