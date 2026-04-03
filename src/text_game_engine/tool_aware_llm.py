@@ -3613,6 +3613,21 @@ class ToolAwareZorkLLM:
                     slug for slug in listener_npc_slugs if slug and slug not in player_slugs and slug != viewer_slug
                 }
                 scene_npc_slugs = speaker_npc_slugs.union(listener_npc_slugs)
+                # All participant slugs (NPCs + players) for summary/recent-turns LCD filtering.
+                _all_speaker_slugs = {
+                    emulator._player_slug_key(raw_slug)  # noqa: SLF001
+                    for raw_slug in list(_ready_speakers)
+                    if emulator._player_slug_key(raw_slug)  # noqa: SLF001
+                }
+                _all_listener_slugs = {
+                    emulator._player_slug_key(raw_slug)  # noqa: SLF001
+                    for raw_slug in list(_ready_listeners)
+                    if emulator._player_slug_key(raw_slug)  # noqa: SLF001
+                }
+                scene_participant_slugs = _all_speaker_slugs.union(_all_listener_slugs)
+                # Always include the viewer so their own turns pass the filter.
+                if viewer_slug:
+                    scene_participant_slugs.add(viewer_slug)
                 final_character_entries: list[dict[str, Any]] = []
                 for slug in sorted(scene_npc_slugs):
                     row = campaign_characters.get(slug) if isinstance(campaign_characters, dict) else None
@@ -3654,6 +3669,10 @@ class ToolAwareZorkLLM:
                         f"{emulator._dump_json(narrowed_location_cards)}\n"  # noqa: SLF001
                     )
                 turns = emulator.get_recent_turns(campaign_id, limit=0)
+                # Use full participant set (NPCs + players) for summary/recent-turns
+                # LCD filtering so the narration agent only sees events all scene
+                # participants would plausibly know about.
+                _lcd_slugs = scene_participant_slugs or scene_npc_slugs or None
                 shared_summary = emulator._compose_world_summary(  # noqa: SLF001
                     campaign,
                     campaign_state,
@@ -3662,7 +3681,7 @@ class ToolAwareZorkLLM:
                     viewer_slug=viewer_slug,
                     viewer_location_key=viewer_location_key,
                     viewer_private_context_key=viewer_private_context_key,
-                    scene_npc_slugs=scene_npc_slugs or None,
+                    scene_npc_slugs=_lcd_slugs,
                     recent_turn_window=0,
                     max_chars=emulator.MAX_SUMMARY_CHARS,  # noqa: SLF001
                 )
@@ -3675,7 +3694,7 @@ class ToolAwareZorkLLM:
                     viewer_private_context_key=viewer_private_context_key,
                     requested_player_slugs=set(),
                     requested_npc_slugs=scene_npc_slugs,
-                    scene_npc_slugs=scene_npc_slugs or None,
+                    scene_npc_slugs=_lcd_slugs,
                 )
                 lcd_recent_limit = max(
                     int(getattr(emulator, "MAX_LCD_RECENT_TURNS", 8) or 8), 4
@@ -3701,14 +3720,14 @@ class ToolAwareZorkLLM:
                     text_value = str(payload.get("text") or "").strip()
                     if text_value:
                         shared_recent_texts.add(text_value)
-                if shared_summary and not scene_npc_slugs:
+                if shared_summary and not _lcd_slugs:
                     deduped_summary_lines = [
                         line
                         for line in str(shared_summary).splitlines()
                         if line.strip() and line.strip() not in shared_recent_texts
                     ]
                     shared_summary = "\n".join(deduped_summary_lines).strip()
-                if scene_npc_slugs:
+                if _lcd_slugs:
                     _clean_final_user_prompt = re.sub(
                         r"(?m)^WORLD_SUMMARY(?:_FINAL)?:[^\n]*\n?",
                         "",
