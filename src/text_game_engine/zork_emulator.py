@@ -20464,7 +20464,6 @@ class ZorkEmulator:
             )
         ]
 
-    @staticmethod
     # Keys that are TTS-only and should never appear in context output
     _RECENT_TURN_STRIP_KEYS = {"index", "vocal_intensity"}
 

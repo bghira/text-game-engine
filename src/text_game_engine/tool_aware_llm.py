@@ -343,7 +343,6 @@ class ToolAwareZorkLLM:
             normalized = normalized[: max_chars - 3].rstrip() + "..."
         return normalized
 
-    @staticmethod
     # Keys that are TTS-only and should never appear in context output
     _TOOL_ROW_STRIP_KEYS = {"index", "vocal_intensity"}
 
