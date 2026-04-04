@@ -598,7 +598,8 @@ class ZorkEmulator:
         "Do NOT narrate yet unless the system explicitly says to finalize.\n"
         "Do NOT output planning prose, self-talk, or meta lines such as 'I need to...', 'Let me...', or 'I should...'.\n"
         "In research phase, output ONLY a JSON tool call or ready_to_write JSON.\n"
-        "Your job in this phase is to gather any deeper continuity, canon, SMS, plot, chapter, or consequence context that materially matters for this turn.\n"
+        "Your job in this phase is to gather continuity, canon, SMS, plot, chapter, or consequence context needed for this turn. "
+        "Always look up character history and relationships rather than inventing or inferring them.\n"
         'When research is sufficient, return ONLY {"tool_call": "ready_to_write", "speakers": [...], "listeners": [...]}.\n'
     )
     READY_TO_WRITE_TOOL_PROMPT = (
@@ -1099,17 +1100,7 @@ class ZorkEmulator:
         "or the world should move without the player.\n"
         "- Your narration should hint at urgency narratively (e.g. 'the footsteps grow louder') but NEVER include countdowns, timestamps, emoji clocks, or explicit seconds. The system adds its own countdown display automatically.\n"
     )
-    MEMORY_LOOKUP_MIN_SUMMARY_CHARS = 2000
-    MEMORY_TOOL_DISABLED_PROMPT = (
-        "\nEARLY-CAMPAIGN MEMORY MODE:\n"
-        "- Long-term memory lookup tools are disabled for this turn because WORLD_SUMMARY is still within context budget.\n"
-        "- Source-material memory search should only be enabled when the current player action explicitly asks for canon recall/details.\n"
-        "- Do NOT call memory_search, memory_terms, memory_turn, or memory_store.\n"
-        "- You may still call recent_turns for immediate visible continuity.\n"
-        "- Use WORLD_SUMMARY, WORLD_STATE, SCENE_STATE, CHARACTER_INDEX, CHARACTER_CARDS, LOCATION_INDEX, LOCATION_CARDS, PARTY_SNAPSHOT, and recent_turns when needed.\n"
-        "- SCENE_STATE is the immediate actionable scene. CHARACTER_CARDS / LOCATION_CARDS are the primary entity fact stores.\n"
-        "- WORLD_CHARACTERS remains as a compatibility alias; prefer CHARACTER_INDEX and CHARACTER_CARDS.\n"
-    )
+    MEMORY_LOOKUP_MIN_SUMMARY_CHARS = 0
     RECENT_TURNS_TOOL_PROMPT = (
         "\nYou have a recent_turns tool for immediate visible continuity.\n"
         "You MUST call it before final narration/state JSON on every normal gameplay turn.\n"
@@ -7709,10 +7700,49 @@ class ZorkEmulator:
                         interrupt_note += f' Interruption context: "{interrupt_action.strip()}"'
                     with self._session_factory() as session:
                         campaign = session.get(Campaign, campaign_id)
-                        campaign_state = parse_json_dict(campaign.state_json) if campaign is not None else {}
-                        turn_meta = self._dump_json(
-                            {"game_time": self._extract_game_time_snapshot(campaign_state)}
+                        actor = (
+                            session.query(Player)
+                            .filter(Player.campaign_id == campaign_id)
+                            .filter(Player.actor_id == actor_id)
+                            .first()
                         )
+                        campaign_state = parse_json_dict(campaign.state_json) if campaign is not None else {}
+                        turn_visibility = self._default_turn_visibility_meta(
+                            campaign,
+                            actor,
+                            is_private_context=False,
+                        ) if campaign is not None else {
+                            "scope": "limited",
+                            "actor_player_slug": None,
+                            "actor_actor_id": actor_id,
+                            "visible_player_slugs": [],
+                            "visible_actor_ids": [actor_id],
+                            "location_key": None,
+                            "context_key": None,
+                            "aware_npc_slugs": [],
+                            "source": "timer-interrupted-fallback",
+                        }
+                        if str(turn_visibility.get("scope") or "").strip().lower() == "public":
+                            turn_visibility["scope"] = "limited"
+                            turn_visibility["visible_actor_ids"] = [str(actor_id)]
+                            actor_slug = self._player_slug_key(turn_visibility.get("actor_player_slug"))
+                            turn_visibility["visible_player_slugs"] = [actor_slug] if actor_slug else []
+                            turn_visibility["location_key"] = None
+                            turn_visibility["source"] = "timer-interrupted-limited"
+                        turn_meta_payload = {
+                            "game_time": self._extract_game_time_snapshot(campaign_state),
+                            "visibility": turn_visibility,
+                        }
+                        resolved_keys = self._resolved_turn_visibility_keys(
+                            turn_visibility,
+                            scene_output_raw=None,
+                            player_state_update=None,
+                        )
+                        if resolved_keys.get("location_key"):
+                            turn_meta_payload["location_key"] = resolved_keys["location_key"]
+                        if resolved_keys.get("context_key"):
+                            turn_meta_payload["context_key"] = resolved_keys["context_key"]
+                        turn_meta = self._dump_json(turn_meta_payload)
                         session.add(
                             Turn(
                                 campaign_id=campaign_id,
@@ -9393,7 +9423,8 @@ class ZorkEmulator:
                     "RECENT_TURNS is pre-loaded for research reference — do not call recent_turns again this turn."
                 ),
                 (
-                    "Use memory/source/SMS/planning tools only when they materially improve continuity."
+                    "Use memory/source/SMS/planning tools to look up character history, relationships, and prior events before writing. "
+                    "Do not invent backstory, origin details, or relationship history from inference — look it up."
                 ),
                 (
                     "You MUST return ready_to_write to proceed — it triggers a separate writing prompt with "
@@ -14726,20 +14757,14 @@ class ZorkEmulator:
         if stage == self.PROMPT_STAGE_BOOTSTRAP:
             system_prompt = self.BOOTSTRAP_SYSTEM_PROMPT
             system_prompt = f"{system_prompt}{self.RECENT_TURNS_TOOL_PROMPT}"
-            if memory_lookup_enabled:
-                system_prompt = f"{system_prompt}{self.MEMORY_BOOTSTRAP_TOOL_PROMPT}"
-            else:
-                system_prompt = f"{system_prompt}{self.MEMORY_TOOL_DISABLED_PROMPT}"
+            system_prompt = f"{system_prompt}{self.MEMORY_BOOTSTRAP_TOOL_PROMPT}"
         elif stage == self.PROMPT_STAGE_RESEARCH:
             system_prompt = self.RESEARCH_SYSTEM_PROMPT
             if guardrails_enabled:
                 system_prompt = f"{system_prompt}{self.GUARDRAILS_SYSTEM_PROMPT}"
             if on_rails:
                 system_prompt = f"{system_prompt}{self.ON_RAILS_SYSTEM_PROMPT}"
-            if memory_lookup_enabled:
-                system_prompt = f"{system_prompt}{self.MEMORY_TOOL_PROMPT}"
-            else:
-                system_prompt = f"{system_prompt}{self.MEMORY_TOOL_DISABLED_PROMPT}"
+            system_prompt = f"{system_prompt}{self.MEMORY_TOOL_PROMPT}"
             system_prompt = f"{system_prompt}{self.SMS_TOOL_PROMPT}"
             system_prompt = f"{system_prompt}{self.SONG_SEARCH_TOOL_PROMPT}"
             if state.get("timed_events_enabled", True):

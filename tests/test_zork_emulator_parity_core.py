@@ -5934,6 +5934,53 @@ def test_global_timer_can_be_interrupted_by_any_player(session_factory, seed_cam
     asyncio.run(run_test())
 
 
+def test_timer_interrupted_turn_is_not_persisted_as_public_visibility(
+    session_factory,
+    seed_campaign_and_actor,
+):
+    async def run_test():
+        compat = _build_compat(session_factory)
+        campaign_id = seed_campaign_and_actor["campaign_id"]
+        owner_actor_id = seed_campaign_and_actor["actor_id"]
+        other_actor_id = "actor-2"
+        compat.get_or_create_player(campaign_id, owner_actor_id)
+        compat.get_or_create_player(campaign_id, other_actor_id)
+
+        compat._schedule_timer(
+            campaign_id=campaign_id,
+            channel_id="chan-1",
+            delay_seconds=300,
+            event_description="The alarm countdown begins.",
+            interruptible=True,
+            interrupt_scope="global",
+            interrupt_actor_id=owner_actor_id,
+        )
+
+        narration = await compat.play_action(
+            campaign_id=campaign_id,
+            actor_id=other_actor_id,
+            action="slam the console switch",
+        )
+        assert narration is not None
+
+        with session_factory() as session:
+            interrupted_turn = (
+                session.query(Turn)
+                .filter(Turn.campaign_id == campaign_id)
+                .filter(Turn.kind == "narrator")
+                .filter(Turn.content.contains("[TIMER INTERRUPTED]"))
+                .order_by(Turn.id.desc())
+                .first()
+            )
+            assert interrupted_turn is not None
+            meta = json.loads(interrupted_turn.meta_json or "{}")
+            visibility = meta.get("visibility") or {}
+            assert visibility.get("scope") != "public"
+            assert str(other_actor_id) in [str(item) for item in list(visibility.get("visible_actor_ids") or [])]
+
+    asyncio.run(run_test())
+
+
 def test_ooc_action_does_not_record_player_turn(
     uow_factory,
     session_factory,
