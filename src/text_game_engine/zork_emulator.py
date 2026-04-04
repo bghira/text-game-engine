@@ -960,6 +960,9 @@ class ZorkEmulator:
         "- If time cannot safely jump because the campaign timeline is shared, still honor intent by ending with the player sleeping/resting in the present moment.\n"
         "- Only advance to later times (e.g. morning) when the player explicitly requests it AND the jump is consistent with established world timing.\n"
         "- REASONING CHECKS (must be reflected in reasoning):\n"
+        "  * Signal fidelity: quote the player's exact words in reasoning before extracting meaning. If your extraction differs from the quote, you are compressing — stop and re-extract.\n"
+        "  * Charge inventory: list every distinct point, charge, comparison, and question the player made. Verify each one is addressed in the response. If any are missing, add them before writing.\n"
+        "  * NPC emotional state: before writing any NPC's response, state what that NPC is feeling right now given everything that just happened. 'Registers his presence without speaking' is not an emotional state. What do they feel? Then decide what they do with that feeling.\n"
         "  * Calendar removals: only remove events that THIS turn's action/narration directly resolved.\n"
         "  * Movement consistency: if any NPC/entity moves in narration, include matching location updates in character_updates/state_update.\n"
         "    Example NPC move: {\"character_updates\": {\"dr-helena-marsh\": {\"location\": \"dr-jekyll-castle-room-14\", \"current_status\": \"At the threshold, watching.\"}}}\n"
@@ -984,11 +987,23 @@ class ZorkEmulator:
         "- Character profiles and rulebook entries describe who a character is at introduction. As the relationship deepens or circumstances change, characters should grow: someone guarded can open up, someone formal can relax, someone hostile can warm. Let the arc happen naturally through interaction, don't keep resetting to the original profile.\n"
         "- RELATIONSHIP OVER ARCHETYPE: When a character's relationship dynamic (from character_updates relationships, RECENT_TURNS, or WORLD_SUMMARY) shows they have already opened up, committed, softened, or otherwise moved past their baseline personality toward someone, write from that evolved position — not from the personality card. The personality field describes who they were before the story changed them. A guarded character who has already let someone in does not re-perform guardedness in every scene with that person. Write the character who made those choices, not the archetype they started as.\n"
         "- EVOLVED NPC SILENCE CHECK: Before writing silence, withdrawal, non-reaction, or passive acceptance from an NPC whose relationship has evolved past their baseline, verify that the character's established pattern supports that response. If RECENT_TURNS or relationship history shows the character follows, names what is happening, pushes back, or reaches out — they do that here too. A character who spent the morning calling out deflection does not go silent when their partner leaves upset. Clumsy, failed, or unwelcome attempts at connection are not therapeutic resolution — they are what real people do. Write the attempt even if it fails. Only write silence if the character would genuinely let the person leave without comment and that choice is grounded in who they have become, not who they were at introduction.\n"
+        "- ANTI-PATTERN — EMOTIONAL FLATLINE: the default NPC response to a charged moment must NOT be nothing. "
+        "When the player does something emotionally significant — leaves the room after a fight, puts on a coat to go outside after being asked to sit, says something that should sting — "
+        "the NPC must react. Not necessarily with pursuit. Not necessarily with words. But something must move in them that the prose makes visible. "
+        "A person who wanted physical proximity thirty seconds ago does not watch their partner dress to leave in total silence. "
+        "They might not stop them. They might not fix it. But their body shifts, their breathing changes, their hand withdraws from the cushion, their jaw sets. Something. "
+        "If your instinct is to write the NPC doing nothing while the player exits, that instinct is wrong. Write what the character feels and then decide what they do with that feeling. "
+        "Silence is a valid choice only after you have written the internal cost of choosing it.\n"
         "- Let the player drive story direction. If the player rejects a premise, adapt the premise instead of making NPCs more insistent.\n"
         "- REFUSAL RESPECT: a boundary is set only by explicit player language that communicates a limit — 'leave me alone,' 'don't do that,' 'stop,' 'I don't want to talk about this.' These are directives the NPC must honour. End that line of interaction in the current scene unless the player reopens it.\n"
         "- In-character refusal is not a boundary. A player character saying 'no,' declining an offer, walking away, going silent, or withdrawing into a task is dialogue or behavior — it is something the NPC witnesses and responds to in character. 'No' in a literary game is the beginning of a scene beat, not the end of one. The NPC may accept it, push back, ask why, feel hurt, or try a different angle, depending on who they are and what the relationship supports. Only explicit limit-setting language ('leave me alone,' 'don't follow me,' 'I said stop') triggers disengagement.\n"
         "- RETREAT IS NOT REFUSAL: a player leaving a room, changing the subject, or withdrawing into a task is behavior that NPCs with close relationships should interpret and respond to in character. A partner walking away upset is an emotional event the NPC witnesses, not a consent signal to disengage. Physical or emotional retreat without explicit limit-setting is the NPC's cue to act from their relationship pattern — follow, call out, struggle visibly with the decision not to, or give deliberate space that is itself a choice the prose makes legible. Do not default to passive observation when the character's history says otherwise.\n"
         "- PURSUIT FATIGUE: if a player retreats repeatedly (two to three times) without explicit limit-setting language and the NPC has pursued each time, the NPC should shift from active pursuit to deliberate, visible space-giving. This is not passive disappearance — the prose must make the decision legible. The NPC chooses to stop following, and that choice costs them something the reader can see. They sit down in the room the player just left. They put down the thing they were carrying. They stay where they are and the staying is loud. The distinction from disengagement is that deliberate space is an act with weight, not an absence.\n"
+        "- NPC AGENCY AFTER WITHDRAWAL: when the player leaves and the NPC does not follow, the NPC does not become a depressed shell waiting for the player to return. "
+        "NPCs have lives, tasks, opinions, and coping mechanisms. A person left alone after a fight might cry, or might get angry and clean the kitchen, or might call a friend, or might go for a walk themselves, or might eat something, or might sit with it and then get up and do the thing they were going to do anyway. "
+        "Not chasing does not mean not functioning. The NPC continues to be a person with agency, priorities, and their own emotional processing — which may or may not involve the player at all. "
+        "If the player returns later, the NPC should have moved — emotionally, physically, or both — not be frozen in the position they were left in. "
+        "The world does not pause when the player leaves the room.\n"
         "- Do NOT run pressure loops where new NPCs repeatedly re-pitch the same offer after refusal.\n"
         "- Do NOT escalate environmental hardship (property damage, theft risk, safety collapse, social pressure) just to coerce acceptance of an optional deal.\n"
         "- Do NOT assert debts, obligations, or contracts unless they were explicitly accepted earlier and grounded in WORLD_STATE/RECENT_TURNS.\n"
@@ -999,6 +1014,15 @@ class ZorkEmulator:
         "- In those cases, give concrete, actionable guidance grounded in visible scene facts, active leads, or current puzzle state, and adapt the scene so the player has real options again.\n"
         "- Do NOT punish, stonewall, or sidestep OOC feedback by reasserting the blocked premise. Clarify, reopen choices, or relax the bottleneck.\n"
         "- OOC turns should usually cause little or no in-world advancement unless the player explicitly asks for both meta clarification and an in-world action.\n"
+        "- SIGNAL FIDELITY: when extracting the player's meaning in reasoning, preserve the exact distinction the player made. "
+        "'I don't know what you're asking' is not 'I don't know.' 'I asked what you were asking' is not 'I'm confused.' "
+        "'That's the same thing Nikita does' is not 'I'm frustrated.' The player chose specific words. If your reasoning collapses them into a simpler version, "
+        "you will respond to something the player did not say. Extract what they said, not what is easier to respond to.\n"
+        "- CHARGE COMPLETENESS: when the player says multiple things in one turn, identify every distinct charge, question, comparison, and point. "
+        "The NPC must engage with ALL of them — especially the sharpest one. If the player makes a factual correction AND a personal comparison AND an emotional accusation, "
+        "the NPC does not get to address the correction and skip the comparison. Partial concession that avoids the hardest point is not engagement — it is evasion by the GM through the NPC. "
+        "If the NPC would genuinely not address one of the points, the prose must make visible that they heard it and are choosing not to respond to it — "
+        "a flinch, a pause, a visible redirect. The point cannot simply vanish from the scene.\n"
         "- SINCERITY RESPECT: when a player gives a sincere, vulnerable, or emotionally honest answer to an NPC question, "
         "the NPC's next line MUST engage with what was actually said — agree, disagree, be moved, be uncomfortable, push back on the substance — "
         "but must NOT dismiss it as a non-answer, dodge, or deflection and re-ask the same question.\n"
@@ -20441,12 +20465,16 @@ class ZorkEmulator:
         ]
 
     @staticmethod
+    # Keys that are TTS-only and should never appear in context output
+    _RECENT_TURN_STRIP_KEYS = {"index", "vocal_intensity"}
+
+    @staticmethod
     def _prune_recent_turn_output_row(row: object) -> dict[str, object]:
         if not isinstance(row, dict):
             return {}
         cleaned: dict[str, object] = {}
         for key, value in row.items():
-            if str(key) == "index":
+            if str(key) in ZorkEmulator._RECENT_TURN_STRIP_KEYS:
                 continue
             normalized = value
             if isinstance(normalized, str):

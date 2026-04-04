@@ -344,12 +344,16 @@ class ToolAwareZorkLLM:
         return normalized
 
     @staticmethod
+    # Keys that are TTS-only and should never appear in context output
+    _TOOL_ROW_STRIP_KEYS = {"index", "vocal_intensity"}
+
+    @staticmethod
     def _prune_recent_turn_tool_row(row: object) -> dict[str, Any]:
         if not isinstance(row, dict):
             return {}
         cleaned: dict[str, Any] = {}
         for key, value in row.items():
-            if str(key) == "index":
+            if str(key) in ToolAwareLLM._TOOL_ROW_STRIP_KEYS:
                 continue
             normalized = value
             if isinstance(normalized, str):
