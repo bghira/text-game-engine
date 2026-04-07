@@ -528,6 +528,7 @@ class ZorkEmulator:
     }
     RESPONSE_STYLE_NOTE = (
         "[SYSTEM NOTE: FOR THIS RESPONSE ONLY: use the current style direction. Narrate in 1 to 2 beats as needed, and make those beats cover the full in-world time you advance this turn. "
+        "Each beat has exactly ONE speaker — never put dialogue from two different characters in the same beat object. Separate characters = separate beats. "
         "No recap of unchanged facts. No flowery language unless a character canonically speaks that way. "
         "Do not restage the room with a closing tableau or camera sweep over unchanged props, plates, parked cars, shadows, music, or weather. "
         "If those details did not materially change this turn, leave them implicit. "
@@ -702,6 +703,10 @@ class ZorkEmulator:
         "  scene_output MUST be a JSON object, never a string.\n"
         "  Keys: location_key, context_key, beats.\n"
         "  beats MUST be an array of beat objects, even when there is only one beat.\n"
+        "  ONE SPEAKER PER BEAT — NEVER combine dialogue or actions from multiple characters in the same beat object. "
+        "If two characters speak in the same turn, that is two separate beat objects, each with its own speaker. "
+        "A beat's speaker field identifies the single character who owns that beat's text. "
+        "Violating this rule breaks TTS rendering and visibility routing.\n"
         "  Each beat MUST begin with reasoning and include: type, speaker, actors, listeners, visibility, "
         "aware_npc_slugs, and text. Optional: vocal_intensity (float, 0.5–2.0).\n"
         "  speaker=narrator for pure environment/description only; otherwise name the acting character.\n"
