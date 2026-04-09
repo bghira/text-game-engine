@@ -43,14 +43,32 @@ class ZAIBackend:
             "thinking_enabled", self._thinking_enabled
         )
         messages = self._prepare_messages(request.messages)
-        stream = await asyncio.to_thread(
-            self._open_stream,
-            messages,
-            model=model,
-            temperature=request.temperature,
-            max_tokens=request.max_tokens,
-            thinking_enabled=bool(thinking),
-        )
+
+        delay = 2.0
+        max_delay = 120.0
+        while True:
+            try:
+                stream = await asyncio.to_thread(
+                    self._open_stream,
+                    messages,
+                    model=model,
+                    temperature=request.temperature,
+                    max_tokens=request.max_tokens,
+                    thinking_enabled=bool(thinking),
+                )
+                break
+            except Exception as exc:
+                # Retry indefinitely on rate-limit (429) errors.
+                status = getattr(exc, "status_code", None)
+                if status == 429:
+                    logger.warning(
+                        "ZAI 429 rate-limited — retrying in %.0fs", delay,
+                    )
+                    await asyncio.sleep(delay)
+                    delay = min(delay * 2, max_delay)
+                    continue
+                raise
+
         text = await asyncio.to_thread(self._consume_stream, stream)
         return CompletionResult(
             text=text or "",
