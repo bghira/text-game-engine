@@ -9579,6 +9579,14 @@ class ZorkEmulator:
     ) -> str:
         active_name = str(player_state.get("character_name") or "").strip()
         action_label = f"PLAYER_ACTION ({active_name.upper()})" if active_name else "PLAYER_ACTION"
+        # Quoted input → explicit speech: "foo" becomes "foo", I say
+        action_stripped = action.strip()
+        if (
+            len(action_stripped) >= 2
+            and action_stripped.startswith('"')
+            and action_stripped.endswith('"')
+        ):
+            action = f'{action_stripped}, I say'
         parts = [f"{action_label}: {action}"]
         if turn_attachment_context:
             parts.append(f"TURN_ATTACHMENT_CONTEXT:\n{turn_attachment_context}")
