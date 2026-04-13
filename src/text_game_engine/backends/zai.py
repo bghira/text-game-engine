@@ -180,9 +180,22 @@ class ZAIBackend:
         headers: dict[str, str] = {
             "Content-Type": "application/json",
             "Accept": "*/*",
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:149.0) Gecko/20100101 Firefox/149.0",
         }
         if self._api_key:
             headers["Authorization"] = f"Bearer {self._api_key}"
+            headers["Cookie"] = f"token={self._api_key}"
+
+        # Log equivalent curl command for debugging.
+        _curl_parts = [f"curl '{url}'"]
+        for hk, hv in headers.items():
+            _safe_v = hv
+            if hk in ("Authorization", "Cookie"):
+                _safe_v = hv[:20] + "..." if len(hv) > 20 else hv
+            _curl_parts.append(f"  -H '{hk}: {_safe_v}'")
+        _body_json = json.dumps(body, ensure_ascii=False)
+        _curl_parts.append(f"  --data-raw '{_body_json}'")
+        logger.info("ZAI request curl:\n%s", " \\\n".join(_curl_parts))
 
         resp = _requests.post(
             url,
@@ -191,10 +204,24 @@ class ZAIBackend:
             stream=True,
             timeout=300,
         )
+
+        logger.info(
+            "ZAI response: status=%d headers=%s",
+            resp.status_code,
+            dict(resp.headers),
+        )
+
         if resp.status_code == 429:
             resp.close()
             raise _RateLimited("ZAI 429")
-        resp.raise_for_status()
+        if not resp.ok:
+            # Log the body for non-2xx so we can see rejection reasons.
+            try:
+                err_body = resp.text
+            except Exception:
+                err_body = "(unreadable)"
+            logger.warning("ZAI error response body: %s", err_body[:2000])
+            resp.raise_for_status()
         return resp
 
     @staticmethod
