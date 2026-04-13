@@ -195,7 +195,7 @@ class ZAIBackend:
             _curl_parts.append(f"  -H '{hk}: {_safe_v}'")
         _body_json = json.dumps(body, ensure_ascii=False)
         _curl_parts.append(f"  --data-raw '{_body_json}'")
-        logger.info("ZAI request curl:\n%s", " \\\n".join(_curl_parts))
+        logger.warning("ZAI request curl:\n%s", " \\\n".join(_curl_parts))
 
         resp = _requests.post(
             url,
@@ -205,7 +205,7 @@ class ZAIBackend:
             timeout=300,
         )
 
-        logger.info(
+        logger.warning(
             "ZAI response: status=%d headers=%s",
             resp.status_code,
             dict(resp.headers),

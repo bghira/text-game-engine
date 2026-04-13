@@ -26,7 +26,7 @@ class BackendTextCompletionPort:
         if system_prompt:
             messages.append(ChatMessage(role="system", content=system_prompt))
         messages.append(ChatMessage(role="user", content=prompt))
-        logger.info(
+        logger.warning(
             "BackendTextCompletionPort.complete: backend=%s model=%s msgs=%d temp=%.2f max_tokens=%d",
             type(self._backend).__name__,
             self._model,
@@ -42,7 +42,7 @@ class BackendTextCompletionPort:
                 max_tokens=max_tokens,
             )
         )
-        logger.info(
+        logger.warning(
             "BackendTextCompletionPort.complete: result_len=%d",
             len(result.text or ""),
         )
