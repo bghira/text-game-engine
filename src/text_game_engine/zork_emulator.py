@@ -20329,6 +20329,8 @@ class ZorkEmulator:
             if not content:
                 continue
             meta = self._safe_turn_meta(turn)
+            if bool(meta.get("suppress_context")):
+                continue
             if focus_on_requested_receivers and (
                 requested_player_slugs or requested_npc_slugs
             ):
