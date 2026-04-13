@@ -144,15 +144,26 @@ class ZAIBackend:
                 "ZAI backend requires the 'requests' package."
             ) from exc
 
+        import time as _time
+        import urllib.parse as _urlparse
+
         chat_id = str(uuid.uuid4())
         request_id = str(uuid.uuid4())
         message_id = str(uuid.uuid4())
         parent_id = str(uuid.uuid4())
 
+        # Extract the last user message for signature_prompt.
+        last_user_content = ""
+        for msg in reversed(messages):
+            if msg.get("role") == "user":
+                last_user_content = msg.get("content", "")
+                break
+
         body: dict[str, Any] = {
             "stream": True,
             "model": model,
             "messages": messages,
+            "signature_prompt": last_user_content,
             "params": {},
             "extra": {},
             "features": {
@@ -166,6 +177,7 @@ class ZAIBackend:
                 "vlm_website_mode": False,
                 "enable_thinking": bool(thinking_enabled),
             },
+            "variables": {},
             "chat_id": chat_id,
             "id": request_id,
             "current_user_message_id": message_id,
@@ -176,11 +188,59 @@ class ZAIBackend:
             },
         }
 
-        url = f"{self._base_url}/api/v2/chat/completions"
+        ts = int(_time.time() * 1000)
+        query_params = _urlparse.urlencode({
+            "timestamp": ts,
+            "requestId": request_id,
+            "version": "0.0.1",
+            "platform": "web",
+            "token": self._api_key or "",
+            "user_agent": "Mozilla/5.0 (X11; Linux x86_64; rv:149.0) Gecko/20100101 Firefox/149.0",
+            "language": "en-US",
+            "languages": "en-US,en",
+            "timezone": "America/Belize",
+            "cookie_enabled": "true",
+            "screen_width": "3840",
+            "screen_height": "2160",
+            "screen_resolution": "3840x2160",
+            "viewport_height": "1047",
+            "viewport_width": "1920",
+            "viewport_size": "1920x1047",
+            "color_depth": "24",
+            "pixel_ratio": "1",
+            "current_url": f"https://chat.z.ai/c/{chat_id}",
+            "pathname": f"/c/{chat_id}",
+            "search": "",
+            "hash": "",
+            "host": "chat.z.ai",
+            "hostname": "chat.z.ai",
+            "protocol": "https:",
+            "referrer": "",
+            "title": "Z.ai - Free AI Chatbot & Agent powered by GLM-5.1 & GLM-5",
+            "timezone_offset": "360",
+            "is_mobile": "false",
+            "is_touch": "false",
+            "max_touch_points": "0",
+            "browser_name": "Firefox",
+            "os_name": "Linux",
+            "signature_timestamp": ts,
+        })
+        url = f"{self._base_url}/api/v2/chat/completions?{query_params}"
         headers: dict[str, str] = {
             "Content-Type": "application/json",
             "Accept": "*/*",
+            "Accept-Language": "en-US",
+            "Accept-Encoding": "gzip, deflate",
             "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:149.0) Gecko/20100101 Firefox/149.0",
+            "X-FE-Version": "prod-fe-1.1.7",
+            "Origin": "https://chat.z.ai",
+            "Connection": "keep-alive",
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-origin",
+            "Priority": "u=0",
+            "Pragma": "no-cache",
+            "Cache-Control": "no-cache",
         }
         if self._api_key:
             headers["Authorization"] = f"Bearer {self._api_key}"
