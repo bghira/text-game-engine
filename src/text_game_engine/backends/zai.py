@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_BASE_URL = "https://chat.z.ai"
 _DEFAULT_MODEL = "glm-5"
-_SIGNING_SECRET = "junjie"
+_SIGNING_SECRET = "key-@@@@)))()((9))-xxxx&&&%%%%%"
 
 
 def _extract_user_id_from_jwt(token: str) -> str:
@@ -24,7 +24,6 @@ def _extract_user_id_from_jwt(token: str) -> str:
         parts = token.split(".")
         if len(parts) < 2:
             return ""
-        # Add padding
         payload_b64 = parts[1]
         payload_b64 += "=" * (-len(payload_b64) % 4)
         payload = json.loads(base64.urlsafe_b64decode(payload_b64))
@@ -45,6 +44,13 @@ def _compute_signature(
     secret: str = _SIGNING_SECRET,
 ) -> str:
     """Dual-layer HMAC-SHA256 signature for Z.ai WebUI endpoint."""
+    # Base64-encode the prompt text (matching the frontend's btoa(binaryStr))
+    prompt_b64 = base64.b64encode(message_text.encode("utf-8")).decode("ascii")
+
+    # Sorted payload: alphabetical key order → requestId, timestamp, user_id
+    sorted_payload = f"requestId,{request_id},timestamp,{timestamp_ms},user_id,{user_id}"
+    canonical = f"{sorted_payload}|{prompt_b64}|{timestamp_ms}"
+
     # Layer 1: time-windowed key derivation (5-minute windows)
     window_index = timestamp_ms // (5 * 60 * 1000)
     derived = hmac.new(
@@ -52,8 +58,6 @@ def _compute_signature(
     ).hexdigest()
 
     # Layer 2: sign canonical string with derived key
-    e = f"requestId,{request_id},timestamp,{timestamp_ms},user_id,{user_id}"
-    canonical = f"{e}|{message_text}|{timestamp_ms}"
     return hmac.new(
         derived.encode(), canonical.encode(), hashlib.sha256
     ).hexdigest()
@@ -275,7 +279,7 @@ class ZAIBackend:
             "os_name": "Linux",
             "signature_timestamp": ts,
         })
-        url = f"{self._base_url}/api/chat/completions?{query_params}"
+        url = f"{self._base_url}/api/v2/chat/completions?{query_params}"
         headers: dict[str, str] = {
             "Content-Type": "application/json",
             "Accept": "*/*",
