@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
+import hmac
 import json
 import logging
 import uuid
@@ -12,6 +15,48 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_BASE_URL = "https://chat.z.ai"
 _DEFAULT_MODEL = "glm-5"
+_SIGNING_SECRET = "junjie"
+
+
+def _extract_user_id_from_jwt(token: str) -> str:
+    """Decode the JWT payload (no verification) and return the user ID."""
+    try:
+        parts = token.split(".")
+        if len(parts) < 2:
+            return ""
+        # Add padding
+        payload_b64 = parts[1]
+        payload_b64 += "=" * (-len(payload_b64) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(payload_b64))
+        for field in ("id", "user_id", "uid", "sub"):
+            val = payload.get(field)
+            if val:
+                return str(val)
+    except Exception:
+        pass
+    return ""
+
+
+def _compute_signature(
+    message_text: str,
+    request_id: str,
+    timestamp_ms: int,
+    user_id: str,
+    secret: str = _SIGNING_SECRET,
+) -> str:
+    """Dual-layer HMAC-SHA256 signature for Z.ai WebUI endpoint."""
+    # Layer 1: time-windowed key derivation (5-minute windows)
+    window_index = timestamp_ms // (5 * 60 * 1000)
+    derived = hmac.new(
+        secret.encode(), str(window_index).encode(), hashlib.sha256
+    ).hexdigest()
+
+    # Layer 2: sign canonical string with derived key
+    e = f"requestId,{request_id},timestamp,{timestamp_ms},user_id,{user_id}"
+    canonical = f"{e}|{message_text}|{timestamp_ms}"
+    return hmac.new(
+        derived.encode(), canonical.encode(), hashlib.sha256
+    ).hexdigest()
 
 
 class _RateLimited(Exception):
@@ -189,9 +234,14 @@ class ZAIBackend:
         }
 
         ts = int(_time.time() * 1000)
+        user_id = _extract_user_id_from_jwt(self._api_key or "")
+        signature = _compute_signature(
+            last_user_content, request_id, ts, user_id,
+        )
         query_params = _urlparse.urlencode({
             "timestamp": ts,
             "requestId": request_id,
+            "user_id": user_id,
             "version": "0.0.1",
             "platform": "web",
             "token": self._api_key or "",
@@ -233,6 +283,7 @@ class ZAIBackend:
             "Accept-Encoding": "gzip, deflate",
             "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:149.0) Gecko/20100101 Firefox/149.0",
             "X-FE-Version": "prod-fe-1.1.7",
+            "X-Signature": signature,
             "Origin": "https://chat.z.ai",
             "Connection": "keep-alive",
             "Sec-Fetch-Dest": "empty",
