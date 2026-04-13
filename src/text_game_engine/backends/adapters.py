@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import logging
+
 from .base import ChatMessage, CompletionRequest, ModelBackend
+
+logger = logging.getLogger(__name__)
 
 
 class BackendTextCompletionPort:
@@ -22,6 +26,14 @@ class BackendTextCompletionPort:
         if system_prompt:
             messages.append(ChatMessage(role="system", content=system_prompt))
         messages.append(ChatMessage(role="user", content=prompt))
+        logger.info(
+            "BackendTextCompletionPort.complete: backend=%s model=%s msgs=%d temp=%.2f max_tokens=%d",
+            type(self._backend).__name__,
+            self._model,
+            len(messages),
+            temperature,
+            max_tokens,
+        )
         result = await self._backend.complete(
             CompletionRequest(
                 messages=messages,
@@ -29,5 +41,9 @@ class BackendTextCompletionPort:
                 temperature=temperature,
                 max_tokens=max_tokens,
             )
+        )
+        logger.info(
+            "BackendTextCompletionPort.complete: result_len=%d",
+            len(result.text or ""),
         )
         return result.text
