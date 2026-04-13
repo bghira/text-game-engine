@@ -7857,6 +7857,7 @@ class ZorkEmulator:
                         turn_meta_payload = {
                             "game_time": self._extract_game_time_snapshot(campaign_state),
                             "visibility": turn_visibility,
+                            "suppress_context": True,
                         }
                         resolved_keys = self._resolved_turn_visibility_keys(
                             turn_visibility,

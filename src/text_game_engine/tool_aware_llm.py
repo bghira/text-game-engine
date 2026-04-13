@@ -3758,6 +3758,7 @@ class ToolAwareZorkLLM:
                     int(getattr(emulator, "MAX_SPEAKER_CONTINUITY_TURNS", 12) or 12), 4
                 )
                 speaker_blocks: list[str] = []
+                emitted_speaker_lines: set[str] = set()
                 for speaker_slug in sorted(speaker_npc_slugs):
                     speaker_recent = emulator._recent_turns_text_for_viewer(  # noqa: SLF001
                         campaign,
@@ -3776,12 +3777,17 @@ class ToolAwareZorkLLM:
                         deduped_speaker_lines = [
                             line
                             for line in str(speaker_recent).splitlines()
-                            if line.strip() and line.strip() not in shared_recent_lines
+                            if line.strip()
+                            and line.strip() not in shared_recent_lines
+                            and line.strip() not in emitted_speaker_lines
                         ]
                         if not deduped_speaker_lines:
                             continue
                         if len(deduped_speaker_lines) > speaker_line_limit:
                             deduped_speaker_lines = deduped_speaker_lines[-speaker_line_limit:]
+                        emitted_speaker_lines.update(
+                            line.strip() for line in deduped_speaker_lines
+                        )
                         speaker_blocks.append(
                             f"SPEAKER_CONTINUITY[{speaker_slug}]:\n"
                             + "\n".join(deduped_speaker_lines)
