@@ -88,12 +88,61 @@ class ZAIBackend:
         self._base_url = base_url.rstrip("/")
         self._model = model
         self._thinking_enabled = thinking_enabled
+        self._token_lock = asyncio.Lock()
+        self._last_token_refresh: float = 0
+
+    # ------------------------------------------------------------------
+    # Token refresh
+    # ------------------------------------------------------------------
+
+    _TOKEN_REFRESH_INTERVAL = 120  # seconds between refreshes
+
+    def _refresh_token_sync(self) -> None:
+        """Hit /api/v1/auths/ to get a fresh JWT."""
+        try:
+            import requests as _requests
+        except ImportError:
+            return
+        if not self._api_key:
+            return
+        try:
+            resp = _requests.get(
+                f"{self._base_url}/api/v1/auths/",
+                headers={
+                    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:149.0) Gecko/20100101 Firefox/149.0",
+                    "Accept": "*/*",
+                    "Origin": self._base_url,
+                    "Authorization": f"Bearer {self._api_key}",
+                    "Cookie": f"token={self._api_key}",
+                },
+                timeout=10,
+            )
+            if resp.ok:
+                data = resp.json()
+                new_token = data.get("token")
+                if new_token and new_token != self._api_key:
+                    logger.warning("ZAI token refreshed (user=%s)", data.get("email", "?"))
+                    self._api_key = new_token
+        except Exception as exc:
+            logger.warning("ZAI token refresh failed: %s", exc)
+
+    async def _ensure_fresh_token(self) -> None:
+        import time as _time
+        now = _time.time()
+        if now - self._last_token_refresh < self._TOKEN_REFRESH_INTERVAL:
+            return
+        async with self._token_lock:
+            if now - self._last_token_refresh < self._TOKEN_REFRESH_INTERVAL:
+                return
+            await asyncio.to_thread(self._refresh_token_sync)
+            self._last_token_refresh = _time.time()
 
     # ------------------------------------------------------------------
     # ModelBackend protocol
     # ------------------------------------------------------------------
 
     async def complete(self, request: CompletionRequest) -> CompletionResult:
+        await self._ensure_fresh_token()
         model = request.model or self._model
         thinking = request.provider_options.get(
             "thinking_enabled", self._thinking_enabled
@@ -267,7 +316,7 @@ class ZAIBackend:
             "Accept-Language": "en-US",
             "Accept-Encoding": "gzip, deflate",
             "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:149.0) Gecko/20100101 Firefox/149.0",
-            "X-FE-Version": "prod-fe-1.1.7",
+            "X-FE-Version": "prod-fe-1.1.9",
             "X-Signature": signature,
             "Origin": "https://chat.z.ai",
             "Connection": "keep-alive",
