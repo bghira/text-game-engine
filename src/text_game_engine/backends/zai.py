@@ -1,23 +1,30 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import uuid
 from typing import Any
 
 from .base import ChatMessage, CompletionRequest, CompletionResult
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_BASE_URL = "https://api.z.ai/api/coding/paas/v4"
-_DEFAULT_MODEL = "glm-5.1"
+_DEFAULT_BASE_URL = "https://chat.z.ai"
+_DEFAULT_MODEL = "glm-5"
+
+
+class _RateLimited(Exception):
+    """Raised when the ZAI WebUI endpoint returns 429."""
 
 
 class ZAIBackend:
-    """ZAI backend with streaming and early tool-call detection.
+    """ZAI backend using the Open WebUI completions endpoint.
 
-    Uses the OpenAI SDK pointed at the ZAI endpoint.  Streams responses so
-    that tool-call JSON objects (``{"tool_call": ...}``) can be returned as
-    soon as the JSON closes, without waiting for trailing thinking tokens.
+    Streams responses via SSE (``data: {...}`` lines) and supports early
+    tool-call detection so that ``{"tool_call": ...}`` payloads are returned
+    as soon as the JSON object closes, without waiting for trailing thinking
+    tokens.
     """
 
     def __init__(
@@ -29,7 +36,7 @@ class ZAIBackend:
         thinking_enabled: bool = True,
     ):
         self._api_key = api_key
-        self._base_url = base_url
+        self._base_url = base_url.rstrip("/")
         self._model = model
         self._thinking_enabled = thinking_enabled
 
@@ -74,13 +81,13 @@ class ZAIBackend:
                     result = await coro
                     stream = result
                     break
-                except Exception as exc:
-                    if getattr(exc, "status_code", None) != 429:
-                        # Non-rate-limit error — cancel remaining and raise.
-                        for t in tasks:
-                            t.cancel()
-                        raise
+                except _RateLimited as exc:
                     last_exc = exc
+                except Exception as exc:
+                    # Non-rate-limit error — cancel remaining and raise.
+                    for t in tasks:
+                        t.cancel()
+                    raise
 
             if stream is not None:
                 # Cancel any still-running burst tasks.
@@ -111,17 +118,14 @@ class ZAIBackend:
     def _prepare_messages(
         messages: list[ChatMessage],
     ) -> list[dict[str, str]]:
-        """Map ChatMessages to ZAI-compatible dicts.
+        """Map ChatMessages to WebUI-compatible dicts.
 
-        ZAI uses ``assistant`` for the system-like preamble (instead of
-        ``system``).  Convert accordingly.
+        The WebUI endpoint accepts standard ``system`` / ``user`` /
+        ``assistant`` roles.
         """
         out: list[dict[str, str]] = []
         for msg in messages:
-            role = msg.role
-            if role == "system":
-                role = "assistant"
-            out.append({"role": role, "content": msg.content})
+            out.append({"role": msg.role, "content": msg.content})
         return out
 
     def _open_stream(
@@ -134,38 +138,73 @@ class ZAIBackend:
         thinking_enabled: bool,
     ) -> Any:
         try:
-            from openai import OpenAI
-        except ImportError as exc:  # pragma: no cover - dependency guard
+            import requests as _requests
+        except ImportError as exc:  # pragma: no cover
             raise RuntimeError(
-                "ZAI backend requires the optional 'openai' package. "
-                "Install text-game-engine with the dependency needed for the 'zai' provider."
+                "ZAI backend requires the 'requests' package."
             ) from exc
 
-        client = OpenAI(
-            api_key=self._api_key,
-            base_url=self._base_url,
-        )
-        request_kwargs: dict[str, Any] = {
+        chat_id = str(uuid.uuid4())
+        request_id = str(uuid.uuid4())
+        message_id = str(uuid.uuid4())
+        parent_id = str(uuid.uuid4())
+
+        body: dict[str, Any] = {
+            "stream": True,
             "model": model,
             "messages": messages,
-            "max_completion_tokens": max_tokens,
-            "temperature": temperature,
-            "stream": True,
+            "params": {},
+            "extra": {},
+            "features": {
+                "image_generation": False,
+                "web_search": False,
+                "auto_web_search": False,
+                "preview_mode": True,
+                "flags": [],
+                "vlm_tools_enable": False,
+                "vlm_web_search_enable": False,
+                "vlm_website_mode": False,
+                "enable_thinking": bool(thinking_enabled),
+            },
+            "chat_id": chat_id,
+            "id": request_id,
+            "current_user_message_id": message_id,
+            "current_user_message_parent_id": parent_id,
+            "background_tasks": {
+                "title_generation": False,
+                "tags_generation": False,
+            },
         }
-        if thinking_enabled:
-            request_kwargs["extra_body"] = {
-                "thinking": {"type": "enabled"},
-            }
-        return client.chat.completions.create(**request_kwargs)
+
+        url = f"{self._base_url}/api/v2/chat/completions"
+        headers: dict[str, str] = {
+            "Content-Type": "application/json",
+            "Accept": "*/*",
+        }
+        if self._api_key:
+            headers["Authorization"] = f"Bearer {self._api_key}"
+
+        resp = _requests.post(
+            url,
+            headers=headers,
+            json=body,
+            stream=True,
+            timeout=300,
+        )
+        if resp.status_code == 429:
+            resp.close()
+            raise _RateLimited("ZAI 429")
+        resp.raise_for_status()
+        return resp
 
     @staticmethod
-    def _consume_stream(stream: Any) -> str | None:
-        """Consume a ZAI streaming response.
+    def _consume_stream(resp: Any) -> str | None:
+        """Consume a ZAI WebUI SSE stream.
 
-        Tracks JSON brace depth so that tool-call responses
+        Parses ``data: {...}`` lines.  Only ``phase: "answer"`` deltas are
+        collected.  Tracks JSON brace depth so that tool-call responses
         (``{"tool_call": ...}``) are returned as soon as the top-level
-        object closes — without waiting for trailing thinking tokens.
-        Non-tool-call responses are consumed in full.
+        object closes, without waiting for trailing thinking tokens.
         """
         chunks: list[str] = []
         brace_depth = 0
@@ -175,13 +214,49 @@ class ZAIBackend:
         escape_next = False
 
         try:
-            for chunk in stream:
-                delta = chunk.choices[0].delta if chunk.choices else None
-                if delta is None:
+            for raw_line in resp.iter_lines(decode_unicode=True):
+                if not raw_line:
                     continue
-                text = delta.content
-                if not text:
+                line = raw_line
+                if line.startswith("data: "):
+                    line = line[6:]
+                elif line.startswith("data:"):
+                    line = line[5:]
+                else:
                     continue
+
+                line = line.strip()
+                if not line or line == "[DONE]":
+                    continue
+
+                try:
+                    event = json.loads(line)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+
+                # WebUI format: {"type": "chat:completion", "data": {"delta_content": "...", "phase": "..."}}
+                if isinstance(event, dict) and "data" in event:
+                    inner = event["data"]
+                    if isinstance(inner, dict):
+                        phase = inner.get("phase", "")
+                        delta = inner.get("delta_content")
+                        if phase != "answer" or not delta:
+                            continue
+                        text = str(delta)
+                    else:
+                        continue
+                # Fallback: OpenAI-style {"choices": [{"delta": {"content": "..."}}]}
+                elif isinstance(event, dict) and "choices" in event:
+                    choices = event.get("choices") or []
+                    if not choices:
+                        continue
+                    delta_obj = choices[0].get("delta") or {}
+                    text = delta_obj.get("content")
+                    if not text:
+                        continue
+                else:
+                    continue
+
                 chunks.append(text)
 
                 for ch in text:
@@ -213,9 +288,14 @@ class ZAIBackend:
                                 found_tool_call = True
 
                 if found_tool_call:
-                    stream.close()
+                    resp.close()
                     break
         except Exception as exc:
             logger.warning("Error during ZAI stream consumption: %s", exc)
+        finally:
+            try:
+                resp.close()
+            except Exception:
+                pass
 
         return "".join(chunks) or None
