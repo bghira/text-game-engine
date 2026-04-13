@@ -44,11 +44,15 @@ class ZAIBackend:
         )
         messages = self._prepare_messages(request.messages)
 
-        delay = 2.0
-        max_delay = 120.0
+        burst_size = 5
+        gap = 0.3
+        pause = 2.0
+        max_pause = 120.0
         while True:
-            try:
-                stream = await asyncio.to_thread(
+            # Fire a burst of concurrent attempts to race past the
+            # global rate-limit window during competition.
+            async def _attempt() -> Any:
+                return await asyncio.to_thread(
                     self._open_stream,
                     messages,
                     model=model,
@@ -56,18 +60,42 @@ class ZAIBackend:
                     max_tokens=request.max_tokens,
                     thinking_enabled=bool(thinking),
                 )
+
+            tasks = []
+            for i in range(burst_size):
+                tasks.append(asyncio.ensure_future(_attempt()))
+                if i < burst_size - 1:
+                    await asyncio.sleep(gap)
+
+            stream = None
+            last_exc: Exception | None = None
+            for coro in asyncio.as_completed(tasks):
+                try:
+                    result = await coro
+                    stream = result
+                    break
+                except Exception as exc:
+                    if getattr(exc, "status_code", None) != 429:
+                        # Non-rate-limit error — cancel remaining and raise.
+                        for t in tasks:
+                            t.cancel()
+                        raise
+                    last_exc = exc
+
+            if stream is not None:
+                # Cancel any still-running burst tasks.
+                for t in tasks:
+                    if not t.done():
+                        t.cancel()
                 break
-            except Exception as exc:
-                # Retry indefinitely on rate-limit (429) errors.
-                status = getattr(exc, "status_code", None)
-                if status == 429:
-                    logger.warning(
-                        "ZAI 429 rate-limited — retrying in %.0fs", delay,
-                    )
-                    await asyncio.sleep(delay)
-                    delay = min(delay * 2, max_delay)
-                    continue
-                raise
+
+            # All burst attempts hit 429 — back off then retry.
+            logger.warning(
+                "ZAI 429 rate-limited — burst of %d failed, retrying in %.0fs",
+                burst_size, pause,
+            )
+            await asyncio.sleep(pause)
+            pause = min(pause * 2, max_pause)
 
         text = await asyncio.to_thread(self._consume_stream, stream)
         return CompletionResult(
