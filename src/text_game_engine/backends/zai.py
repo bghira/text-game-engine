@@ -349,6 +349,7 @@ class ZAIBackend:
         object closes, without waiting for trailing thinking tokens.
         """
         chunks: list[str] = []
+        raw_lines: list[str] = []
         brace_depth = 0
         in_json = False
         found_tool_call = False
@@ -359,6 +360,7 @@ class ZAIBackend:
             for raw_line in resp.iter_lines(decode_unicode=True):
                 if not raw_line:
                     continue
+                raw_lines.append(raw_line)
                 line = raw_line
                 if line.startswith("data: "):
                     line = line[6:]
@@ -440,4 +442,15 @@ class ZAIBackend:
             except Exception:
                 pass
 
-        return "".join(chunks) or None
+        result = "".join(chunks) or None
+        logger.warning(
+            "ZAI stream consumed: raw_lines=%d answer_chunks=%d result_len=%d",
+            len(raw_lines), len(chunks), len(result or ""),
+        )
+        if not result:
+            # Dump the first 50 raw SSE lines so we can see what actually came back.
+            logger.warning(
+                "ZAI stream returned empty answer. Raw SSE lines (first 50):\n%s",
+                "\n".join(raw_lines[:50]),
+            )
+        return result
