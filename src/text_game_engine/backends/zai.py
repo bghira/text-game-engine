@@ -275,7 +275,7 @@ class ZAIBackend:
             "os_name": "Linux",
             "signature_timestamp": ts,
         })
-        url = f"{self._base_url}/api/v2/chat/completions?{query_params}"
+        url = f"{self._base_url}/api/chat/completions?{query_params}"
         headers: dict[str, str] = {
             "Content-Type": "application/json",
             "Accept": "*/*",
