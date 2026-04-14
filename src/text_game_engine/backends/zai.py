@@ -11,6 +11,7 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_BASE_URL = "https://api.z.ai/api/coding/paas/v4"
 _DEFAULT_MODEL = "glm-5-turbo"
+_OPENCODE_VERSION = "1.4.3"
 
 
 class _RateLimited(Exception):
@@ -122,9 +123,13 @@ class ZAIBackend:
             "stream": True,
         }
 
+        import uuid as _uuid
+        session_id = str(_uuid.uuid4())
         headers: dict[str, str] = {
             "Content-Type": "application/json",
             "Accept": "text/event-stream",
+            "User-Agent": f"opencode/{_OPENCODE_VERSION}",
+            "x-session-affinity": session_id,
         }
         if self._api_key:
             headers["Authorization"] = f"Bearer {self._api_key}"
