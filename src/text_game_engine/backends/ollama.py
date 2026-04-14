@@ -44,7 +44,7 @@ class OllamaBackend:
         max_delay = 120.0
         while True:
             try:
-                data = await asyncio.to_thread(self._post_json, "/api/chat", payload)
+                data = await asyncio.to_thread(self._post_streaming, "/api/chat", payload)
             except (TimeoutError, OSError) as exc:
                 logger.warning("Ollama request failed (%s) — retrying in %.0fs", exc, delay)
                 await asyncio.sleep(delay)
@@ -85,7 +85,7 @@ class OllamaBackend:
         payload: dict[str, Any] = {
             "model": model,
             "messages": [self._message_payload(message) for message in request.messages],
-            "stream": False,
+            "stream": True,
         }
         payload_options = dict(self._options)
         payload_options.setdefault("temperature", request.temperature)
@@ -124,11 +124,18 @@ class OllamaBackend:
             "content": str(message.content),
         }
 
-    def _post_json(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
+    def _post_streaming(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """Send a streaming request and accumulate the response.
+
+        Each streamed chunk resets the socket read timeout, so the model can
+        think for arbitrarily long as long as tokens keep arriving within the
+        timeout window.  The final chunk (``done: true``) carries the full
+        metadata (usage counts, done_reason, etc.).
+        """
         data = json.dumps(payload).encode("utf-8")
         headers = {
             "Content-Type": "application/json",
-            "Accept": "application/json",
+            "Accept": "application/x-ndjson",
             **self._headers,
         }
         req = urllib_request.Request(
@@ -138,8 +145,7 @@ class OllamaBackend:
             method="POST",
         )
         try:
-            with urllib_request.urlopen(req, timeout=self._request_timeout) as response:
-                body = response.read().decode("utf-8")
+            resp = urllib_request.urlopen(req, timeout=self._request_timeout)
         except urllib_error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
             raise RuntimeError(
@@ -147,13 +153,39 @@ class OllamaBackend:
             ) from exc
         except urllib_error.URLError as exc:
             raise RuntimeError(f"Ollama request failed: {exc.reason}") from exc
+
+        content_parts: list[str] = []
+        final_chunk: dict[str, Any] = {}
         try:
-            parsed = json.loads(body)
-        except json.JSONDecodeError as exc:
-            raise RuntimeError("Ollama returned invalid JSON") from exc
-        if not isinstance(parsed, dict):
-            raise RuntimeError("Ollama returned an unexpected response shape")
-        return parsed
+            for raw_line in resp:
+                line = raw_line.decode("utf-8", errors="replace").strip()
+                if not line:
+                    continue
+                try:
+                    chunk = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(chunk, dict):
+                    continue
+                # Accumulate content from streamed message fragments.
+                msg = chunk.get("message")
+                if isinstance(msg, dict):
+                    part = msg.get("content")
+                    if part:
+                        content_parts.append(str(part))
+                # The final chunk has done=true and carries metadata.
+                if chunk.get("done"):
+                    final_chunk = chunk
+        finally:
+            resp.close()
+
+        # Build a merged response that looks like a non-streaming response.
+        assembled_text = "".join(content_parts)
+        result: dict[str, Any] = dict(final_chunk)
+        result["message"] = {"role": "assistant", "content": assembled_text}
+        # Keep .response for legacy callers that check it.
+        result["response"] = assembled_text
+        return result
 
     @staticmethod
     def _coerce_text(value: object) -> str | None:
