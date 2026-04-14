@@ -22,7 +22,7 @@ class OllamaBackend:
         *,
         model: str | None = None,
         base_url: str = "http://127.0.0.1:11434",
-        request_timeout: float = 180.0,
+        request_timeout: float = 300.0,
         keep_alive: str | None = None,
         options: dict[str, Any] | None = None,
         headers: dict[str, str] | None = None,
