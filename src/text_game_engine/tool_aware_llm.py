@@ -3207,25 +3207,39 @@ class ToolAwareZorkLLM:
         self._zork_log(f"RESEARCH RESPONSE campaign={campaign_id}", first or "(empty)")
         payload = self._parse_model_payload(first)
         if payload is None:
-            logger.warning("_resolve_payload: initial payload parse failed → JSON retry")
-            self._zork_log(f"PARSE FAILED campaign={campaign_id}", first or "(empty)")
-            await _notify_progress(progress, "refining")
-            retry_prompt = (
-                f"{user_prompt}\n\n"
-                "IMPORTANT: Your previous response was not valid JSON.  "
-                "Return ONLY a single JSON object with no markdown fences, "
-                "no commentary, no prose.  Begin with {{ and end with }}."
-            )
-            retry_resp = await self._completion.complete(
-                system_prompt,
-                retry_prompt,
-                temperature=max(0.1, self._temperature - 0.3),
-                max_tokens=self._max_tokens,
-            )
-            self._zork_log(f"PARSE RETRY RESPONSE campaign={campaign_id}", retry_resp or "(empty)")
-            payload = self._parse_model_payload(retry_resp)
+            max_json_retries = 3
+            for attempt in range(1, max_json_retries + 1):
+                logger.warning(
+                    "_resolve_payload: payload parse failed → JSON retry %d/%d (campaign=%s)",
+                    attempt, max_json_retries, campaign_id,
+                )
+                self._zork_log(f"PARSE FAILED campaign={campaign_id} attempt={attempt}", first or "(empty)")
+                await _notify_progress(progress, "refining")
+                retry_prompt = (
+                    f"{user_prompt}\n\n"
+                    "IMPORTANT: Your previous response was not valid JSON.  "
+                    "Return ONLY a single JSON object with no markdown fences, "
+                    "no commentary, no prose.  Begin with {{ and end with }}."
+                )
+                retry_temp = max(0.1, self._temperature - 0.15 * attempt)
+                retry_resp = await self._completion.complete(
+                    system_prompt,
+                    retry_prompt,
+                    temperature=retry_temp,
+                    max_tokens=self._max_tokens,
+                )
+                self._zork_log(
+                    f"PARSE RETRY RESPONSE campaign={campaign_id} attempt={attempt}",
+                    retry_resp or "(empty)",
+                )
+                payload = self._parse_model_payload(retry_resp)
+                if payload is not None:
+                    break
             if payload is None:
-                logger.warning("_resolve_payload: retry parse also failed → DeterministicLLM fallback")
+                logger.warning(
+                    "_resolve_payload: all %d JSON retries failed (campaign=%s) — returning None",
+                    max_json_retries, campaign_id,
+                )
                 return None
 
         tool_history = ""
@@ -3479,8 +3493,32 @@ class ToolAwareZorkLLM:
             self._zork_log(f"AUGMENTED API RESPONSE campaign={campaign_id} tool={tool_name}", nxt or "(empty)")
             payload = self._parse_model_payload(nxt)
             if payload is None:
-                logger.warning("_resolve_payload: post-tool-execution response unparseable (tool=%s)", tool_name)
-                return None
+                for _post_tool_retry in range(1, 4):
+                    logger.warning(
+                        "_resolve_payload: post-tool response unparseable (tool=%s) — retry %d/3",
+                        tool_name, _post_tool_retry,
+                    )
+                    retry_prompt = (
+                        f"{augmented_prompt}\n\n"
+                        "IMPORTANT: Your previous response was not valid JSON.  "
+                        "Return ONLY a single JSON object with no markdown fences, "
+                        "no commentary, no prose.  Begin with {{ and end with }}."
+                    )
+                    nxt = await self._completion.complete(
+                        system_prompt,
+                        retry_prompt,
+                        temperature=max(0.1, self._temperature - 0.15 * (_post_tool_retry + 1)),
+                        max_tokens=self._max_tokens,
+                    )
+                    payload = self._parse_model_payload(nxt)
+                    if payload is not None:
+                        break
+                if payload is None:
+                    logger.warning(
+                        "_resolve_payload: post-tool response unrecoverable after 3 retries (tool=%s)",
+                        tool_name,
+                    )
+                    return None
             if not emulator._is_tool_call(payload):  # noqa: SLF001
                 self._zork_log(
                     f"RESEARCH PHASE PROTOCOL VIOLATION campaign={campaign_id}",

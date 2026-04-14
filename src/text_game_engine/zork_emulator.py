@@ -18091,12 +18091,22 @@ class ZorkEmulator:
     @classmethod
     def _repair_json_lenient_text(cls, text: str) -> str:
         repaired = str(text or "")
+        repaired = cls._repair_json_key_whitespace(repaired)
         repaired = cls._repair_unquoted_json_keys(repaired)
         repaired = cls._repair_trailing_json_commas(repaired)
         repaired = cls._repair_unquoted_json_string_fields(repaired)
         repaired = cls._repair_known_schema_string_fields(repaired)
         repaired = cls._repair_unmatched_json_closers(repaired)
         return repaired
+
+    _RE_KEY_WHITESPACE = re.compile(
+        r'"\s+([A-Za-z_][A-Za-z0-9_]*)\s*"\s*:',
+    )
+
+    @classmethod
+    def _repair_json_key_whitespace(cls, text: str) -> str:
+        """Fix keys with errant whitespace, e.g. ``" "queries":`` → ``"queries":``."""
+        return cls._RE_KEY_WHITESPACE.sub(r'"\1":', text)
 
     @classmethod
     def _repair_unmatched_json_closers(cls, text: str) -> str:
