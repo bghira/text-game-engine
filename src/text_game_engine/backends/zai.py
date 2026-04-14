@@ -199,12 +199,15 @@ class ZAIBackend:
     ) -> list[dict[str, str]]:
         """Map ChatMessages to WebUI-compatible dicts.
 
-        The WebUI endpoint accepts standard ``system`` / ``user`` /
-        ``assistant`` roles.
+        The WebUI endpoint does not accept ``system`` role — map it to
+        ``assistant`` (used as the system-like preamble by Z.ai).
         """
         out: list[dict[str, str]] = []
         for msg in messages:
-            out.append({"role": msg.role, "content": msg.content})
+            role = msg.role
+            if role == "system":
+                role = "assistant"
+            out.append({"role": role, "content": msg.content})
         return out
 
     def _open_stream(
