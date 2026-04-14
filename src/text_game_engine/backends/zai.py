@@ -248,7 +248,7 @@ class ZAIBackend:
                 "image_generation": False,
                 "web_search": False,
                 "auto_web_search": False,
-                "preview_mode": "preview",
+                "preview_mode": True,
                 "flags": [],
                 "vlm_tools_enable": False,
                 "vlm_web_search_enable": False,
