@@ -30,4 +30,5 @@ def build_backend(provider: str, **config: Any) -> ModelBackend:
 
 
 def build_text_completion_port(provider: str, **config: Any) -> BackendTextCompletionPort:
-    return BackendTextCompletionPort(build_backend(provider, **config))
+    model = config.get("model")
+    return BackendTextCompletionPort(build_backend(provider, **config), model=model)
