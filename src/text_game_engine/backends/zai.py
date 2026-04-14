@@ -1,79 +1,29 @@
 from __future__ import annotations
 
 import asyncio
-import base64
-import hashlib
-import hmac
 import json
 import logging
-import uuid
 from typing import Any
 
 from .base import ChatMessage, CompletionRequest, CompletionResult
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_BASE_URL = "https://chat.z.ai"
-_DEFAULT_MODEL = "glm-5"
-_SIGNING_SECRET = "key-@@@@)))()((9))-xxxx&&&%%%%%"
-
-
-def _extract_user_id_from_jwt(token: str) -> str:
-    """Decode the JWT payload (no verification) and return the user ID."""
-    try:
-        parts = token.split(".")
-        if len(parts) < 2:
-            return ""
-        payload_b64 = parts[1]
-        payload_b64 += "=" * (-len(payload_b64) % 4)
-        payload = json.loads(base64.urlsafe_b64decode(payload_b64))
-        for field in ("id", "user_id", "uid", "sub"):
-            val = payload.get(field)
-            if val:
-                return str(val)
-    except Exception:
-        pass
-    return ""
-
-
-def _compute_signature(
-    message_text: str,
-    request_id: str,
-    timestamp_ms: int,
-    user_id: str,
-    secret: str = _SIGNING_SECRET,
-) -> str:
-    """Dual-layer HMAC-SHA256 signature for Z.ai WebUI endpoint."""
-    # Base64-encode the prompt text (matching the frontend's btoa(binaryStr))
-    prompt_b64 = base64.b64encode(message_text.encode("utf-8")).decode("ascii")
-
-    # Sorted payload: alphabetical key order → requestId, timestamp, user_id
-    sorted_payload = f"requestId,{request_id},timestamp,{timestamp_ms},user_id,{user_id}"
-    canonical = f"{sorted_payload}|{prompt_b64}|{timestamp_ms}"
-
-    # Layer 1: time-windowed key derivation (5-minute windows)
-    window_index = timestamp_ms // (5 * 60 * 1000)
-    derived = hmac.new(
-        secret.encode(), str(window_index).encode(), hashlib.sha256
-    ).hexdigest()
-
-    # Layer 2: sign canonical string with derived key
-    return hmac.new(
-        derived.encode(), canonical.encode(), hashlib.sha256
-    ).hexdigest()
+_DEFAULT_BASE_URL = "https://api.z.ai/api/coding/paas/v4"
+_DEFAULT_MODEL = "glm-5-turbo"
 
 
 class _RateLimited(Exception):
-    """Raised when the ZAI WebUI endpoint returns 429."""
+    """Raised when the ZAI endpoint returns 429."""
 
 
 class ZAIBackend:
-    """ZAI backend using the Open WebUI completions endpoint.
+    """ZAI backend using the OpenAI-compatible coding endpoint.
 
-    Streams responses via SSE (``data: {...}`` lines) and supports early
-    tool-call detection so that ``{"tool_call": ...}`` payloads are returned
-    as soon as the JSON object closes, without waiting for trailing thinking
-    tokens.
+    Sends standard ``/chat/completions`` requests via ``requests`` and
+    supports early tool-call detection so that ``{"tool_call": ...}``
+    payloads are returned as soon as the JSON object closes, without
+    waiting for trailing thinking tokens.
     """
 
     def __init__(
@@ -88,65 +38,13 @@ class ZAIBackend:
         self._base_url = base_url.rstrip("/")
         self._model = model
         self._thinking_enabled = thinking_enabled
-        self._token_lock = asyncio.Lock()
-        self._last_token_refresh: float = 0
-
-    # ------------------------------------------------------------------
-    # Token refresh
-    # ------------------------------------------------------------------
-
-    _TOKEN_REFRESH_INTERVAL = 120  # seconds between refreshes
-
-    def _refresh_token_sync(self) -> None:
-        """Hit /api/v1/auths/ to get a fresh JWT."""
-        try:
-            import requests as _requests
-        except ImportError:
-            return
-        if not self._api_key:
-            return
-        try:
-            resp = _requests.get(
-                f"{self._base_url}/api/v1/auths/",
-                headers={
-                    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:149.0) Gecko/20100101 Firefox/149.0",
-                    "Accept": "*/*",
-                    "Origin": self._base_url,
-                    "Authorization": f"Bearer {self._api_key}",
-                    "Cookie": f"token={self._api_key}",
-                },
-                timeout=10,
-            )
-            if resp.ok:
-                data = resp.json()
-                new_token = data.get("token")
-                if new_token and new_token != self._api_key:
-                    logger.warning("ZAI token refreshed (user=%s)", data.get("email", "?"))
-                    self._api_key = new_token
-        except Exception as exc:
-            logger.warning("ZAI token refresh failed: %s", exc)
-
-    async def _ensure_fresh_token(self) -> None:
-        import time as _time
-        now = _time.time()
-        if now - self._last_token_refresh < self._TOKEN_REFRESH_INTERVAL:
-            return
-        async with self._token_lock:
-            if now - self._last_token_refresh < self._TOKEN_REFRESH_INTERVAL:
-                return
-            await asyncio.to_thread(self._refresh_token_sync)
-            self._last_token_refresh = _time.time()
 
     # ------------------------------------------------------------------
     # ModelBackend protocol
     # ------------------------------------------------------------------
 
     async def complete(self, request: CompletionRequest) -> CompletionResult:
-        await self._ensure_fresh_token()
         model = request.model or self._model
-        thinking = request.provider_options.get(
-            "thinking_enabled", self._thinking_enabled
-        )
         messages = self._prepare_messages(request.messages)
 
         delay = 2.0
@@ -159,7 +57,6 @@ class ZAIBackend:
                     model=model,
                     temperature=request.temperature,
                     max_tokens=request.max_tokens,
-                    thinking_enabled=bool(thinking),
                 )
             except _RateLimited:
                 logger.warning("ZAI 429 rate-limited — retrying in %.0fs", delay)
@@ -169,7 +66,6 @@ class ZAIBackend:
             except Exception as exc:
                 status = getattr(getattr(exc, "response", None), "status_code", None)
                 if status in (405, 503):
-                    # WAF or temporary overload — retry.
                     logger.warning("ZAI %s — retrying in %.0fs", status, delay)
                     await asyncio.sleep(delay)
                     delay = min(delay * 2, max_delay)
@@ -178,7 +74,6 @@ class ZAIBackend:
 
             text = await asyncio.to_thread(self._consume_stream, stream)
             if not text:
-                # INTERNAL_ERROR or empty answer — retry.
                 logger.warning("ZAI returned empty answer — retrying in %.0fs", delay)
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, max_delay)
@@ -197,7 +92,7 @@ class ZAIBackend:
     def _prepare_messages(
         messages: list[ChatMessage],
     ) -> list[dict[str, str]]:
-        """Map ChatMessages to WebUI-compatible dicts."""
+        """Map ChatMessages to OpenAI-compatible dicts."""
         out: list[dict[str, str]] = []
         for msg in messages:
             out.append({"role": msg.role, "content": msg.content})
@@ -210,7 +105,6 @@ class ZAIBackend:
         model: str,
         temperature: float,
         max_tokens: int,
-        thinking_enabled: bool,
     ) -> Any:
         try:
             import requests as _requests
@@ -219,136 +113,26 @@ class ZAIBackend:
                 "ZAI backend requires the 'requests' package."
             ) from exc
 
-        import time as _time
-        import urllib.parse as _urlparse
-
-        chat_id = str(uuid.uuid4())
-        request_id = str(uuid.uuid4())
-        message_id = str(uuid.uuid4())
-        parent_id = str(uuid.uuid4())
-
-        # Extract the last user message for signature_prompt.
-        last_user_content = ""
-        for msg in reversed(messages):
-            if msg.get("role") == "user":
-                last_user_content = msg.get("content", "")
-                break
-
-        import datetime as _dt
-
-        _now = _dt.datetime.now()
+        url = f"{self._base_url}/chat/completions"
         body: dict[str, Any] = {
-            "stream": True,
             "model": model,
             "messages": messages,
-            "signature_prompt": last_user_content,
-            "params": {},
-            "extra": {},
-            "features": {
-                "image_generation": False,
-                "web_search": False,
-                "auto_web_search": False,
-                "preview_mode": True,
-                "flags": [],
-                "vlm_tools_enable": False,
-                "vlm_web_search_enable": False,
-                "vlm_website_mode": False,
-                "enable_thinking": bool(thinking_enabled),
-            },
-            "variables": {
-                "{{USER_NAME}}": "Player",
-                "{{USER_LOCATION}}": "Unknown",
-                "{{CURRENT_DATETIME}}": _now.strftime("%Y-%m-%d %H:%M:%S"),
-                "{{CURRENT_DATE}}": _now.strftime("%Y-%m-%d"),
-                "{{CURRENT_TIME}}": _now.strftime("%H:%M:%S"),
-                "{{CURRENT_WEEKDAY}}": _now.strftime("%A"),
-                "{{CURRENT_TIMEZONE}}": "America/Belize",
-                "{{USER_LANGUAGE}}": "en-US",
-            },
-            "chat_id": chat_id,
-            "id": request_id,
-            "current_user_message_id": message_id,
-            "current_user_message_parent_id": parent_id,
-            "background_tasks": {
-                "title_generation": True,
-                "tags_generation": True,
-            },
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "stream": True,
         }
 
-        ts = int(_time.time() * 1000)
-        user_id = _extract_user_id_from_jwt(self._api_key or "")
-        signature = _compute_signature(
-            last_user_content, request_id, ts, user_id,
-        )
-        query_params = _urlparse.urlencode({
-            "timestamp": ts,
-            "requestId": request_id,
-            "user_id": user_id,
-            "version": "0.0.1",
-            "platform": "web",
-            "token": self._api_key or "",
-            "user_agent": "Mozilla/5.0 (X11; Linux x86_64; rv:149.0) Gecko/20100101 Firefox/149.0",
-            "language": "en-US",
-            "languages": "en-US,en",
-            "timezone": "America/Belize",
-            "cookie_enabled": "true",
-            "screen_width": "3840",
-            "screen_height": "2160",
-            "screen_resolution": "3840x2160",
-            "viewport_height": "1047",
-            "viewport_width": "1920",
-            "viewport_size": "1920x1047",
-            "color_depth": "24",
-            "pixel_ratio": "1",
-            "current_url": f"https://chat.z.ai/c/{chat_id}",
-            "pathname": f"/c/{chat_id}",
-            "search": "",
-            "hash": "",
-            "host": "chat.z.ai",
-            "hostname": "chat.z.ai",
-            "protocol": "https:",
-            "referrer": "",
-            "title": "Z.ai - Free AI Chatbot & Agent powered by GLM-5.1 & GLM-5",
-            "timezone_offset": "360",
-            "is_mobile": "false",
-            "is_touch": "false",
-            "max_touch_points": "0",
-            "browser_name": "Firefox",
-            "os_name": "Linux",
-            "signature_timestamp": ts,
-        })
-        url = f"{self._base_url}/api/v2/chat/completions?{query_params}"
         headers: dict[str, str] = {
             "Content-Type": "application/json",
-            "Accept": "*/*",
-            "Accept-Language": "en-US",
-            "Accept-Encoding": "gzip, deflate",
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:149.0) Gecko/20100101 Firefox/149.0",
-            "X-FE-Version": "prod-fe-1.1.9",
-            "X-Signature": signature,
-            "Origin": "https://chat.z.ai",
-            "Connection": "keep-alive",
-            "Sec-Fetch-Dest": "empty",
-            "Sec-Fetch-Mode": "cors",
-            "Sec-Fetch-Site": "same-origin",
-            "Priority": "u=0",
-            "Pragma": "no-cache",
-            "Cache-Control": "no-cache",
+            "Accept": "text/event-stream",
         }
         if self._api_key:
             headers["Authorization"] = f"Bearer {self._api_key}"
-            headers["Cookie"] = f"token={self._api_key}"
 
-        # Log equivalent curl command for debugging.
-        _curl_parts = [f"curl '{url}'"]
-        for hk, hv in headers.items():
-            _safe_v = hv
-            if hk in ("Authorization", "Cookie"):
-                _safe_v = hv[:20] + "..." if len(hv) > 20 else hv
-            _curl_parts.append(f"  -H '{hk}: {_safe_v}'")
-        _body_json = json.dumps(body, ensure_ascii=False)
-        _curl_parts.append(f"  --data-raw '{_body_json}'")
-        logger.warning("ZAI request curl:\n%s", " \\\n".join(_curl_parts))
+        logger.warning(
+            "ZAI request: url=%s model=%s msgs=%d",
+            url, model, len(messages),
+        )
 
         resp = _requests.post(
             url,
@@ -359,16 +143,14 @@ class ZAIBackend:
         )
 
         logger.warning(
-            "ZAI response: status=%d headers=%s",
+            "ZAI response: status=%d",
             resp.status_code,
-            dict(resp.headers),
         )
 
         if resp.status_code == 429:
             resp.close()
             raise _RateLimited("ZAI 429")
         if not resp.ok:
-            # Log the body for non-2xx so we can see rejection reasons.
             try:
                 err_body = resp.text
             except Exception:
@@ -379,12 +161,11 @@ class ZAIBackend:
 
     @staticmethod
     def _consume_stream(resp: Any) -> str | None:
-        """Consume a ZAI WebUI SSE stream.
+        """Consume an OpenAI-compatible SSE stream.
 
-        Parses ``data: {...}`` lines.  Only ``phase: "answer"`` deltas are
-        collected.  Tracks JSON brace depth so that tool-call responses
-        (``{"tool_call": ...}``) are returned as soon as the top-level
-        object closes, without waiting for trailing thinking tokens.
+        Parses ``data: {...}`` lines with ``choices[0].delta.content``.
+        Tracks JSON brace depth so that tool-call responses are returned
+        as soon as the top-level JSON object closes.
         """
         chunks: list[str] = []
         raw_lines: list[str] = []
@@ -416,19 +197,8 @@ class ZAIBackend:
                 except (json.JSONDecodeError, ValueError):
                     continue
 
-                # WebUI format: {"type": "chat:completion", "data": {"delta_content": "...", "phase": "..."}}
-                if isinstance(event, dict) and "data" in event:
-                    inner = event["data"]
-                    if isinstance(inner, dict):
-                        phase = inner.get("phase", "")
-                        delta = inner.get("delta_content")
-                        if phase != "answer" or not delta:
-                            continue
-                        text = str(delta)
-                    else:
-                        continue
-                # Fallback: OpenAI-style {"choices": [{"delta": {"content": "..."}}]}
-                elif isinstance(event, dict) and "choices" in event:
+                # OpenAI-style {"choices": [{"delta": {"content": "..."}}]}
+                if isinstance(event, dict) and "choices" in event:
                     choices = event.get("choices") or []
                     if not choices:
                         continue
@@ -486,7 +256,6 @@ class ZAIBackend:
             len(raw_lines), len(chunks), len(result or ""),
         )
         if not result:
-            # Dump the first 50 raw SSE lines so we can see what actually came back.
             logger.warning(
                 "ZAI stream returned empty answer. Raw SSE lines (first 50):\n%s",
                 "\n".join(raw_lines[:50]),
