@@ -197,17 +197,10 @@ class ZAIBackend:
     def _prepare_messages(
         messages: list[ChatMessage],
     ) -> list[dict[str, str]]:
-        """Map ChatMessages to WebUI-compatible dicts.
-
-        The WebUI endpoint does not accept ``system`` role — map it to
-        ``assistant`` (used as the system-like preamble by Z.ai).
-        """
+        """Map ChatMessages to WebUI-compatible dicts."""
         out: list[dict[str, str]] = []
         for msg in messages:
-            role = msg.role
-            if role == "system":
-                role = "assistant"
-            out.append({"role": role, "content": msg.content})
+            out.append({"role": msg.role, "content": msg.content})
         return out
 
     def _open_stream(
@@ -241,6 +234,9 @@ class ZAIBackend:
                 last_user_content = msg.get("content", "")
                 break
 
+        import datetime as _dt
+
+        _now = _dt.datetime.now()
         body: dict[str, Any] = {
             "stream": True,
             "model": model,
@@ -252,21 +248,30 @@ class ZAIBackend:
                 "image_generation": False,
                 "web_search": False,
                 "auto_web_search": False,
-                "preview_mode": True,
+                "preview_mode": "preview",
                 "flags": [],
                 "vlm_tools_enable": False,
                 "vlm_web_search_enable": False,
                 "vlm_website_mode": False,
                 "enable_thinking": bool(thinking_enabled),
             },
-            "variables": {},
+            "variables": {
+                "{{USER_NAME}}": "Player",
+                "{{USER_LOCATION}}": "Unknown",
+                "{{CURRENT_DATETIME}}": _now.strftime("%Y-%m-%d %H:%M:%S"),
+                "{{CURRENT_DATE}}": _now.strftime("%Y-%m-%d"),
+                "{{CURRENT_TIME}}": _now.strftime("%H:%M:%S"),
+                "{{CURRENT_WEEKDAY}}": _now.strftime("%A"),
+                "{{CURRENT_TIMEZONE}}": "America/Belize",
+                "{{USER_LANGUAGE}}": "en-US",
+            },
             "chat_id": chat_id,
             "id": request_id,
             "current_user_message_id": message_id,
             "current_user_message_parent_id": parent_id,
             "background_tasks": {
-                "title_generation": False,
-                "tags_generation": False,
+                "title_generation": True,
+                "tags_generation": True,
             },
         }
 
