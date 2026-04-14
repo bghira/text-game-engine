@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from typing import Any
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 
 from .base import ChatMessage, CompletionRequest, CompletionResult
+
+logger = logging.getLogger(__name__)
 
 
 class OllamaBackend:
@@ -36,20 +39,46 @@ class OllamaBackend:
         if not model:
             raise ValueError("OllamaBackend requires a model name")
         payload = self._build_payload(request, model=model)
-        data = await asyncio.to_thread(self._post_json, "/api/chat", payload)
-        message = data.get("message")
-        text = ""
-        if isinstance(message, dict):
-            text = str(message.get("content") or "").strip()
-        if not text:
-            text = str(data.get("response") or "").strip()
-        usage = self._extract_usage(data)
-        return CompletionResult(
-            text=text,
-            finish_reason=self._coerce_text(data.get("done_reason")),
-            usage=usage,
-            raw_response=data,
-        )
+
+        delay = 2.0
+        max_delay = 120.0
+        while True:
+            try:
+                data = await asyncio.to_thread(self._post_json, "/api/chat", payload)
+            except (TimeoutError, OSError) as exc:
+                logger.warning("Ollama request failed (%s) — retrying in %.0fs", exc, delay)
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, max_delay)
+                continue
+            except RuntimeError as exc:
+                exc_str = str(exc)
+                # Retry on 429, 502, 503, 504
+                if any(f"HTTP {code}" in exc_str for code in ("429", "502", "503", "504")):
+                    logger.warning("Ollama %s — retrying in %.0fs", exc_str[:100], delay)
+                    await asyncio.sleep(delay)
+                    delay = min(delay * 2, max_delay)
+                    continue
+                raise
+
+            message = data.get("message")
+            text = ""
+            if isinstance(message, dict):
+                text = str(message.get("content") or "").strip()
+            if not text:
+                text = str(data.get("response") or "").strip()
+            if not text:
+                logger.warning("Ollama returned empty response — retrying in %.0fs", delay)
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, max_delay)
+                continue
+
+            usage = self._extract_usage(data)
+            return CompletionResult(
+                text=text,
+                finish_reason=self._coerce_text(data.get("done_reason")),
+                usage=usage,
+                raw_response=data,
+            )
 
     def _build_payload(self, request: CompletionRequest, *, model: str) -> dict[str, Any]:
         provider_options = dict(request.provider_options or {})
