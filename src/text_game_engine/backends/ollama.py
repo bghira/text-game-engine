@@ -34,6 +34,9 @@ class OllamaBackend:
         self._options = dict(options or {})
         self._headers = dict(headers or {})
 
+    # Hard wall-clock cap on a single request (connect + think + generate).
+    _TOTAL_REQUEST_TIMEOUT: float = 240.0  # 4 minutes
+
     async def complete(self, request: CompletionRequest) -> CompletionResult:
         model = request.model or self._model
         if not model:
@@ -44,8 +47,11 @@ class OllamaBackend:
         max_delay = 120.0
         while True:
             try:
-                data = await asyncio.to_thread(self._post_streaming, "/api/chat", payload)
-            except (TimeoutError, OSError) as exc:
+                data = await asyncio.wait_for(
+                    asyncio.to_thread(self._post_streaming, "/api/chat", payload),
+                    timeout=self._TOTAL_REQUEST_TIMEOUT,
+                )
+            except (TimeoutError, asyncio.TimeoutError, OSError) as exc:
                 logger.warning("Ollama request failed (%s) — retrying in %.0fs", exc, delay)
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, max_delay)
