@@ -47,6 +47,10 @@ class OllamaBackend:
         if not model:
             raise ValueError("OllamaBackend requires a model name")
         payload = self._build_payload(request, model=model)
+        logger.warning(
+            "OllamaBackend.complete: model=%s think=%s base_url=%s",
+            model, payload.get("think", False), self._base_url,
+        )
 
         delay = 2.0
         max_delay = 120.0
