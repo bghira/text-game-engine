@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from typing import Any
 from urllib import error as urllib_error
 from urllib import request as urllib_request
@@ -10,6 +11,8 @@ from urllib import request as urllib_request
 from .base import ChatMessage, CompletionRequest, CompletionResult
 
 logger = logging.getLogger(__name__)
+
+_RE_THINK_BLOCK = re.compile(r"<think>.*?</think>", re.DOTALL)
 
 
 class OllamaBackend:
@@ -26,6 +29,7 @@ class OllamaBackend:
         keep_alive: str | None = None,
         options: dict[str, Any] | None = None,
         headers: dict[str, str] | None = None,
+        think: bool = False,
     ):
         self._model = model
         self._base_url = base_url.rstrip("/")
@@ -33,6 +37,7 @@ class OllamaBackend:
         self._keep_alive = keep_alive
         self._options = dict(options or {})
         self._headers = dict(headers or {})
+        self._think = think
 
     # Hard wall-clock cap on a single request (connect + think + generate).
     _TOTAL_REQUEST_TIMEOUT: float = 240.0  # 4 minutes
@@ -72,6 +77,9 @@ class OllamaBackend:
                 text = str(message.get("content") or "").strip()
             if not text:
                 text = str(data.get("response") or "").strip()
+            # Strip <think>...</think> blocks from the visible output.
+            if text:
+                text = _RE_THINK_BLOCK.sub("", text).strip()
             if not text:
                 logger.warning("Ollama returned empty response — retrying in %.0fs", delay)
                 await asyncio.sleep(delay)
@@ -93,6 +101,8 @@ class OllamaBackend:
             "messages": [self._message_payload(message) for message in request.messages],
             "stream": True,
         }
+        if self._think:
+            payload["think"] = True
         payload_options = dict(self._options)
         payload_options.setdefault("temperature", request.temperature)
         payload_options.setdefault("num_predict", max(1, int(request.max_tokens)))
