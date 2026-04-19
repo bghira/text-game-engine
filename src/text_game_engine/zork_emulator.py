@@ -4235,8 +4235,11 @@ class ZorkEmulator:
         response string.
         """
         if self._completion_port is None:
+            self._zork_log("_setup_tool_loop", "completion_port is None — returning {}")
             return "{}"
         augmented_prompt = user_prompt
+        _empty_retries = 0
+        _max_empty_retries = 3
 
         for _step in range(max_tool_steps + 1):
             response = await self._completion_port.complete(
@@ -4246,7 +4249,20 @@ class ZorkEmulator:
                 max_tokens=max_tokens,
             )
             if not response:
-                return "{}"
+                _empty_retries += 1
+                self._zork_log(
+                    "_setup_tool_loop",
+                    f"step={_step} completion_port returned empty/None "
+                    f"(retry {_empty_retries}/{_max_empty_retries})",
+                )
+                if _empty_retries >= _max_empty_retries:
+                    self._zork_log(
+                        "_setup_tool_loop",
+                        f"giving up after {_max_empty_retries} empty responses",
+                    )
+                    return "{}"
+                await asyncio.sleep(2.0 * _empty_retries)
+                continue
             response = self._clean_response(response)
             json_text = self._extract_json(response)
             if not json_text:
@@ -5440,10 +5456,10 @@ class ZorkEmulator:
                 f"is_known={is_known} raw_name={raw_name!r} work_desc={work_desc!r}\n"
                 f"--- SYSTEM ---\n{system_prompt}\n--- USER ---\n{user_prompt}",
             )
-            for attempt in range(2):
+            for attempt in range(4):
                 try:
                     cur_user = user_prompt
-                    if attempt == 1:
+                    if attempt >= 1:
                         cur_user = (
                             f"{user_prompt}\n\n"
                             "FORMAT REPAIR: Your previous response was invalid or incomplete JSON. "
