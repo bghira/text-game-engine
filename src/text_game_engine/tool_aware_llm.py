@@ -3836,11 +3836,25 @@ class ToolAwareZorkLLM:
                             + "\n"
                         )
                 if speaker_blocks:
+                    _multi_speaker_rule = ""
+                    if len(speaker_blocks) > 1:
+                        _multi_speaker_rule = (
+                            "\nCROSS-NPC ANTI-ECHO: When multiple NPCs speak or act in the same turn, "
+                            "each NPC must react differently. They must NOT echo, paraphrase, or mirror "
+                            "each other's sentiment, stance, phrasing, or emotional register. "
+                            "Each speaker should foreground a different concern, priority, or personality facet. "
+                            "If one NPC has already reacted to the player's action, the next NPC must add "
+                            "something new — a different angle, a complication, a contradiction, a practical "
+                            "detail, or conspicuous silence. Two NPCs saying roughly the same thing in "
+                            "different words is a failure mode.\n"
+                        )
                     _speaker_continuity_block = (
                         "\nSPEAKER_CONTINUITY_RULES:\n"
                         "Each SPEAKER_CONTINUITY block is extra continuity for that named speaker only. "
                         "That speaker may use it to decide what to reveal, conceal, or emphasize. "
-                        "Do NOT let listeners or silent bystanders act on a speaker's private continuity unless they were independently involved in those same events.\n\n"
+                        "Do NOT let listeners or silent bystanders act on a speaker's private continuity unless they were independently involved in those same events.\n"
+                        + _multi_speaker_rule
+                        + "\n"
                         + "\n".join(speaker_blocks)
                     )
             final_output_contract = (
