@@ -842,10 +842,19 @@ class GameEngine:
                 campaign_state[self.LOCATION_CARDS_STATE_KEY] = applied_locations
             else:
                 campaign_state.pop(self.LOCATION_CARDS_STATE_KEY, None)
+            if time_model == self.TIME_MODEL_INDIVIDUAL_CLOCKS:
+                calendar_source_game_time = (
+                    player_state.get("game_time")
+                    or campaign_state.get("game_time")
+                    or {}
+                )
+            else:
+                calendar_source_game_time = campaign_state.get("game_time") or {}
             campaign_state = self._apply_calendar_update(
                 campaign_state,
                 calendar_update,
                 resolution_context=resolution_context,
+                effective_game_time=calendar_source_game_time,
             )
             if time_model != self.TIME_MODEL_INDIVIDUAL_CLOCKS:
                 campaign_state = self._ensure_game_time_progress(
@@ -2875,12 +2884,20 @@ class GameEngine:
         campaign_state: dict[str, Any],
         calendar_update: Any,
         resolution_context: str = "",
+        effective_game_time: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         if not isinstance(calendar_update, dict):
             return campaign_state
 
         calendar_raw = list(campaign_state.get("calendar") or [])
-        game_time = campaign_state.get("game_time") or {}
+        # Under individual_clocks the acting player's personal clock is the
+        # correct frame of reference for calendar normalization — not the
+        # global campaign clock. Callers pass the effective pre-turn clock
+        # explicitly; fall back to the campaign clock for legacy call sites.
+        if isinstance(effective_game_time, dict) and effective_game_time:
+            game_time = effective_game_time
+        else:
+            game_time = campaign_state.get("game_time") or {}
         current_day = game_time.get("day", 1)
         current_hour = game_time.get("hour", 8)
         day_int = int(current_day) if isinstance(current_day, (int, float)) else 1

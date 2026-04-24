@@ -12536,15 +12536,24 @@ class ZorkEmulator:
         self,
         campaign_state: Dict[str, object],
         calendar_update: dict,
+        effective_game_time: dict | None = None,
     ) -> Dict[str, object]:
-        """Process calendar add/remove ops and persist absolute fire_day entries."""
+        """Process calendar add/remove ops and persist absolute fire_day entries.
+
+        When the time model is individual_clocks, callers should pass the
+        acting player's personal clock via effective_game_time so calendar
+        events are normalized against the right frame of reference.
+        """
         if not isinstance(calendar_update, dict):
             return campaign_state
         calendar_update = self._normalize_calendar_update(calendar_update)
         if calendar_update is None:
             return campaign_state
         calendar_raw = list(campaign_state.get("calendar") or [])
-        game_time = campaign_state.get("game_time") or {}
+        if isinstance(effective_game_time, dict) and effective_game_time:
+            game_time = effective_game_time
+        else:
+            game_time = campaign_state.get("game_time") or {}
         current_day = game_time.get("day", 1)
         current_hour = game_time.get("hour", 8)
         calendar = []
