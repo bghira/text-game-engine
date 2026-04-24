@@ -175,6 +175,7 @@ class OllamaBackend:
             raise RuntimeError(f"Ollama request failed: {exc.reason}") from exc
 
         content_parts: list[str] = []
+        thinking_parts: list[str] = []
         final_chunk: dict[str, Any] = {}
         try:
             for raw_line in resp:
@@ -187,12 +188,15 @@ class OllamaBackend:
                     continue
                 if not isinstance(chunk, dict):
                     continue
-                # Accumulate content from streamed message fragments.
+                # Accumulate content and thinking from streamed message fragments.
                 msg = chunk.get("message")
                 if isinstance(msg, dict):
                     part = msg.get("content")
                     if part:
                         content_parts.append(str(part))
+                    thinking_part = msg.get("thinking")
+                    if thinking_part:
+                        thinking_parts.append(str(thinking_part))
                 # The final chunk has done=true and carries metadata.
                 if chunk.get("done"):
                     final_chunk = chunk
@@ -201,10 +205,35 @@ class OllamaBackend:
 
         # Build a merged response that looks like a non-streaming response.
         assembled_text = "".join(content_parts)
+        assembled_thinking = "".join(thinking_parts)
         result: dict[str, Any] = dict(final_chunk)
-        result["message"] = {"role": "assistant", "content": assembled_text}
+        message_payload: dict[str, Any] = {"role": "assistant", "content": assembled_text}
+        if assembled_thinking:
+            message_payload["thinking"] = assembled_thinking
+        result["message"] = message_payload
         # Keep .response for legacy callers that check it.
         result["response"] = assembled_text
+
+        # Diagnostic: did native thinking actually run?
+        think_requested = bool(payload.get("think"))
+        eval_count = result.get("eval_count")
+        logger.warning(
+            "OllamaBackend.stream: think_requested=%s thinking_chars=%d content_chars=%d eval_count=%s",
+            think_requested,
+            len(assembled_thinking),
+            len(assembled_text),
+            eval_count,
+        )
+        if assembled_thinking:
+            preview = assembled_thinking if len(assembled_thinking) <= 4000 else (
+                assembled_thinking[:2000] + "\n...[truncated]...\n" + assembled_thinking[-1500:]
+            )
+            logger.debug("OllamaBackend.reasoning:\n%s", preview)
+        elif think_requested:
+            logger.warning(
+                "OllamaBackend: think=True was requested but response carried no thinking tokens "
+                "(model may not support native thinking, or Ollama version is too old)."
+            )
         return result
 
     @staticmethod
