@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 from typing import Any
 from urllib import error as urllib_error
@@ -13,6 +14,25 @@ from .base import ChatMessage, CompletionRequest, CompletionResult
 logger = logging.getLogger(__name__)
 
 _RE_THINK_BLOCK = re.compile(r"<think>.*?</think>", re.DOTALL)
+
+
+def _reasoning_log_level() -> int:
+    """Resolve the log level for dumping the Ollama reasoning chain.
+
+    Defaults to DEBUG (quiet). Set OLLAMA_LOG_REASONING to a level name
+    (e.g. ``INFO``, ``WARNING``) or an integer to make it visible under
+    host log configs that filter DEBUG.
+    """
+    raw = os.environ.get("OLLAMA_LOG_REASONING")
+    if not raw:
+        return logging.DEBUG
+    raw = raw.strip()
+    if raw.isdigit():
+        return int(raw)
+    if raw in ("1", "true", "yes", "on"):
+        return logging.INFO
+    resolved = logging.getLevelName(raw.upper())
+    return resolved if isinstance(resolved, int) else logging.DEBUG
 
 
 class OllamaBackend:
@@ -228,7 +248,7 @@ class OllamaBackend:
             preview = assembled_thinking if len(assembled_thinking) <= 4000 else (
                 assembled_thinking[:2000] + "\n...[truncated]...\n" + assembled_thinking[-1500:]
             )
-            logger.debug("OllamaBackend.reasoning:\n%s", preview)
+            logger.log(_reasoning_log_level(), "OllamaBackend.reasoning:\n%s", preview)
         elif think_requested:
             logger.warning(
                 "OllamaBackend: think=True was requested but response carried no thinking tokens "
