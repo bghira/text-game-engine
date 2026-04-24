@@ -62,18 +62,29 @@ class OllamaBackend:
     # Hard wall-clock cap on a single request (connect + think + generate).
     _TOTAL_REQUEST_TIMEOUT: float = 240.0  # 4 minutes
 
+    # Thinking models need headroom: num_predict caps TOTAL generation including
+    # reasoning tokens, so a normal cap starves the final content.
+    _THINKING_NUM_PREDICT_FLOOR: int = 10_000
+    # When done_reason=length, add this many tokens and retry, up to _MAX_LENGTH_BOOSTS times.
+    _LENGTH_BOOST_TOKENS: int = 5_000
+    _MAX_LENGTH_BOOSTS: int = 3
+
     async def complete(self, request: CompletionRequest) -> CompletionResult:
         model = request.model or self._model
         if not model:
             raise ValueError("OllamaBackend requires a model name")
         payload = self._build_payload(request, model=model)
         logger.warning(
-            "OllamaBackend.complete: model=%s think=%s base_url=%s",
-            model, payload.get("think", False), self._base_url,
+            "OllamaBackend.complete: model=%s think=%s num_predict=%s base_url=%s",
+            model,
+            payload.get("think", False),
+            payload.get("options", {}).get("num_predict"),
+            self._base_url,
         )
 
         delay = 2.0
         max_delay = 120.0
+        length_boosts = 0
         while True:
             try:
                 data = await asyncio.wait_for(
@@ -104,11 +115,43 @@ class OllamaBackend:
             # Strip <think>...</think> blocks from the visible output.
             if text:
                 text = _RE_THINK_BLOCK.sub("", text).strip()
-            if not text:
+
+            done_reason = str(data.get("done_reason") or "").strip().lower()
+            hit_length_limit = done_reason == "length"
+
+            # Generation ran out of num_predict budget. Boost and retry so the
+            # model can actually produce content after its thinking chain.
+            if hit_length_limit and length_boosts < self._MAX_LENGTH_BOOSTS:
+                options = payload.setdefault("options", {})
+                current_predict = int(options.get("num_predict") or request.max_tokens or 0)
+                new_predict = current_predict + self._LENGTH_BOOST_TOKENS
+                options["num_predict"] = new_predict
+                length_boosts += 1
+                logger.warning(
+                    "Ollama hit length limit (num_predict=%d, content_chars=%d) — "
+                    "boosting to %d and retrying (%d/%d)",
+                    current_predict,
+                    len(text),
+                    new_predict,
+                    length_boosts,
+                    self._MAX_LENGTH_BOOSTS,
+                )
+                continue
+
+            # Empty content on a non-length reason: transient, retry as before.
+            if not text and not hit_length_limit:
                 logger.warning("Ollama returned empty response — retrying in %.0fs", delay)
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, max_delay)
                 continue
+
+            if hit_length_limit:
+                logger.warning(
+                    "Ollama length limit reached after %d boost(s); returning truncated "
+                    "response (content_chars=%d)",
+                    length_boosts,
+                    len(text),
+                )
 
             usage = self._extract_usage(data)
             return CompletionResult(
@@ -129,7 +172,13 @@ class OllamaBackend:
             payload["think"] = True
         payload_options = dict(self._options)
         payload_options.setdefault("temperature", request.temperature)
-        payload_options.setdefault("num_predict", max(1, int(request.max_tokens)))
+        # When thinking is enabled, num_predict caps TOTAL generation including
+        # reasoning tokens. A typical 3200-token cap starves the final content,
+        # so floor the budget at _THINKING_NUM_PREDICT_FLOOR for thinking runs.
+        base_num_predict = max(1, int(request.max_tokens))
+        if self._think:
+            base_num_predict = max(base_num_predict, self._THINKING_NUM_PREDICT_FLOOR)
+        payload_options.setdefault("num_predict", base_num_predict)
         if request.stop:
             payload_options["stop"] = list(request.stop)
         provider_specific_options = provider_options.pop("options", None)
