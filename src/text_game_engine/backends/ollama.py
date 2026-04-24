@@ -49,7 +49,7 @@ class OllamaBackend:
         keep_alive: str | None = None,
         options: dict[str, Any] | None = None,
         headers: dict[str, str] | None = None,
-        think: bool = False,
+        think: bool | str = False,
     ):
         self._model = model
         self._base_url = base_url.rstrip("/")
@@ -57,7 +57,7 @@ class OllamaBackend:
         self._keep_alive = keep_alive
         self._options = dict(options or {})
         self._headers = dict(headers or {})
-        self._think = think
+        self._think = self._normalize_think(think)
 
     # Hard wall-clock cap on a single request (connect + think + generate).
     _TOTAL_REQUEST_TIMEOUT: float = 240.0  # 4 minutes
@@ -98,8 +98,8 @@ class OllamaBackend:
                 continue
             except RuntimeError as exc:
                 exc_str = str(exc)
-                # Retry on 429, 502, 503, 504
-                if any(f"HTTP {code}" in exc_str for code in ("429", "502", "503", "504")):
+                # Retry on 429 (rate limit) and 5xx (server-side transient errors).
+                if any(f"HTTP {code}" in exc_str for code in ("429", "500", "502", "503", "504")):
                     logger.warning("Ollama %s — retrying in %.0fs", exc_str[:100], delay)
                     await asyncio.sleep(delay)
                     delay = min(delay * 2, max_delay)
@@ -163,20 +163,20 @@ class OllamaBackend:
 
     def _build_payload(self, request: CompletionRequest, *, model: str) -> dict[str, Any]:
         provider_options = dict(request.provider_options or {})
+        think_value = self._normalize_think(provider_options.pop("think", self._think))
         payload: dict[str, Any] = {
             "model": model,
             "messages": [self._message_payload(message) for message in request.messages],
             "stream": True,
+            "think": think_value,
         }
-        if self._think:
-            payload["think"] = True
         payload_options = dict(self._options)
         payload_options.setdefault("temperature", request.temperature)
         # When thinking is enabled, num_predict caps TOTAL generation including
         # reasoning tokens. A typical 3200-token cap starves the final content,
         # so floor the budget at _THINKING_NUM_PREDICT_FLOOR for thinking runs.
         base_num_predict = max(1, int(request.max_tokens))
-        if self._think:
+        if self._thinking_requested(think_value):
             base_num_predict = max(base_num_predict, self._THINKING_NUM_PREDICT_FLOOR)
         payload_options.setdefault("num_predict", base_num_predict)
         if request.stop:
@@ -244,6 +244,7 @@ class OllamaBackend:
             raise RuntimeError(f"Ollama request failed: {exc.reason}") from exc
 
         content_parts: list[str] = []
+        think_requested = self._thinking_requested(payload.get("think"))
         thinking_parts: list[str] = []
         final_chunk: dict[str, Any] = {}
         try:
@@ -264,7 +265,7 @@ class OllamaBackend:
                     if part:
                         content_parts.append(str(part))
                     thinking_part = msg.get("thinking")
-                    if thinking_part:
+                    if think_requested and thinking_part:
                         thinking_parts.append(str(thinking_part))
                 # The final chunk has done=true and carries metadata.
                 if chunk.get("done"):
@@ -284,7 +285,6 @@ class OllamaBackend:
         result["response"] = assembled_text
 
         # Diagnostic: did native thinking actually run?
-        think_requested = bool(payload.get("think"))
         eval_count = result.get("eval_count")
         logger.warning(
             "OllamaBackend.stream: think_requested=%s thinking_chars=%d content_chars=%d eval_count=%s",
@@ -304,6 +304,21 @@ class OllamaBackend:
                 "(model may not support native thinking, or Ollama version is too old)."
             )
         return result
+
+    @staticmethod
+    def _thinking_requested(value: object) -> bool:
+        return bool(value)
+
+    @staticmethod
+    def _normalize_think(value: object) -> object:
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"", "0", "false", "no", "off"}:
+                return False
+            if normalized in {"1", "true", "yes", "on"}:
+                return True
+            return normalized
+        return value
 
     @staticmethod
     def _coerce_text(value: object) -> str | None:
