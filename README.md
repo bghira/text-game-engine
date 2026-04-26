@@ -76,6 +76,8 @@ backend = OllamaBackend(model="llama3.1")
 completion_port = BackendTextCompletionPort(backend)
 ```
 
+`OllamaBackend` explicitly sends `think=False` by default so thinking-capable Ollama models do not emit reasoning traces unless you opt in with `think=True`.
+
 Pass `completion_port` into `ZorkEmulator(...)` for setup, summarization, map generation, and other emulator-side completions.
 
 ## Codex CLI

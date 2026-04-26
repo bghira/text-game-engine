@@ -132,9 +132,12 @@ backend = OllamaBackend(
     model="qwen2.5:14b",
     base_url="http://127.0.0.1:11434",
     keep_alive="30m",
+    think=False,
 )
 completion_port = BackendTextCompletionPort(backend)
 ```
+
+`think=False` is the default and is sent explicitly to Ollama so thinking-capable models return only final content. Use `think=True` or a supported string level such as `"low"` when you need native Ollama reasoning traces.
 
 This adapter targets the emulator-facing `TextCompletionPort`. `GameEngine` turn resolution still uses `LLMPort`.
 

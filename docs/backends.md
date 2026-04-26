@@ -30,6 +30,7 @@ backend = OllamaBackend(
     model="llama3.1",
     base_url="http://127.0.0.1:11434",
     keep_alive="30m",
+    think=False,
     options={
         "num_ctx": 32768,
     },
@@ -39,6 +40,8 @@ completion_port = BackendTextCompletionPort(backend)
 ```
 
 The adapter exposes the existing `TextCompletionPort` shape used by `ZorkEmulator`, attachment summarization, setup classification, map generation, and related helper calls.
+
+`OllamaBackend` sends `think=False` by default because Ollama enables thinking by default for supported thinking models. Pass `think=True` to collect native `message.thinking` traces, or pass a supported string level such as `"low"` through either `OllamaBackend(think="low")` or per-request `provider_options={"think": "low"}`.
 
 ## Codex CLI
 

@@ -18,9 +18,21 @@ class RecordingOllamaBackend(OllamaBackend):
         self.response_payload = response_payload
         self.calls: list[tuple[str, dict]] = []
 
-    def _post_json(self, path: str, payload: dict) -> dict:
+    def _post_streaming(self, path: str, payload: dict) -> dict:
         self.calls.append((path, payload))
         return dict(self.response_payload)
+
+
+class FakeStreamingResponse:
+    def __init__(self, lines: list[bytes]):
+        self._lines = lines
+        self.closed = False
+
+    def __iter__(self):
+        return iter(self._lines)
+
+    def close(self):
+        self.closed = True
 
 
 def test_ollama_backend_builds_native_chat_payload_and_parses_response():
@@ -58,7 +70,8 @@ def test_ollama_backend_builds_native_chat_payload_and_parses_response():
         path, payload = backend.calls[0]
         assert path == "/api/chat"
         assert payload["model"] == "llama3.1"
-        assert payload["stream"] is False
+        assert payload["stream"] is True
+        assert payload["think"] is False
         assert payload["keep_alive"] == "15m"
         assert payload["messages"] == [
             {"role": "system", "content": "You are concise."},
@@ -94,6 +107,7 @@ def test_ollama_backend_json_mode_and_provider_options_override_defaults():
         assert result.text == "{\"ok\":true}"
         _, payload = backend.calls[0]
         assert payload["format"] == "json"
+        assert payload["think"] is False
         assert payload["keep_alive"] == "1h"
         assert payload["options"]["seed"] == 7
         assert payload["options"]["temperature"] == 0.1
@@ -101,6 +115,126 @@ def test_ollama_backend_json_mode_and_provider_options_override_defaults():
         assert payload["options"]["num_predict"] == 128
 
     asyncio.run(run_test())
+
+
+def test_ollama_backend_sends_think_true_and_expands_token_budget():
+    async def run_test():
+        backend = RecordingOllamaBackend(
+            {"message": {"role": "assistant", "content": "with thinking"}},
+            model="qwen3",
+            think=True,
+        )
+        result = await backend.complete(
+            CompletionRequest(
+                messages=[ChatMessage(role="user", content="Think this through.")],
+                max_tokens=128,
+            )
+        )
+        assert result.text == "with thinking"
+        _, payload = backend.calls[0]
+        assert payload["think"] is True
+        assert payload["options"]["num_predict"] == backend._THINKING_NUM_PREDICT_FLOOR
+
+    asyncio.run(run_test())
+
+
+def test_ollama_backend_allows_provider_options_think_override():
+    async def run_test():
+        backend = RecordingOllamaBackend(
+            {"message": {"role": "assistant", "content": "low effort"}},
+            model="gpt-oss",
+        )
+        await backend.complete(
+            CompletionRequest(
+                messages=[ChatMessage(role="user", content="Use low reasoning.")],
+                max_tokens=128,
+                provider_options={"think": "low"},
+            )
+        )
+        _, payload = backend.calls[0]
+        assert payload["think"] == "low"
+        assert payload["options"]["num_predict"] == backend._THINKING_NUM_PREDICT_FLOOR
+
+    asyncio.run(run_test())
+
+
+def test_ollama_backend_normalizes_string_false_think_values():
+    async def run_test():
+        backend = RecordingOllamaBackend(
+            {"message": {"role": "assistant", "content": "without thinking"}},
+            model="qwen3",
+            think="false",
+        )
+        await backend.complete(
+            CompletionRequest(
+                messages=[ChatMessage(role="user", content="No reasoning trace.")],
+                max_tokens=128,
+            )
+        )
+        _, payload = backend.calls[0]
+        assert payload["think"] is False
+        assert payload["options"]["num_predict"] == 128
+
+    asyncio.run(run_test())
+
+
+def test_ollama_streaming_ignores_thinking_chunks_when_think_is_false(monkeypatch):
+    response = FakeStreamingResponse(
+        [
+            b'{"message":{"thinking":"hidden reasoning"},"done":false}\n',
+            b'{"message":{"content":"visible answer"},"done":false}\n',
+            b'{"done":true,"done_reason":"stop","eval_count":2}\n',
+        ]
+    )
+
+    def fake_urlopen(req, timeout):
+        return response
+
+    monkeypatch.setattr(
+        "text_game_engine.backends.ollama.urllib_request.urlopen",
+        fake_urlopen,
+    )
+
+    backend = OllamaBackend(model="qwen3")
+    result = backend._post_streaming(
+        "/api/chat",
+        {"model": "qwen3", "messages": [], "stream": True, "think": False},
+    )
+
+    assert result["message"] == {"role": "assistant", "content": "visible answer"}
+    assert result["response"] == "visible answer"
+    assert response.closed is True
+
+
+def test_ollama_streaming_keeps_thinking_chunks_when_requested(monkeypatch):
+    response = FakeStreamingResponse(
+        [
+            b'{"message":{"thinking":"reasoning "},"done":false}\n',
+            b'{"message":{"thinking":"trace"},"done":false}\n',
+            b'{"message":{"content":"visible answer"},"done":false}\n',
+            b'{"done":true,"done_reason":"stop","eval_count":3}\n',
+        ]
+    )
+
+    def fake_urlopen(req, timeout):
+        return response
+
+    monkeypatch.setattr(
+        "text_game_engine.backends.ollama.urllib_request.urlopen",
+        fake_urlopen,
+    )
+
+    backend = OllamaBackend(model="qwen3")
+    result = backend._post_streaming(
+        "/api/chat",
+        {"model": "qwen3", "messages": [], "stream": True, "think": True},
+    )
+
+    assert result["message"] == {
+        "role": "assistant",
+        "content": "visible answer",
+        "thinking": "reasoning trace",
+    }
 
 
 def test_backend_text_completion_port_adapts_backend_to_emulator_surface():
