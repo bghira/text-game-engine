@@ -10005,7 +10005,15 @@ class ZorkEmulator:
             line_l = line.lower()
             if line_l in {"none", "n/a", "na", "lel without elaboration."}:
                 return
-            if any(token in line_l for token in ("inventory:", "📨 unread sms:", "calendar_update")):
+            if any(
+                token in line_l
+                for token in (
+                    "inventory:",
+                    "📨 unread sms:",
+                    "calendar_update",
+                    "[timer interrupted]",
+                )
+            ):
                 return
             if line_l in seen:
                 return
