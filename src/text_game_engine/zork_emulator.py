@@ -578,7 +578,8 @@ class ZorkEmulator:
         "- Temporal coverage matters: your 1 to 2 beats must justify the full amount of in-world time you advance. Stay immediate for short spans; compress visibly for larger spans. Follow TURN_TIME_BEAT_GUIDANCE when it is provided.\n"
         "TTS_EMOTIVES — optional vocal performance markers (stripped from display, passed only to text-to-speech):\n"
         "  Available tags: <giggle> <laughter> <guffaw> <sigh> <cry> <gasp> <groan> <inhale> <exhale> <whisper> <mumble> <uh> <um> <cough> <clear_throat> <shhh> <singing> <humming> <quiet>.\n"
-        '  PLACEMENT IS STRICT: when a speaking character delivers the emotive, the tag MUST sit INSIDE that character\'s quoted dialogue, immediately adjacent to the words it colours. Example: "<quiet>that\'s the difference." or "I— <sigh> I know." NEVER put an emotive tag on its own line, between beats, in a narrator beat, or outside the quotation marks of the speaker who performs it. Only the quoted span is fed to that character\'s TTS voice; tags outside the quotes are lost or mis-voiced by the narrator.\n'
+        '  TAGS ARE STANDALONE — there is NO closing form. WRONG: <quiet>"You don\'t leave."</quiet>. RIGHT: "<quiet>You don\'t leave." There is no </quiet>, no </sigh>, no closing tag of any kind. Any string starting with </ will leak into the rendered output verbatim and break TTS.\n'
+        '  PLACEMENT IS STRICT: when a speaking character delivers the emotive, the tag MUST sit literally INSIDE that character\'s quotation marks, before the words it colours. Examples: "<quiet>that\'s the difference." — "I— <sigh> I know." — "<whisper>not yet." NEVER place the tag between beats, on its own line, in a narrator beat, or outside the quotation marks of the speaker who performs it. Only the quoted span is fed to that character\'s TTS voice; anything outside the quotes is read by the narrator voice or stripped.\n'
         "  Use sparingly and only when the emotive adds genuine colour — once or twice per turn at most. Never pile them up.\n"
         "  ALL CAPS in beat text signals shouting/raised voice for TTS. Use it for genuinely loud moments.\n"
         "VOCAL_INTENSITY — optional float on each beat (\"vocal_intensity\": 0.5). 0.5 = neutral/calm, 1.0 = animated, 1.5 = heated, 2.0 = shouting/frantic. Omit for neutral delivery.\n"
@@ -712,6 +713,8 @@ class ZorkEmulator:
         "aware_npc_slugs, and text. Optional: vocal_intensity (float, 0.5–2.0).\n"
         "  speaker=narrator for pure environment/description only; otherwise name the acting character. A character's gesture, glance, breath, posture, or proximity belongs to THAT CHARACTER — never to the narrator. If Elin sighs and looks down, the speaker is elin, not narrator.\n"
         "  CONSOLIDATE DIALOGUE WITH ITS ACCOMPANYING ACTION: when a character speaks and physically acts in the same moment, put both in ONE beat owned by that character (see the Marin example below). Do NOT split a character's continuous dialogue across multiple beats by inserting narrator action beats between the spoken lines — that voice-flaps the TTS between narrator and character on every line and is exhausting to read. If a single character has three lines of dialogue with small gestures between them, that is ONE beat with the speaker as that character, not three dialogue beats interleaved with narrator beats. Reserve separate beats for: a different speaker taking over, a meaningful pause/scene shift, or pure environmental description with no character involvement.\n"
+        "  WITHIN A SINGLE BEAT, prose texture also matters for TTS: the renderer splits beat text on quotation marks — quoted spans are spoken in the character's voice, unquoted spans are read by the narrator voice. So even inside one character-owned beat, alternating every quoted line with a sentence of physical description ('Her fingers moved. \"Three words.\" She said it back. Processing. \"You want—\" A breath. \"—a package.\"') still flips the TTS voice on every sentence. Keep continuous-dialogue runs TIGHT. Group quoted lines together, then let one or two key gestures land — not a body-language report between every spoken sentence. A beat with eight quoted fragments and seven narration interjections is a failure mode, not good prose.\n"
+        "  AS A RULE OF THUMB inside a single beat: at most one short narrator-voiced sentence per quoted run, and only when it carries real weight (a turn-defining gesture, a beat of silence that must land). Default to letting the dialogue flow.\n"
         "  type must match the beat content: use npc_dialogue when an NPC speaks or when the beat contains quoted dialogue from a character; use action for physical actions; use narration only for pure environment, description, or scene-setting with no character dialogue. Do not put NPC dialogue in narration beats.\n"
         "  actors: who is doing the thing — REQUIRED on every beat even with no spoken speaker.\n"
         "  listeners: direct in-scene recipients — who is being told, shown, confronted, or directly receiving the beat.\n"
@@ -9773,6 +9776,7 @@ class ZorkEmulator:
     ) -> None:
         active_actor_id: str | None = None
         pre_character_slugs: set[str] = set()
+        fired_timer_id: str | None = None
         lock = self._get_lock(campaign_id)
         async with lock:
             with self._session_factory() as session:
@@ -9782,6 +9786,20 @@ class ZorkEmulator:
                 pre_character_slugs = set(parse_json_dict(campaign.characters_json).keys())
                 if not self.is_timed_events_enabled(campaign):
                     return
+                now = datetime.now(timezone.utc).replace(tzinfo=None)
+                active_timer = (
+                    session.query(Timer)
+                    .filter(Timer.campaign_id == campaign_id)
+                    .filter(Timer.status.in_(["scheduled_unbound", "scheduled_bound"]))
+                    .order_by(Timer.created_at.desc())
+                    .first()
+                )
+                if active_timer is not None:
+                    active_timer.status = "expired"
+                    active_timer.fired_at = now
+                    active_timer.updated_at = now
+                    fired_timer_id = str(active_timer.id)
+                    session.commit()
                 latest_turn = (
                     session.query(Turn)
                     .filter(Turn.campaign_id == campaign_id)
@@ -9911,6 +9929,14 @@ class ZorkEmulator:
                     )
                 except Exception:
                     return
+            if fired_timer_id:
+                with self._session_factory() as session:
+                    timer = session.get(Timer, fired_timer_id)
+                    if timer is not None and timer.status == "expired":
+                        now = datetime.now(timezone.utc).replace(tzinfo=None)
+                        timer.status = "consumed"
+                        timer.updated_at = now
+                        session.commit()
         finally:
             self._clear_timed_event_inflight(campaign_id, active_actor_id)
 
