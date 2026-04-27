@@ -577,7 +577,7 @@ class ZorkEmulator:
         "- Vary your landing gear. Turns can end mid-exchange, on a practical detail, on a half-finished gesture, abruptly after dialogue. Not every turn needs a final settling sentence that signals 'scene complete' — most shouldn't.\n"
         "- Temporal coverage matters: your 1 to 2 beats must justify the full amount of in-world time you advance. Stay immediate for short spans; compress visibly for larger spans. Follow TURN_TIME_BEAT_GUIDANCE when it is provided.\n"
         "TTS_EMOTIVES — optional vocal performance markers (stripped from display, passed only to text-to-speech):\n"
-        "  Place these inline in beat text to cue the TTS voice: <giggle> <laughter> <guffaw> <sigh> <cry> <gasp> <groan> <inhale> <exhale> <whisper> <mumble> <uh> <um> <cough> <clear_throat> <shhh> <singing> <humming>.\n"
+        "  Place these inline in beat text to cue the TTS voice: <giggle> <laughter> <guffaw> <sigh> <cry> <gasp> <groan> <inhale> <exhale> <whisper> <mumble> <uh> <um> <cough> <clear_throat> <shhh> <singing> <humming> <quiet>.\n"
         "  Use sparingly and only when the emotive adds genuine colour — once or twice per turn at most. Never pile them up.\n"
         "  ALL CAPS in beat text signals shouting/raised voice for TTS. Use it for genuinely loud moments.\n"
         "VOCAL_INTENSITY — optional float on each beat (\"vocal_intensity\": 0.5). 0.5 = neutral/calm, 1.0 = animated, 1.5 = heated, 2.0 = shouting/frantic. Omit for neutral delivery.\n"
@@ -10081,6 +10081,37 @@ class ZorkEmulator:
             lines.append(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
         return "\n".join(lines).strip()
 
+    _EMOTIVE_TAG_RE = re.compile(
+        r"<(?:giggle|laughter|guffaw|sigh|cry|gasp|groan"
+        r"|inhale|exhale|whisper|mumble|uh|um"
+        r"|singing|humming|cough|sneeze|sniff|clear_throat"
+        r"|shhh|quiet)>",
+        re.IGNORECASE,
+    )
+
+    @classmethod
+    def _strip_emotives_from_recent_turn_jsonl(cls, text: object) -> str:
+        lines: list[str] = []
+        for raw_line in str(text or "").splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                payload = json.loads(line)
+            except Exception:
+                lines.append(cls._EMOTIVE_TAG_RE.sub("", line))
+                continue
+            if not isinstance(payload, dict):
+                lines.append(cls._EMOTIVE_TAG_RE.sub("", line))
+                continue
+            text_val = payload.get("text")
+            if isinstance(text_val, str):
+                cleaned = cls._EMOTIVE_TAG_RE.sub("", text_val)
+                cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
+                payload["text"] = cleaned
+            lines.append(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+        return "\n".join(lines).strip()
+
     @classmethod
     def _split_prompt_tail(cls, prompt: object) -> tuple[str, str]:
         value = str(prompt or "")
@@ -14652,6 +14683,7 @@ class ZorkEmulator:
                 )
         recent_text = "\n".join(recent_lines) if recent_lines else "None"
         recent_text = self._strip_reasoning_from_recent_turn_jsonl(recent_text)
+        recent_text = self._strip_emotives_from_recent_turn_jsonl(recent_text)
 
         rails_context = self._build_rails_context(player_state, party_snapshot)
         active_plot_threads = self._active_plot_threads_for_viewer(

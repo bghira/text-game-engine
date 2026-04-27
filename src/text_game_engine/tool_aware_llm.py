@@ -2304,7 +2304,10 @@ class ToolAwareZorkLLM:
             for row in rows
             if isinstance(row, dict)
         ]
-        return "\n".join(header_lines) + "\n" + self._memory_tool_jsonl(cleaned_rows)
+        body = self._emulator._strip_emotives_from_recent_turn_jsonl(  # noqa: SLF001
+            self._memory_tool_jsonl(cleaned_rows)
+        )
+        return "\n".join(header_lines) + "\n" + body
 
     def _tool_memory_turn(
         self,
@@ -3749,6 +3752,7 @@ class ToolAwareZorkLLM:
                 ]
                 if len(_recent_lines) > lcd_recent_limit:
                     shared_recent = "\n".join(_recent_lines[-lcd_recent_limit:])
+                shared_recent = emulator._strip_emotives_from_recent_turn_jsonl(shared_recent)  # noqa: SLF001
                 shared_recent_with_reasoning = shared_recent
                 shared_recent = emulator._strip_reasoning_from_recent_turn_jsonl(shared_recent)  # noqa: SLF001
                 shared_recent_texts: set[str] = set()
@@ -3815,6 +3819,7 @@ class ToolAwareZorkLLM:
                         focus_on_requested_receivers=True,
                     )
                     speaker_recent = emulator._strip_reasoning_from_recent_turn_jsonl(speaker_recent)  # noqa: SLF001
+                    speaker_recent = emulator._strip_emotives_from_recent_turn_jsonl(speaker_recent)  # noqa: SLF001
                     if speaker_recent and speaker_recent != "None":
                         deduped_speaker_lines = [
                             line
