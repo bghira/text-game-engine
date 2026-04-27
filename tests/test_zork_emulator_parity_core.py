@@ -4483,7 +4483,10 @@ def test_timer_runtime_emits_effect(session_factory, seed_campaign_and_actor):
             event_description="The floor collapses.",
             interruptible=True,
         )
-        await asyncio.sleep(0.05)
+        for _ in range(20):
+            if timer_effects.emits:
+                break
+            await asyncio.sleep(0.05)
         assert timer_effects.emits
         campaign_id, channel_id, actor_id, narration = timer_effects.emits[-1]
         assert campaign_id == seed_campaign_and_actor["campaign_id"]
@@ -4500,6 +4503,52 @@ def test_timer_runtime_emits_effect(session_factory, seed_campaign_and_actor):
             )
             assert turns
             assert all(t.kind == "narrator" for t in turns)
+
+    asyncio.run(run_test())
+
+
+def test_timer_runtime_marks_persisted_timer_consumed(session_factory, seed_campaign_and_actor):
+    async def run_test():
+        timer_effects = StubTimerEffects()
+        compat = _build_compat(
+            session_factory,
+            timer_effects=timer_effects,
+        )
+        campaign_id = seed_campaign_and_actor["campaign_id"]
+        actor_id = seed_campaign_and_actor["actor_id"]
+        compat.get_or_create_player(campaign_id, actor_id)
+
+        with session_factory() as session:
+            row = Timer(
+                campaign_id=campaign_id,
+                session_id=None,
+                status="scheduled_bound",
+                event_text="The floor collapses.",
+                interruptible=True,
+                due_at=datetime.now(timezone.utc).replace(tzinfo=None),
+            )
+            session.add(row)
+            session.commit()
+            timer_id = row.id
+
+        compat._schedule_timer(
+            campaign_id=campaign_id,
+            channel_id="chan-1",
+            delay_seconds=0,
+            event_description="The floor collapses.",
+            interruptible=True,
+        )
+        for _ in range(20):
+            if timer_effects.emits:
+                break
+            await asyncio.sleep(0.05)
+        assert timer_effects.emits
+
+        with session_factory() as session:
+            timer = session.get(Timer, timer_id)
+            assert timer is not None
+            assert timer.status == "consumed"
+            assert timer.fired_at is not None
 
     asyncio.run(run_test())
 
