@@ -398,6 +398,40 @@ class ToolAwareZorkLLM:
         return text in {"1", "true", "yes", "y", "on"}
 
     @staticmethod
+    def _parse_required_terms(query: str) -> tuple[str, list[str]]:
+        """Extract double-quoted phrases from a query as required substrings.
+
+        Phrases inside double quotes ("...") become hard filters: any hit
+        must contain every quoted phrase as a case-insensitive substring.
+        The quote characters are stripped from the returned search query so
+        the underlying keyword/embedding searches still see the words.
+        Returns (search_query, required_terms_lowercased).
+        """
+        if not query or query.count('"') < 2:
+            return query, []
+        required: list[str] = []
+        pieces: list[str] = []
+        i = 0
+        n = len(query)
+        last = 0
+        while i < n:
+            if query[i] == '"':
+                j = query.find('"', i + 1)
+                if j == -1:
+                    break
+                pieces.append(query[last:i])
+                phrase = query[i + 1 : j].strip()
+                if phrase:
+                    required.append(phrase.lower())
+                    pieces.append(phrase)
+                i = j + 1
+                last = i
+                continue
+            i += 1
+        pieces.append(query[last:])
+        return "".join(pieces), required
+
+    @staticmethod
     def _memory_tool_turn_id_list(
         value: object,
         *,
@@ -1328,12 +1362,17 @@ class ToolAwareZorkLLM:
             curated_seen: set[tuple[str, str]] = set()
             if include_manual_hits:
                 for query in queries[:4]:
+                    search_q, required_terms = self._parse_required_terms(query)
                     for hit in self._emulator.search_curated_memories(
-                        query=query,
+                        query=search_q,
                         campaign_id=campaign_id,
                         category=category,
                         top_k=5,
                     ):
+                        if required_terms:
+                            memory_lower = str(hit[1] or "").lower()
+                            if not all(term in memory_lower for term in required_terms):
+                                continue
                         dedup_key = (str(hit[0] or "").strip(), str(hit[1] or "").strip())
                         if dedup_key in curated_seen:
                             continue
@@ -1392,7 +1431,8 @@ class ToolAwareZorkLLM:
                     actor_state
                 )
             for query in queries[:4]:
-                q = query.lower().strip()
+                search_q, required_terms = self._parse_required_terms(query)
+                q = search_q.lower().strip()
                 parts = [token for token in re.split(r"\W+", q) if token]
                 for turn in turns:
                     turn_id = int(turn.id or 0)
@@ -1452,6 +1492,8 @@ class ToolAwareZorkLLM:
                             if row_scope != visibility_scope_filter:
                                 continue
                     hay = content.lower()
+                    if required_terms and not all(term in hay for term in required_terms):
+                        continue
                     score = 0.0
                     if q and q in hay:
                         score = 1.0
@@ -1480,9 +1522,10 @@ class ToolAwareZorkLLM:
             and self._emulator._memory_port is not None
         ):
             for query in queries[:4]:
+                search_q, required_terms = self._parse_required_terms(query)
                 try:
                     embed_hits = self._emulator._memory_port.search(  # noqa: SLF001
-                        query=query,
+                        query=search_q,
                         campaign_id=campaign_id,
                         top_k=5,
                     )
@@ -1492,6 +1535,10 @@ class ToolAwareZorkLLM:
                             continue
                         if excluded_recent_turn_ids and tid in excluded_recent_turn_ids:
                             continue
+                        if required_terms:
+                            content_lower = str(content or "").lower()
+                            if not all(term in content_lower for term in required_terms):
+                                continue
                         if tid in narrator_hits:
                             # Already found by keyword — boost score if embedding is higher.
                             prior = narrator_hits[tid]
@@ -1527,16 +1574,20 @@ class ToolAwareZorkLLM:
         source_hits_flat: list[tuple[str, str, int, str, float]] = []
         if self._emulator is not None and has_source_material and include_source_hits:
             for query in queries[:4]:
-                source_hits_flat.extend(
-                    self._emulator.search_source_material(
-                        query,
-                        campaign_id,
-                        document_key=source_scope_key,
-                        top_k=10 if source_scope else 6,
-                        before_lines=source_before_lines,
-                        after_lines=source_after_lines,
-                    )
-                )
+                search_q, required_terms = self._parse_required_terms(query)
+                for row in self._emulator.search_source_material(
+                    search_q,
+                    campaign_id,
+                    document_key=source_scope_key,
+                    top_k=10 if source_scope else 6,
+                    before_lines=source_before_lines,
+                    after_lines=source_after_lines,
+                ):
+                    if required_terms:
+                        chunk_lower = str(row[3] or "").lower()
+                        if not all(term in chunk_lower for term in required_terms):
+                            continue
+                    source_hits_flat.append(row)
         source_hits_unique: list[tuple[str, str, int, str, float]] = []
         seen_source = set()
         for row in source_hits_flat:

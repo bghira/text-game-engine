@@ -1255,6 +1255,7 @@ class ZorkEmulator:
         "Do NOT use them before recent_turns unless the system explicitly says recent_turns is already loaded.\n"
         "After recent_turns, use memory_search when deeper or older recall materially matters.\n"
         'memory_search syntax: {"tool_call": "memory_search", "queries": ["Marcus at the penthouse", "the deal in the warehouse"]}\n'
+        'QUOTED PHRASES ARE HARD REQUIREMENTS: any double-quoted phrase inside a query must appear verbatim (case-insensitive substring) in every returned hit. Use this to force exact-term matching when you need a specific name, distinctive phrase, or exact wording. Example: {"queries": ["the deal \\"Marcus offered\\""]} returns only hits that contain the literal phrase \'Marcus offered\'. Multiple quoted phrases in one query all must appear. Unquoted words in the same query still drive ranking but are not required.\n'
         "memory_search returns compact snippets by default. Start broad, then narrow before requesting full text.\n"
         'Narrow within the previous turn hits: {"tool_call": "memory_search", "search_within": "last_results", "queries": ["confession", "deal"]}\n'
         'After narrowing, request expanded turn text only if you still need it: {"tool_call": "memory_search", "search_within": "last_results", "queries": ["exact wording"], "full_text": true}\n'
@@ -1299,6 +1300,7 @@ class ZorkEmulator:
         "You may also optionally include category, search_within, full_text, keep_memory_turns, before_lines, and after_lines.\n"
         "Optional category scope example:\n"
         '{"tool_call": "memory_search", "category": "char:marcus-blackwell", "queries": ["Marcus at the penthouse", "the deal Marcus offered"]}\n'
+        'QUOTED PHRASES ARE HARD REQUIREMENTS: any double-quoted phrase inside a query MUST appear verbatim (case-insensitive substring) in every returned hit. Use quotes to force exact-term matching for proper nouns, distinctive phrases, or exact wording. Example: {"queries": ["the confrontation \\"Anastasia\'s ledger\\""]} returns only hits containing the literal phrase \'Anastasia\'s ledger\'. Multiple quoted phrases in one query all must appear. Unquoted words still drive ranking but are not hard filters. Use sparingly — quoting words that don\'t actually appear in any turn produces zero hits.\n'
         "memory_search returns compact snippets by default. Do a broad summary search first, then narrow before asking for more text.\n"
         'Narrow within the previous turn hits only: {"tool_call": "memory_search", "search_within": "last_results", "queries": ["confession", "deal"]}\n'
         'After narrowing, request expanded turn text only if you still need it: {"tool_call": "memory_search", "search_within": "last_results", "queries": ["exact wording"], "full_text": true}\n'
