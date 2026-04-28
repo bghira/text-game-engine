@@ -16,6 +16,7 @@ from .dice import format_dice_result, resolve_dice_check
 from .errors import StaleClaimError, TurnBusyError
 from .minigames import MinigameEngine, MinigameState
 from .normalize import apply_patch, dump_json, normalize_give_item, parse_json_dict
+from .prose_sanitizer import sanitize_prose, sanitize_scene_output
 from .ports import ActorResolverPort, LLMPort, ProgressCallback
 from .puzzles import PuzzleEngine, PuzzleState
 from .types import DiceCheckRequest, DiceCheckResult, ResolveTurnInput, ResolveTurnResult, RewindResult, TurnContext
@@ -1002,6 +1003,13 @@ class GameEngine:
             suppress_recent_context = bool(private_phone_redacted)
             turn_is_public = str(turn_visibility.get("scope") or "").strip().lower() == "public"
 
+            if isinstance(getattr(llm_output, "scene_output", None), dict):
+                sanitize_scene_output(llm_output.scene_output)
+            if isinstance(getattr(llm_output, "narration", None), str):
+                llm_output.narration = sanitize_prose(llm_output.narration)
+            if isinstance(getattr(llm_output, "summary_update", None), str):
+                llm_output.summary_update = sanitize_prose(llm_output.summary_update)
+
             summary = campaign.summary or ""
             if (
                 turn_is_public
@@ -1009,7 +1017,6 @@ class GameEngine:
                 and llm_output.summary_update.strip()
             ):
                 summary = (summary + "\n" + llm_output.summary_update.strip()).strip()
-
             narration = (llm_output.narration or "").strip()
             if not narration:
                 narration = self._fallback_narration_from_updates(
