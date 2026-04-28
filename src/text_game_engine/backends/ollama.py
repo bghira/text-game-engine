@@ -59,9 +59,6 @@ class OllamaBackend:
         self._headers = dict(headers or {})
         self._think = self._normalize_think(think)
 
-    # Hard wall-clock cap on a single request (connect + think + generate).
-    _TOTAL_REQUEST_TIMEOUT: float = 240.0  # 4 minutes
-
     # Thinking models need headroom: num_predict caps TOTAL generation including
     # reasoning tokens, so a normal cap starves the final content.
     _THINKING_NUM_PREDICT_FLOOR: int = 10_000
@@ -87,12 +84,14 @@ class OllamaBackend:
         length_boosts = 0
         while True:
             try:
-                data = await asyncio.wait_for(
-                    asyncio.to_thread(self._post_streaming, "/api/chat", payload),
-                    timeout=self._TOTAL_REQUEST_TIMEOUT,
+                data = await asyncio.to_thread(self._post_streaming, "/api/chat", payload)
+            except OSError as exc:
+                logger.warning(
+                    "Ollama request failed (%s: %s) — retrying in %.0fs",
+                    type(exc).__name__,
+                    exc,
+                    delay,
                 )
-            except (TimeoutError, asyncio.TimeoutError, OSError) as exc:
-                logger.warning("Ollama request failed (%s) — retrying in %.0fs", exc, delay)
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, max_delay)
                 continue
