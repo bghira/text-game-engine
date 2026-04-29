@@ -11,6 +11,7 @@ from urllib.parse import quote_plus, urlparse
 
 logger = logging.getLogger(__name__)
 
+from .completion_phase import PHASE_NARRATION, PHASE_RESEARCH, phase as _completion_phase
 from .core.ports import ProgressCallback
 from .core.types import GiveItemInstruction, LLMTurnOutput, TimerInstruction
 from .persistence.sqlalchemy.models import Campaign, Player, Turn

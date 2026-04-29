@@ -18,6 +18,12 @@ from .backends import (
     build_backend,
     build_text_completion_port,
 )
+from .completion_phase import (
+    PHASE_NARRATION,
+    PHASE_RESEARCH,
+    current_phase,
+    phase,
+)
 from .core.dice import format_dice_result, resolve_dice_check, roll_d20, skill_check
 from .core.engine import GameEngine
 from .core.emulator_ports import IMDBLookupPort, MediaGenerationPort, MemorySearchPort, NotificationPort, TextCompletionPort, TimerEffectsPort
@@ -35,6 +41,10 @@ from .tool_aware_llm import DeterministicLLM, ToolAwareZorkLLM, ZorkToolAwareLLM
 from .zork_emulator import ZorkEmulator
 
 __all__ = [
+    "PHASE_NARRATION",
+    "PHASE_RESEARCH",
+    "current_phase",
+    "phase",
     "GameEngine",
     "ZorkEmulator",
     "DeterministicLLM",
