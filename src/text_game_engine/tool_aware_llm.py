@@ -328,6 +328,38 @@ class ToolAwareZorkLLM:
             except Exception:
                 pass
 
+    async def _complete_research(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        *,
+        temperature: float,
+        max_tokens: int,
+    ) -> str | None:
+        with _completion_phase(PHASE_RESEARCH):
+            return await self._completion.complete(
+                system_prompt,
+                user_prompt,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+
+    async def _complete_narration(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        *,
+        temperature: float,
+        max_tokens: int,
+    ) -> str | None:
+        with _completion_phase(PHASE_NARRATION):
+            return await self._completion.complete(
+                system_prompt,
+                user_prompt,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+
     @staticmethod
     def _parse_json(text: str | None, default: Any) -> Any:
         if not text:
@@ -2017,7 +2049,7 @@ class ToolAwareZorkLLM:
         )
 
         # Phase 2: LLM call (no DB session held open).
-        response = await self._completion.complete(
+        response = await self._complete_research(
             system_prompt,
             user_prompt,
             temperature=0.3,
@@ -3252,7 +3284,7 @@ class ToolAwareZorkLLM:
             f"RESEARCH REQUEST campaign={campaign_id}",
             f"SYSTEM:\n{system_prompt}\n\nUSER:\n{user_prompt}",
         )
-        first = await self._completion.complete(
+        first = await self._complete_research(
             system_prompt,
             user_prompt,
             temperature=self._temperature,
@@ -3277,7 +3309,7 @@ class ToolAwareZorkLLM:
                     "no commentary, no prose.  Begin with {{ and end with }}."
                 )
                 retry_temp = max(0.1, self._temperature - 0.15 * attempt)
-                retry_resp = await self._completion.complete(
+                retry_resp = await self._complete_research(
                     system_prompt,
                     retry_prompt,
                     temperature=retry_temp,
@@ -3400,7 +3432,7 @@ class ToolAwareZorkLLM:
                     "Do NOT return final narration/state JSON during research."
                 )
                 self._zork_log(f"FORCED MEMORY SEARCH campaign={campaign_id}", augmented_prompt)
-                nxt = await self._completion.complete(
+                nxt = await self._complete_research(
                     system_prompt,
                     augmented_prompt,
                     temperature=max(0.1, self._temperature - 0.2),
@@ -3438,7 +3470,7 @@ class ToolAwareZorkLLM:
                     "Do NOT return final narration/state JSON during research."
                 )
                 self._zork_log(f"MEMORY TOOL DISABLED AUGMENTED RESPONSE campaign={campaign_id}", augmented_prompt)
-                nxt = await self._completion.complete(
+                nxt = await self._complete_research(
                     system_prompt,
                     augmented_prompt,
                     temperature=max(0.1, self._temperature - 0.2),
@@ -3466,7 +3498,7 @@ class ToolAwareZorkLLM:
                     "Do NOT return final narration/state JSON during research."
                 )
                 self._zork_log(f"TOOL DEDUP AUGMENTED RESPONSE campaign={campaign_id}", augmented_prompt)
-                nxt = await self._completion.complete(
+                nxt = await self._complete_research(
                     system_prompt,
                     augmented_prompt,
                     temperature=max(0.1, self._temperature - 0.2),
@@ -3539,7 +3571,7 @@ class ToolAwareZorkLLM:
                 "Do NOT return final narration/state JSON during research."
             )
             self._zork_log(f"AUGMENTED API REQUEST campaign={campaign_id} tool={tool_name}", augmented_prompt)
-            nxt = await self._completion.complete(
+            nxt = await self._complete_research(
                 system_prompt,
                 augmented_prompt,
                 temperature=max(0.1, self._temperature - 0.2),
@@ -3559,7 +3591,7 @@ class ToolAwareZorkLLM:
                         "Return ONLY a single JSON object with no markdown fences, "
                         "no commentary, no prose.  Begin with {{ and end with }}."
                     )
-                    nxt = await self._completion.complete(
+                    nxt = await self._complete_research(
                         system_prompt,
                         retry_prompt,
                         temperature=max(0.1, self._temperature - 0.15 * (_post_tool_retry + 1)),
@@ -3593,7 +3625,7 @@ class ToolAwareZorkLLM:
                         f"RESEARCH RESTAGE REQUEST campaign={campaign_id} attempt={attempt + 1}",
                         restage_prompt,
                     )
-                    restage_response = await self._completion.complete(
+                    restage_response = await self._complete_research(
                         system_prompt,
                         restage_prompt,
                         temperature=max(0.1, self._temperature - 0.2),
@@ -3938,7 +3970,7 @@ class ToolAwareZorkLLM:
                 + emulator.WRITING_CRAFT_PROMPT
             )
             self._zork_log(f"FINALIZATION REQUEST campaign={campaign_id}", f"SYSTEM:\n{final_system_prompt}\n\nUSER:\n{finalize_prompt}")
-            finalized = await self._completion.complete(
+            finalized = await self._complete_narration(
                 final_system_prompt,
                 finalize_prompt,
                 temperature=self._temperature,
@@ -3978,7 +4010,7 @@ class ToolAwareZorkLLM:
                     f"EMPTY RESPONSE REPAIR campaign={campaign_id} attempt={attempt + 1}",
                     repair_prompt,
                 )
-                repaired = await self._completion.complete(
+                repaired = await self._complete_narration(
                     system_prompt,
                     repair_prompt,
                     temperature=max(0.1, self._temperature - 0.1),
@@ -4006,7 +4038,7 @@ class ToolAwareZorkLLM:
                 "Return ONLY final JSON (no tool_call) with reasoning.\n"
             )
             self._zork_log(f"CLOCK DRIFT RETRY campaign={campaign_id}", clock_prompt)
-            clock_retry = await self._completion.complete(
+            clock_retry = await self._complete_narration(
                 system_prompt,
                 clock_prompt,
                 temperature=max(0.1, self._temperature - 0.1),
