@@ -15,7 +15,13 @@ from .ascii_map import update_room_map_graph
 from .dice import format_dice_result, resolve_dice_check
 from .errors import StaleClaimError, TurnBusyError
 from .minigames import MinigameEngine, MinigameState
-from .normalize import apply_patch, dump_json, normalize_give_item, parse_json_dict
+from .normalize import (
+    apply_patch,
+    dump_json,
+    normalize_give_item,
+    parse_json_dict,
+    strip_reserved_campaign_state,
+)
 from .prose_sanitizer import sanitize_prose, sanitize_scene_output
 from .ports import ActorResolverPort, LLMPort, ProgressCallback
 from .puzzles import PuzzleEngine, PuzzleState
@@ -190,7 +196,11 @@ class GameEngine:
                 campaign_id=campaign_id,
                 expected_row_version=campaign.row_version,
                 values={
-                    "state_json": snapshot.campaign_state_json,
+                    "state_json": dump_json(
+                        strip_reserved_campaign_state(
+                            parse_json_dict(snapshot.campaign_state_json)
+                        )
+                    ),
                     "characters_json": snapshot.campaign_characters_json,
                     "summary": snapshot.campaign_summary,
                     "last_narration": snapshot.campaign_last_narration,
@@ -696,7 +706,9 @@ class GameEngine:
                 actor_id=turn_input.actor_id,
                 session_id=turn_input.session_id,
                 action=turn_input.action,
-                campaign_state=parse_json_dict(campaign.state_json),
+                campaign_state=strip_reserved_campaign_state(
+                    parse_json_dict(campaign.state_json)
+                ),
                 campaign_summary=campaign.summary or "",
                 campaign_characters=parse_json_dict(campaign.characters_json),
                 player_state=parse_json_dict(player.state_json),
@@ -768,7 +780,9 @@ class GameEngine:
                     turn_input.campaign_id,
                 )
 
-            campaign_state = parse_json_dict(campaign.state_json)
+            campaign_state = strip_reserved_campaign_state(
+                parse_json_dict(campaign.state_json)
+            )
             campaign_characters = parse_json_dict(campaign.characters_json)
             player_state = parse_json_dict(player.state_json)
             time_model = self._time_model_from_state(campaign_state)
@@ -777,7 +791,9 @@ class GameEngine:
             else:
                 pre_turn_game_time = self._extract_game_time_snapshot(context.campaign_state)
 
-            campaign_state_update = dict(llm_output.state_update or {})
+            campaign_state_update = strip_reserved_campaign_state(
+                dict(llm_output.state_update or {})
+            )
             personal_game_time_update = (
                 campaign_state_update.pop("game_time", None)
                 if time_model == self.TIME_MODEL_INDIVIDUAL_CLOCKS
@@ -1230,6 +1246,8 @@ class GameEngine:
                         "state_json": p.state_json,
                     }
                 )
+
+            campaign_state = strip_reserved_campaign_state(campaign_state)
 
             uow.snapshots.add(
                 turn_id=narrator_turn.id,

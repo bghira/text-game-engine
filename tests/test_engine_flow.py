@@ -109,6 +109,67 @@ def test_row_version_drift_does_not_trigger_retry(
     asyncio.run(run_test())
 
 
+def test_engine_strips_reserved_backend_config_from_context_and_commits(
+    session_factory,
+    uow_factory,
+    seed_campaign_and_actor,
+):
+    async def run_test():
+        llm = QueueLLM(
+            [
+                LLMTurnOutput(
+                    narration="The town square stays quiet.",
+                    state_update={
+                        "public_clock": "noon",
+                        "zork_backend_config": {
+                            "backend": "zai",
+                            "api_key": "sk-output-secret",
+                        },
+                    },
+                )
+            ]
+        )
+        engine = GameEngine(uow_factory=uow_factory, llm=llm, max_conflict_retries=0)
+
+        with session_factory() as session:
+            campaign = session.get(Campaign, seed_campaign_and_actor["campaign_id"])
+            assert campaign is not None
+            campaign.state_json = json.dumps(
+                {
+                    "setting": "A quiet test town.",
+                    "zork_backend_config": {
+                        "backend": "zai",
+                        "api_key": "sk-existing-secret",
+                    },
+                }
+            )
+            session.commit()
+
+        result = await engine.resolve_turn(
+            ResolveTurnInput(
+                campaign_id=seed_campaign_and_actor["campaign_id"],
+                actor_id=seed_campaign_and_actor["actor_id"],
+                action="look",
+            )
+        )
+        assert result.status == "ok"
+        assert llm.contexts
+        assert "zork_backend_config" not in llm.contexts[0].campaign_state
+
+        with session_factory() as session:
+            campaign = session.get(Campaign, seed_campaign_and_actor["campaign_id"])
+            state = json.loads(campaign.state_json or "{}")
+            snapshot = session.execute(select(Snapshot)).scalars().first()
+            snapshot_state = json.loads(snapshot.campaign_state_json or "{}")
+
+        assert state["setting"] == "A quiet test town."
+        assert state["public_clock"] == "noon"
+        assert "zork_backend_config" not in state
+        assert "zork_backend_config" not in snapshot_state
+
+    asyncio.run(run_test())
+
+
 def test_timer_transition_idempotency(uow_factory, seed_campaign_and_actor):
     now = datetime.now(timezone.utc).replace(tzinfo=None)
     with uow_factory() as uow:

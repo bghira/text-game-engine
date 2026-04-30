@@ -38,7 +38,12 @@ from .core.emulator_ports import (
     TimerEffectsPort,
 )
 from .core.engine import GameEngine
-from .core.normalize import normalize_campaign_name, parse_json_dict
+from .core.normalize import (
+    RESERVED_CAMPAIGN_STATE_KEYS as CORE_RESERVED_CAMPAIGN_STATE_KEYS,
+    normalize_campaign_name,
+    parse_json_dict,
+    strip_reserved_campaign_state,
+)
 from .core.tokens import glm_token_count
 from .core.types import ResolveTurnInput
 from .persistence.sqlalchemy.models import (
@@ -438,7 +443,8 @@ class ZorkEmulator:
     CONSEQUENCE_STATE_KEY = "_consequences"
     # --- Private context -------------------------------------------------
     PRIVATE_CONTEXT_STATE_KEY = "_active_private_context"
-    MODEL_STATE_EXCLUDE_KEYS = ROOM_STATE_KEYS | {
+    RESERVED_CAMPAIGN_STATE_KEYS = CORE_RESERVED_CAMPAIGN_STATE_KEYS
+    MODEL_STATE_EXCLUDE_KEYS = ROOM_STATE_KEYS | RESERVED_CAMPAIGN_STATE_KEYS | {
         "last_narration",
         "room_scene_images",
         "scene_image_model",
@@ -10227,6 +10233,7 @@ class ZorkEmulator:
     def _build_model_state(self, campaign_state: Dict[str, object]) -> Dict[str, object]:
         if not isinstance(campaign_state, dict):
             return {}
+        campaign_state = strip_reserved_campaign_state(campaign_state)
         model_state: Dict[str, object] = {}
         for key, value in campaign_state.items():
             if key in self.MODEL_STATE_EXCLUDE_KEYS:
@@ -13997,6 +14004,8 @@ class ZorkEmulator:
         characters: Dict[str, dict] | None = None,
         campaign: Campaign | None = None,
     ) -> None:
+        if state is not None:
+            state = strip_reserved_campaign_state(state)
         if campaign is not None:
             if state is not None:
                 campaign.state_json = self._dump_json(state)
@@ -14563,8 +14572,10 @@ class ZorkEmulator:
             stage = self.PROMPT_STAGE_FINAL
         bootstrap_only = bootstrap_only or stage == self.PROMPT_STAGE_BOOTSTRAP
         state = self.get_campaign_state(campaign)
+        scrubbed_state = strip_reserved_campaign_state(state)
+        state_dirty = scrubbed_state != state
+        state = scrubbed_state
         state = self._scrub_inventory_from_state(state)
-        state_dirty = False
         if self.CLOCK_START_DAY_OF_WEEK_KEY not in state:
             state[self.CLOCK_START_DAY_OF_WEEK_KEY] = "monday"
             state_dirty = True

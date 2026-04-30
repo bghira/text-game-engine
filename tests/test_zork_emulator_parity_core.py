@@ -623,6 +623,48 @@ def test_build_prompt_shape(session_factory, seed_campaign_and_actor):
     assert "CHARACTER ROSTER & PORTRAITS:" not in system_prompt
 
 
+def test_build_prompt_strips_reserved_backend_config_from_world_state(
+    session_factory,
+    seed_campaign_and_actor,
+):
+    compat = _build_compat(session_factory)
+    campaign = compat.get_or_create_campaign(
+        "default",
+        "main",
+        seed_campaign_and_actor["actor_id"],
+    )
+    player = compat.get_or_create_player(
+        seed_campaign_and_actor["campaign_id"],
+        seed_campaign_and_actor["actor_id"],
+    )
+    with session_factory() as session:
+        row = session.get(Campaign, seed_campaign_and_actor["campaign_id"])
+        assert row is not None
+        row.state_json = json.dumps(
+            {
+                "setting": "A quiet test town.",
+                "zork_backend_config": {
+                    "backend": "zai",
+                    "api_key": "sk-test-secret",
+                    "base_url": "https://example.invalid",
+                },
+            }
+        )
+        session.commit()
+
+    turns = compat.get_recent_turns(seed_campaign_and_actor["campaign_id"])
+    _system_prompt, user_prompt = compat.build_prompt(campaign, player, "look", turns)
+
+    assert "zork_backend_config" not in user_prompt
+    assert "sk-test-secret" not in user_prompt
+    assert '"setting": "A quiet test town."' in user_prompt
+    with session_factory() as session:
+        refreshed = session.get(Campaign, seed_campaign_and_actor["campaign_id"])
+        state = json.loads(refreshed.state_json or "{}")
+    assert "zork_backend_config" not in state
+    assert state["setting"] == "A quiet test town."
+
+
 def test_build_prompt_ignores_non_dict_character_entries(session_factory, seed_campaign_and_actor):
     compat = _build_compat(session_factory)
     campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])

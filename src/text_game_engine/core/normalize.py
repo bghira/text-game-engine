@@ -7,6 +7,10 @@ from typing import Any
 from .ports import ActorResolverPort
 from .types import GiveItemInstruction
 
+RESERVED_CAMPAIGN_STATE_KEYS = frozenset({
+    "zork_backend_config",
+})
+
 
 def normalize_campaign_name(value: str) -> str:
     value = (value or "").strip()
@@ -27,6 +31,16 @@ def parse_json_dict(text: str | None) -> dict[str, Any]:
 
 def dump_json(data: dict[str, Any]) -> str:
     return json.dumps(data, ensure_ascii=True, separators=(",", ":"))
+
+
+def strip_reserved_campaign_state(data: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(data, dict):
+        return {}
+    return {
+        key: value
+        for key, value in data.items()
+        if str(key) not in RESERVED_CAMPAIGN_STATE_KEYS
+    }
 
 
 def apply_patch(base: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:

@@ -53,6 +53,9 @@ def uow_factory():
 - Active timer is unique per campaign.
 - Outbox idempotency is unique per campaign + session scope + event + key.
 - Rewind sets `memory_visible_max_turn_id`; memory queries must filter by it.
+- Runtime/backend configuration is not campaign world state. Reserved keys such
+  as `zork_backend_config` are stripped from prompt state, turn state updates,
+  campaign snapshots, and campaign state commits.
 
 Details are documented in `SCHEMA.md`.
 
