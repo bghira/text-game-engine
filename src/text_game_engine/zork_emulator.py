@@ -840,6 +840,7 @@ class ZorkEmulator:
         "- Return ONLY the JSON object. No markdown, no code fences, no text before or after the JSON.\n"
         "- In final non-tool responses, include reasoning and put it as the first key.\n"
         "- Keep reasoning concise (roughly 1-4 short sentences, <=1200 chars).\n"
+        "- Do not overthink routine turns: when context is clear, use the obvious grounded outcome and keep reasoning proportional to the action.\n"
         "- Do NOT repeat the narration outside the JSON object.\n"
         "- Keep narration under 1800 characters.\n"
         "- Write in the current style direction.\n"

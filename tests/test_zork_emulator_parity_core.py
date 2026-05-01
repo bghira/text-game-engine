@@ -623,6 +623,27 @@ def test_build_prompt_shape(session_factory, seed_campaign_and_actor):
     assert "CHARACTER ROSTER & PORTRAITS:" not in system_prompt
 
 
+def test_build_prompt_tells_model_not_to_overthink_routine_turns(
+    session_factory,
+    seed_campaign_and_actor,
+):
+    compat = _build_compat(session_factory)
+    campaign = compat.get_or_create_campaign(
+        "default",
+        "main",
+        seed_campaign_and_actor["actor_id"],
+    )
+    player = compat.get_or_create_player(
+        seed_campaign_and_actor["campaign_id"],
+        seed_campaign_and_actor["actor_id"],
+    )
+    turns = compat.get_recent_turns(seed_campaign_and_actor["campaign_id"])
+
+    system_prompt, _user_prompt = compat.build_prompt(campaign, player, "look", turns)
+
+    assert "Do not overthink routine turns" in system_prompt
+
+
 def test_build_prompt_strips_reserved_backend_config_from_world_state(
     session_factory,
     seed_campaign_and_actor,
