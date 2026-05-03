@@ -3463,6 +3463,62 @@ def test_recent_turns_keeps_shared_local_listener_history_after_location_change(
     assert '"reasoning":' not in recent_block
 
 
+def test_recent_turns_preserves_reasoning_when_reasoning_history_enabled(
+    session_factory,
+    seed_campaign_and_actor,
+):
+    compat = _build_compat(session_factory)
+    campaign = compat.get_or_create_campaign(
+        "default",
+        "main",
+        seed_campaign_and_actor["actor_id"],
+    )
+    player = compat.get_or_create_player(
+        seed_campaign_and_actor["campaign_id"],
+        seed_campaign_and_actor["actor_id"],
+    )
+    with session_factory() as session:
+        row = session.get(Campaign, seed_campaign_and_actor["campaign_id"])
+        assert row is not None
+        state = json.loads(row.state_json or "{}")
+        state[compat.REASONING_HISTORY_STATE_KEY] = True
+        row.state_json = json.dumps(state)
+        session.add(
+            Turn(
+                campaign_id=seed_campaign_and_actor["campaign_id"],
+                actor_id=seed_campaign_and_actor["actor_id"],
+                kind="narrator",
+                content="Penny says she is staying.",
+                meta_json=json.dumps(
+                    {
+                        "scene_output": {
+                            "beats": [
+                                {
+                                    "reasoning": "Penny is answering directly.",
+                                    "type": "npc_dialogue",
+                                    "speaker": "penny",
+                                    "actors": ["penny"],
+                                    "listeners": ["player-1"],
+                                    "visibility": "local",
+                                    "aware_npc_slugs": [],
+                                    "text": "Penny says she is staying.",
+                                }
+                            ],
+                        }
+                    }
+                ),
+            )
+        )
+        session.commit()
+
+    turns = compat.get_recent_turns(seed_campaign_and_actor["campaign_id"])
+    _system_prompt, user_prompt = compat.build_prompt(campaign, player, "look", turns)
+
+    recent_block = user_prompt.split("RECENT_TURNS:\n", 1)[1].split("\nPLAYER_ACTION ", 1)[0]
+    assert '"reasoning":"Penny is answering directly."' in recent_block
+    assert compat.REASONING_HISTORY_STATE_KEY not in user_prompt
+
+
 def test_recent_turns_still_hides_actor_turns_with_suppress_context(
     session_factory,
     seed_campaign_and_actor,
@@ -3699,7 +3755,7 @@ def test_ready_to_write_strips_reasoning_from_recent_turns_lcd_and_speaker_conti
         assert "SPEAKER_CONTINUITY[simone-ashworth]:" in final_prompt
         recent_final_block = final_prompt.split("RECENT_TURNS_LCD:\n", 1)[1].split("\n\n", 1)[0]
         speaker_block = final_prompt.split("SPEAKER_CONTINUITY[simone-ashworth]:\n", 1)[1].split("\n\n", 1)[0]
-        assert '"reasoning":' in recent_final_block
+        assert '"reasoning":' not in recent_final_block
         assert '"index":' not in recent_final_block
         assert '"reasoning":' not in speaker_block
         assert '"index":' not in speaker_block

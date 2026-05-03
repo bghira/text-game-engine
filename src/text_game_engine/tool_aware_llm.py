@@ -3710,6 +3710,7 @@ class ToolAwareZorkLLM:
             player = emulator.get_or_create_player(campaign_id, actor_id)
             if campaign is not None and player is not None:
                 campaign_state = emulator.get_campaign_state(campaign)  # noqa: SLF001
+                reasoning_history_enabled = emulator._reasoning_history_enabled(campaign_state)  # noqa: SLF001
                 campaign_characters = emulator.get_campaign_characters(campaign)  # noqa: SLF001
                 player_state = emulator.get_player_state(player)
                 viewer_location_key = emulator._room_key_from_player_state(player_state).lower()  # noqa: SLF001
@@ -3837,8 +3838,8 @@ class ToolAwareZorkLLM:
                 if len(_recent_lines) > lcd_recent_limit:
                     shared_recent = "\n".join(_recent_lines[-lcd_recent_limit:])
                 shared_recent = emulator._strip_emotives_from_recent_turn_jsonl(shared_recent)  # noqa: SLF001
-                shared_recent_with_reasoning = shared_recent
-                shared_recent = emulator._strip_reasoning_from_recent_turn_jsonl(shared_recent)  # noqa: SLF001
+                if not reasoning_history_enabled:
+                    shared_recent = emulator._strip_reasoning_from_recent_turn_jsonl(shared_recent)  # noqa: SLF001
                 shared_recent_texts: set[str] = set()
                 for line in str(shared_recent or "").splitlines():
                     stripped = line.strip()
@@ -3872,7 +3873,7 @@ class ToolAwareZorkLLM:
                         "only events that ALL named participants would plausibly know about. "
                         "Use this as the shared pool for common knowledge in the scene.\n"
                         f"\nWORLD_SUMMARY_LCD: {shared_summary or '(empty)'}\n"
-                        f"\nRECENT_TURNS_LCD:\n{shared_recent_with_reasoning}\n"
+                        f"\nRECENT_TURNS_LCD:\n{shared_recent}\n"
                     )
                 elif shared_recent and shared_recent != "None":
                     _shared_context_block = (
@@ -3902,7 +3903,8 @@ class ToolAwareZorkLLM:
                         scene_npc_slugs=None,
                         focus_on_requested_receivers=True,
                     )
-                    speaker_recent = emulator._strip_reasoning_from_recent_turn_jsonl(speaker_recent)  # noqa: SLF001
+                    if not reasoning_history_enabled:
+                        speaker_recent = emulator._strip_reasoning_from_recent_turn_jsonl(speaker_recent)  # noqa: SLF001
                     speaker_recent = emulator._strip_emotives_from_recent_turn_jsonl(speaker_recent)  # noqa: SLF001
                     if speaker_recent and speaker_recent != "None":
                         deduped_speaker_lines = [

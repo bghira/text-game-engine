@@ -441,6 +441,8 @@ class ZorkEmulator:
     PLOT_THREADS_STATE_KEY = "_plot_threads"
     CHAPTER_PLAN_STATE_KEY = "_chapter_plan"
     CONSEQUENCE_STATE_KEY = "_consequences"
+    REASONING_HISTORY_STATE_KEY = "_reasoning_history_enabled"
+    DEFAULT_REASONING_HISTORY_ENABLED = False
     # --- Private context -------------------------------------------------
     PRIVATE_CONTEXT_STATE_KEY = "_active_private_context"
     RESERVED_CAMPAIGN_STATE_KEYS = CORE_RESERVED_CAMPAIGN_STATE_KEYS
@@ -450,6 +452,7 @@ class ZorkEmulator:
         "scene_image_model",
         "default_persona",
         "start_room",
+        REASONING_HISTORY_STATE_KEY,
         "story_outline",
         "chapters",
         "current_chapter",
@@ -10137,6 +10140,21 @@ class ZorkEmulator:
             lines.append(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
         return "\n".join(lines).strip()
 
+    @classmethod
+    def _reasoning_history_enabled(cls, campaign_state: object) -> bool:
+        if not isinstance(campaign_state, dict):
+            return cls.DEFAULT_REASONING_HISTORY_ENABLED
+        raw = campaign_state.get(cls.REASONING_HISTORY_STATE_KEY)
+        if isinstance(raw, bool):
+            return raw
+        if isinstance(raw, str):
+            normalized = raw.strip().lower()
+            if normalized in {"1", "true", "yes", "on", "enable", "enabled"}:
+                return True
+            if normalized in {"0", "false", "no", "off", "disable", "disabled"}:
+                return False
+        return cls.DEFAULT_REASONING_HISTORY_ENABLED
+
     _EMOTIVE_TAG_RE = re.compile(
         r"<(?:giggle|laughter|guffaw|sigh|cry|gasp|groan"
         r"|inhale|exhale|whisper|mumble|uh|um"
@@ -14743,7 +14761,8 @@ class ZorkEmulator:
                     )
                 )
         recent_text = "\n".join(recent_lines) if recent_lines else "None"
-        recent_text = self._strip_reasoning_from_recent_turn_jsonl(recent_text)
+        if not self._reasoning_history_enabled(state):
+            recent_text = self._strip_reasoning_from_recent_turn_jsonl(recent_text)
         recent_text = self._strip_emotives_from_recent_turn_jsonl(recent_text)
 
         rails_context = self._build_rails_context(player_state, party_snapshot)
