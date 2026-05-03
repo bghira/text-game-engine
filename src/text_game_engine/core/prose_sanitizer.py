@@ -67,6 +67,10 @@ _TAG_FRAGMENT_RE = re.compile(
 )
 _INVALID_TTS_CLOSING_TAG_RE = re.compile(r"</\s*[A-Za-z][^>\n]{0,80}>")
 _INVALID_TTS_BRACKET_CLOSING_RE = re.compile(r"\[/\s*emotive\s*\]", re.IGNORECASE)
+_LEADING_UNQUOTED_EMOTIVE_DIALOGUE_RE = re.compile(
+    r"^(\s*)(\[emotive:[^\]\r\n]{1,80}\])([^\S\r\n]*)(?!\")(.+\"[^\r\n]*)$",
+    re.IGNORECASE | re.DOTALL,
+)
 
 
 def _drop_if_banned(match: re.Match[str]) -> str:
@@ -79,6 +83,20 @@ def strip_invalid_tts_closing_tags(text: object) -> str:
         return text if isinstance(text, str) else ""
     text = _INVALID_TTS_CLOSING_TAG_RE.sub("", text)
     return _INVALID_TTS_BRACKET_CLOSING_RE.sub("", text)
+
+
+def normalize_leading_emotive_dialogue(text: object) -> str:
+    """Move a leading emotive marker inside a missing opening dialogue quote."""
+    if not isinstance(text, str) or not text:
+        return text if isinstance(text, str) else ""
+
+    def _replace(match: re.Match[str]) -> str:
+        prefix, marker, spacing, rest = match.groups()
+        if not rest.strip():
+            return match.group(0)
+        return f'{prefix}"{marker}{spacing}{rest}'
+
+    return _LEADING_UNQUOTED_EMOTIVE_DIALOGUE_RE.sub(_replace, text, count=1)
 
 
 def _sanitize_unquoted(text: str) -> str:
@@ -99,6 +117,7 @@ def sanitize_prose(text: object) -> str:
     """
     if not isinstance(text, str) or not text:
         return text if isinstance(text, str) else ""
+    text = normalize_leading_emotive_dialogue(text)
     text = strip_invalid_tts_closing_tags(text)
     if '"' not in text:
         out = _sanitize_unquoted(text)

@@ -62,6 +62,13 @@ class TestTtsEmotiveMarkers:
 
         assert cleaned == '"[emotive:quiet]Stay here." She waits.'
 
+    def test_prose_sanitizer_quotes_leading_standalone_emotive_dialogue(self):
+        from text_game_engine.core.prose_sanitizer import sanitize_prose
+
+        cleaned = sanitize_prose('[emotive:quiet]Yeah. Right there."')
+
+        assert cleaned == '"[emotive:quiet]Yeah. Right there."'
+
 
 # ---------------------------------------------------------------------------
 # JSON repair pipeline
