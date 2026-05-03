@@ -1891,6 +1891,104 @@ def test_ready_to_write_lcd_backfills_older_shared_turns_after_solo_gap(
     asyncio.run(run_test())
 
 
+def test_lcd_keeps_actor_local_player_setup_for_scene_participants(
+    session_factory,
+    seed_campaign_and_actor,
+):
+    compat = _build_compat(session_factory)
+    campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
+    player = compat.get_or_create_player(campaign.id, seed_campaign_and_actor["actor_id"])
+
+    with session_factory() as session:
+        campaign_row = session.get(Campaign, campaign.id)
+        campaign_row.characters_json = json.dumps(
+            {
+                "sage": {
+                    "name": "Sage",
+                    "location": "mountain-cabin-kitchen",
+                    "current_status": "At the table.",
+                }
+            }
+        )
+        player_row = session.get(Player, player.id)
+        player_state = json.loads(player_row.state_json or "{}")
+        player_state["character_name"] = "Alex"
+        player_state["location"] = "mountain-cabin-kitchen"
+        player_state["room_title"] = "Mountain Cabin Kitchen"
+        player_state["room_summary"] = "A winter kitchen in the childhood cabin."
+        player_row.state_json = json.dumps(player_state)
+        session.add(
+            Turn(
+                campaign_id=campaign.id,
+                session_id=None,
+                actor_id=player.actor_id,
+                kind="player",
+                content="it's a nice winter day in the pacific northwest at our mountain childhood home we grew up in",
+                meta_json=json.dumps(
+                    {
+                        "game_time": {"day": 1, "hour": 8, "minute": 0},
+                        "visibility": {
+                            "scope": "local",
+                            "actor_player_slug": "player-actor-1",
+                            "location_key": "mountain-cabin-kitchen",
+                        },
+                        "location_key": "mountain-cabin-kitchen",
+                    }
+                ),
+            )
+        )
+        session.add(
+            Turn(
+                campaign_id=campaign.id,
+                session_id=None,
+                actor_id=player.actor_id,
+                kind="narrator",
+                content="Sage watches the treeline.",
+                meta_json=json.dumps(
+                    {
+                        "game_time": {"day": 1, "hour": 8, "minute": 20},
+                        "visibility": {
+                            "scope": "local",
+                            "actor_player_slug": "player-actor-1",
+                            "location_key": "mountain-cabin-kitchen",
+                        },
+                        "location_key": "mountain-cabin-kitchen",
+                        "scene_output": {
+                            "location_key": "mountain-cabin-kitchen",
+                            "beats": [
+                                {
+                                    "type": "npc_dialogue",
+                                    "speaker": "sage",
+                                    "actors": ["sage"],
+                                    "listeners": ["player-actor-1"],
+                                    "visibility": "local",
+                                    "text": "Sage watches the treeline.",
+                                }
+                            ],
+                        },
+                    }
+                ),
+            )
+        )
+        session.commit()
+
+    turns = compat.get_recent_turns(campaign.id, limit=0)
+    lcd_recent = compat._recent_turns_text_for_viewer(
+        campaign,
+        turns,
+        viewer_actor_id=player.actor_id,
+        viewer_slug="player-actor-1",
+        viewer_location_key="mountain-cabin-kitchen",
+        viewer_private_context_key="",
+        requested_player_slugs=set(),
+        requested_npc_slugs={"sage"},
+        scene_npc_slugs={"sage", "player-actor-1"},
+    )
+
+    assert "nice winter day in the pacific northwest" in lcd_recent
+    assert "Sage watches the treeline." in lcd_recent
+
+
 def test_resolve_payload_forces_finalization_after_tool_round_limit(
     session_factory,
     seed_campaign_and_actor,

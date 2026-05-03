@@ -20169,6 +20169,42 @@ class ZorkEmulator:
                 return False
         return True
 
+    def _actor_local_player_turn_visible_to_scene_lcd(
+        self,
+        turn: Turn,
+        *,
+        viewer_actor_id: str,
+        viewer_location_key_norm: str,
+    ) -> bool:
+        if str(getattr(turn, "kind", "") or "").strip() != "player":
+            return False
+        if str(getattr(turn, "actor_id", "") or "").strip() != str(
+            viewer_actor_id or ""
+        ).strip():
+            return False
+        meta = self._safe_turn_meta(turn)
+        visibility = meta.get("visibility")
+        scope = "public"
+        turn_location_keys = {
+            self._normalize_location_key(meta.get("location_key")),
+        }
+        if isinstance(visibility, dict):
+            scope = str(visibility.get("scope") or "").strip().lower() or "public"
+            turn_location_keys.add(
+                self._normalize_location_key(visibility.get("location_key"))
+            )
+        if scope in {"private", "limited"}:
+            return False
+        if scope in {"", "public"}:
+            return True
+        turn_location_keys = {key for key in turn_location_keys if key}
+        return bool(
+            scope == "local"
+            and viewer_location_key_norm
+            and turn_location_keys
+            and viewer_location_key_norm in turn_location_keys
+        )
+
     def _beat_visible_to_all_scene_npcs(
         self,
         beat: Dict[str, object],
@@ -20409,7 +20445,12 @@ class ZorkEmulator:
             if scene_npc_slugs and not self._turn_visible_to_all_scene_npcs(
                 turn, scene_npc_slugs
             ):
-                continue
+                if not self._actor_local_player_turn_visible_to_scene_lcd(
+                    turn,
+                    viewer_actor_id=viewer_actor_id,
+                    viewer_location_key_norm=viewer_location_key_norm,
+                ):
+                    continue
 
             _strip_time = (
                 _is_individual_clocks
