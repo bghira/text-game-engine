@@ -3498,7 +3498,7 @@ def test_recent_turns_keeps_actor_local_history_after_location_change(
     assert "You mutter to yourself in the old room." in user_prompt
 
 
-def test_recent_turns_keeps_shared_local_listener_history_after_location_change(
+def test_recent_turns_strips_reasoning_when_reasoning_history_disabled(
     session_factory,
     seed_campaign_and_actor,
 ):
@@ -3508,6 +3508,11 @@ def test_recent_turns_keeps_shared_local_listener_history_after_location_change(
     other_player = compat.get_or_create_player(seed_campaign_and_actor["campaign_id"], "actor-2")
 
     with session_factory() as session:
+        campaign_row = session.get(Campaign, campaign.id)
+        assert campaign_row is not None
+        state = json.loads(campaign_row.state_json or "{}")
+        state[compat.REASONING_HISTORY_STATE_KEY] = False
+        campaign_row.state_json = json.dumps(state)
         player_row = session.get(Player, player.id)
         assert player_row is not None
         player_row.state_json = compat._dump_json(
@@ -3615,6 +3620,14 @@ def test_recent_turns_preserves_reasoning_when_reasoning_history_enabled(
     recent_block = user_prompt.split("RECENT_TURNS:\n", 1)[1].split("\nPLAYER_ACTION ", 1)[0]
     assert '"reasoning":"Penny is answering directly."' in recent_block
     assert compat.REASONING_HISTORY_STATE_KEY not in user_prompt
+
+
+def test_reasoning_history_enabled_by_default():
+    assert ZorkEmulator.DEFAULT_REASONING_HISTORY_ENABLED is True
+    assert ZorkEmulator._reasoning_history_enabled({}) is True
+    assert ZorkEmulator._reasoning_history_enabled(
+        {ZorkEmulator.REASONING_HISTORY_STATE_KEY: False}
+    ) is False
 
 
 def test_recent_turns_still_hides_actor_turns_with_suppress_context(

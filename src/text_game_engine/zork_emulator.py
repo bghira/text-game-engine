@@ -442,7 +442,7 @@ class ZorkEmulator:
     CHAPTER_PLAN_STATE_KEY = "_chapter_plan"
     CONSEQUENCE_STATE_KEY = "_consequences"
     REASONING_HISTORY_STATE_KEY = "_reasoning_history_enabled"
-    DEFAULT_REASONING_HISTORY_ENABLED = False
+    DEFAULT_REASONING_HISTORY_ENABLED = True
     # --- Private context -------------------------------------------------
     PRIVATE_CONTEXT_STATE_KEY = "_active_private_context"
     RESERVED_CAMPAIGN_STATE_KEYS = CORE_RESERVED_CAMPAIGN_STATE_KEYS
