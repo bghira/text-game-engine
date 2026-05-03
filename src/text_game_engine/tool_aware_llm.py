@@ -376,6 +376,15 @@ class ToolAwareZorkLLM:
             normalized = normalized[: max_chars - 3].rstrip() + "..."
         return normalized
 
+    def _memory_turn_content_value(self, text: object) -> str:
+        normalized = str(text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+        if self._emulator is not None:
+            try:
+                return self._emulator._strip_ephemeral_context_lines(normalized)  # noqa: SLF001
+            except Exception:
+                return normalized
+        return normalized
+
     # Keys that are TTS-only and should never appear in context output
     _TOOL_ROW_STRIP_KEYS = {"index", "vocal_intensity"}
 
@@ -1473,7 +1482,7 @@ class ToolAwareZorkLLM:
                         continue
                     if excluded_recent_turn_ids and turn_id in excluded_recent_turn_ids:
                         continue
-                    content = str(turn.content or "")
+                    content = self._memory_turn_content_value(turn.content)
                     if not content:
                         continue
                     meta = self._parse_json(turn.meta_json, {})
@@ -1564,6 +1573,9 @@ class ToolAwareZorkLLM:
                     )
                     for turn_id, kind, content, score in embed_hits:
                         tid = int(turn_id)
+                        content = self._memory_turn_content_value(content)
+                        if not content:
+                            continue
                         if search_within_turn_id_set and tid not in search_within_turn_id_set:
                             continue
                         if excluded_recent_turn_ids and tid in excluded_recent_turn_ids:
@@ -1583,7 +1595,7 @@ class ToolAwareZorkLLM:
                                 embed_only_hits[tid] = {
                                     "turn_id": tid,
                                     "score": float(score),
-                                    "content": str(content or ""),
+                                    "content": content,
                                     "visibility_scope": "public",
                                     "actor_player_slug": "",
                                     "location_key": "",
@@ -2362,7 +2374,10 @@ class ToolAwareZorkLLM:
                             (visibility or {}).get("context_key") or meta.get("context_key") or ""
                         ).strip()
                         or None,
-                        "text": self._memory_tool_text_value(turn.content or "", max_chars=2000),
+                        "text": self._memory_tool_text_value(
+                            self._memory_turn_content_value(turn.content),
+                            max_chars=2000,
+                        ),
                     }
                 )
             if visible_count >= limit:
@@ -2485,7 +2500,8 @@ class ToolAwareZorkLLM:
                         "actor_id": str(turn.actor_id or ""),
                         "created_at": turn.created_at.isoformat() if turn.created_at else None,
                         "full_text": self._memory_tool_text_value(
-                            turn.content or "", max_chars=12000
+                            self._memory_turn_content_value(turn.content),
+                            max_chars=12000,
                         ),
                     }
                 ]

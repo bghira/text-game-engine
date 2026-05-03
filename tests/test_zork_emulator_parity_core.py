@@ -623,6 +623,19 @@ def test_build_prompt_shape(session_factory, seed_campaign_and_actor):
     assert "CHARACTER ROSTER & PORTRAITS:" not in system_prompt
 
 
+def test_prompt_discourages_motific_physical_tics_and_npc_puppeting():
+    prompt = ZorkEmulator.RESPONSE_STYLE_NOTE + "\n" + ZorkEmulator.SYSTEM_PROMPT
+
+    assert "testing restraints" in prompt
+    assert "do not mention them checking, testing, tugging" in prompt
+    assert "Central NPC contribution" in prompt
+    assert "Do not make them a puppet" in prompt
+    assert "filler gesture or request for the player to steer" in prompt
+    assert "Do not write NPC abdication lines" in prompt
+    assert "pair them with the NPC's own preference" in prompt
+    assert "do not spend the turn apologizing" in prompt
+
+
 def test_build_prompt_tells_model_not_to_overthink_routine_turns(
     session_factory,
     seed_campaign_and_actor,
@@ -2396,6 +2409,56 @@ def test_memory_search_supports_last_results_full_text_and_context_pruning(
         assert outside_tail not in second_augmented_prompt
 
     asyncio.run(run_test())
+
+
+def test_memory_search_strips_ephemeral_inventory_from_legacy_turn_rows(
+    session_factory,
+    seed_campaign_and_actor,
+):
+    compat = _build_compat(session_factory)
+    campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
+    compat.get_or_create_player(campaign.id, seed_campaign_and_actor["actor_id"])
+    compat._record_simple_turn_pair(
+        campaign_id=campaign.id,
+        actor_id=seed_campaign_and_actor["actor_id"],
+        session_id=None,
+        action_text="remember alpha",
+        narration='Alpha clue remains."\n\nInventory: empty',
+    )
+    with session_factory() as session:
+        turn = (
+            session.query(Turn)
+            .filter(Turn.campaign_id == campaign.id)
+            .filter(Turn.kind == "narrator")
+            .order_by(Turn.id.desc())
+            .first()
+        )
+        assert turn is not None
+        turn_id = int(turn.id)
+
+    tool_llm = ToolAwareZorkLLM(
+        session_factory=session_factory,
+        completion_port=StubCompletionPort(),
+        temperature=0.8,
+        max_tokens=2048,
+    )
+    tool_llm.bind_emulator(compat)
+
+    output = tool_llm._tool_memory_search(  # noqa: SLF001
+        campaign.id,
+        {"queries": ["alpha"], "full_text": True, "search_within_turn_ids": [turn_id]},
+        actor_id=seed_campaign_and_actor["actor_id"],
+    )
+    assert "Alpha clue remains" in output
+    assert "Inventory:" not in output
+
+    turn_output = tool_llm._tool_memory_turn(  # noqa: SLF001
+        campaign.id,
+        {"turn_id": turn_id},
+        actor_id=seed_campaign_and_actor["actor_id"],
+    )
+    assert "Alpha clue remains" in turn_output
+    assert "Inventory:" not in turn_output
 
 
 def test_memory_search_excludes_recent_turns_already_in_prompt_context(
@@ -6128,13 +6191,13 @@ def test_play_action_appends_inventory_and_timer_and_persists(
         assert narration is not None
         assert "Inventory: Lantern" in narration
         assert "⏰ *Timed event:* <t:" in narration
-        assert ":R> - The vault seals" in narration
+        assert ":R> - A rain wall slams across Dock 9." in narration
         assert "(act to prevent!)" in narration
 
         with session_factory() as session:
             campaign = session.get(Campaign, seed_campaign_and_actor["campaign_id"])
             assert campaign is not None
-            assert campaign.last_narration == narration
+            assert campaign.last_narration == "Storm gathers over the pier."
             narrator_turn = (
                 session.query(Turn)
                 .filter(Turn.campaign_id == seed_campaign_and_actor["campaign_id"])
@@ -6143,10 +6206,58 @@ def test_play_action_appends_inventory_and_timer_and_persists(
                 .first()
             )
             assert narrator_turn is not None
-            assert narrator_turn.content == narration
+            assert narrator_turn.content == "Storm gathers over the pier."
+            assert "Inventory:" not in narrator_turn.content
+            assert "⏰" not in narrator_turn.content
             snapshot = session.query(Snapshot).filter(Snapshot.turn_id == narrator_turn.id).first()
             assert snapshot is not None
-            assert snapshot.campaign_last_narration == narration
+            assert snapshot.campaign_last_narration == "Storm gathers over the pier."
+
+    asyncio.run(run_test())
+
+
+def test_play_action_does_not_persist_inventory_footer_from_model_output(
+    uow_factory,
+    session_factory,
+    seed_campaign_and_actor,
+):
+    async def run_test():
+        llm = StubLLM(
+            LLMTurnOutput(
+                narration='The latch clicks open."\n\nInventory: empty',
+            )
+        )
+        engine = GameEngine(uow_factory=uow_factory, llm=llm)
+        compat = ZorkEmulator(game_engine=engine, session_factory=session_factory)
+        compat.get_or_create_player(
+            seed_campaign_and_actor["campaign_id"],
+            seed_campaign_and_actor["actor_id"],
+        )
+
+        narration = await compat.play_action(
+            campaign_id=seed_campaign_and_actor["campaign_id"],
+            actor_id=seed_campaign_and_actor["actor_id"],
+            action="open latch",
+        )
+        assert narration is not None
+        assert narration == 'The latch clicks open."\n\nInventory: empty'
+
+        with session_factory() as session:
+            campaign = session.get(Campaign, seed_campaign_and_actor["campaign_id"])
+            assert campaign is not None
+            assert campaign.last_narration == 'The latch clicks open."'
+            narrator_turn = (
+                session.query(Turn)
+                .filter(Turn.campaign_id == seed_campaign_and_actor["campaign_id"])
+                .filter(Turn.kind == "narrator")
+                .order_by(Turn.id.desc())
+                .first()
+            )
+            assert narrator_turn is not None
+            assert narrator_turn.content == 'The latch clicks open."'
+            snapshot = session.query(Snapshot).filter(Snapshot.turn_id == narrator_turn.id).first()
+            assert snapshot is not None
+            assert snapshot.campaign_last_narration == 'The latch clicks open."'
 
     asyncio.run(run_test())
 

@@ -545,6 +545,7 @@ class ZorkEmulator:
         "No novelistic inner monologue or comic-book melodrama. NPCs should want things and act from those wants: "
         "they may misunderstand, push back, change tactics, make a concrete offer, lose patience, or say the wrong thing for a human reason. "
         "When an NPC is central to the turn, give them one concrete contribution of their own instead of asking the player to direct them. "
+        "If a physical detail repeated recently, replace it with dialogue, a decision, or a materially new action. "
         "Vary pacing and meter between turns: sometimes clipped, sometimes patient, sometimes blunt, sometimes practical. "
         "Let emotional beats take the cadence of the character and the moment, not a stock counseling voice. "
         "No closing cadence: do not end turns with a settlement phrase that resolves scene energy through rhythmic finality. If the scene is still tense, the last line stays tense. "
@@ -862,6 +863,7 @@ class ZorkEmulator:
         "- Player indirection: humor, flirtation, metaphor, practical phrasing, silence, or physical action can still be sincere communication. Gate NPC response on substance, not on the player using a preferred literal sentence. Calling out evasion is appropriate only when the player is genuinely dodging the substance.\n"
         "- NPC agency: the player is not solely responsible for emotional momentum. NPCs have opinions, needs, routines, and unfinished business. They can initiate, answer badly, change the subject for a character reason, keep doing a task while talking, or choose visible space instead of pursuit.\n"
         "- Central NPC contribution: if an NPC is the focus of the scene and the player's action gives them room to respond, they must add something new: a want, refusal, correction, instruction, admission, practical move, complication, joke, tactic, or limit. Do not make them a puppet who asks the player what the scene should be. Questions are allowed only when they reveal the NPC's own agenda or create a concrete choice the NPC cares about.\n"
+        "- Do not write NPC abdication lines as a substitute for agency: 'tell me what to do,' 'what do you want me to do,' 'you decide,' 'direct me,' or equivalents. If an NPC is uncertain, inexperienced, restrained, scared, or aroused, they can still contribute a smaller choice: what they want tried, what they do not want, what they notice, what they can offer, what they need slowed down, or what they want to happen next. Consent checks and safety questions are valid, but pair them with the NPC's own preference, limit, or concrete option.\n"
         "- DELTA MODE: each turn should add NEW developments only. Do not recap unchanged context from WORLD_SUMMARY or RECENT_TURNS.\n"
         "- CONTINUATION, NOT RECAP: the player's action has already happened on the page. Your turn is what comes next, picking up from the moment immediately after it. Do not summarize, re-narrate, paraphrase, or restate the player's action — even briefly — before the NPC reacts. No 'as you do X, NPC...' or 'after you Y, NPC...' framings; just continue. The only exception is when one exact phrase from the player must be quoted because the scene literally hinges on its wording.\n"
         "- Avoid repetitive recap loops: at most one brief callback sentence to prior events, then move the scene forward.\n"
@@ -871,7 +873,7 @@ class ZorkEmulator:
         "- No refrain or motific repetition — do not repeat the same structural tail, closing image, or variable-word-swap line across consecutive turns. A repeated line does not accumulate weight; it becomes a crutch. If you catch yourself ending two turns the same way, cut the pattern.\n"
         "- ANTI-SELF-IMITATION: RECENT_TURNS contains your own prior output. Do not treat it as a template. Before writing, identify any repeated physical business, repeated opening move, repeated scene structure, or repeated NPC tactic from the last few turns, then choose a different move. The format, structure, and texture you used last turn is NOT a contract for this turn. If the last turn opened on a character's body-language tell, this one should not. If the last two turns each had exactly two beats of equal length, break that now.\n"
         "- NO GESTURE TICS: do not let any character accumulate a recurring physical tic across turns — testing restraints, tugging cuffs, flexing fingers, tucking hair, clearing throat, tilting head, exhaling through the nose, shifting weight, the same half-smile. If a gesture appeared in a recent turn for a given character, pick a different physical vocabulary this turn or skip the gesture entirely. Reused gestures read as an LLM tell, not character.\n"
-        "- Restraints and held positions: if a character is bound, handcuffed, pinned, injured, seated, or otherwise physically constrained, do not mention them checking, testing, tugging, straining, or re-settling against that constraint every turn. Mention the constraint again only when it changes the options, causes a new consequence, or the character deliberately uses it to pursue a want.\n"
+        "- Restraints and held positions: if a character is bound, handcuffed, pinned, injured, seated, or otherwise physically constrained, do not mention them checking, testing, tugging, straining, flexing, twisting, pulling, rolling, re-settling, or measuring that constraint every turn. Mention the constraint again only when it changes the options, causes a new consequence, or the character deliberately uses it to pursue a want.\n"
         "- BANNED GESTURES (hard prohibition, not just per-turn variation): finger tracing of any kind — tracing a back, a jaw, a cheekbone, a collarbone, a shape, a pattern, an outline, a name, a letter. Do not write 'fingers traced X', 'her thumb traced X', 'a finger traced X', or any variant. This phrasing is a recurrent LLM tell and it is exhausting. If a touch matters, write what the touch DOES — pressure, grip, hold, push, lift, anchor, settle — not a fingertip drawing patterns on someone's anatomy.\n"
         "- BANNED PROSE STRUCTURE — PAIRED-FRAGMENT REDEFINITION (also called the 'Not X. Y.' tic). Hard prohibition. Examples to refuse to write: 'Not mocking. Holding.' 'Not pity. Recognition.' 'Not teasing. Recognition.' 'Not dismissal. Recognition.' 'Not accusation. Naming.' 'Not testing. Recognizing.' 'Not question. Recognition.' 'Not defense. Her.' This template — short negation fragment followed by a one-word renaming fragment — is an LLM tell that LABELS a feeling instead of rendering it. It is not literary minimalism; it is annotation. Do not write it. If a moment needs nuance, write the action and let the reader infer; do not narrate the diagnosis. The same prohibition covers 'X. But Y.' compressions of the same shape ('Wrecked. But watching.', 'Soft. But certain.').\n"
         "- BANNED PROSE STRUCTURE — SINGLE-WORD EMOTIONAL-TAG FRAGMENTS. Do not chain one-word sentence-fragments that label a character's internal state or posture: 'Filing.' 'Processing.' 'Recognition.' 'Naming.' 'Watching.' 'Holding.' 'Staying.' 'Present.' 'Connected.' 'Wordless.' 'Steady.' 'Direct.' 'Unhurried.' 'Absent.' 'Flat.' 'Certain.' 'Wrecked.' These are TAGS, not prose. Two or three of them stacked together ('Direct. Unhurried.' / 'Staying. Present.' / 'Flat. Filing.') is the same failure mode as 'Not X. Y.': it tells the reader what to feel and substitutes labels for behavior. A fragment is allowed at most ONCE per beat and must do real work — never as a chain, never as a closing cadence, never as a substitute for showing the action.\n"
@@ -1042,6 +1044,7 @@ class ZorkEmulator:
         "- You MUST address the OOC substance directly instead of ignoring it and continuing the same scene pressure unchanged.\n"
         "- If the player asks for a hint, says they are stuck/confused, or says the scene feels railroaded/forced, take that seriously.\n"
         "- In those cases, give concrete, actionable guidance grounded in visible scene facts, active leads, or current puzzle state, and adapt the scene so the player has real options again.\n"
+        "- When OOC feedback identifies a writing failure, do not spend the turn apologizing, diagnosing yourself, or promising to do better later. Name the concrete correction briefly, then apply it in the current response if an in-world continuation is still requested.\n"
         "- Do NOT punish, stonewall, or sidestep OOC feedback by reasserting the blocked premise. Clarify, reopen choices, or relax the bottleneck.\n"
         "- OOC turns should usually cause little or no in-world advancement unless the player explicitly asks for both meta clarification and an in-world action.\n"
         "- Player signal fidelity: preserve the distinction the player made, especially direct questions, factual corrections, comparisons, and emotionally loaded charges. If an NPC cannot or will not answer part of it, make that visible through character behavior rather than letting the point disappear.\n"
@@ -8066,9 +8069,12 @@ class ZorkEmulator:
         timer_instruction=None,
         timer_delay_seconds: int | None = None,
     ) -> str:
-        decorated = strip_invalid_tts_closing_tags(
-            self._strip_narration_footer((narration or "").strip())
+        clean_narration = self._strip_ephemeral_context_lines(
+            strip_invalid_tts_closing_tags(
+                self._strip_narration_footer((narration or "").strip())
+            )
         )
+        decorated = clean_narration
         has_inventory_line = any(
             line.strip().lower().startswith("inventory:")
             for line in decorated.splitlines()
@@ -8137,7 +8143,7 @@ class ZorkEmulator:
                 )
 
             if campaign is not None:
-                campaign.last_narration = decorated
+                campaign.last_narration = clean_narration
                 campaign.state_json = self._dump_json(campaign_state)
                 campaign.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
 
@@ -8149,10 +8155,10 @@ class ZorkEmulator:
                 .first()
             )
             if narrator_turn is not None:
-                narrator_turn.content = decorated
+                narrator_turn.content = clean_narration
                 snapshot = session.query(Snapshot).filter(Snapshot.turn_id == narrator_turn.id).first()
                 if snapshot is not None:
-                    snapshot.campaign_last_narration = decorated
+                    snapshot.campaign_last_narration = clean_narration
             session.commit()
 
         return decorated
