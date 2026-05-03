@@ -10029,6 +10029,13 @@ class ZorkEmulator:
         return "\n".join(lines).strip()
 
     @classmethod
+    def _context_reasoning_value(cls, value: object) -> str:
+        text = str(value or "").strip()
+        if text.startswith("Compatibility fallback"):
+            return ""
+        return text
+
+    @classmethod
     def _reasoning_history_enabled(cls, campaign_state: object) -> bool:
         if not isinstance(campaign_state, dict):
             return cls.DEFAULT_REASONING_HISTORY_ENABLED
@@ -20603,11 +20610,6 @@ class ZorkEmulator:
             "kind": "beat",
             "turn_id": turn_number,
             "index": 0,
-            "reasoning": (
-                "Compatibility fallback from player turn text."
-                if turn.kind == "player"
-                else "Compatibility fallback from plain narration."
-            ),
             "type": beat_type,
             "speaker": speaker,
             "actors": actors,
@@ -20955,7 +20957,7 @@ class ZorkEmulator:
                 "kind": "beat",
                 "turn_id": turn_id,
                 "index": beat_index,
-                "reasoning": str(beat.get("reasoning") or "").strip(),
+                "reasoning": self._context_reasoning_value(beat.get("reasoning")),
                 "type": str(beat.get("type") or "narration").strip(),
                 "speaker": str(beat.get("speaker") or "narrator").strip(),
                 "actors": list(beat.get("actors") or []),
@@ -21113,7 +21115,7 @@ class ZorkEmulator:
                 "kind": "beat",
                 "turn_id": turn_number,
                 "index": beat_index,
-                "reasoning": str(beat.get("reasoning") or "").strip(),
+                "reasoning": self._context_reasoning_value(beat.get("reasoning")),
                 "type": str(beat.get("type") or "narration").strip(),
                 "speaker": str(beat.get("speaker") or "narrator").strip(),
                 "actors": list(beat.get("actors") or []),

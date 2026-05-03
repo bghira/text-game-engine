@@ -2578,6 +2578,9 @@ def test_recent_turns_prompt_uses_structured_fallback_not_legacy_player_lines(
     assert '"type":"player_action"' in user_prompt
     assert '"speaker":"chace-preston"' in user_prompt
     assert '\\"what is yield\\"' in user_prompt
+    recent_block = user_prompt.split("RECENT_TURNS:\n", 1)[1].split("\nPLAYER_ACTION ", 1)[0]
+    assert "Compatibility fallback" not in recent_block
+    assert '"reasoning":' not in recent_block
 
 
 def test_sms_thread_roundtrip(session_factory, seed_campaign_and_actor):
@@ -3766,7 +3769,7 @@ def test_recent_turns_focus_mode_filters_speaker_continuity_to_requested_npc(
     assert "i get ready for my meeting with simone" not in recent
 
 
-def test_ready_to_write_strips_reasoning_from_recent_turns_lcd_and_speaker_continuity(
+def test_ready_to_write_strips_reasoning_when_reasoning_history_disabled(
     session_factory,
     seed_campaign_and_actor,
 ):
@@ -3803,6 +3806,9 @@ def test_ready_to_write_strips_reasoning_from_recent_turns_lcd_and_speaker_conti
         with session_factory() as session:
             row = session.get(Campaign, campaign.id)
             assert row is not None
+            state = json.loads(row.state_json or "{}")
+            state[compat.REASONING_HISTORY_STATE_KEY] = False
+            row.state_json = compat._dump_json(state)
             characters = json.loads(row.characters_json or "{}")
             characters["simone-ashworth"] = {"name": "Simone Ashworth"}
             row.characters_json = compat._dump_json(characters)
@@ -3926,6 +3932,8 @@ def test_recent_turns_tool_emits_beats_without_turn_wrapper_rows(
     assert '"context_key":null' not in output
     assert '"location_key":null' not in output
     assert '"visibility":"local"' not in output
+    assert "Compatibility fallback" not in output
+    assert '"reasoning":' not in output
 
 
 def test_character_cards_tool_returns_scene_cards_instead_of_unsupported_error(

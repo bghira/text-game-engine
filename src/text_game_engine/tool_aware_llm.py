@@ -385,7 +385,7 @@ class ToolAwareZorkLLM:
             return {}
         cleaned: dict[str, Any] = {}
         for key, value in row.items():
-            if str(key) in ToolAwareLLM._TOOL_ROW_STRIP_KEYS:
+            if str(key) in ToolAwareZorkLLM._TOOL_ROW_STRIP_KEYS:
                 continue
             normalized = value
             if isinstance(normalized, str):
@@ -2323,12 +2323,15 @@ class ToolAwareZorkLLM:
                 for index, beat in enumerate(beats):
                     if not isinstance(beat, dict):
                         continue
+                    reasoning = str(beat.get("reasoning") or "").strip()
+                    if reasoning.startswith("Compatibility fallback"):
+                        reasoning = ""
                     rows.append(
                         {
                             "kind": "beat",
                             "turn_id": int(turn.id),
                             "index": index,
-                            "reasoning": str(beat.get("reasoning") or "").strip(),
+                            "reasoning": reasoning,
                             "type": str(beat.get("type") or "narration").strip(),
                             "speaker": str(beat.get("speaker") or "narrator").strip(),
                             "actors": list(beat.get("actors") or []),
@@ -2347,7 +2350,6 @@ class ToolAwareZorkLLM:
                         "kind": "beat",
                         "turn_id": int(turn.id),
                         "index": 0,
-                        "reasoning": "Compatibility fallback from stored turn text.",
                         "type": "player_action" if str(turn.kind or "") == "player" else "narration",
                         "speaker": str(turn.actor_id or "narrator"),
                         "actors": [str(turn.actor_id or "").strip()] if str(turn.kind or "") == "player" else [],
