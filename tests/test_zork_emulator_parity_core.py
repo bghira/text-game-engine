@@ -2150,8 +2150,8 @@ def test_ready_to_write_finalization_reexpands_character_and_location_cards(
         assert completion.calls[1]["prompt"].count("Yasmin watches the desk.") == 1
         assert "FINAL_LOCATION_CARDS:" in completion.calls[1]["prompt"]
         assert "hotel-lobby" in completion.calls[1]["prompt"]
-        assert "BAN: THERAPEUTIC RESOLUTION FRAMING." in completion.calls[1]["prompt"]
-        assert "BAN: filing-cabinet phrasing." in completion.calls[1]["prompt"]
+        assert "Let emotional scenes stay practical, unresolved, awkward" in completion.calls[1]["prompt"]
+        assert "Avoid filing-cabinet phrasing:" in completion.calls[1]["prompt"]
         final_location_match = re.search(r"FINAL_LOCATION_CARDS:\s*(\[.*?\])\n", completion.calls[1]["prompt"], re.DOTALL)
         assert final_location_match is not None
         assert '"expanded":' not in final_location_match.group(1)
