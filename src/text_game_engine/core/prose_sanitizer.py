@@ -10,6 +10,7 @@ Patterns stripped:
 2. ``Not <word>. <Word>.`` paired-fragment redefinitions ("Not pity. Recognition.").
 3. Standalone single-word emotional-tag sentences from a blocklist
    ("Filing." / "Processing." / "Staying." / etc.).
+4. Stray closing TTS tags such as ``</quiet>`` or ``[/emotive]``.
 """
 
 from __future__ import annotations
@@ -64,10 +65,20 @@ _NOT_X_Y_RE = re.compile(
 _TAG_FRAGMENT_RE = re.compile(
     r"(?<![\w'])([A-Z][a-z]+)\.(?=\s|$|[\"')])",
 )
+_INVALID_TTS_CLOSING_TAG_RE = re.compile(r"</\s*[A-Za-z][^>\n]{0,80}>")
+_INVALID_TTS_BRACKET_CLOSING_RE = re.compile(r"\[/\s*emotive\s*\]", re.IGNORECASE)
 
 
 def _drop_if_banned(match: re.Match[str]) -> str:
     return "" if match.group(1).lower() in _BANNED_TAG_WORDS else match.group(0)
+
+
+def strip_invalid_tts_closing_tags(text: object) -> str:
+    """Remove closing tags emitted for standalone TTS/emotive markers."""
+    if not isinstance(text, str) or not text:
+        return text if isinstance(text, str) else ""
+    text = _INVALID_TTS_CLOSING_TAG_RE.sub("", text)
+    return _INVALID_TTS_BRACKET_CLOSING_RE.sub("", text)
 
 
 def _sanitize_unquoted(text: str) -> str:
@@ -88,6 +99,7 @@ def sanitize_prose(text: object) -> str:
     """
     if not isinstance(text, str) or not text:
         return text if isinstance(text, str) else ""
+    text = strip_invalid_tts_closing_tags(text)
     if '"' not in text:
         out = _sanitize_unquoted(text)
     else:

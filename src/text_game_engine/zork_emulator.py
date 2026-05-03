@@ -44,6 +44,7 @@ from .core.normalize import (
     parse_json_dict,
     strip_reserved_campaign_state,
 )
+from .core.prose_sanitizer import strip_invalid_tts_closing_tags
 from .core.tokens import glm_token_count
 from .core.types import ResolveTurnInput
 from .persistence.sqlalchemy.models import (
@@ -543,6 +544,7 @@ class ZorkEmulator:
         "If those details did not materially change this turn, leave them implicit. "
         "No novelistic inner monologue or comic-book melodrama. NPCs should want things and act from those wants: "
         "they may misunderstand, push back, change tactics, make a concrete offer, lose patience, or say the wrong thing for a human reason. "
+        "When an NPC is central to the turn, give them one concrete contribution of their own instead of asking the player to direct them. "
         "Vary pacing and meter between turns: sometimes clipped, sometimes patient, sometimes blunt, sometimes practical. "
         "Let emotional beats take the cadence of the character and the moment, not a stock counseling voice. "
         "No closing cadence: do not end turns with a settlement phrase that resolves scene energy through rhythmic finality. If the scene is still tense, the last line stays tense. "
@@ -588,9 +590,9 @@ class ZorkEmulator:
         "- Vary your landing gear. Turns can end mid-exchange, on a practical detail, on a half-finished gesture, abruptly after dialogue. Not every turn needs a final settling sentence that signals 'scene complete' — most shouldn't.\n"
         "- Temporal coverage matters: your 1 to 2 beats must justify the full amount of in-world time you advance. Stay immediate for short spans; compress visibly for larger spans. Follow TURN_TIME_BEAT_GUIDANCE when it is provided.\n"
         "TTS_EMOTIVES — optional vocal performance markers (stripped from display, passed only to text-to-speech):\n"
-        "  Available tags: <giggle> <laughter> <guffaw> <sigh> <cry> <gasp> <groan> <inhale> <exhale> <whisper> <mumble> <uh> <um> <cough> <clear_throat> <shhh> <singing> <humming> <quiet>.\n"
-        '  TAGS ARE STANDALONE — there is NO closing form. WRONG: <quiet>"You don\'t leave."</quiet>. RIGHT: "<quiet>You don\'t leave." There is no </quiet>, no </sigh>, no closing tag of any kind. Any string starting with </ will leak into the rendered output verbatim and break TTS.\n'
-        '  PLACEMENT IS STRICT: when a speaking character delivers the emotive, the tag MUST sit literally INSIDE that character\'s quotation marks, before the words it colours. Examples: "<quiet>that\'s the difference." — "I— <sigh> I know." — "<whisper>not yet." NEVER place the tag between beats, on its own line, in a narrator beat, or outside the quotation marks of the speaker who performs it. Only the quoted span is fed to that character\'s TTS voice; anything outside the quotes is read by the narrator voice or stripped.\n'
+        "  Format: [emotive:text], where text is a short lower-case vocal direction such as quiet giggle, weary sigh, sharp inhale, whisper, or nervous cough.\n"
+        '  MARKERS ARE STANDALONE — there is NO closing form. WRONG: "<quiet>You don\'t leave.</quiet>" or "[emotive:quiet]You don\'t leave.[/emotive]". RIGHT: "[emotive:quiet]You don\'t leave." Never output any </...> or [/...] closing tag for TTS.\n'
+        '  PLACEMENT IS STRICT: when a speaking character delivers the emotive, the marker MUST sit literally INSIDE that character\'s quotation marks, before the words it colours. Examples: "[emotive:quiet]that\'s the difference." — "I— [emotive:weary sigh] I know." — "[emotive:whisper]not yet." NEVER place the marker between beats, on its own line, in a narrator beat, or outside the quotation marks of the speaker who performs it. Only the quoted span is fed to that character\'s TTS voice; anything outside the quotes is read by the narrator voice or stripped.\n'
         "  Use sparingly and only when the emotive adds genuine colour — once or twice per turn at most. Never pile them up.\n"
         "  ALL CAPS in beat text signals shouting/raised voice for TTS. Use it for genuinely loud moments.\n"
         "VOCAL_INTENSITY — optional float on each beat (\"vocal_intensity\": 0.5). 0.5 = neutral/calm, 1.0 = animated, 1.5 = heated, 2.0 = shouting/frantic. Omit for neutral delivery.\n"
@@ -856,9 +858,10 @@ class ZorkEmulator:
         "- Relationship register: close or intimate relationships are not logistics. When the scene touches love, loyalty, resentment, fear, attraction, or trust, let the prose and dialogue carry that charge in a way that fits the characters. Do not flatten tenderness into task management, and do not inflate ordinary distance into catastrophe.\n"
         "- Emotional scenes: let them stay practical, unresolved, awkward, funny, angry, tender, or ordinary as the characters warrant. NPCs should want things. They may misunderstand, push back, make a concrete offer, change tactics, lose patience, reach out, retreat deliberately, do something useful, or say the wrong thing for a human reason.\n"
         "- Emotional payoff: when a scene has built across multiple turns, the response should carry proportional weight even if little time passes. Weight can come from action, dialogue, timing, refusal, risk, or silence that costs something visible.\n"
-        "- Physical beats: write what touch or movement does. Use pressure, grip, distance, withdrawal, posture, and action rather than clinical placement reports or qualifying phrases that retract the gesture before it lands.\n"
+        "- Physical beats: write what touch or movement does only when it changes the exchange. Do not use restraint-checking, breath, eye movement, posture shifts, small tests, swallowing, jaw work, or hand movement as filler. If the same physical business appeared in RECENT_TURNS, retire it unless a materially new consequence follows.\n"
         "- Player indirection: humor, flirtation, metaphor, practical phrasing, silence, or physical action can still be sincere communication. Gate NPC response on substance, not on the player using a preferred literal sentence. Calling out evasion is appropriate only when the player is genuinely dodging the substance.\n"
         "- NPC agency: the player is not solely responsible for emotional momentum. NPCs have opinions, needs, routines, and unfinished business. They can initiate, answer badly, change the subject for a character reason, keep doing a task while talking, or choose visible space instead of pursuit.\n"
+        "- Central NPC contribution: if an NPC is the focus of the scene and the player's action gives them room to respond, they must add something new: a want, refusal, correction, instruction, admission, practical move, complication, joke, tactic, or limit. Do not make them a puppet who asks the player what the scene should be. Questions are allowed only when they reveal the NPC's own agenda or create a concrete choice the NPC cares about.\n"
         "- DELTA MODE: each turn should add NEW developments only. Do not recap unchanged context from WORLD_SUMMARY or RECENT_TURNS.\n"
         "- CONTINUATION, NOT RECAP: the player's action has already happened on the page. Your turn is what comes next, picking up from the moment immediately after it. Do not summarize, re-narrate, paraphrase, or restate the player's action — even briefly — before the NPC reacts. No 'as you do X, NPC...' or 'after you Y, NPC...' framings; just continue. The only exception is when one exact phrase from the player must be quoted because the scene literally hinges on its wording.\n"
         "- Avoid repetitive recap loops: at most one brief callback sentence to prior events, then move the scene forward.\n"
@@ -866,8 +869,9 @@ class ZorkEmulator:
         "- Do not end the turn with a poetic wrap-up line, thematic echo, or atmospheric summary sentence. No 'The [place] holds its [emotion]', no 'whatever comes after X', no rhetorical questions framing the next beat. End on the last concrete action or line of dialogue, then stop.\n"
         "- CLOSING CADENCE: do not write a settlement phrase — a rhythmically final sentence that resolves scene energy with prosodic falling meter. If tension is still live, the last sentence should leave it live. Vary how turns end: mid-dialogue, mid-action, on a question, on a practical detail, abruptly. A turn that always lands with the same settling rhythm trains the reader to stop feeling tension.\n"
         "- No refrain or motific repetition — do not repeat the same structural tail, closing image, or variable-word-swap line across consecutive turns. A repeated line does not accumulate weight; it becomes a crutch. If you catch yourself ending two turns the same way, cut the pattern.\n"
-        "- ANTI-SELF-IMITATION: RECENT_TURNS contains your own prior output. Do not treat it as a template. The format, structure, and texture you used last turn is NOT a contract for this turn. Actively break any pattern you notice yourself having set — do not carry forward the same opening move (e.g. always a sensory cue, always an NPC gesture, always a weather line), the same sentence cadence, the same paragraph shape, the same beat count, the same speaker order, or the same dialogue-to-narration ratio. If the last turn opened on a character's body-language tell, this one should not. If the last two turns each had exactly two beats of equal length, break that now. Format calcification across turns is a failure mode; variety is the default.\n"
-        "- NO GESTURE TICS: do not let any character accumulate a recurring physical tic across turns — tucking hair, clearing throat, tilting head, exhaling through the nose, shifting weight, the same half-smile. If a gesture appeared in a recent turn for a given character, pick a different physical vocabulary this turn or skip the gesture entirely. Reused gestures read as an LLM tell, not character.\n"
+        "- ANTI-SELF-IMITATION: RECENT_TURNS contains your own prior output. Do not treat it as a template. Before writing, identify any repeated physical business, repeated opening move, repeated scene structure, or repeated NPC tactic from the last few turns, then choose a different move. The format, structure, and texture you used last turn is NOT a contract for this turn. If the last turn opened on a character's body-language tell, this one should not. If the last two turns each had exactly two beats of equal length, break that now.\n"
+        "- NO GESTURE TICS: do not let any character accumulate a recurring physical tic across turns — testing restraints, tugging cuffs, flexing fingers, tucking hair, clearing throat, tilting head, exhaling through the nose, shifting weight, the same half-smile. If a gesture appeared in a recent turn for a given character, pick a different physical vocabulary this turn or skip the gesture entirely. Reused gestures read as an LLM tell, not character.\n"
+        "- Restraints and held positions: if a character is bound, handcuffed, pinned, injured, seated, or otherwise physically constrained, do not mention them checking, testing, tugging, straining, or re-settling against that constraint every turn. Mention the constraint again only when it changes the options, causes a new consequence, or the character deliberately uses it to pursue a want.\n"
         "- BANNED GESTURES (hard prohibition, not just per-turn variation): finger tracing of any kind — tracing a back, a jaw, a cheekbone, a collarbone, a shape, a pattern, an outline, a name, a letter. Do not write 'fingers traced X', 'her thumb traced X', 'a finger traced X', or any variant. This phrasing is a recurrent LLM tell and it is exhausting. If a touch matters, write what the touch DOES — pressure, grip, hold, push, lift, anchor, settle — not a fingertip drawing patterns on someone's anatomy.\n"
         "- BANNED PROSE STRUCTURE — PAIRED-FRAGMENT REDEFINITION (also called the 'Not X. Y.' tic). Hard prohibition. Examples to refuse to write: 'Not mocking. Holding.' 'Not pity. Recognition.' 'Not teasing. Recognition.' 'Not dismissal. Recognition.' 'Not accusation. Naming.' 'Not testing. Recognizing.' 'Not question. Recognition.' 'Not defense. Her.' This template — short negation fragment followed by a one-word renaming fragment — is an LLM tell that LABELS a feeling instead of rendering it. It is not literary minimalism; it is annotation. Do not write it. If a moment needs nuance, write the action and let the reader infer; do not narrate the diagnosis. The same prohibition covers 'X. But Y.' compressions of the same shape ('Wrecked. But watching.', 'Soft. But certain.').\n"
         "- BANNED PROSE STRUCTURE — SINGLE-WORD EMOTIONAL-TAG FRAGMENTS. Do not chain one-word sentence-fragments that label a character's internal state or posture: 'Filing.' 'Processing.' 'Recognition.' 'Naming.' 'Watching.' 'Holding.' 'Staying.' 'Present.' 'Connected.' 'Wordless.' 'Steady.' 'Direct.' 'Unhurried.' 'Absent.' 'Flat.' 'Certain.' 'Wrecked.' These are TAGS, not prose. Two or three of them stacked together ('Direct. Unhurried.' / 'Staying. Present.' / 'Flat. Filing.') is the same failure mode as 'Not X. Y.': it tells the reader what to feel and substitutes labels for behavior. A fragment is allowed at most ONCE per beat and must do real work — never as a chain, never as a closing cadence, never as a substitute for showing the action.\n"
@@ -995,7 +999,7 @@ class ZorkEmulator:
         "- Only advance to later times (e.g. morning) when the player explicitly requests it AND the jump is consistent with established world timing.\n"
         "- GROUNDING CHECKS (reflect only the relevant items concisely in reasoning):\n"
         "  * Player signal: distinguish quoted speech from unquoted intent/action, and preserve any direct questions or concrete charges.\n"
-        "  * NPC basis: name what each speaking/acting NPC wants or is trying to do this turn, grounded in visible scene facts and known continuity.\n"
+        "  * NPC basis: name what each speaking/acting NPC wants or is trying to do this turn, grounded in visible scene facts and known continuity. If they are central, make sure the beat gives them a new contribution rather than a filler gesture or request for the player to steer.\n"
         "  * Pending invitations: if a player previously set a condition such as 'come find me when you're ready,' decide whether enough time has passed for the NPC to act on it.\n"
         "  * Sequence: do not let NPCs make factual claims about the order of events unless RECENT_TURNS supports them.\n"
         "  * Options: leave at least one genuine avenue for continued engagement when a conversation remains unresolved.\n"
@@ -8062,7 +8066,9 @@ class ZorkEmulator:
         timer_instruction=None,
         timer_delay_seconds: int | None = None,
     ) -> str:
-        decorated = self._strip_narration_footer((narration or "").strip())
+        decorated = strip_invalid_tts_closing_tags(
+            self._strip_narration_footer((narration or "").strip())
+        )
         has_inventory_line = any(
             line.strip().lower().startswith("inventory:")
             for line in decorated.splitlines()
@@ -10057,6 +10063,18 @@ class ZorkEmulator:
         r"|shhh|quiet)>",
         re.IGNORECASE,
     )
+    _EMOTIVE_MARKER_RE = re.compile(
+        r"\[emotive:[^\]\r\n]{1,80}\]",
+        re.IGNORECASE,
+    )
+
+    @classmethod
+    def _strip_tts_markers_from_text(cls, text: object) -> str:
+        cleaned = str(text or "")
+        cleaned = cls._EMOTIVE_TAG_RE.sub("", cleaned)
+        cleaned = cls._EMOTIVE_MARKER_RE.sub("", cleaned)
+        cleaned = strip_invalid_tts_closing_tags(cleaned)
+        return re.sub(r"\[/\s*emotive\s*\]", "", cleaned, flags=re.IGNORECASE)
 
     @classmethod
     def _strip_emotives_from_recent_turn_jsonl(cls, text: object) -> str:
@@ -10068,14 +10086,14 @@ class ZorkEmulator:
             try:
                 payload = json.loads(line)
             except Exception:
-                lines.append(cls._EMOTIVE_TAG_RE.sub("", line))
+                lines.append(cls._strip_tts_markers_from_text(line))
                 continue
             if not isinstance(payload, dict):
-                lines.append(cls._EMOTIVE_TAG_RE.sub("", line))
+                lines.append(cls._strip_tts_markers_from_text(line))
                 continue
             text_val = payload.get("text")
             if isinstance(text_val, str):
-                cleaned = cls._EMOTIVE_TAG_RE.sub("", text_val)
+                cleaned = cls._strip_tts_markers_from_text(text_val)
                 cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
                 payload["text"] = cleaned
             lines.append(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))

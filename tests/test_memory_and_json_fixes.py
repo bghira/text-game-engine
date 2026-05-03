@@ -20,6 +20,49 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 
+class TestTtsEmotiveMarkers:
+    def test_prompt_uses_bracket_emotive_contract(self):
+        from text_game_engine.zork_emulator import ZorkEmulator
+
+        prompt = ZorkEmulator.WRITING_CRAFT_PROMPT
+
+        assert "[emotive:text]" in prompt
+        assert "[emotive:quiet]You don't leave." in prompt
+        assert "Available tags: <giggle>" not in prompt
+
+    def test_recent_turn_context_strips_legacy_and_bracket_emotives(self):
+        from text_game_engine.zork_emulator import ZorkEmulator
+
+        raw = "\n".join(
+            [
+                json.dumps(
+                    {
+                        "kind": "beat",
+                        "text": '"[emotive:quiet giggle]fine," she says. </quiet>',
+                    }
+                ),
+                'plain <sigh>fallback line</sigh> and "[emotive:whisper]still here."',
+            ]
+        )
+
+        cleaned = ZorkEmulator._strip_emotives_from_recent_turn_jsonl(raw)
+
+        assert "[emotive:" not in cleaned
+        assert "<sigh>" not in cleaned
+        assert "</quiet>" not in cleaned
+        assert "</sigh>" not in cleaned
+        first_line, second_line = cleaned.splitlines()
+        assert json.loads(first_line)["text"] == '"fine," she says.'
+        assert second_line == 'plain fallback line and "still here."'
+
+    def test_prose_sanitizer_strips_invalid_tts_closing_tags_inside_dialogue(self):
+        from text_game_engine.core.prose_sanitizer import sanitize_prose
+
+        cleaned = sanitize_prose('"[emotive:quiet]Stay here.</quiet>" She waits.</sigh>')
+
+        assert cleaned == '"[emotive:quiet]Stay here." She waits.'
+
+
 # ---------------------------------------------------------------------------
 # JSON repair pipeline
 # ---------------------------------------------------------------------------
