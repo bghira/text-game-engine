@@ -543,6 +543,25 @@ class ToolAwareZorkLLM:
             out.append(row_turn_id)
         return out
 
+    @staticmethod
+    def _memory_tool_turn_id_from_row(row: dict[str, Any]) -> int:
+        row_kind = str(row.get("kind") or "").strip().lower()
+        row_turn_id = 0
+        if row_kind == "memory_turn_result":
+            try:
+                row_turn_id = int(row.get("turn_id") or 0)
+            except Exception:
+                row_turn_id = 0
+        elif (
+            row_kind == "memory_hit"
+            and str(row.get("memory_type") or "").strip().lower() == "turn"
+        ):
+            try:
+                row_turn_id = int(row.get("turn_id") or 0)
+            except Exception:
+                row_turn_id = 0
+        return row_turn_id
+
     def _memory_tool_excluded_turn_ids_from_recent_context(
         self,
         campaign_id: str,
@@ -641,6 +660,149 @@ class ToolAwareZorkLLM:
         }
         prefix = "MEMORY_TURN_RESULT:" if tool_key == "memory_turn" else "MEMORY_RECALL:"
         return prefix + "\n" + cls._memory_tool_jsonl([retained_meta, *kept_rows])
+
+    def _memory_turn_visible_to_final_lcd(
+        self,
+        turn: Turn | None,
+        *,
+        actor_id: str,
+        scene_lcd_slugs: set[str],
+        viewer_location_key: str,
+    ) -> bool:
+        emulator = self._emulator
+        if emulator is None or turn is None:
+            return False
+        if not scene_lcd_slugs:
+            return True
+        if emulator._turn_visible_to_all_scene_npcs(turn, scene_lcd_slugs):  # noqa: SLF001
+            return True
+        return emulator._actor_local_player_turn_visible_to_scene_lcd(  # noqa: SLF001
+            turn,
+            viewer_actor_id=actor_id,
+            viewer_location_key_norm=emulator._normalize_location_key(viewer_location_key),  # noqa: SLF001
+        )
+
+    def _filter_memory_tool_text_for_final_lcd(
+        self,
+        campaign_id: str,
+        tool_name: str,
+        text: object,
+        *,
+        actor_id: str,
+        scene_lcd_slugs: set[str],
+        viewer_location_key: str,
+    ) -> str:
+        tool_key = str(tool_name or "").strip().lower()
+        raw_text = str(text or "").strip()
+        if tool_key not in {"memory_search", "memory_turn"} or not scene_lcd_slugs:
+            return raw_text
+        records = self._memory_tool_records_from_text(raw_text)
+        if not records:
+            return raw_text
+
+        turn_ids = {
+            turn_id
+            for turn_id in (self._memory_tool_turn_id_from_row(row) for row in records)
+            if turn_id > 0
+        }
+        if not turn_ids:
+            return raw_text
+        with self._session_factory() as session:
+            turns = (
+                session.query(Turn)
+                .filter(Turn.campaign_id == str(campaign_id))
+                .filter(Turn.id.in_(sorted(turn_ids)))
+                .all()
+            )
+        turn_by_id = {int(turn.id): turn for turn in turns if turn.id is not None}
+
+        kept_rows: list[dict[str, Any]] = []
+        dropped_turn_count = 0
+        for row in records:
+            row_turn_id = self._memory_tool_turn_id_from_row(row)
+            if row_turn_id <= 0:
+                kept_rows.append(row)
+                continue
+            if self._memory_turn_visible_to_final_lcd(
+                turn_by_id.get(row_turn_id),
+                actor_id=actor_id,
+                scene_lcd_slugs=scene_lcd_slugs,
+                viewer_location_key=viewer_location_key,
+            ):
+                kept_rows.append(row)
+            else:
+                dropped_turn_count += 1
+
+        if dropped_turn_count <= 0:
+            return raw_text
+
+        hit_count = sum(
+            1
+            for row in kept_rows
+            if str(row.get("kind") or "").strip().lower() == "memory_hit"
+        )
+        retained_turn_ids = sorted(
+            {
+                turn_id
+                for turn_id in (
+                    self._memory_tool_turn_id_from_row(row) for row in kept_rows
+                )
+                if turn_id > 0
+            }
+        )
+        annotated_rows: list[dict[str, Any]] = []
+        for row in kept_rows:
+            row_kind = str(row.get("kind") or "").strip().lower()
+            if row_kind == "memory_query_result":
+                patched = dict(row)
+                patched["hit_count"] = hit_count
+                patched["lcd_filtered_turn_count"] = dropped_turn_count
+                patched["lcd_filter_slugs"] = sorted(scene_lcd_slugs)
+                annotated_rows.append(patched)
+            elif row_kind == "memory_context_retained":
+                patched = dict(row)
+                patched["retained_turn_ids"] = retained_turn_ids
+                patched["retained_count"] = sum(
+                    1
+                    for kept in kept_rows
+                    if self._memory_tool_turn_id_from_row(kept) > 0
+                )
+                patched["lcd_filtered_turn_count"] = dropped_turn_count
+                patched["lcd_filter_slugs"] = sorted(scene_lcd_slugs)
+                annotated_rows.append(patched)
+            else:
+                annotated_rows.append(row)
+
+        prefix = "MEMORY_TURN_RESULT:" if tool_key == "memory_turn" else "MEMORY_RECALL:"
+        return prefix + "\n" + self._memory_tool_jsonl(annotated_rows)
+
+    def _final_tool_history_for_lcd(
+        self,
+        tool_history_entries: list[dict[str, str]],
+        *,
+        campaign_id: str,
+        actor_id: str,
+        scene_lcd_slugs: set[str],
+        viewer_location_key: str,
+    ) -> str:
+        chunks: list[str] = []
+        for entry in tool_history_entries:
+            tool_name = str(entry.get("tool_name") or "").strip().lower()
+            text = str(entry.get("text") or "").strip()
+            if not text:
+                continue
+            if tool_name in {"memory_search", "memory_turn"}:
+                text = self._filter_memory_tool_text_for_final_lcd(
+                    campaign_id,
+                    tool_name,
+                    text,
+                    actor_id=actor_id,
+                    scene_lcd_slugs=scene_lcd_slugs,
+                    viewer_location_key=viewer_location_key,
+                )
+            if text:
+                chunks.append(text)
+        return "".join(f"\n\n{chunk}" for chunk in chunks)
 
     @staticmethod
     def _tool_call_signature(payload: dict[str, Any]) -> str:
@@ -3777,8 +3939,32 @@ class ToolAwareZorkLLM:
                 }
                 scene_participant_slugs = _all_speaker_slugs.union(_all_listener_slugs)
                 # Always include the viewer so their own turns pass the filter.
-                if viewer_slug:
+                viewer_character_slug = emulator._player_slug_key(  # noqa: SLF001
+                    player_state.get("character_name")
+                    or player_state.get("name")
+                    or player_state.get("display_name")
+                    or ""
+                )
+                if (
+                    viewer_slug
+                    and viewer_slug not in scene_participant_slugs
+                    and (
+                        not viewer_character_slug
+                        or viewer_character_slug not in scene_participant_slugs
+                    )
+                ):
                     scene_participant_slugs.add(viewer_slug)
+                if scene_participant_slugs:
+                    _filtered_tool_history = self._final_tool_history_for_lcd(
+                        tool_history_entries,
+                        campaign_id=str(campaign_id),
+                        actor_id=str(actor_id),
+                        scene_lcd_slugs=scene_participant_slugs,
+                        viewer_location_key=viewer_location_key,
+                    )
+                    _clean_tool_history = emulator._strip_recent_turns_prompt_sections(  # noqa: SLF001
+                        _filtered_tool_history
+                    )
                 final_character_entries: list[dict[str, Any]] = []
                 for slug in sorted(scene_npc_slugs):
                     row = campaign_characters.get(slug) if isinstance(campaign_characters, dict) else None

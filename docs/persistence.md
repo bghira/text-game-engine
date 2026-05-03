@@ -53,6 +53,11 @@ def uow_factory():
 - Active timer is unique per campaign.
 - Outbox idempotency is unique per campaign + session scope + event + key.
 - Rewind sets `memory_visible_max_turn_id`; memory queries must filter by it.
+- Narrator `Turn.content`, `Campaign.last_narration`, and snapshot
+  `campaign_last_narration` store clean narration only. UI/runtime footers such
+  as `Inventory: ...`, unread-SMS notices, and timed-event countdown lines are
+  returned to callers for display but are not persisted into turn history or
+  memory-search source text.
 - Runtime/backend configuration is not campaign world state. Reserved keys such
   as `zork_backend_config` are stripped from prompt state, turn state updates,
   campaign snapshots, and campaign state commits.

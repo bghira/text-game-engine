@@ -1904,6 +1904,128 @@ def test_ready_to_write_lcd_backfills_older_shared_turns_after_solo_gap(
     asyncio.run(run_test())
 
 
+def test_ready_to_write_filters_memory_search_turn_hits_to_speaker_lcd(
+    session_factory,
+    seed_campaign_and_actor,
+):
+    class MemoryLcdCompletionPort:
+        def __init__(self, private_turn_id: int, public_turn_id: int):
+            self.private_turn_id = private_turn_id
+            self.public_turn_id = public_turn_id
+            self.calls = []
+
+        async def complete(self, system_prompt, prompt, *, temperature=0.8, max_tokens=2048):
+            self.calls.append({"system_prompt": system_prompt, "prompt": prompt})
+            if len(self.calls) == 1:
+                return json.dumps(
+                    {
+                        "tool_call": "memory_search",
+                        "queries": ["memory marker"],
+                        "search_within_turn_ids": [
+                            self.private_turn_id,
+                            self.public_turn_id,
+                        ],
+                    }
+                )
+            if len(self.calls) == 2:
+                return '{"tool_call":"ready_to_write","speakers":["simone-ashworth"],"listeners":[]}'
+            return (
+                '{"reasoning":"finalized","narration":"Final scene.",'
+                '"state_update":{"game_time":{"day":1,"hour":9,"minute":0,"day_of_week":"monday","period":"morning","date_label":"Monday, Day 1, Morning"}},'
+                '"summary_update":"done"}'
+            )
+
+    async def run_test():
+        compat = _build_compat(session_factory)
+        campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
+        player = compat.get_or_create_player(campaign.id, seed_campaign_and_actor["actor_id"])
+
+        with session_factory() as session:
+            row = session.get(Campaign, campaign.id)
+            assert row is not None
+            row.characters_json = compat._dump_json(
+                {"simone-ashworth": {"name": "Simone Ashworth", "location": "office"}}
+            )
+            player_row = session.get(Player, player.id)
+            player_state = json.loads(player_row.state_json or "{}")
+            player_state["character_name"] = "Alex"
+            player_state["location"] = "office"
+            player_row.state_json = compat._dump_json(player_state)
+
+            private_turn = Turn(
+                campaign_id=campaign.id,
+                session_id=None,
+                actor_id=seed_campaign_and_actor["actor_id"],
+                kind="narrator",
+                content="PRIVATE-MEMORY-MARKER: Alex found the hidden ledger alone.",
+                meta_json=json.dumps(
+                    {
+                        "visibility": {
+                            "scope": "private",
+                            "actor_player_slug": "alex",
+                            "visible_actor_ids": [seed_campaign_and_actor["actor_id"]],
+                            "visible_player_slugs": ["alex"],
+                            "aware_npc_slugs": [],
+                            "location_key": "office",
+                        },
+                        "location_key": "office",
+                    }
+                ),
+            )
+            public_turn = Turn(
+                campaign_id=campaign.id,
+                session_id=None,
+                actor_id=seed_campaign_and_actor["actor_id"],
+                kind="narrator",
+                content="PUBLIC-MEMORY-MARKER: The office windows rattled during the storm.",
+                meta_json=json.dumps(
+                    {
+                        "visibility": {"scope": "public", "location_key": "office"},
+                        "location_key": "office",
+                    }
+                ),
+            )
+            session.add(private_turn)
+            session.add(public_turn)
+            session.flush()
+            private_turn_id = int(private_turn.id)
+            public_turn_id = int(public_turn.id)
+            session.commit()
+
+        completion = MemoryLcdCompletionPort(private_turn_id, public_turn_id)
+        tool_llm = ToolAwareZorkLLM(
+            session_factory=session_factory,
+            completion_port=completion,
+            temperature=0.8,
+            max_tokens=2048,
+        )
+        tool_llm.bind_emulator(compat)
+
+        payload = await tool_llm._resolve_payload(  # noqa: SLF001
+            campaign.id,
+            seed_campaign_and_actor["actor_id"],
+            "ask Simone what she remembers",
+            "research system",
+            "PLAYER_ACTION: ask Simone what she remembers\nmemory_lookup_enabled: true",
+            "final system",
+            "PLAYER_ACTION: ask Simone what she remembers\nmemory_lookup_enabled: true",
+        )
+
+        assert payload is not None
+        assert len(completion.calls) == 3
+        research_augmented_prompt = completion.calls[1]["prompt"]
+        assert "PRIVATE-MEMORY-MARKER" in research_augmented_prompt
+        assert "PUBLIC-MEMORY-MARKER" in research_augmented_prompt
+
+        final_prompt = completion.calls[2]["prompt"]
+        assert "PUBLIC-MEMORY-MARKER" in final_prompt
+        assert "PRIVATE-MEMORY-MARKER" not in final_prompt
+        assert '"lcd_filtered_turn_count":1' in final_prompt
+        assert "simone-ashworth" in final_prompt
+
+    asyncio.run(run_test())
+
+
 def test_lcd_keeps_actor_local_player_setup_for_scene_participants(
     session_factory,
     seed_campaign_and_actor,
