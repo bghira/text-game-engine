@@ -4163,6 +4163,14 @@ class ToolAwareZorkLLM:
                 "beats MUST be an array of 1 to 2 beat objects; scene_output as a plain string is invalid.\n"
                 "narration is optional when scene_output is present; prefer omitting it and let the harness render beat text.\n"
             )
+            quality_pass_prompt = (
+                "QUALITY_PASS:\n"
+                "Before returning final JSON, silently revise the turn once.\n"
+                "Do not take the first obvious phrasing. Replace generic emotional beats, repeated gestures, recap, and filler "
+                "with one character-specific action, admission, refusal, tactic, or concrete change.\n"
+                "Every speaking NPC must contribute something new that only that character would say or do in this situation.\n"
+                "If the draft feels like a continuation of your last few outputs, rewrite the shape before returning it.\n"
+            )
             finalize_prompt = (
                 f"{_clean_final_user_prompt}\n"
                 f"{_clean_tool_history}\n\n"
@@ -4173,6 +4181,7 @@ class ToolAwareZorkLLM:
                 + _final_character_cards_block
                 + _final_location_cards_block
                 + (f"\n{_final_prompt_tail}\n" if _final_prompt_tail else "")
+                + quality_pass_prompt
                 + emulator.WRITING_CRAFT_PROMPT
             )
             self._zork_log(f"FINALIZATION REQUEST campaign={campaign_id}", f"SYSTEM:\n{final_system_prompt}\n\nUSER:\n{finalize_prompt}")

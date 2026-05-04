@@ -1622,6 +1622,8 @@ def test_ready_to_write_finalization_uses_final_stage_system_prompt(
         assert "tool_calls MUST be the last top-level key" in completion.calls[1]["system_prompt"]
         assert "make those beats cover the full span implied by state_update.game_time" in completion.calls[1]["system_prompt"]
         assert "follow TURN_TIME_BEAT_GUIDANCE for the current minimum span" in completion.calls[1]["system_prompt"]
+        assert "QUALITY_PASS:" in completion.calls[1]["prompt"]
+        assert "silently revise the turn once" in completion.calls[1]["prompt"]
         assert '"kind":"turn"' not in completion.calls[1]["prompt"]
 
     asyncio.run(run_test())
