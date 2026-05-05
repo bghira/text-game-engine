@@ -30,6 +30,15 @@ class TestTtsEmotiveMarkers:
         assert "[emotive:quiet]You don't leave." in prompt
         assert "Available tags: <giggle>" not in prompt
 
+    def test_prompt_tells_npcs_to_soften_with_familiarity(self):
+        from text_game_engine.zork_emulator import ZorkEmulator
+
+        prompt = ZorkEmulator.WRITING_CRAFT_PROMPT
+
+        assert "Familiarity modulates warmth" in prompt
+        assert "softer knee-jerk defenses" in prompt
+        assert "Do not reset them to first-meeting guardedness" in prompt
+
     def test_recent_turn_context_strips_legacy_and_bracket_emotives(self):
         from text_game_engine.zork_emulator import ZorkEmulator
 
