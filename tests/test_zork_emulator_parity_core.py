@@ -1624,6 +1624,9 @@ def test_ready_to_write_finalization_uses_final_stage_system_prompt(
         assert "follow TURN_TIME_BEAT_GUIDANCE for the current minimum span" in completion.calls[1]["system_prompt"]
         assert "QUALITY_PASS:" in completion.calls[1]["prompt"]
         assert "silently revise the turn once" in completion.calls[1]["prompt"]
+        assert "NPC self-interest rule" in completion.calls[1]["prompt"]
+        assert "respond from their own lives, dreams, obligations" in completion.calls[1]["prompt"]
+        assert "unless the character card, autobiography, relationship history" in completion.calls[1]["prompt"]
         assert '"kind":"turn"' not in completion.calls[1]["prompt"]
 
     asyncio.run(run_test())

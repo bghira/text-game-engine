@@ -4169,6 +4169,11 @@ class ToolAwareZorkLLM:
                 "Do not take the first obvious phrasing. Replace generic emotional beats, repeated gestures, recap, and filler "
                 "with one character-specific action, admission, refusal, tactic, or concrete change.\n"
                 "Every speaking NPC must contribute something new that only that character would say or do in this situation.\n"
+                "NPC self-interest rule: by default, NPCs respond from their own lives, dreams, obligations, fears, "
+                "comfort, survival, ambition, curiosity, pride, routines, and boundaries first. "
+                "Do not make an NPC primarily optimize for the player's emotional arc, convenience, desire, or plan unless "
+                "the character card, autobiography, relationship history, or immediate circumstance establishes that kind of selflessness, duty, devotion, coercion, or dependence. "
+                "Help, loyalty, tenderness, lust, and sacrifice are valid only when they still feel like that NPC pursuing or protecting something of their own.\n"
                 "If the draft feels like a continuation of your last few outputs, rewrite the shape before returning it.\n"
             )
             finalize_prompt = (
