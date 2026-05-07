@@ -11767,6 +11767,74 @@ class ZorkEmulator:
         return key or "actor-unknown"
 
     @classmethod
+    def _sms_relative_player_aliases(cls) -> set[str]:
+        return {
+            alias
+            for alias in (
+                cls._sms_normalize_thread_key("player"),
+                cls._sms_normalize_thread_key("the player"),
+                cls._sms_normalize_thread_key("me"),
+                cls._sms_normalize_thread_key("myself"),
+                cls._sms_normalize_thread_key("you"),
+                cls._sms_normalize_thread_key("yourself"),
+                cls._sms_normalize_thread_key("pc"),
+                cls._sms_normalize_thread_key("protagonist"),
+                cls._sms_normalize_thread_key("main character"),
+            )
+            if alias
+        }
+
+    @classmethod
+    def _sms_is_relative_player_target(cls, value: object) -> bool:
+        return cls._sms_normalize_thread_key(value) in cls._sms_relative_player_aliases()
+
+    @classmethod
+    def _sms_owner_display_target(
+        cls,
+        *,
+        actor_id: object,
+        player_state: Dict[str, object] | None,
+    ) -> str:
+        if isinstance(player_state, dict):
+            character_name = str(player_state.get("character_name") or "").strip()
+            if character_name:
+                return character_name[:80]
+        visibility_slug = cls._player_visibility_slug(actor_id)
+        return visibility_slug[:80] if visibility_slug else str(actor_id or "Player")[:80]
+
+    @classmethod
+    def _sms_normalize_owned_participants(
+        cls,
+        *,
+        thread: str,
+        sender: str,
+        recipient: str,
+        owner_actor_id: object,
+        owner_player_state: Dict[str, object] | None,
+    ) -> tuple[str, str, str]:
+        if not str(owner_actor_id or "").strip():
+            return thread, sender, recipient
+        owner_display = cls._sms_owner_display_target(
+            actor_id=owner_actor_id,
+            player_state=owner_player_state,
+        )
+        sender_is_owner = cls._sms_is_relative_player_target(sender)
+        recipient_is_owner = cls._sms_is_relative_player_target(recipient)
+        thread_is_owner = cls._sms_is_relative_player_target(thread)
+        if sender_is_owner and owner_display:
+            sender = owner_display
+        if recipient_is_owner and owner_display:
+            recipient = owner_display
+        if thread_is_owner:
+            if recipient_is_owner and not sender_is_owner and sender:
+                thread = sender
+            elif sender_is_owner and not recipient_is_owner and recipient:
+                thread = recipient
+            elif owner_display:
+                thread = owner_display
+        return thread, sender, recipient
+
+    @classmethod
     def _sms_player_aliases(
         cls,
         *,
@@ -11823,6 +11891,8 @@ class ZorkEmulator:
             actor_id=actor_id,
             player_state=player_state,
         )
+        if str(row.get("owner_actor_id") or "").strip() == str(actor_id or "").strip():
+            aliases = set(aliases) | cls._sms_relative_player_aliases()
         messages = cls._sms_visible_messages_for_viewer(
             row,
             viewer_actor_id=actor_id,
@@ -11957,6 +12027,8 @@ class ZorkEmulator:
             actor_id=viewer_actor_id,
             player_state=player_state,
         )
+        if str(row.get("owner_actor_id") or "").strip() == str(viewer_actor_id or "").strip():
+            aliases = set(aliases) | cls._sms_relative_player_aliases()
         messages = (
             list(visible_messages)
             if isinstance(visible_messages, list)
@@ -12122,13 +12194,17 @@ class ZorkEmulator:
             messages = row.get("messages")
             if not isinstance(messages, list):
                 continue
+            row_owner_actor_id = str(row.get("owner_actor_id") or "").strip()
+            effective_aliases = aliases
+            if row_owner_actor_id and row_owner_actor_id == str(actor_id or "").strip():
+                effective_aliases = set(aliases) | cls._sms_relative_player_aliases()
             seen_marker = cls._coerce_non_negative_int(read_threads.get(thread_key, 0), default=0)
             thread_unread = 0
             for msg in messages:
                 if not isinstance(msg, dict):
                     continue
                 to_norm = cls._sms_normalize_thread_key(msg.get("to"))
-                if not to_norm or to_norm not in aliases:
+                if not to_norm or to_norm not in effective_aliases:
                     continue
                 seq = cls._coerce_non_negative_int(msg.get("seq", 0), default=0)
                 turn_id = cls._coerce_non_negative_int(msg.get("turn_id", 0), default=0)
@@ -12402,6 +12478,23 @@ class ZorkEmulator:
                     .first()
                 )
                 effective_turn_id = int(latest_turn.id) if latest_turn is not None else 0
+            if owner_actor_id:
+                owner_player = (
+                    session.query(Player)
+                    .filter(Player.campaign_id == str(campaign_id))
+                    .filter(Player.actor_id == str(owner_actor_id))
+                    .first()
+                )
+                owner_player_state = (
+                    self.get_player_state(owner_player) if owner_player is not None else {}
+                )
+                thread, sender, recipient = self._sms_normalize_owned_participants(
+                    thread=thread,
+                    sender=sender,
+                    recipient=recipient,
+                    owner_actor_id=owner_actor_id,
+                    owner_player_state=owner_player_state,
+                )
             self._sms_write(
                 campaign_state,
                 thread=thread,
@@ -15681,6 +15774,16 @@ class ZorkEmulator:
                     )
                     if player_time:
                         game_time = player_time
+                    owner_player_state = self.get_player_state(player_row)
+                else:
+                    owner_player_state = {}
+                thread, sender, recipient = self._sms_normalize_owned_participants(
+                    thread=thread,
+                    sender=sender,
+                    recipient=recipient,
+                    owner_actor_id=owner_text,
+                    owner_player_state=owner_player_state,
+                )
             self._sms_write(
                 campaign_state,
                 thread=thread,

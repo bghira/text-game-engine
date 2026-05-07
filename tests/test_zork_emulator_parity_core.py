@@ -3072,6 +3072,167 @@ def test_sms_reply_nudge_clears_when_reply_arrives_on_canonical_alias_thread(
     assert "Caitlin Ward" not in joined
 
 
+def test_sms_write_normalizes_relative_player_target_to_owner_thread(
+    session_factory,
+    seed_campaign_and_actor,
+):
+    compat = _build_compat(session_factory)
+    compat.NPC_NUDGE_CHANCE = 0.0
+    compat.SMS_REPLY_NUDGE_CHANCE = 1.0
+    campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
+    compat.get_or_create_player(campaign.id, seed_campaign_and_actor["actor_id"])
+
+    with session_factory() as session:
+        player = (
+            session.query(Player)
+            .filter(Player.campaign_id == campaign.id)
+            .filter(Player.actor_id == seed_campaign_and_actor["actor_id"])
+            .first()
+        )
+        assert player is not None
+        player_state = json.loads(player.state_json or "{}")
+        player_state["character_name"] = "Chris"
+        player.state_json = compat._dump_json(player_state)
+        session.commit()
+
+    ok, status = compat.write_sms_thread(
+        campaign.id,
+        thread="caitlin",
+        sender="Chris",
+        recipient="Caitlin",
+        message="you around?",
+        owner_actor_id=seed_campaign_and_actor["actor_id"],
+    )
+    assert ok is True and status == "stored"
+
+    ok, status = compat.write_sms_thread(
+        campaign.id,
+        thread="Player",
+        sender="Caitlin",
+        recipient="Player",
+        message="yeah, I saw it",
+        owner_actor_id=seed_campaign_and_actor["actor_id"],
+    )
+    assert ok is True and status == "stored"
+
+    canonical, _label, messages = compat.read_sms_thread(
+        campaign.id,
+        "caitlin",
+        limit=20,
+        viewer_actor_id=seed_campaign_and_actor["actor_id"],
+    )
+    assert canonical == "caitlin"
+    assert len(messages) == 2
+    assert any(
+        row.get("from") == "Caitlin"
+        and row.get("to") == "Chris"
+        and row.get("message") == "yeah, I saw it"
+        for row in messages
+    )
+
+    with session_factory() as session:
+        player = (
+            session.query(Player)
+            .filter(Player.campaign_id == campaign.id)
+            .filter(Player.actor_id == seed_campaign_and_actor["actor_id"])
+            .first()
+        )
+        assert player is not None
+        player_state = compat.get_player_state(player)
+        row = session.get(Campaign, campaign.id)
+        campaign_state = compat.get_campaign_state(row)
+
+    joined = "\n".join(
+        compat._passive_npc_sms_nudge_lines(
+            campaign,
+            campaign_state,
+            player,
+            player_state,
+        )
+    )
+    assert "SMS_REPLY_NUDGE:" not in joined
+
+
+def test_sms_reply_nudge_treats_legacy_relative_player_target_as_owner_alias(
+    session_factory,
+    seed_campaign_and_actor,
+):
+    compat = _build_compat(session_factory)
+    compat.NPC_NUDGE_CHANCE = 0.0
+    compat.SMS_REPLY_NUDGE_CHANCE = 1.0
+    campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
+    compat.get_or_create_player(campaign.id, seed_campaign_and_actor["actor_id"])
+
+    with session_factory() as session:
+        player = (
+            session.query(Player)
+            .filter(Player.campaign_id == campaign.id)
+            .filter(Player.actor_id == seed_campaign_and_actor["actor_id"])
+            .first()
+        )
+        assert player is not None
+        player_state = json.loads(player.state_json or "{}")
+        player_state["character_name"] = "Chris"
+        player.state_json = compat._dump_json(player_state)
+
+        row = session.get(Campaign, campaign.id)
+        campaign_state = compat.get_campaign_state(row)
+        compat._sms_write(
+            campaign_state,
+            thread="caitlin",
+            sender="Chris",
+            recipient="Caitlin",
+            message="you around?",
+            game_time={"day": 1, "hour": 9, "minute": 0},
+            turn_id=1,
+            owner_actor_id=seed_campaign_and_actor["actor_id"],
+        )
+        compat._sms_write(
+            campaign_state,
+            thread="Player",
+            sender="Caitlin",
+            recipient="Player",
+            message="yeah, I saw it",
+            game_time={"day": 1, "hour": 9, "minute": 1},
+            turn_id=2,
+            owner_actor_id=seed_campaign_and_actor["actor_id"],
+        )
+        row.state_json = compat._dump_json(campaign_state)
+        session.commit()
+
+    listed = compat.list_sms_threads(
+        campaign.id,
+        wildcard="*",
+        limit=20,
+        viewer_actor_id=seed_campaign_and_actor["actor_id"],
+    )
+    caitlin_rows = [row for row in listed if row.get("thread") == "caitlin"]
+    assert len(caitlin_rows) == 1
+    assert caitlin_rows[0]["count"] == 2
+
+    with session_factory() as session:
+        player = (
+            session.query(Player)
+            .filter(Player.campaign_id == campaign.id)
+            .filter(Player.actor_id == seed_campaign_and_actor["actor_id"])
+            .first()
+        )
+        assert player is not None
+        player_state = compat.get_player_state(player)
+        row = session.get(Campaign, campaign.id)
+        campaign_state = compat.get_campaign_state(row)
+
+    joined = "\n".join(
+        compat._passive_npc_sms_nudge_lines(
+            campaign,
+            campaign_state,
+            player,
+            player_state,
+        )
+    )
+    assert "SMS_REPLY_NUDGE:" not in joined
+
+
 def test_sms_reply_nudge_stops_after_three_identical_suggestions(
     session_factory,
     seed_campaign_and_actor,
