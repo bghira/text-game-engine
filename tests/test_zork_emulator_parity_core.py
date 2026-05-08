@@ -1707,7 +1707,7 @@ def test_empty_response_repair_reuses_final_output_contract_without_forcing_extr
     asyncio.run(run_test())
 
 
-def test_ready_to_write_lcd_backfills_older_shared_turns_after_solo_gap(
+def test_ready_to_write_lcd_does_not_backfill_older_shared_turns_after_solo_gap(
     session_factory,
     seed_campaign_and_actor,
 ):
@@ -1893,13 +1893,13 @@ def test_ready_to_write_lcd_backfills_older_shared_turns_after_solo_gap(
         lcd_prompt = completion.calls[1]["prompt"]
         assert "RECENT_TURNS_LCD:" in lcd_prompt
         assert "WORLD_SUMMARY_LCD:" in lcd_prompt
-        assert "Penny and Tony already shared an earlier conversation beat." in lcd_prompt
-        assert "Penny and Tony reconnect in the current scene." in lcd_prompt
-        assert "Older shared beat with Penny." in lcd_prompt
-        assert "Recent shared beat with Penny." in lcd_prompt
-        assert "Solo gap beat 0." not in lcd_prompt
-        assert "Solo gap beat 129." not in lcd_prompt
         lcd_block = lcd_prompt.split("RECENT_TURNS_LCD:\n", 1)[1].split("\n\n", 1)[0]
+        assert "Penny and Tony reconnect in the current scene." in lcd_prompt
+        assert "Recent shared beat with Penny." in lcd_prompt
+        assert "Penny and Tony already shared an earlier conversation beat." not in lcd_prompt
+        assert "Older shared beat with Penny." not in lcd_block
+        assert "Solo gap beat 0." not in lcd_block
+        assert "Solo gap beat 129." not in lcd_block
         # reasoning is preserved when present; this test's beats lack it
         assert '"aware_npc_slugs":[]' not in lcd_block
         assert '"context_key":null' not in lcd_block
@@ -4118,6 +4118,84 @@ def test_recent_turns_focus_mode_filters_speaker_continuity_to_requested_npc(
 
     assert "She's already there waiting by the entrance." in recent
     assert "i get ready for my meeting with simone" not in recent
+
+
+def test_recent_turns_lcd_treats_player_slug_and_character_name_as_same_participant(
+    session_factory,
+    seed_campaign_and_actor,
+):
+    compat = _build_compat(session_factory)
+    campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
+    player = compat.get_or_create_player(campaign.id, seed_campaign_and_actor["actor_id"])
+
+    with session_factory() as session:
+        player_row = session.get(Player, player.id)
+        assert player_row is not None
+        player_state = json.loads(player_row.state_json or "{}")
+        player_state["character_name"] = "Rowan"
+        player_state["location"] = "favela-apartment-rua-das-laranjeiras"
+        player_row.state_json = compat._dump_json(player_state)
+        row = session.get(Campaign, campaign.id)
+        assert row is not None
+        characters = json.loads(row.characters_json or "{}")
+        characters["sage"] = {"name": "Sage"}
+        row.characters_json = compat._dump_json(characters)
+        for turn_id, listener, text in (
+            (1, "rowan", "Sage answers Rowan by name."),
+            (2, "player-actor-1", "Sage answers the player slug."),
+        ):
+            session.add(
+                Turn(
+                    campaign_id=campaign.id,
+                    session_id=None,
+                    actor_id=player.actor_id,
+                    kind="narrator",
+                    content=text,
+                    meta_json=json.dumps(
+                        {
+                            "game_time": {"day": 5, "hour": 21, "minute": 30 + turn_id},
+                            "visibility": {
+                                "scope": "local",
+                                "actor_player_slug": "player-actor-1",
+                                "location_key": "favela-apartment-rua-das-laranjeiras",
+                            },
+                            "location_key": "favela-apartment-rua-das-laranjeiras",
+                            "scene_output": {
+                                "location_key": "favela-apartment-rua-das-laranjeiras",
+                                "beats": [
+                                    {
+                                        "reasoning": "Sage is talking to Rowan.",
+                                        "type": "npc_dialogue",
+                                        "speaker": "sage",
+                                        "actors": ["sage"],
+                                        "listeners": [listener],
+                                        "visibility": "local",
+                                        "aware_npc_slugs": ["sage"],
+                                        "text": text,
+                                    }
+                                ],
+                            },
+                        }
+                    ),
+                )
+            )
+        session.commit()
+
+    turns = compat.get_recent_turns(campaign.id)
+    recent = compat._recent_turns_text_for_viewer(
+        campaign,
+        turns,
+        viewer_actor_id=seed_campaign_and_actor["actor_id"],
+        viewer_slug="player-actor-1",
+        viewer_location_key="favela-apartment-rua-das-laranjeiras",
+        viewer_private_context_key="",
+        requested_player_slugs=set(),
+        requested_npc_slugs={"sage"},
+        scene_npc_slugs={"sage", "player-actor-1"},
+    )
+
+    assert "Sage answers Rowan by name." in recent
+    assert "Sage answers the player slug." in recent
 
 
 def test_ready_to_write_strips_reasoning_when_reasoning_history_disabled(

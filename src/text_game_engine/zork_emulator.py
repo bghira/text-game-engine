@@ -20245,6 +20245,7 @@ class ZorkEmulator:
         self,
         turn: Turn,
         npc_slug: str,
+        participant_aliases: Optional[Dict[str, str]] = None,
     ) -> bool:
         """Check whether *npc_slug* would plausibly know about *turn*.
 
@@ -20263,8 +20264,16 @@ class ZorkEmulator:
             return True
 
         slug_norm = self._player_slug_key(npc_slug)
+        if participant_aliases and slug_norm in participant_aliases:
+            slug_norm = participant_aliases[slug_norm]
         if not slug_norm:
             return False
+
+        def _canonical_slug(raw: object) -> str:
+            slug = self._player_slug_key(raw)
+            if participant_aliases and slug in participant_aliases:
+                return participant_aliases[slug]
+            return slug
 
         # Check scene_output beats for NPC presence
         scene_output = meta.get("scene_output")
@@ -20274,13 +20283,13 @@ class ZorkEmulator:
                 for beat in beats:
                     if not isinstance(beat, dict):
                         continue
-                    if self._player_slug_key(beat.get("speaker")) == slug_norm:
+                    if _canonical_slug(beat.get("speaker")) == slug_norm:
                         return True
                     for field in ("actors", "listeners", "aware_npc_slugs"):
                         entries = beat.get(field)
                         if isinstance(entries, list):
                             for entry in entries:
-                                if self._player_slug_key(entry) == slug_norm:
+                                if _canonical_slug(entry) == slug_norm:
                                     return True
 
         # Check turn-level visibility participant lists
@@ -20289,7 +20298,7 @@ class ZorkEmulator:
                 raw = visibility.get(field)
                 if isinstance(raw, list):
                     for entry in raw:
-                        if self._player_slug_key(entry) == slug_norm:
+                        if _canonical_slug(entry) == slug_norm:
                             return True
 
         return False
@@ -20298,10 +20307,15 @@ class ZorkEmulator:
         self,
         turn: Turn,
         npc_slugs: set[str],
+        participant_aliases: Optional[Dict[str, str]] = None,
     ) -> bool:
         """Return True only if ALL listed NPCs would know about this turn."""
         for npc_slug in npc_slugs:
-            if not self._turn_visible_to_npc(turn, npc_slug):
+            if not self._turn_visible_to_npc(
+                turn,
+                npc_slug,
+                participant_aliases=participant_aliases,
+            ):
                 return False
         return True
 
@@ -20345,26 +20359,34 @@ class ZorkEmulator:
         self,
         beat: Dict[str, object],
         npc_slugs: set[str],
+        participant_aliases: Optional[Dict[str, str]] = None,
     ) -> bool:
         if not npc_slugs:
             return True
         beat_visibility = str(beat.get("visibility") or "").strip().lower()
         if beat_visibility in {"", "public"}:
             return True
+
+        def _canonical_slug(raw: object) -> str:
+            slug = self._player_slug_key(raw)
+            if participant_aliases and slug in participant_aliases:
+                return participant_aliases[slug]
+            return slug
+
         beat_npc_slugs = {
-            self._player_slug_key(entry)
+            _canonical_slug(entry)
             for entry in (
                 list(beat.get("actors") or [])
                 + list(beat.get("listeners") or [])
                 + list(beat.get("aware_npc_slugs") or [])
                 + [beat.get("speaker")]
             )
-            if self._player_slug_key(entry)
+            if _canonical_slug(entry)
         }
         return all(
-            self._player_slug_key(npc_slug) in beat_npc_slugs
+            _canonical_slug(npc_slug) in beat_npc_slugs
             for npc_slug in npc_slugs
-            if self._player_slug_key(npc_slug)
+            if _canonical_slug(npc_slug)
         )
 
     def _recent_turn_receiver_hints(
@@ -20523,6 +20545,7 @@ class ZorkEmulator:
             str(campaign.id), self._session_factory
         )
         player_names: Dict[str, str] = {}
+        participant_aliases: Dict[str, str] = {}
         for raw_actor_id, info in registry.get("by_actor_id", {}).items():
             actor_id = str(raw_actor_id or "").strip()
             if not actor_id:
@@ -20530,6 +20553,26 @@ class ZorkEmulator:
             name = str(info.get("name") or "").strip()
             if name:
                 player_names[actor_id] = name
+            canonical_slug = (
+                self._player_slug_key(info.get("slug"))
+                or self._player_visibility_slug(actor_id)
+                or self._player_slug_key(name)
+            )
+            if canonical_slug:
+                alias_values = [
+                    info.get("slug"),
+                    name,
+                    actor_id,
+                    self._player_visibility_slug(actor_id),
+                ]
+                if name:
+                    alias_values.extend(
+                        part for part in re.split(r"[\s\-]+", name) if len(part) >= 3
+                    )
+                for raw_alias in alias_values:
+                    alias_slug = self._player_slug_key(raw_alias)
+                    if alias_slug:
+                        participant_aliases[alias_slug] = canonical_slug
 
         _is_individual_clocks = self._time_model_from_state(
             self.get_campaign_state(campaign)
@@ -20579,7 +20622,9 @@ class ZorkEmulator:
                 continue
             # LCD filtering: skip turns that scene NPCs don't know about
             if scene_npc_slugs and not self._turn_visible_to_all_scene_npcs(
-                turn, scene_npc_slugs
+                turn,
+                scene_npc_slugs,
+                participant_aliases=participant_aliases,
             ):
                 if not self._actor_local_player_turn_visible_to_scene_lcd(
                     turn,
@@ -20602,6 +20647,7 @@ class ZorkEmulator:
                 viewer_private_context_key=viewer_private_context_key,
                 requested_npc_slugs=requested_npc_slugs,
                 scene_npc_slugs=scene_npc_slugs,
+                participant_aliases=participant_aliases,
                 strip_time=_strip_time,
             )
             if scene_output_lines and turn.kind == "narrator":
@@ -21120,6 +21166,7 @@ class ZorkEmulator:
         viewer_private_context_key: str = "",
         requested_npc_slugs: Optional[set[str]] = None,
         scene_npc_slugs: Optional[set[str]] = None,
+        participant_aliases: Optional[Dict[str, str]] = None,
         strip_time: bool = False,
     ) -> List[str]:
         if not isinstance(scene_output, dict):
@@ -21144,6 +21191,13 @@ class ZorkEmulator:
         viewer_location_key_norm = self._normalize_location_key(viewer_location_key)
         viewer_private_context_key_norm = str(viewer_private_context_key or "").strip()
         is_actor_turn = str(getattr(turn, "actor_id", "") or "").strip() == str(viewer_actor_id or "").strip()
+
+        def _canonical_slug(raw: object) -> str:
+            slug = self._player_slug_key(raw)
+            if participant_aliases and slug in participant_aliases:
+                return participant_aliases[slug]
+            return slug
+
         for beat_index, beat in enumerate(beats):
             if not isinstance(beat, dict):
                 continue
@@ -21165,9 +21219,9 @@ class ZorkEmulator:
                 if aware_id and aware_id not in beat_visible_actor_ids:
                     beat_visible_actor_ids.append(aware_id)
             beat_actor_listener_slugs = {
-                self._player_slug_key(item)
+                _canonical_slug(item)
                 for item in list(beat.get("actors") or []) + list(beat.get("listeners") or [])
-                if self._player_slug_key(item)
+                if _canonical_slug(item)
             }
             beat_visible = False
             if beat_visibility in {"", "public"}:
@@ -21210,19 +21264,19 @@ class ZorkEmulator:
                 )
             if not beat_visible and requested_npc_slugs and not scene_npc_slugs:
                 beat_npc_slugs = {
-                    self._player_slug_key(e)
+                    _canonical_slug(e)
                     for e in (
                         list(beat.get("actors") or [])
                         + list(beat.get("listeners") or [])
                         + list(beat.get("aware_npc_slugs") or [])
                         + [beat.get("speaker")]
                     )
-                    if self._player_slug_key(e)
+                    if _canonical_slug(e)
                 }
                 requested_npc_keys = {
-                    self._player_slug_key(npc)
+                    _canonical_slug(npc)
                     for npc in requested_npc_slugs
-                    if self._player_slug_key(npc)
+                    if _canonical_slug(npc)
                 }
                 if beat_npc_slugs.intersection(requested_npc_keys):
                     beat_visible = True
@@ -21231,6 +21285,7 @@ class ZorkEmulator:
             if scene_npc_slugs and not self._beat_visible_to_all_scene_npcs(
                 beat,
                 scene_npc_slugs,
+                participant_aliases=participant_aliases,
             ):
                 continue
             raw_vi = beat.get("vocal_intensity")

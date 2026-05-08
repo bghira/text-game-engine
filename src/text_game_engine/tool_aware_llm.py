@@ -3903,19 +3903,44 @@ class ToolAwareZorkLLM:
                     (registry.get("by_actor_id", {}).get(actor_id) or {}).get("slug")
                     or emulator._player_visibility_slug(actor_id)  # noqa: SLF001
                 ).strip()
-                player_slugs = {
-                    emulator._player_slug_key(info.get("slug") or info.get("name") or "")  # noqa: SLF001
-                    for info in registry.get("by_actor_id", {}).values()
-                    if isinstance(info, dict)
-                    and emulator._player_slug_key(info.get("slug") or info.get("name") or "")  # noqa: SLF001
-                }
+                player_alias_to_slug: dict[str, str] = {}
+                for raw_actor_id, info in registry.get("by_actor_id", {}).items():
+                    if not isinstance(info, dict):
+                        continue
+                    canonical_slug = (
+                        emulator._player_slug_key(info.get("slug"))  # noqa: SLF001
+                        or emulator._player_visibility_slug(raw_actor_id)  # noqa: SLF001
+                        or emulator._player_slug_key(info.get("name"))  # noqa: SLF001
+                    )
+                    if not canonical_slug:
+                        continue
+                    alias_values = [
+                        info.get("slug"),
+                        info.get("name"),
+                        raw_actor_id,
+                        emulator._player_visibility_slug(raw_actor_id),  # noqa: SLF001
+                    ]
+                    name_text = str(info.get("name") or "").strip()
+                    if name_text:
+                        alias_values.extend(part for part in re.split(r"[\s\-]+", name_text) if len(part) >= 3)
+                    for raw_alias in alias_values:
+                        alias_slug = emulator._player_slug_key(raw_alias)  # noqa: SLF001
+                        if alias_slug:
+                            player_alias_to_slug[alias_slug] = canonical_slug
+                player_slugs = set(player_alias_to_slug.values())
+
+                def _canonical_participant_slug(raw: object) -> str:
+                    slug = emulator._player_slug_key(raw)  # noqa: SLF001
+                    return player_alias_to_slug.get(slug, slug)
+
+                player_alias_slugs = set(player_alias_to_slug.keys())
                 speaker_npc_slugs = {
                     emulator._player_slug_key(raw_slug)  # noqa: SLF001
                     for raw_slug in list(_ready_speakers)
                     if emulator._player_slug_key(raw_slug)  # noqa: SLF001
                 }
                 speaker_npc_slugs = {
-                    slug for slug in speaker_npc_slugs if slug and slug not in player_slugs and slug != viewer_slug
+                    slug for slug in speaker_npc_slugs if slug and slug not in player_alias_slugs and slug not in player_slugs and slug != viewer_slug
                 }
                 listener_npc_slugs = {
                     emulator._player_slug_key(raw_slug)  # noqa: SLF001
@@ -3923,19 +3948,19 @@ class ToolAwareZorkLLM:
                     if emulator._player_slug_key(raw_slug)  # noqa: SLF001
                 }
                 listener_npc_slugs = {
-                    slug for slug in listener_npc_slugs if slug and slug not in player_slugs and slug != viewer_slug
+                    slug for slug in listener_npc_slugs if slug and slug not in player_alias_slugs and slug not in player_slugs and slug != viewer_slug
                 }
                 scene_npc_slugs = speaker_npc_slugs.union(listener_npc_slugs)
                 # All participant slugs (NPCs + players) for summary/recent-turns LCD filtering.
                 _all_speaker_slugs = {
-                    emulator._player_slug_key(raw_slug)  # noqa: SLF001
+                    _canonical_participant_slug(raw_slug)
                     for raw_slug in list(_ready_speakers)
-                    if emulator._player_slug_key(raw_slug)  # noqa: SLF001
+                    if _canonical_participant_slug(raw_slug)
                 }
                 _all_listener_slugs = {
-                    emulator._player_slug_key(raw_slug)  # noqa: SLF001
+                    _canonical_participant_slug(raw_slug)
                     for raw_slug in list(_ready_listeners)
-                    if emulator._player_slug_key(raw_slug)  # noqa: SLF001
+                    if _canonical_participant_slug(raw_slug)
                 }
                 scene_participant_slugs = _all_speaker_slugs.union(_all_listener_slugs)
                 # Always include the viewer so their own turns pass the filter.
