@@ -4045,6 +4045,7 @@ class ToolAwareZorkLLM:
                 if not reasoning_history_enabled:
                     shared_recent = emulator._strip_reasoning_from_recent_turn_jsonl(shared_recent)  # noqa: SLF001
                 shared_recent_texts: set[str] = set()
+                shared_recent_turn_ids: set[int] = set()
                 for line in str(shared_recent or "").splitlines():
                     stripped = line.strip()
                     if not stripped:
@@ -4058,6 +4059,12 @@ class ToolAwareZorkLLM:
                     text_value = str(payload.get("text") or "").strip()
                     if text_value:
                         shared_recent_texts.add(text_value)
+                    try:
+                        turn_id = int(payload.get("turn_id") or 0)
+                    except Exception:
+                        turn_id = 0
+                    if turn_id > 0:
+                        shared_recent_turn_ids.add(turn_id)
                 if shared_summary and not _lcd_slugs:
                     deduped_summary_lines = [
                         line
@@ -4111,13 +4118,27 @@ class ToolAwareZorkLLM:
                         speaker_recent = emulator._strip_reasoning_from_recent_turn_jsonl(speaker_recent)  # noqa: SLF001
                     speaker_recent = emulator._strip_emotives_from_recent_turn_jsonl(speaker_recent)  # noqa: SLF001
                     if speaker_recent and speaker_recent != "None":
-                        deduped_speaker_lines = [
-                            line
-                            for line in str(speaker_recent).splitlines()
-                            if line.strip()
-                            and line.strip() not in shared_recent_lines
-                            and line.strip() not in emitted_speaker_lines
-                        ]
+                        deduped_speaker_lines = []
+                        for line in str(speaker_recent).splitlines():
+                            stripped = line.strip()
+                            if (
+                                not stripped
+                                or stripped in shared_recent_lines
+                                or stripped in emitted_speaker_lines
+                            ):
+                                continue
+                            try:
+                                line_payload = json.loads(stripped)
+                            except Exception:
+                                line_payload = None
+                            if isinstance(line_payload, dict):
+                                try:
+                                    line_turn_id = int(line_payload.get("turn_id") or 0)
+                                except Exception:
+                                    line_turn_id = 0
+                                if line_turn_id > 0 and line_turn_id in shared_recent_turn_ids:
+                                    continue
+                            deduped_speaker_lines.append(line)
                         if not deduped_speaker_lines:
                             continue
                         if len(deduped_speaker_lines) > speaker_line_limit:
@@ -4146,6 +4167,7 @@ class ToolAwareZorkLLM:
                     _speaker_continuity_block = (
                         "\nSPEAKER_CONTINUITY_RULES:\n"
                         "Each SPEAKER_CONTINUITY block is extra continuity for that named speaker only. "
+                        "RECENT_TURNS_LCD is the primary chronological sequence; use SPEAKER_CONTINUITY only as older or additional speaker-private context. "
                         "That speaker may use it to decide what to reveal, conceal, or emphasize. "
                         "Do NOT let listeners or silent bystanders act on a speaker's private continuity unless they were independently involved in those same events.\n"
                         + _multi_speaker_rule

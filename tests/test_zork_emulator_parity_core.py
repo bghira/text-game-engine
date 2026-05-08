@@ -4233,6 +4233,116 @@ def test_ready_to_write_strips_reasoning_when_reasoning_history_disabled(
     asyncio.run(run_test())
 
 
+def test_ready_to_write_speaker_continuity_does_not_split_lcd_turn_sequence(
+    session_factory,
+    seed_campaign_and_actor,
+):
+    class SpeakerContinuityCompletionPort:
+        def __init__(self):
+            self.calls = []
+
+        async def complete(self, system_prompt, prompt, *, temperature=0.8, max_tokens=2048):
+            self.calls.append({"system_prompt": system_prompt, "prompt": prompt})
+            if len(self.calls) == 1:
+                return '{"tool_call":"ready_to_write","speakers":["simone-ashworth"],"listeners":[]}'
+            return (
+                '{"reasoning":"finalized","narration":"Final scene.","state_update":{"game_time":{"day":1,"hour":9,"minute":0,"day_of_week":"monday","period":"morning","date_label":"Monday, Day 1, Morning"}},"summary_update":"done"}'
+            )
+
+    async def run_test():
+        completion = SpeakerContinuityCompletionPort()
+        engine = GameEngine(
+            uow_factory=lambda: SQLAlchemyUnitOfWork(session_factory),
+            llm=StubLLM(LLMTurnOutput(narration="unused")),
+        )
+        compat = ZorkEmulator(engine, session_factory, completion_port=completion)
+        tool_llm = ToolAwareZorkLLM(
+            session_factory=session_factory,
+            completion_port=completion,
+            temperature=0.8,
+            max_tokens=2048,
+        )
+        tool_llm.bind_emulator(compat)
+
+        campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
+        player = compat.get_or_create_player(campaign.id, seed_campaign_and_actor["actor_id"])
+
+        with session_factory() as session:
+            row = session.get(Campaign, campaign.id)
+            assert row is not None
+            characters = json.loads(row.characters_json or "{}")
+            characters["simone-ashworth"] = {"name": "Simone Ashworth"}
+            row.characters_json = compat._dump_json(characters)
+            session.commit()
+
+        def fake_recent_turns_text_for_viewer(
+            self,
+            campaign,
+            turns,
+            *,
+            viewer_actor_id,
+            viewer_slug,
+            viewer_location_key,
+            viewer_private_context_key,
+            requested_player_slugs,
+            requested_npc_slugs,
+            scene_npc_slugs=None,
+            focus_on_requested_receivers=False,
+        ):
+            if focus_on_requested_receivers:
+                return "\n".join(
+                    [
+                        '{"kind":"beat","turn_id":41,"type":"npc_dialogue","speaker":"simone-ashworth","text":"Same-turn private Simone detail."}',
+                        '{"kind":"beat","turn_id":12,"type":"npc_dialogue","speaker":"simone-ashworth","text":"Older Simone-private detail."}',
+                    ]
+                )
+            return (
+                '{"kind":"beat","turn_id":41,"type":"narration","speaker":"narrator",'
+                '"text":"Shared current sequence beat."}'
+            )
+
+        compat._recent_turns_text_for_viewer = fake_recent_turns_text_for_viewer.__get__(compat, ZorkEmulator)
+
+        turns = compat.get_recent_turns(campaign.id)
+        research_system_prompt, research_user_prompt = compat.build_prompt(
+            campaign,
+            player,
+            "look",
+            turns,
+            prompt_stage=compat.PROMPT_STAGE_RESEARCH,
+        )
+        final_system_prompt, final_user_prompt = compat.build_prompt(
+            campaign,
+            player,
+            "look",
+            turns,
+            prompt_stage=compat.PROMPT_STAGE_FINAL,
+        )
+
+        payload = await tool_llm._resolve_payload(
+            campaign.id,
+            seed_campaign_and_actor["actor_id"],
+            "look",
+            research_system_prompt,
+            research_user_prompt,
+            final_system_prompt,
+            final_user_prompt,
+        )
+
+        assert payload is not None
+        final_prompt = completion.calls[1]["prompt"]
+        assert "RECENT_TURNS_LCD:" in final_prompt
+        assert "SPEAKER_CONTINUITY[simone-ashworth]:" in final_prompt
+        recent_final_block = final_prompt.split("RECENT_TURNS_LCD:\n", 1)[1].split("\n\n", 1)[0]
+        speaker_block = final_prompt.split("SPEAKER_CONTINUITY[simone-ashworth]:\n", 1)[1].split("\n\n", 1)[0]
+        assert "Shared current sequence beat." in recent_final_block
+        assert "Same-turn private Simone detail." not in speaker_block
+        assert "Older Simone-private detail." in speaker_block
+        assert "RECENT_TURNS_LCD is the primary chronological sequence" in final_prompt
+
+    asyncio.run(run_test())
+
+
 def test_recent_turns_tool_emits_beats_without_turn_wrapper_rows(
     session_factory,
     seed_campaign_and_actor,
