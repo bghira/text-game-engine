@@ -4292,13 +4292,17 @@ def test_ready_to_write_speaker_continuity_does_not_split_lcd_turn_sequence(
             if focus_on_requested_receivers:
                 return "\n".join(
                     [
+                        '{"kind":"beat","turn_id":40,"type":"npc_dialogue","speaker":"simone-ashworth","text":"Boundary-turn private Simone detail."}',
                         '{"kind":"beat","turn_id":41,"type":"npc_dialogue","speaker":"simone-ashworth","text":"Same-turn private Simone detail."}',
+                        '{"kind":"beat","turn_id":39,"type":"npc_dialogue","speaker":"simone-ashworth","text":"Before-window Simone detail."}',
                         '{"kind":"beat","turn_id":12,"type":"npc_dialogue","speaker":"simone-ashworth","text":"Older Simone-private detail."}',
                     ]
                 )
-            return (
-                '{"kind":"beat","turn_id":41,"type":"narration","speaker":"narrator",'
-                '"text":"Shared current sequence beat."}'
+            return "\n".join(
+                [
+                    '{"kind":"beat","turn_id":40,"type":"narration","speaker":"narrator","text":"First shared current sequence beat."}',
+                    '{"kind":"beat","turn_id":42,"type":"narration","speaker":"narrator","text":"Later shared current sequence beat."}',
+                ]
             )
 
         compat._recent_turns_text_for_viewer = fake_recent_turns_text_for_viewer.__get__(compat, ZorkEmulator)
@@ -4335,10 +4339,13 @@ def test_ready_to_write_speaker_continuity_does_not_split_lcd_turn_sequence(
         assert "SPEAKER_CONTINUITY[simone-ashworth]:" in final_prompt
         recent_final_block = final_prompt.split("RECENT_TURNS_LCD:\n", 1)[1].split("\n\n", 1)[0]
         speaker_block = final_prompt.split("SPEAKER_CONTINUITY[simone-ashworth]:\n", 1)[1].split("\n\n", 1)[0]
-        assert "Shared current sequence beat." in recent_final_block
+        assert "First shared current sequence beat." in recent_final_block
+        assert "Later shared current sequence beat." in recent_final_block
+        assert "Boundary-turn private Simone detail." not in speaker_block
         assert "Same-turn private Simone detail." not in speaker_block
+        assert "Before-window Simone detail." in speaker_block
         assert "Older Simone-private detail." in speaker_block
-        assert "RECENT_TURNS_LCD is the primary chronological sequence" in final_prompt
+        assert "before the first RECENT_TURNS_LCD turn" in final_prompt
 
     asyncio.run(run_test())
 

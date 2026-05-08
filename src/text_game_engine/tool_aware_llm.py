@@ -4046,6 +4046,7 @@ class ToolAwareZorkLLM:
                     shared_recent = emulator._strip_reasoning_from_recent_turn_jsonl(shared_recent)  # noqa: SLF001
                 shared_recent_texts: set[str] = set()
                 shared_recent_turn_ids: set[int] = set()
+                first_shared_recent_turn_id: int | None = None
                 for line in str(shared_recent or "").splitlines():
                     stripped = line.strip()
                     if not stripped:
@@ -4065,6 +4066,8 @@ class ToolAwareZorkLLM:
                         turn_id = 0
                     if turn_id > 0:
                         shared_recent_turn_ids.add(turn_id)
+                        if first_shared_recent_turn_id is None:
+                            first_shared_recent_turn_id = turn_id
                 if shared_summary and not _lcd_slugs:
                     deduped_summary_lines = [
                         line
@@ -4136,7 +4139,16 @@ class ToolAwareZorkLLM:
                                     line_turn_id = int(line_payload.get("turn_id") or 0)
                                 except Exception:
                                     line_turn_id = 0
-                                if line_turn_id > 0 and line_turn_id in shared_recent_turn_ids:
+                                if (
+                                    line_turn_id > 0
+                                    and (
+                                        line_turn_id in shared_recent_turn_ids
+                                        or (
+                                            first_shared_recent_turn_id is not None
+                                            and line_turn_id >= first_shared_recent_turn_id
+                                        )
+                                    )
+                                ):
                                     continue
                             deduped_speaker_lines.append(line)
                         if not deduped_speaker_lines:
@@ -4167,7 +4179,7 @@ class ToolAwareZorkLLM:
                     _speaker_continuity_block = (
                         "\nSPEAKER_CONTINUITY_RULES:\n"
                         "Each SPEAKER_CONTINUITY block is extra continuity for that named speaker only. "
-                        "RECENT_TURNS_LCD is the primary chronological sequence; use SPEAKER_CONTINUITY only as older or additional speaker-private context. "
+                        "RECENT_TURNS_LCD is the primary chronological sequence; use SPEAKER_CONTINUITY only for context from before the first RECENT_TURNS_LCD turn, or for unsequenced speaker-private context that cannot be placed in that recent window. "
                         "That speaker may use it to decide what to reveal, conceal, or emphasize. "
                         "Do NOT let listeners or silent bystanders act on a speaker's private continuity unless they were independently involved in those same events.\n"
                         + _multi_speaker_rule
