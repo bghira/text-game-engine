@@ -4266,6 +4266,8 @@ def test_ready_to_write_speaker_continuity_does_not_split_lcd_turn_sequence(
 
         campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
         player = compat.get_or_create_player(campaign.id, seed_campaign_and_actor["actor_id"])
+        compat.MAX_LCD_RECENT_TURNS = 2
+        raw_turn_ids = []
 
         with session_factory() as session:
             row = session.get(Campaign, campaign.id)
@@ -4273,7 +4275,28 @@ def test_ready_to_write_speaker_continuity_does_not_split_lcd_turn_sequence(
             characters = json.loads(row.characters_json or "{}")
             characters["simone-ashworth"] = {"name": "Simone Ashworth"}
             row.characters_json = compat._dump_json(characters)
+            for label in (
+                "before-window raw turn",
+                "window boundary raw turn",
+                "window middle raw turn",
+                "window later raw turn",
+                "latest raw turn",
+            ):
+                turn = Turn(
+                    campaign_id=campaign.id,
+                    session_id=None,
+                    actor_id=seed_campaign_and_actor["actor_id"],
+                    kind="narrator",
+                    content=label,
+                    meta_json=json.dumps({"visibility": {"scope": "public"}}),
+                )
+                session.add(turn)
+                session.flush()
+                raw_turn_ids.append(int(turn.id))
             session.commit()
+        before_window_id = raw_turn_ids[0]
+        window_start_id = raw_turn_ids[1]
+        latest_id = raw_turn_ids[-1]
 
         def fake_recent_turns_text_for_viewer(
             self,
@@ -4289,19 +4312,21 @@ def test_ready_to_write_speaker_continuity_does_not_split_lcd_turn_sequence(
             scene_npc_slugs=None,
             focus_on_requested_receivers=False,
         ):
+            turn_ids = [int(getattr(turn, "id", 0) or 0) for turn in turns]
+            if not turn_ids:
+                return "None"
             if focus_on_requested_receivers:
                 return "\n".join(
                     [
-                        '{"kind":"beat","turn_id":40,"type":"npc_dialogue","speaker":"simone-ashworth","text":"Boundary-turn private Simone detail."}',
-                        '{"kind":"beat","turn_id":41,"type":"npc_dialogue","speaker":"simone-ashworth","text":"Same-turn private Simone detail."}',
-                        '{"kind":"beat","turn_id":39,"type":"npc_dialogue","speaker":"simone-ashworth","text":"Before-window Simone detail."}',
-                        '{"kind":"beat","turn_id":12,"type":"npc_dialogue","speaker":"simone-ashworth","text":"Older Simone-private detail."}',
+                        f'{{"kind":"beat","turn_id":{window_start_id},"type":"npc_dialogue","speaker":"simone-ashworth","text":"Boundary-turn private Simone detail."}}',
+                        f'{{"kind":"beat","turn_id":{latest_id},"type":"npc_dialogue","speaker":"simone-ashworth","text":"Latest-turn private Simone detail."}}',
+                        f'{{"kind":"beat","turn_id":{before_window_id},"type":"npc_dialogue","speaker":"simone-ashworth","text":"Before-window Simone detail."}}',
                     ]
                 )
             return "\n".join(
                 [
-                    '{"kind":"beat","turn_id":40,"type":"narration","speaker":"narrator","text":"First shared current sequence beat."}',
-                    '{"kind":"beat","turn_id":42,"type":"narration","speaker":"narrator","text":"Later shared current sequence beat."}',
+                    f'{{"kind":"beat","turn_id":{turn_id},"type":"narration","speaker":"narrator","text":"Shared LCD turn {turn_id}."}}'
+                    for turn_id in turn_ids
                 ]
             )
 
@@ -4339,13 +4364,17 @@ def test_ready_to_write_speaker_continuity_does_not_split_lcd_turn_sequence(
         assert "SPEAKER_CONTINUITY[simone-ashworth]:" in final_prompt
         recent_final_block = final_prompt.split("RECENT_TURNS_LCD:\n", 1)[1].split("\n\n", 1)[0]
         speaker_block = final_prompt.split("SPEAKER_CONTINUITY[simone-ashworth]:\n", 1)[1].split("\n\n", 1)[0]
-        assert "First shared current sequence beat." in recent_final_block
-        assert "Later shared current sequence beat." in recent_final_block
+        recent_turn_ids = [int(match) for match in re.findall(r'"turn_id":(\d+)', recent_final_block)]
+        assert len(recent_turn_ids) == 4
+        assert recent_turn_ids == sorted(recent_turn_ids)
+        assert before_window_id not in recent_turn_ids
+        assert recent_turn_ids[0] == window_start_id
+        assert recent_turn_ids[-1] == latest_id
+        assert "Shared LCD turn" in recent_final_block
         assert "Boundary-turn private Simone detail." not in speaker_block
-        assert "Same-turn private Simone detail." not in speaker_block
+        assert "Latest-turn private Simone detail." not in speaker_block
         assert "Before-window Simone detail." in speaker_block
-        assert "Older Simone-private detail." in speaker_block
-        assert "before the first RECENT_TURNS_LCD turn" in final_prompt
+        assert "before the first turn in the raw recent-turn window" in final_prompt
 
     asyncio.run(run_test())
 

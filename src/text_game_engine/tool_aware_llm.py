@@ -4022,9 +4022,34 @@ class ToolAwareZorkLLM:
                     recent_turn_window=0,
                     max_chars=emulator.MAX_SUMMARY_CHARS,  # noqa: SLF001
                 )
+                lcd_recent_limit = max(
+                    int(getattr(emulator, "MAX_LCD_RECENT_TURNS", 8) or 8), 4
+                )
+                recent_window_turns = list(turns or [])
+                first_recent_window_turn_id: int | None = None
+                if _lcd_slugs:
+                    recent_window_candidates = [
+                        turn
+                        for turn in recent_window_turns
+                        if emulator._turn_visible_in_recent_turns_context(  # noqa: SLF001
+                            turn,
+                            viewer_actor_id=actor_id,
+                            viewer_slug=viewer_slug,
+                            viewer_location_key=viewer_location_key,
+                            viewer_private_context_key=viewer_private_context_key,
+                        )
+                    ]
+                    if len(recent_window_candidates) > lcd_recent_limit:
+                        recent_window_candidates = recent_window_candidates[-lcd_recent_limit:]
+                    recent_window_turns = recent_window_candidates
+                    for turn in recent_window_turns:
+                        turn_id = int(getattr(turn, "id", 0) or 0)
+                        if turn_id > 0:
+                            first_recent_window_turn_id = turn_id
+                            break
                 shared_recent = emulator._recent_turns_text_for_viewer(  # noqa: SLF001
                     campaign,
-                    turns,
+                    recent_window_turns,
                     viewer_actor_id=actor_id,
                     viewer_slug=viewer_slug,
                     viewer_location_key=viewer_location_key,
@@ -4032,9 +4057,6 @@ class ToolAwareZorkLLM:
                     requested_player_slugs=set(),
                     requested_npc_slugs=scene_npc_slugs,
                     scene_npc_slugs=_lcd_slugs,
-                )
-                lcd_recent_limit = max(
-                    int(getattr(emulator, "MAX_LCD_RECENT_TURNS", 8) or 8), 4
                 )
                 _recent_lines = [
                     ln for ln in str(shared_recent or "").splitlines() if ln.strip()
@@ -4046,7 +4068,6 @@ class ToolAwareZorkLLM:
                     shared_recent = emulator._strip_reasoning_from_recent_turn_jsonl(shared_recent)  # noqa: SLF001
                 shared_recent_texts: set[str] = set()
                 shared_recent_turn_ids: set[int] = set()
-                first_shared_recent_turn_id: int | None = None
                 for line in str(shared_recent or "").splitlines():
                     stripped = line.strip()
                     if not stripped:
@@ -4066,8 +4087,6 @@ class ToolAwareZorkLLM:
                         turn_id = 0
                     if turn_id > 0:
                         shared_recent_turn_ids.add(turn_id)
-                        if first_shared_recent_turn_id is None:
-                            first_shared_recent_turn_id = turn_id
                 if shared_summary and not _lcd_slugs:
                     deduped_summary_lines = [
                         line
@@ -4144,8 +4163,8 @@ class ToolAwareZorkLLM:
                                     and (
                                         line_turn_id in shared_recent_turn_ids
                                         or (
-                                            first_shared_recent_turn_id is not None
-                                            and line_turn_id >= first_shared_recent_turn_id
+                                            first_recent_window_turn_id is not None
+                                            and line_turn_id >= first_recent_window_turn_id
                                         )
                                     )
                                 ):
@@ -4179,7 +4198,7 @@ class ToolAwareZorkLLM:
                     _speaker_continuity_block = (
                         "\nSPEAKER_CONTINUITY_RULES:\n"
                         "Each SPEAKER_CONTINUITY block is extra continuity for that named speaker only. "
-                        "RECENT_TURNS_LCD is the primary chronological sequence; use SPEAKER_CONTINUITY only for context from before the first RECENT_TURNS_LCD turn, or for unsequenced speaker-private context that cannot be placed in that recent window. "
+                        "RECENT_TURNS_LCD is the primary chronological sequence; use SPEAKER_CONTINUITY only for context from before the first turn in the raw recent-turn window, or for unsequenced speaker-private context that cannot be placed in that recent window. "
                         "That speaker may use it to decide what to reveal, conceal, or emphasize. "
                         "Do NOT let listeners or silent bystanders act on a speaker's private continuity unless they were independently involved in those same events.\n"
                         + _multi_speaker_rule
