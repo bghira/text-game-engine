@@ -78,6 +78,40 @@ class TestTtsEmotiveMarkers:
 
         assert cleaned == '"[emotive:quiet]Yeah. Right there."'
 
+    def test_prose_sanitizer_quotes_inline_standalone_emotive_dialogue(self):
+        from text_game_engine.core.prose_sanitizer import sanitize_prose
+
+        cleaned = sanitize_prose(
+            "Sarah's hand finds his jaw. [emotive:rough murmur]You're going to be the death of me.\" "
+            "Her head tips back."
+        )
+
+        assert (
+            cleaned
+            == "Sarah's hand finds his jaw. \"[emotive:rough murmur]You're going to be the death of me.\" "
+            "Her head tips back."
+        )
+
+    def test_prose_sanitizer_quotes_multiple_inline_emotive_dialogue_markers(self):
+        from text_game_engine.core.prose_sanitizer import sanitize_prose
+
+        cleaned = sanitize_prose(
+            "Dorothy looks at Sarah. [emotive:quiet]Yeah. Alright.\" "
+            "She folds the towel. [emotive:steadier]Twenty-two minutes.\""
+        )
+
+        assert cleaned == (
+            "Dorothy looks at Sarah. \"[emotive:quiet]Yeah. Alright.\" "
+            "She folds the towel. \"[emotive:steadier]Twenty-two minutes.\""
+        )
+
+    def test_prose_sanitizer_keeps_already_quoted_emotive_dialogue(self):
+        from text_game_engine.core.prose_sanitizer import sanitize_prose
+
+        cleaned = sanitize_prose('She says "[emotive:quiet]Stay here." Then waits.')
+
+        assert cleaned == 'She says "[emotive:quiet]Stay here." Then waits.'
+
 
 # ---------------------------------------------------------------------------
 # JSON repair pipeline

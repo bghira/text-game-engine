@@ -67,10 +67,7 @@ _TAG_FRAGMENT_RE = re.compile(
 )
 _INVALID_TTS_CLOSING_TAG_RE = re.compile(r"</\s*[A-Za-z][^>\n]{0,80}>")
 _INVALID_TTS_BRACKET_CLOSING_RE = re.compile(r"\[/\s*emotive\s*\]", re.IGNORECASE)
-_LEADING_UNQUOTED_EMOTIVE_DIALOGUE_RE = re.compile(
-    r"^(\s*)(\[emotive:[^\]\r\n]{1,80}\])([^\S\r\n]*)(?!\")(.+\"[^\r\n]*)$",
-    re.IGNORECASE | re.DOTALL,
-)
+_EMOTIVE_MARKER_RE = re.compile(r"\[emotive:[^\]\r\n]{1,80}\]", re.IGNORECASE)
 
 
 def _drop_if_banned(match: re.Match[str]) -> str:
@@ -86,17 +83,50 @@ def strip_invalid_tts_closing_tags(text: object) -> str:
 
 
 def normalize_leading_emotive_dialogue(text: object) -> str:
-    """Move a leading emotive marker inside a missing opening dialogue quote."""
+    """Move unquoted emotive markers inside a missing opening dialogue quote."""
     if not isinstance(text, str) or not text:
         return text if isinstance(text, str) else ""
 
-    def _replace(match: re.Match[str]) -> str:
-        prefix, marker, spacing, rest = match.groups()
-        if not rest.strip():
-            return match.group(0)
-        return f'{prefix}"{marker}{spacing}{rest}'
+    def _is_escaped(pos: int) -> bool:
+        backslashes = 0
+        i = pos - 1
+        while i >= 0 and text[i] == "\\":
+            backslashes += 1
+            i -= 1
+        return backslashes % 2 == 1
 
-    return _LEADING_UNQUOTED_EMOTIVE_DIALOGUE_RE.sub(_replace, text, count=1)
+    def _has_closing_quote_same_line(start: int) -> bool:
+        i = start
+        while i < len(text):
+            ch = text[i]
+            if ch in "\r\n":
+                return False
+            if ch == '"' and not _is_escaped(i):
+                return True
+            i += 1
+        return False
+
+    out: list[str] = []
+    in_quote = False
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if ch == '"' and not _is_escaped(i):
+            in_quote = not in_quote
+            out.append(ch)
+            i += 1
+            continue
+        marker_match = _EMOTIVE_MARKER_RE.match(text, i)
+        if marker_match and not in_quote and _has_closing_quote_same_line(marker_match.end()):
+            out.append('"')
+            out.append(marker_match.group(0))
+            in_quote = True
+            i = marker_match.end()
+            continue
+        out.append(ch)
+        i += 1
+
+    return "".join(out)
 
 
 def _sanitize_unquoted(text: str) -> str:
