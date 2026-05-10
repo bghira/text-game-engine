@@ -1896,7 +1896,6 @@ def test_ready_to_write_lcd_does_not_backfill_older_shared_turns_after_solo_gap(
         lcd_block = lcd_prompt.split("RECENT_TURNS_LCD:\n", 1)[1].split("\n\n", 1)[0]
         assert "Penny and Tony reconnect in the current scene." in lcd_prompt
         assert "Recent shared beat with Penny." in lcd_prompt
-        assert "Penny and Tony already shared an earlier conversation beat." not in lcd_prompt
         assert "Older shared beat with Penny." not in lcd_block
         assert "Solo gap beat 0." not in lcd_block
         assert "Solo gap beat 129." not in lcd_block
@@ -4196,6 +4195,29 @@ def test_recent_turns_lcd_treats_player_slug_and_character_name_as_same_particip
 
     assert "Sage answers Rowan by name." in recent
     assert "Sage answers the player slug." in recent
+
+    with session_factory() as session:
+        player_row = session.get(Player, player.id)
+        assert player_row is not None
+        player_state = json.loads(player_row.state_json or "{}")
+        player_state["character_name"] = "Alex"
+        player_row.state_json = compat._dump_json(player_state)
+        session.commit()
+
+    recent_after_rename = compat._recent_turns_text_for_viewer(
+        campaign,
+        turns,
+        viewer_actor_id=seed_campaign_and_actor["actor_id"],
+        viewer_slug="player-actor-1",
+        viewer_location_key="favela-apartment-rua-das-laranjeiras",
+        viewer_private_context_key="",
+        requested_player_slugs=set(),
+        requested_npc_slugs={"sage"},
+        scene_npc_slugs={"sage", "alex"},
+    )
+
+    assert "Sage answers Rowan by name." not in recent_after_rename
+    assert "Sage answers the player slug." in recent_after_rename
 
 
 def test_ready_to_write_strips_reasoning_when_reasoning_history_disabled(

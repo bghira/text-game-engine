@@ -20554,9 +20554,9 @@ class ZorkEmulator:
             if name:
                 player_names[actor_id] = name
             canonical_slug = (
-                self._player_slug_key(info.get("slug"))
+                self._player_slug_key(name)
+                or self._player_slug_key(info.get("slug"))
                 or self._player_visibility_slug(actor_id)
-                or self._player_slug_key(name)
             )
             if canonical_slug:
                 alias_values = [

@@ -3908,9 +3908,9 @@ class ToolAwareZorkLLM:
                     if not isinstance(info, dict):
                         continue
                     canonical_slug = (
-                        emulator._player_slug_key(info.get("slug"))  # noqa: SLF001
+                        emulator._player_slug_key(info.get("name"))  # noqa: SLF001
+                        or emulator._player_slug_key(info.get("slug"))  # noqa: SLF001
                         or emulator._player_visibility_slug(raw_actor_id)  # noqa: SLF001
-                        or emulator._player_slug_key(info.get("name"))  # noqa: SLF001
                     )
                     if not canonical_slug:
                         continue
