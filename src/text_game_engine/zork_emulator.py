@@ -9948,7 +9948,12 @@ class ZorkEmulator:
         summary_turn_window = max(1, summary_turn_window)
         if isinstance(turns, list) and viewer_actor_id and turns:
             for turn in turns[-summary_turn_window:]:
-                if not isinstance(turn, Turn) or turn.kind != "narrator":
+                if not isinstance(turn, Turn):
+                    continue
+                meta = self._safe_turn_meta(turn)
+                summary_candidate = meta.get("summary_update")
+                has_summary_update = bool(str(summary_candidate or "").strip())
+                if turn.kind != "narrator" and not has_summary_update:
                     continue
                 if not self._turn_visible_in_recent_turns_context(
                     turn,
@@ -9966,8 +9971,7 @@ class ZorkEmulator:
                     continue
                 if bool(meta.get("suppress_context")):
                     continue
-                summary_candidate = meta.get("summary_update")
-                if not str(summary_candidate or "").strip():
+                if not has_summary_update:
                     summary_candidate = (
                         meta.get("scene_output_rendered")
                         or turn.content

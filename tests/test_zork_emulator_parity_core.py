@@ -1833,6 +1833,28 @@ def test_ready_to_write_lcd_does_not_backfill_older_shared_turns_after_solo_gap(
                     campaign_id=campaign.id,
                     session_id=None,
                     actor_id=player.actor_id,
+                    kind="player",
+                    content="I ask Penny to stay.",
+                    meta_json=json.dumps(
+                        {
+                            "game_time": {"day": 3657, "hour": 19, "minute": 50},
+                            "summary_update": "Tony directly asks Penny to stay.",
+                            "visibility": {
+                                "scope": "public",
+                                "actor_player_slug": "tony",
+                                "location_key": "tony-condo-interior",
+                            },
+                            "location_key": "tony-condo-interior",
+                        }
+                    ),
+                )
+            )
+
+            session.add(
+                Turn(
+                    campaign_id=campaign.id,
+                    session_id=None,
+                    actor_id=player.actor_id,
                     kind="narrator",
                     content="Recent shared beat",
                     meta_json=json.dumps(
@@ -1895,6 +1917,7 @@ def test_ready_to_write_lcd_does_not_backfill_older_shared_turns_after_solo_gap(
         assert "WORLD_SUMMARY_LCD:" in lcd_prompt
         lcd_block = lcd_prompt.split("RECENT_TURNS_LCD:\n", 1)[1].split("\n\n", 1)[0]
         assert "Penny and Tony reconnect in the current scene." in lcd_prompt
+        assert "Tony directly asks Penny to stay." in lcd_prompt
         assert "Recent shared beat with Penny." in lcd_prompt
         assert "Older shared beat with Penny." not in lcd_block
         assert "Solo gap beat 0." not in lcd_block
