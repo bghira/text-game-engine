@@ -9963,7 +9963,6 @@ class ZorkEmulator:
                     viewer_private_context_key=viewer_private_context_key,
                 ):
                     continue
-                meta = self._safe_turn_meta(turn)
                 if scene_npc_slugs and not self._turn_visible_to_all_scene_npcs(
                     turn,
                     scene_npc_slugs,
