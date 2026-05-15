@@ -83,7 +83,7 @@ def strip_invalid_tts_closing_tags(text: object) -> str:
 
 
 def normalize_leading_emotive_dialogue(text: object) -> str:
-    """Move unquoted emotive markers inside a missing opening dialogue quote."""
+    """Move unquoted emotive markers inside adjacent or missing dialogue quotes."""
     if not isinstance(text, str) or not text:
         return text if isinstance(text, str) else ""
 
@@ -106,6 +106,12 @@ def normalize_leading_emotive_dialogue(text: object) -> str:
             i += 1
         return False
 
+    def _next_inline_non_space(start: int) -> int:
+        i = start
+        while i < len(text) and text[i] in " \t":
+            i += 1
+        return i
+
     out: list[str] = []
     in_quote = False
     i = 0
@@ -118,8 +124,17 @@ def normalize_leading_emotive_dialogue(text: object) -> str:
             continue
         marker_match = _EMOTIVE_MARKER_RE.match(text, i)
         if marker_match and not in_quote and _has_closing_quote_same_line(marker_match.end()):
+            next_non_space = _next_inline_non_space(marker_match.end())
             out.append('"')
             out.append(marker_match.group(0))
+            if (
+                next_non_space < len(text)
+                and text[next_non_space] == '"'
+                and not _is_escaped(next_non_space)
+            ):
+                i = next_non_space + 1
+                in_quote = True
+                continue
             in_quote = True
             i = marker_match.end()
             continue

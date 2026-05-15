@@ -105,6 +105,28 @@ class TestTtsEmotiveMarkers:
             "She folds the towel. \"[emotive:steadier]Twenty-two minutes.\""
         )
 
+    def test_prose_sanitizer_moves_emotive_before_opening_quote_inside_dialogue(self):
+        from text_game_engine.core.prose_sanitizer import sanitize_prose
+
+        cleaned = sanitize_prose(
+            "Her shoulder shifts against the wall. [emotive:quiet]\"Not kind. Efficient.\" "
+            "She says it the way she'd read a label."
+        )
+
+        assert cleaned == (
+            "Her shoulder shifts against the wall. \"[emotive:quiet]Not kind. Efficient.\" "
+            "She says it the way she'd read a label."
+        )
+
+    def test_prose_sanitizer_moves_spaced_emotive_before_opening_quote_inside_dialogue(self):
+        from text_game_engine.core.prose_sanitizer import sanitize_prose
+
+        cleaned = sanitize_prose(
+            "She folds the towel. [emotive:steadier] \"Twenty-two minutes.\""
+        )
+
+        assert cleaned == 'She folds the towel. "[emotive:steadier]Twenty-two minutes."'
+
     def test_prose_sanitizer_keeps_already_quoted_emotive_dialogue(self):
         from text_game_engine.core.prose_sanitizer import sanitize_prose
 
