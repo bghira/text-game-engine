@@ -636,6 +636,16 @@ def test_prompt_discourages_motific_physical_tics_and_npc_puppeting():
     assert "do not spend the turn apologizing" in prompt
 
 
+def test_prompt_requires_strict_dialogue_continuity_for_npc_deflection():
+    prompt = ZorkEmulator.RESPONSE_STYLE_NOTE + "\n" + ZorkEmulator.SYSTEM_PROMPT
+
+    assert "Strict dialogue continuity" in prompt or "STRICT DIALOGUE CONTINUITY" in prompt
+    assert "must not contradict their own prior spoken words from RECENT_TURNS" in prompt
+    assert "reinterpret intent" in prompt
+    assert "cannot deny factual statements they already made" in prompt
+    assert "acknowledge the words and clarify intent" in prompt
+
+
 def test_build_prompt_tells_model_not_to_overthink_routine_turns(
     session_factory,
     seed_campaign_and_actor,
