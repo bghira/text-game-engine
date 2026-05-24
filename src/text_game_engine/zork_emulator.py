@@ -783,7 +783,7 @@ class ZorkEmulator:
         "Use when a subplot beat should push the outlined story forward without explicit state_update scene change.)\n"
         '- turn_visibility: object (optional; who should get this turn in future prompt context. Keys: "scope" ("public"|"private"|"limited"|"local"), "player_slugs" (array of player slugs, typically `player-<actor_id>` — may be from PARTY_SNAPSHOT OR from WORLD_SUMMARY/RECENT_TURNS/known campaign players even if not co-located), "npc_slugs" (array of CHARACTER_INDEX / WORLD_CHARACTERS slugs who overheard/noticed), and optional "reason". This changes prompt visibility only; it does NOT change shared world state.)\n'
         "- scene_image_prompt: string (optional; include whenever the visible scene changes in a meaningful way: entering a room, newly visible characters/objects, reveals, or strong visual shifts)\n"
-        '- tool_calls: array (optional; inline side-effect tool invocations supported in final JSON. Allowed here: "sms_write", "sms_schedule", "plot_plan", "chapter_plan". Use this when the narrated outcome should also persist a text-message side effect or update off-rails plot/chapter structure. If present, tool_calls MUST be the last top-level key in the final JSON object.)\n'
+        '- tool_calls: array (required when the STRUCTURE CHECKPOINT triggers; otherwise optional; inline side-effect tool invocations supported in final JSON. Allowed here: "sms_write", "sms_schedule", "plot_plan", "chapter_plan", "song_search". Use this when the narrated outcome should also persist a text-message side effect, make a real song link available, or update off-rails plot/chapter structure. Never substitute in-world narration, summary_update, or state_update for plot_plan/chapter_plan persistence. If present, tool_calls MUST be the last top-level key in the final JSON object.)\n'
         "- set_timer_delay: integer (optional; 30-300 seconds, see TIMED EVENTS SYSTEM below)\n"
         "- set_timer_event: string (optional; what happens when the timer expires)\n"
         "- set_timer_interruptible: boolean (optional; default true)\n"
@@ -1237,7 +1237,8 @@ class ZorkEmulator:
         "You may either call sms_write as a separate tool-use round BEFORE final narration, "
         "or include a tool_calls array in your final response JSON alongside narration. "
         "Example: {\"narration\": \"...\", \"tool_calls\": [{\"tool_call\": \"sms_write\", \"thread\": \"saul\", \"from\": \"Saul\", \"to\": \"Dale\", \"message\": \"On my way.\"}]}\n"
-        "Only sms_write and sms_schedule are supported in tool_calls. "
+        "For SMS persistence, the supported SMS tool_calls are sms_write and sms_schedule. "
+        "Other inline tool_calls are governed by the final-stage operational rules. "
         "If you narrate an NPC texting back but don't sms_write it (either way), the reply is lost permanently.\n"
         "- Only skip tools for trivial immediate physical follow-ups where continuity risk is near zero.\n"
         "- If unsure what to query, describe the situation: combine current location, active NPC names, and what the player is doing into a phrase.\n"
@@ -1344,8 +1345,11 @@ class ZorkEmulator:
         "Use when you need details about a chapter not fully shown in STORY_CONTEXT.\n"
     )
     PLOT_PLAN_TOOL_PROMPT = (
-        "\nYou have a plot_plan tool for forward-looking narrative intentions.\n"
-        "Use it to create, update, resolve, or remove multi-turn threads so setups actually pay off.\n"
+        "\nPLOT PLAN TOOL — STRUCTURE, NOT NARRATION:\n"
+        "You have a plot_plan tool for forward-looking narrative intentions.\n"
+        "You MUST use it to create, update, resolve, or remove multi-turn threads so setups actually pay off.\n"
+        "Do not satisfy this by making the narrator or an NPC describe a plan, arc, chapter, setup, or future intention in-world. "
+        "Persist the structure with plot_plan; let narration show only what characters can perceive.\n"
         "Return ONLY:\n"
         '{"tool_call": "plot_plan", "plans": [{"thread": "thread-slug", "setup": "...", "intended_payoff": "...", "target_turns": 12, "dependencies": ["dep-1", "dep-2"]}]}\n'
         "Resolve or update existing threads by setting status/resolution fields:\n"
@@ -1354,11 +1358,13 @@ class ZorkEmulator:
         '{"tool_call": "plot_plan", "plans": [{"thread": "thread-slug", "remove": true}]}\n'
         "ACTIVE_PLOT_THREADS are returned in prompt context.\n"
         "Use ACTIVE_PLOT_THREADS and ACTIVE_HINTS to maintain momentum and prevent mystery-box drift.\n"
-        "Any narrative thread expected to span more than 3 turns SHOULD have a plot plan.\n"
+        "Any narrative thread expected to span more than 3 turns MUST have a plot plan.\n"
     )
     CHAPTER_PLAN_TOOL_PROMPT = (
         "\nOFF-RAILS CHAPTER MANAGEMENT TOOL:\n"
-        "In off-rails mode, you may create, update, advance, or resolve emergent chapter structure via chapter_plan.\n"
+        "In off-rails mode, you MUST create, update, advance, or resolve emergent chapter structure via chapter_plan whenever chapter flow changes.\n"
+        "Do not satisfy this by mentioning chapter structure, pacing, arcs, or plot management in the visible scene. "
+        "chapter_plan is a persistence action; narration is only for in-world events.\n"
         "Create or update a chapter:\n"
         '{"tool_call": "chapter_plan", "action": "create", "chapter": {"slug": "arc-slug", "title": "Arc Title", "summary": "...", "scenes": ["scene-a", "scene-b"], "active": true}}\n'
         "Advance a chapter scene:\n"
@@ -1458,11 +1464,20 @@ class ZorkEmulator:
     FINAL_STAGE_OPERATIONAL_PROMPT = (
         "\nFINALIZATION OPERATIONAL RULES:\n"
         "- You are in the final JSON-writing stage. Do NOT return a standalone tool_call object now.\n"
-        '- You MAY include "tool_calls" in the final JSON for sms_write, sms_schedule, plot_plan, chapter_plan, and song_search only.\n'
+        '- The final JSON supports "tool_calls" for sms_write, sms_schedule, plot_plan, chapter_plan, and song_search only.\n'
         '- If present, tool_calls MUST be the last top-level key in the final JSON object.\n'
         "- If narration includes an SMS/phone reply or outgoing SMS that must persist, include a matching sms_write in tool_calls so both sides of the conversation are logged.\n"
         "- If scheduling a delayed incoming SMS, use tool_calls with sms_schedule and do NOT narrate that delayed message as already received.\n"
-        '- In off-rails play, use tool_calls with {"tool_call": "plot_plan", ...} or {"tool_call": "chapter_plan", ...} when the narrated turn meaningfully creates, advances, resolves, or restructures ongoing story threads or chapter flow.\n'
+        "- STRUCTURE CHECKPOINT: before writing scene_output/narration, internally decide whether this turn changes off-rails plot or chapter structure. "
+        "This checkpoint is mandatory and silent: do not narrate it, do not put it in scene_output, and do not make a character talk about plot/chapter management unless they have an in-world reason.\n"
+        '- If any STRUCTURE CHECKPOINT trigger is true, tool_calls is REQUIRED with {"tool_call": "plot_plan", ...}, {"tool_call": "chapter_plan", ...}, or both. '
+        "Do not replace the required tool call with in-world narration, summary_update, state_update, character_updates, or vague foreshadowing.\n"
+        "- plot_plan triggers: a new multi-turn threat, mystery, relationship pressure, promise, debt, investigation, antagonist move, or delayed payoff is introduced; "
+        "an existing ACTIVE_PLOT_THREADS / ACTIVE_HINTS item is advanced, reframed, paid off, resolved, invalidated, or should be removed; "
+        "or a thread is expected to matter beyond the next 3 turns.\n"
+        "- chapter_plan triggers: no active chapter exists and the player is directionless; the current chapter/scene goal changes; "
+        "the turn advances to a new scene beat, resolves a scene/chapter, splits the party into a new structural arc, or restructures the off-rails chapter flow.\n"
+        "- If no structure trigger is true, omit plot_plan/chapter_plan tool_calls. Do not fabricate structure updates just to use the tools.\n"
         '- Use tool_calls with {"tool_call": "song_search", "query": "..."} when the turn should make a real song link available in the Discord thread/channel.\n'
         "- If the current scene has a believable grounded clock and needs forced urgency, you may include set_timer_delay / set_timer_event / set_timer_interruptible / set_timer_interrupt_action / set_timer_interrupt_scope in the final JSON.\n"
         "- Timers are for real pressure: force a decision, trigger a grounded consequence, move the player, or force an encounter. Do NOT use timers for trivial flavor.\n"
