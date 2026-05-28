@@ -4233,6 +4233,7 @@ class ToolAwareZorkLLM:
             final_output_contract = (
                 "RESEARCH_COMPLETE: Context gathering is complete.\n"
                 "Do NOT call any more tools now. Return final narration/state JSON directly.\n"
+                "A standalone {\"tool_call\": \"...\"} response is invalid in this stage.\n"
                 "REQUIRED fields: reasoning, scene_output, state_update (with game_time), summary_update.\n"
                 "OPTIONAL: set_timer_delay + set_timer_event (include these in the SAME JSON object "
                 "to schedule a timed event when the world has external pressure that would escalate without player input). "
@@ -4282,6 +4283,7 @@ class ToolAwareZorkLLM:
         final_output_contract = (
             "RESEARCH_COMPLETE: Context gathering is complete.\n"
             "Do NOT call any more tools now. Return final narration/state JSON directly.\n"
+            "A standalone {\"tool_call\": \"...\"} response is invalid in this stage.\n"
             "REQUIRED fields: reasoning, scene_output, state_update (with game_time), summary_update.\n"
             "OPTIONAL: set_timer_delay + set_timer_event (include these in the SAME JSON object "
             "to schedule a timed event when the world has external pressure that would escalate without player input). "
@@ -4293,12 +4295,14 @@ class ToolAwareZorkLLM:
 
         if self._is_emptyish_payload(payload):
             await _notify_progress(progress, "refining")
-            for attempt in range(2):
+            repair_rejection_note = ""
+            for attempt in range(3):
                 self._bump_auto_fix_counter(campaign_id, "empty_response_repair_retry")
                 repair_prompt = (
                     f"{user_prompt}\n"
                     f"{tool_history}\n\n"
                     + final_output_contract
+                    + repair_rejection_note
                     + "OUTPUT_VALIDATION_FAILED: previous response was too empty.\n"
                     "Follow the same JSON contract above.\n"
                     "If the turn is mostly OOC, low-motion, or intentionally minimal, one concise valid beat is enough.\n"
@@ -4309,7 +4313,7 @@ class ToolAwareZorkLLM:
                     repair_prompt,
                 )
                 repaired = await self._complete_narration(
-                    system_prompt,
+                    final_system_prompt,
                     repair_prompt,
                     temperature=max(0.1, self._temperature - 0.1),
                     max_tokens=self._max_tokens,
@@ -4319,10 +4323,20 @@ class ToolAwareZorkLLM:
                     repaired or "(empty)",
                 )
                 repaired_payload = self._parse_model_payload(repaired)
-                if repaired_payload is not None and not emulator._is_tool_call(repaired_payload):  # noqa: SLF001
-                    payload = repaired_payload
-                    if not self._is_emptyish_payload(payload):
-                        break
+                if repaired_payload is None:
+                    continue
+                if emulator._is_tool_call(repaired_payload):  # noqa: SLF001
+                    tool_name = str(repaired_payload.get("tool_call") or "").strip() or "unknown"
+                    self._bump_auto_fix_counter(campaign_id, "final_repair_tool_call_rejected")
+                    repair_rejection_note = (
+                        f"FINAL_STAGE_TOOL_CALL_REJECTED: previous repair returned standalone tool_call={tool_name}. "
+                        "No research tools are available during final repair. Return the required final narration/state JSON now, "
+                        "with no standalone tool_call.\n"
+                    )
+                    continue
+                payload = repaired_payload
+                if not self._is_emptyish_payload(payload):
+                    break
 
         narration = str(payload.get("narration") or "")
         if self._narration_has_explicit_clock_time(narration) and not self._action_requests_clock_time(action_text):

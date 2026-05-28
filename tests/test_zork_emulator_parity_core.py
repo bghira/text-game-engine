@@ -1726,6 +1726,84 @@ def test_empty_response_repair_reuses_final_output_contract_without_forcing_extr
     asyncio.run(run_test())
 
 
+def test_empty_response_repair_uses_final_system_prompt_and_rejects_memory_tool_retry(
+    session_factory,
+    seed_campaign_and_actor,
+):
+    class MemoryToolRepairCompletionPort:
+        def __init__(self):
+            self.calls = []
+
+        async def complete(self, system_prompt, prompt, *, temperature=0.8, max_tokens=2048):
+            self.calls.append({"system_prompt": system_prompt, "prompt": prompt})
+            if len(self.calls) == 1:
+                return '{"tool_call":"ready_to_write","speakers":["sarah"],"listeners":["player-actor-1"]}'
+            if len(self.calls) == 2:
+                return "{}"
+            if len(self.calls) == 3:
+                return '{"tool_call":"memory_search","queries":["Sarah older context"]}'
+            return (
+                '{"reasoning":"repair","scene_output":{"location_key":"room","context_key":"repair","beats":[{"reasoning":"The retry stays in final writing mode.","type":"npc_dialogue","speaker":"sarah","actors":["sarah"],"listeners":["player-actor-1"],"visibility":"local","aware_npc_slugs":[],"text":"Sarah stays quiet for a second. \\"I heard you.\\""}]},'
+                '"state_update":{"game_time":{"day":1,"hour":9,"minute":0,"day_of_week":"monday","period":"morning","date_label":"Monday, Day 1, Morning"}},'
+                '"summary_update":"Sarah acknowledges Stephane without adding a new action."}'
+            )
+
+    async def run_test():
+        completion = MemoryToolRepairCompletionPort()
+        engine = GameEngine(
+            uow_factory=lambda: SQLAlchemyUnitOfWork(session_factory),
+            llm=StubLLM(LLMTurnOutput(narration="unused")),
+        )
+        compat = ZorkEmulator(engine, session_factory, completion_port=completion)
+        tool_llm = ToolAwareZorkLLM(
+            session_factory=session_factory,
+            completion_port=completion,
+            temperature=0.8,
+            max_tokens=2048,
+        )
+        tool_llm.bind_emulator(compat)
+
+        campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
+        player = compat.get_or_create_player(campaign.id, seed_campaign_and_actor["actor_id"])
+        turns = compat.get_recent_turns(campaign.id)
+        research_system_prompt, research_user_prompt = compat.build_prompt(
+            campaign,
+            player,
+            "look",
+            turns,
+            prompt_stage=compat.PROMPT_STAGE_RESEARCH,
+        )
+        final_system_prompt, final_user_prompt = compat.build_prompt(
+            campaign,
+            player,
+            "look",
+            turns,
+            prompt_stage=compat.PROMPT_STAGE_FINAL,
+        )
+
+        payload = await tool_llm._resolve_payload(  # noqa: SLF001
+            seed_campaign_and_actor["campaign_id"],
+            seed_campaign_and_actor["actor_id"],
+            "look",
+            research_system_prompt,
+            research_user_prompt,
+            final_system_prompt,
+            final_user_prompt,
+        )
+
+        assert payload is not None
+        assert payload.get("summary_update") == "Sarah acknowledges Stephane without adding a new action."
+        assert len(completion.calls) == 4
+        assert completion.calls[2]["system_prompt"] == final_system_prompt
+        assert completion.calls[3]["system_prompt"] == final_system_prompt
+        assert '{"tool_call": "memory_search"' not in completion.calls[2]["system_prompt"]
+        assert 'A standalone {"tool_call": "..."} response is invalid in this stage.' in completion.calls[2]["prompt"]
+        assert "RESEARCH_COMPLETE: Context gathering is complete." in completion.calls[2]["prompt"]
+        assert "FINAL_STAGE_TOOL_CALL_REJECTED: previous repair returned standalone tool_call=memory_search" in completion.calls[3]["prompt"]
+
+    asyncio.run(run_test())
+
+
 def test_ready_to_write_lcd_does_not_backfill_older_shared_turns_after_solo_gap(
     session_factory,
     seed_campaign_and_actor,
