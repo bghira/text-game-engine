@@ -20340,6 +20340,68 @@ class ZorkEmulator:
 
         return False
 
+    def _participant_aliases_for_lcd(
+        self,
+        campaign_id: str,
+        *,
+        characters: Optional[Dict[str, dict]] = None,
+    ) -> Dict[str, str]:
+        """Return unambiguous player/NPC aliases used by LCD filtering."""
+        alias_targets: Dict[str, set[str]] = {}
+
+        def _add_alias(raw: object, canonical: object) -> None:
+            alias = self._player_slug_key(raw)
+            target = self._player_slug_key(canonical)
+            if alias and target:
+                alias_targets.setdefault(alias, set()).add(target)
+
+        registry = self._campaign_player_registry(str(campaign_id), self._session_factory)
+        for raw_actor_id, info in registry.get("by_actor_id", {}).items():
+            actor_id = str(raw_actor_id or "").strip()
+            if not actor_id or not isinstance(info, dict):
+                continue
+            name = str(info.get("name") or "").strip()
+            canonical_slug = (
+                self._player_slug_key(name)
+                or self._player_slug_key(info.get("slug"))
+                or self._player_visibility_slug(actor_id)
+            )
+            if not canonical_slug:
+                continue
+            _add_alias(info.get("slug"), canonical_slug)
+            _add_alias(name, canonical_slug)
+            _add_alias(actor_id, canonical_slug)
+            _add_alias(self._player_visibility_slug(actor_id), canonical_slug)
+            if name:
+                for part in re.split(r"[\s\-]+", name):
+                    if len(part) >= 3:
+                        _add_alias(part, canonical_slug)
+
+        character_rows = characters
+        if character_rows is None:
+            with self._session_factory() as session:
+                campaign = session.get(Campaign, str(campaign_id))
+            character_rows = self.get_campaign_characters(campaign) if campaign is not None else {}
+        if isinstance(character_rows, dict):
+            for raw_slug, row in character_rows.items():
+                canonical_slug = self._player_slug_key(raw_slug)
+                if not canonical_slug:
+                    continue
+                _add_alias(raw_slug, canonical_slug)
+                if isinstance(row, dict):
+                    name = str(row.get("name") or "").strip()
+                    _add_alias(name, canonical_slug)
+                    if name:
+                        for part in re.split(r"[\s\-]+", name):
+                            if len(part) >= 3:
+                                _add_alias(part, canonical_slug)
+
+        return {
+            alias: next(iter(targets))
+            for alias, targets in alias_targets.items()
+            if len(targets) == 1
+        }
+
     def _turn_visible_to_all_scene_npcs(
         self,
         turn: Turn,
@@ -20610,6 +20672,10 @@ class ZorkEmulator:
                     alias_slug = self._player_slug_key(raw_alias)
                     if alias_slug:
                         participant_aliases[alias_slug] = canonical_slug
+        participant_aliases = self._participant_aliases_for_lcd(
+            str(campaign.id),
+            characters=self.get_campaign_characters(campaign),
+        )
 
         _is_individual_clocks = self._time_model_from_state(
             self.get_campaign_state(campaign)

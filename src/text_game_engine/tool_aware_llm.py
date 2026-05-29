@@ -668,13 +668,18 @@ class ToolAwareZorkLLM:
         actor_id: str,
         scene_lcd_slugs: set[str],
         viewer_location_key: str,
+        participant_aliases: dict[str, str] | None = None,
     ) -> bool:
         emulator = self._emulator
         if emulator is None or turn is None:
             return False
         if not scene_lcd_slugs:
             return True
-        if emulator._turn_visible_to_all_scene_npcs(turn, scene_lcd_slugs):  # noqa: SLF001
+        if emulator._turn_visible_to_all_scene_npcs(  # noqa: SLF001
+            turn,
+            scene_lcd_slugs,
+            participant_aliases=participant_aliases,
+        ):
             return True
         return emulator._actor_local_player_turn_visible_to_scene_lcd(  # noqa: SLF001
             turn,
@@ -696,6 +701,22 @@ class ToolAwareZorkLLM:
         raw_text = str(text or "").strip()
         if tool_key not in {"memory_search", "memory_turn"} or not scene_lcd_slugs:
             return raw_text
+        emulator = self._emulator
+        participant_aliases: dict[str, str] = {}
+        if emulator is not None:
+            participant_aliases = emulator._participant_aliases_for_lcd(str(campaign_id))  # noqa: SLF001
+
+            def _canonical_lcd_slug(raw: object) -> str:
+                slug = emulator._player_slug_key(raw)  # noqa: SLF001
+                return participant_aliases.get(slug, slug)
+
+            scene_lcd_slugs = {
+                canonical
+                for canonical in (_canonical_lcd_slug(slug) for slug in scene_lcd_slugs)
+                if canonical
+            }
+            if not scene_lcd_slugs:
+                return raw_text
         records = self._memory_tool_records_from_text(raw_text)
         if not records:
             return raw_text
@@ -728,6 +749,7 @@ class ToolAwareZorkLLM:
                 actor_id=actor_id,
                 scene_lcd_slugs=scene_lcd_slugs,
                 viewer_location_key=viewer_location_key,
+                participant_aliases=participant_aliases,
             ):
                 kept_rows.append(row)
             else:
@@ -3927,25 +3949,29 @@ class ToolAwareZorkLLM:
                         alias_slug = emulator._player_slug_key(raw_alias)  # noqa: SLF001
                         if alias_slug:
                             player_alias_to_slug[alias_slug] = canonical_slug
+                participant_aliases = emulator._participant_aliases_for_lcd(  # noqa: SLF001
+                    str(campaign_id),
+                    characters=campaign_characters,
+                )
                 player_slugs = set(player_alias_to_slug.values())
 
                 def _canonical_participant_slug(raw: object) -> str:
                     slug = emulator._player_slug_key(raw)  # noqa: SLF001
-                    return player_alias_to_slug.get(slug, slug)
+                    return participant_aliases.get(slug, slug)
 
                 player_alias_slugs = set(player_alias_to_slug.keys())
                 speaker_npc_slugs = {
-                    emulator._player_slug_key(raw_slug)  # noqa: SLF001
+                    _canonical_participant_slug(raw_slug)
                     for raw_slug in list(_ready_speakers)
-                    if emulator._player_slug_key(raw_slug)  # noqa: SLF001
+                    if _canonical_participant_slug(raw_slug)
                 }
                 speaker_npc_slugs = {
                     slug for slug in speaker_npc_slugs if slug and slug not in player_alias_slugs and slug not in player_slugs and slug != viewer_slug
                 }
                 listener_npc_slugs = {
-                    emulator._player_slug_key(raw_slug)  # noqa: SLF001
+                    _canonical_participant_slug(raw_slug)
                     for raw_slug in list(_ready_listeners)
-                    if emulator._player_slug_key(raw_slug)  # noqa: SLF001
+                    if _canonical_participant_slug(raw_slug)
                 }
                 listener_npc_slugs = {
                     slug for slug in listener_npc_slugs if slug and slug not in player_alias_slugs and slug not in player_slugs and slug != viewer_slug

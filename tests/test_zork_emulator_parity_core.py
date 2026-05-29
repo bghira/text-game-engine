@@ -2155,6 +2155,137 @@ def test_ready_to_write_filters_memory_search_turn_hits_to_speaker_lcd(
     asyncio.run(run_test())
 
 
+def test_ready_to_write_memory_lcd_resolves_player_tags_and_character_names(
+    session_factory,
+    seed_campaign_and_actor,
+):
+    class AliasMemoryLcdCompletionPort:
+        def __init__(self, shared_turn_id: int, private_turn_id: int):
+            self.shared_turn_id = shared_turn_id
+            self.private_turn_id = private_turn_id
+            self.calls = []
+
+        async def complete(self, system_prompt, prompt, *, temperature=0.8, max_tokens=2048):
+            self.calls.append({"system_prompt": system_prompt, "prompt": prompt})
+            if len(self.calls) == 1:
+                return json.dumps(
+                    {
+                        "tool_call": "memory_search",
+                        "queries": ["alias memory marker"],
+                        "search_within_turn_ids": [
+                            self.shared_turn_id,
+                            self.private_turn_id,
+                        ],
+                    }
+                )
+            if len(self.calls) == 2:
+                return '{"tool_call":"ready_to_write","speakers":["Sage Mentor"],"listeners":["player-actor-1"]}'
+            return (
+                '{"reasoning":"finalized","narration":"Final scene.",'
+                '"state_update":{"game_time":{"day":1,"hour":9,"minute":0,"day_of_week":"monday","period":"morning","date_label":"Monday, Day 1, Morning"}},'
+                '"summary_update":"done"}'
+            )
+
+    async def run_test():
+        compat = _build_compat(session_factory)
+        campaign = compat.get_or_create_campaign("default", "main", seed_campaign_and_actor["actor_id"])
+        player = compat.get_or_create_player(campaign.id, seed_campaign_and_actor["actor_id"])
+
+        with session_factory() as session:
+            row = session.get(Campaign, campaign.id)
+            assert row is not None
+            row.characters_json = compat._dump_json(
+                {"sage": {"name": "Sage Mentor", "location": "study"}}
+            )
+            player_row = session.get(Player, player.id)
+            player_state = json.loads(player_row.state_json or "{}")
+            player_state["character_name"] = "Rowan Vale"
+            player_state["location"] = "study"
+            player_row.state_json = compat._dump_json(player_state)
+
+            shared_turn = Turn(
+                campaign_id=campaign.id,
+                session_id=None,
+                actor_id=seed_campaign_and_actor["actor_id"],
+                kind="narrator",
+                content="ALIAS-SHARED-MEMORY-MARKER: Sage answers the player tag.",
+                meta_json=json.dumps(
+                    {
+                        "visibility": {"scope": "local", "location_key": "study"},
+                        "location_key": "study",
+                        "scene_output": {
+                            "location_key": "study",
+                            "beats": [
+                                {
+                                    "type": "npc_dialogue",
+                                    "speaker": "sage",
+                                    "actors": ["sage"],
+                                    "listeners": ["player-actor-1"],
+                                    "visibility": "local",
+                                    "aware_npc_slugs": ["sage"],
+                                    "text": "ALIAS-SHARED-MEMORY-MARKER: Sage answers the player tag.",
+                                }
+                            ],
+                        },
+                    }
+                ),
+            )
+            private_turn = Turn(
+                campaign_id=campaign.id,
+                session_id=None,
+                actor_id=seed_campaign_and_actor["actor_id"],
+                kind="narrator",
+                content="ALIAS-PRIVATE-MEMORY-MARKER: Rowan reads alone.",
+                meta_json=json.dumps(
+                    {
+                        "visibility": {
+                            "scope": "private",
+                            "actor_player_slug": "player-actor-1",
+                            "visible_player_slugs": ["player-actor-1"],
+                            "aware_npc_slugs": [],
+                            "location_key": "study",
+                        },
+                        "location_key": "study",
+                    }
+                ),
+            )
+            session.add(shared_turn)
+            session.add(private_turn)
+            session.flush()
+            shared_turn_id = int(shared_turn.id)
+            private_turn_id = int(private_turn.id)
+            session.commit()
+
+        completion = AliasMemoryLcdCompletionPort(shared_turn_id, private_turn_id)
+        tool_llm = ToolAwareZorkLLM(
+            session_factory=session_factory,
+            completion_port=completion,
+            temperature=0.8,
+            max_tokens=2048,
+        )
+        tool_llm.bind_emulator(compat)
+
+        payload = await tool_llm._resolve_payload(  # noqa: SLF001
+            campaign.id,
+            seed_campaign_and_actor["actor_id"],
+            "ask Sage what she remembers",
+            "research system",
+            "PLAYER_ACTION: ask Sage what she remembers\nmemory_lookup_enabled: true",
+            "final system",
+            "PLAYER_ACTION: ask Sage what she remembers\nmemory_lookup_enabled: true",
+        )
+
+        assert payload is not None
+        assert len(completion.calls) == 3
+        final_prompt = completion.calls[2]["prompt"]
+        assert "ALIAS-SHARED-MEMORY-MARKER" in final_prompt
+        assert "ALIAS-PRIVATE-MEMORY-MARKER" not in final_prompt
+        assert '"lcd_filtered_turn_count":1' in final_prompt
+        assert '"lcd_filter_slugs":["rowan-vale","sage"]' in final_prompt
+
+    asyncio.run(run_test())
+
+
 def test_lcd_keeps_actor_local_player_setup_for_scene_participants(
     session_factory,
     seed_campaign_and_actor,
