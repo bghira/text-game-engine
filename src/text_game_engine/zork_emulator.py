@@ -14915,8 +14915,20 @@ class ZorkEmulator:
         effective_standard_turn_advance = self._effective_standard_turn_advance_minutes(
             speed_mult
         )
+        time_skip_request = self._extract_time_skip_request(action)
+        time_skip_minutes = 0
+        if time_skip_request is not None:
+            skip_base = self._coerce_non_negative_int(
+                time_skip_request.get("minutes", 60), default=60
+            )
+            skip_scaled = int(round(skip_base * float(speed_mult or 1.0)))
+            time_skip_minutes = min(
+                7 * 24 * 60, max(effective_min_turn_advance, skip_scaled)
+            )
+        # An explicit time-skip drives the pacing guidance; otherwise the
+        # per-speed minimum span applies.
         turn_time_beat_guidance = self._turn_time_beat_guidance(
-            effective_min_turn_advance
+            max(effective_min_turn_advance, time_skip_minutes)
         )
         difficulty = self.normalize_difficulty(state.get("difficulty", "normal"))
         style_direction = self._resolve_style_direction(campaign)
@@ -15060,6 +15072,9 @@ class ZorkEmulator:
                 player_state,
                 action,
             )
+        )
+        merged_tail_extra_lines.extend(
+            self._time_skip_prompt_extra_lines(time_skip_request, time_skip_minutes)
         )
         merged_tail_extra_lines.extend(
             self._passive_npc_sms_nudge_lines(
@@ -19097,6 +19112,43 @@ class ZorkEmulator:
             "minutes": minutes,
             "description": desc,
         }
+
+    @staticmethod
+    def _humanize_minutes_span(minutes: int) -> str:
+        total = max(0, int(minutes))
+        days, rem = divmod(total, 24 * 60)
+        hours, mins = divmod(rem, 60)
+        parts: list[str] = []
+        if days:
+            parts.append(f"{days} day{'s' if days != 1 else ''}")
+        if hours:
+            parts.append(f"{hours} hour{'s' if hours != 1 else ''}")
+        if mins and not days:
+            parts.append(f"{mins} minute{'s' if mins != 1 else ''}")
+        return " ".join(parts) if parts else "a short while"
+
+    def _time_skip_prompt_extra_lines(
+        self,
+        time_skip_request: Optional[Dict[str, object]],
+        time_skip_minutes: int,
+    ) -> list[str]:
+        if time_skip_request is None:
+            return []
+        human = self._humanize_minutes_span(time_skip_minutes)
+        desc = " ".join(str(time_skip_request.get("description") or "").split())
+        lines = [
+            f"TIME_SKIP_DIRECTIVE: The player issued an explicit time-skip command for approximately {human}.",
+            "Advance state_update.game_time forward by about that span this turn (the harness enforces this span as a floor).",
+            "Narrate the elapsed time as compressed transition or montage that lands on the new moment — do not play it out minute by minute.",
+            "Update room/scene state, location, and any other player_state_update fields so they reflect where and when the player now is after the skip.",
+            "Follow TURN_TIME_BEAT_GUIDANCE for how aggressively to compress.",
+        ]
+        if desc:
+            lines.append(
+                "If the command names a target (e.g. \"to the next event\", \"until morning\", \"until <X>\"), "
+                f"land the scene at that target and set game_time accordingly even if it differs from the literal duration. Player request: \"{desc}\"."
+            )
+        return lines
 
     def _is_ooc_action_text(self, action_text: object) -> bool:
         return bool(re.match(r"\s*\[OOC\b", str(action_text or ""), re.IGNORECASE))
