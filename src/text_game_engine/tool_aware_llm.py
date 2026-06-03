@@ -2829,6 +2829,56 @@ class ToolAwareZorkLLM:
             lines.append("- (no messages)")
         return "\n".join(lines)
 
+    @staticmethod
+    def _norm_sms_text(value: Any) -> str:
+        return " ".join(str(value or "").strip().lower().split())
+
+    def _sms_write_dedup_keys(self, payload: dict[str, Any]):
+        """Yield (recipient_key, content_key) tuples identifying each message in
+        an sms_write/sms_schedule payload, covering BOTH the single-message form
+        and the batched 'messages' array form.
+
+        The recipient key is the stable thread/recipient (not the per-message
+        'to'), so the same reply matches whether one round sent it batched and
+        another re-sent it singly. Used to dedup final inline tool_calls against
+        writes already executed during the research rounds.
+        """
+        recip = (
+            self._norm_sms_text(payload.get("recipient"))
+            or self._norm_sms_text(payload.get("thread"))
+            or self._norm_sms_text(payload.get("to"))
+        )
+        if not recip:
+            return
+        messages = payload.get("messages")
+        if isinstance(messages, list) and messages:
+            for msg in messages:
+                if not isinstance(msg, dict):
+                    continue
+                content = self._norm_sms_text(msg.get("text") or msg.get("message"))
+                if content:
+                    yield (recip, content)
+        else:
+            content = self._norm_sms_text(
+                payload.get("content") or payload.get("text") or payload.get("message")
+            )
+            if content:
+                yield (recip, content)
+
+    @staticmethod
+    def _sms_result_stored_something(result: Any) -> bool:
+        """True when an SMS_WRITE_RESULT string indicates at least one message
+        was persisted — covers single ('stored=True') and batch ('stored=2/3'),
+        while excluding failures ('stored=False', 'stored=0/3', 'invalid')."""
+        if not isinstance(result, str):
+            return False
+        return (
+            "stored=" in result
+            and "stored=False" not in result
+            and "stored=0/" not in result
+            and "invalid payload" not in result
+        )
+
     def _tool_sms_write(
         self,
         campaign_id: str,
@@ -2908,7 +2958,17 @@ class ToolAwareZorkLLM:
             turn_id=turn_id,
             owner_actor_id=actor_id,
         )
-        return f"SMS_WRITE_RESULT: stored={bool(ok)} reason={reason} thread={thread}"
+        if not ok:
+            return f"SMS_WRITE_RESULT: stored=False reason={reason} thread={thread}"
+        # Echo the actual logged message back so the model can SEE what it just
+        # sent. Without this it only gets an opaque "stored=True" and, unable to
+        # confirm its reply landed, re-issues sms_write again and again.
+        return (
+            f"SMS_WRITE_RESULT: stored=True reason={reason} thread={thread} "
+            f"logged=[{sender} -> {recipient}: {message[:200]}] "
+            "(this message is now saved in the thread — do NOT write it again. "
+            "Only call sms_write again to send a genuinely different new message.)"
+        )
 
     def _tool_sms_write_batch(
         self,
@@ -2944,6 +3004,7 @@ class ToolAwareZorkLLM:
                     senders.append(f)
 
         stored = 0
+        logged_lines: list[str] = []
         for msg in messages:
             if not isinstance(msg, dict):
                 continue
@@ -2967,7 +3028,15 @@ class ToolAwareZorkLLM:
             )
             if ok:
                 stored += 1
-        return f"SMS_WRITE_RESULT: stored={stored}/{len(messages)} thread={thread}"
+                logged_lines.append(f"{sender} -> {recipient}: {text[:200]}")
+        # Echo the logged messages so the model can see exactly what landed and
+        # does not re-send them; an opaque count alone makes it write again.
+        logged_str = " | ".join(logged_lines) if logged_lines else "(none)"
+        return (
+            f"SMS_WRITE_RESULT: stored={stored}/{len(messages)} thread={thread} "
+            f"logged=[{logged_str}] "
+            "(these messages are now saved in the thread — do NOT write them again.)"
+        )
 
     def _tool_sms_schedule(
         self,
@@ -3734,10 +3803,9 @@ class ToolAwareZorkLLM:
             self._zork_log(f"TOOL RESULT campaign={campaign_id}", f"tool={tool_name}\nresult={str(tool_result)}")
             # Track sms_write calls executed during research for dedup against
             # final inline tool_calls (models often re-include the outgoing SMS).
-            if tool_name in ("sms_write", "sms_schedule") and isinstance(tool_result, str) and "stored=True" in tool_result:
-                _sms_recipient = " ".join(str(payload.get("recipient") or payload.get("thread") or payload.get("to") or "").strip().lower().split())
-                _sms_content = " ".join(str(payload.get("content") or payload.get("text") or payload.get("message") or "").strip().lower().split())
-                if _sms_recipient and _sms_content:
+            # Handles both single and batched ('messages' array) writes.
+            if tool_name in ("sms_write", "sms_schedule") and self._sms_result_stored_something(tool_result):
+                for _sms_recipient, _sms_content in self._sms_write_dedup_keys(payload):
                     research_sms_writes.append((_sms_recipient, _sms_content))
             _append_tool_history_entry(tool_name, tool_result)
             keep_memory_turns = self._memory_tool_turn_id_list(
@@ -4499,11 +4567,35 @@ class ToolAwareZorkLLM:
                 try:
                     tc_name = str(tc.get("tool_call") or "").strip().lower()
                     if tc_name in ("sms_write", "sms_schedule") and _research_sms_set:
-                        _tc_recip = " ".join(str(tc.get("recipient") or tc.get("thread") or tc.get("to") or "").strip().lower().split())
-                        _tc_content = " ".join(str(tc.get("content") or tc.get("text") or tc.get("message") or "").strip().lower().split())
-                        if (_tc_recip, _tc_content) in _research_sms_set:
-                            logger.debug("complete_turn: skipping duplicate sms_write to=%s (already sent in research)", _tc_recip)
-                            continue
+                        _tc_recip = (
+                            self._norm_sms_text(tc.get("recipient"))
+                            or self._norm_sms_text(tc.get("thread"))
+                            or self._norm_sms_text(tc.get("to"))
+                        )
+                        _tc_messages = tc.get("messages")
+                        if isinstance(_tc_messages, list) and _tc_messages:
+                            # Batched form: drop only the messages already sent
+                            # during research; keep genuinely new ones.
+                            _kept = []
+                            for _m in _tc_messages:
+                                if not isinstance(_m, dict):
+                                    _kept.append(_m)
+                                    continue
+                                _mc = self._norm_sms_text(_m.get("text") or _m.get("message"))
+                                if _mc and (_tc_recip, _mc) in _research_sms_set:
+                                    logger.debug("complete_turn: skipping duplicate batched sms_write content (already sent in research)")
+                                    continue
+                                _kept.append(_m)
+                            if not _kept:
+                                continue  # entire batch was duplicates
+                            tc = {**tc, "messages": _kept}
+                        else:
+                            _tc_content = self._norm_sms_text(
+                                tc.get("content") or tc.get("text") or tc.get("message")
+                            )
+                            if (_tc_recip, _tc_content) in _research_sms_set:
+                                logger.debug("complete_turn: skipping duplicate sms_write to=%s (already sent in research)", _tc_recip)
+                                continue
                     await self._execute_tool_call(context.campaign_id, tc, actor_id=context.actor_id)
                     if tc_name in ("sms_write",):
                         _executed_sms = True
