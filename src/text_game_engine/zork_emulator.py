@@ -1375,13 +1375,16 @@ class ZorkEmulator:
         "chapter_plan is a persistence action; narration is only for in-world events.\n"
         "Create or update a chapter:\n"
         '{"tool_call": "chapter_plan", "action": "create", "chapter": {"slug": "arc-slug", "title": "Arc Title", "summary": "...", "scenes": ["scene-a", "scene-b"], "active": true}}\n'
+        "When creating a chapter you MUST include a human-readable title, a 1-2 sentence summary, and at least two scene slugs. "
+        "Never create a chapter with only a slug — a bare slug is unusable and will not advance.\n"
         "Advance a chapter scene:\n"
         '{"tool_call": "chapter_plan", "action": "advance_scene", "chapter": "arc-slug", "to_scene": "scene-b"}\n'
         "Resolve a chapter:\n"
         '{"tool_call": "chapter_plan", "action": "resolve", "chapter": "arc-slug", "resolution": "What concluded the arc."}\n'
-        "ACTIVE_CHAPTERS are returned in prompt context.\n"
+        "ACTIVE_CHAPTERS are returned in prompt context as full objects (slug, title, summary, scenes, current_scene, status).\n"
+        "Before creating a new chapter, check ACTIVE_CHAPTERS: if the current beat belongs to an existing chapter, advance_scene or update it instead of spawning a new one. "
         "Use ACTIVE_CHAPTERS to maintain momentum and avoid aimless wandering.\n"
-        "If no chapters are active and the player is directionless, create one from the strongest unresolved thread.\n"
+        "If no chapters are active and the player is directionless, create one (fully populated) from the strongest unresolved thread.\n"
     )
     CONSEQUENCE_TOOL_PROMPT = (
         "\nYou have a consequence_log tool for promised downstream effects.\n"
@@ -15059,6 +15062,15 @@ class ZorkEmulator:
                 f"WORLD_STATE: {self._dump_json(model_state)}\n"
                 f"ACTIVE_PLOT_THREADS: {self._dump_json(active_plot_threads)}\n"
                 f"ACTIVE_HINTS: {self._dump_json(active_plot_hints)}\n"
+            )
+            if not on_rails:
+                active_chapters = self._chapters_for_prompt(
+                    state, active_only=True, limit=8
+                )
+                user_prompt += (
+                    f"ACTIVE_CHAPTERS: {self._dump_json(active_chapters)}\n"
+                )
+            user_prompt += (
                 f"CALENDAR: {self._dump_json(calendar_for_prompt)}\n"
                 f"CALENDAR_REMINDERS:\n{calendar_reminders}\n"
                 f"RECENT_TURNS:\n{recent_text}\n"
